@@ -1,0 +1,86 @@
+{
+  "name": "databaker-desktop-recorder",
+  "version": "0.1.0",
+  "private": true,
+  "author": "DataBaker",
+  "description": "DataBaker 桌面音频采集工具",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "build:engine": "node scripts/run-cargo.cjs build --manifest-path engine/Cargo.toml",
+    "build:engine:release": "node scripts/run-cargo.cjs build --release --manifest-path engine/Cargo.toml",
+    "build:renderer": "vite build",
+    "build:electron": "tsc -p electron/tsconfig.json",
+    "build": "npm run build:engine:release && npm run build:renderer && npm run build:electron && node scripts/stage-engine.cjs",
+    "dev:renderer": "vite --host 127.0.0.1",
+    "dev:electron": "npm run build:electron && wait-on http://127.0.0.1:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .",
+    "dev": "npm run build:engine && concurrently -k -n renderer,electron -c cyan,magenta \"npm:dev:renderer\" \"npm:dev:electron\"",
+    "typecheck": "tsc --noEmit && tsc -p electron/tsconfig.json --noEmit",
+    "test:engine": "node scripts/run-cargo.cjs test --manifest-path engine/Cargo.toml",
+    "test": "npm run typecheck && npm run test:engine",
+    "package:dir": "npm run build && electron-builder --dir",
+    "package": "npm run build && electron-builder",
+    "package:win": "npm run build && electron-builder --win nsis --x64"
+  },
+  "build": {
+    "appId": "com.databaker.desktop-recorder",
+    "productName": "DataBaker 音频采集",
+    "asar": true,
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/bin",
+        "to": "bin"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "用于采集朗读语音并保存到本地录制目录。"
+      }
+    },
+    "win": {
+      "artifactName": "DataBaker-Recorder-${version}-Windows-${arch}.${ext}",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    }
+  },
+  "engines": {
+    "node": ">=22.12"
+  },
+  "dependencies": {
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^6.0.5",
+    "concurrently": "^10.0.4",
+    "cross-env": "^10.1.0",
+    "electron": "^43.3.0",
+    "electron-builder": "^26.15.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.1",
+    "wait-on": "^9.1.0"
+  }
+}

@@ -1,0 +1,83 @@
+# DataBaker 桌面音频采集
+
+Electron + React + TypeScript 桌面操作台，配套 Rust 原生录音引擎。当前版本面向本地可落地的逐句朗读采集：持续写入一条母音频，每次录制只保存整数样本边界，确认后导出独立 WAV。
+
+## 当前可用能力
+
+- 启动进入「录制」中心，可新建录制、筛选历史录制、打开目录或重新导出。
+- 导入 UTF-8 CSV / TSV / TXT，标准三列为“序号 / 句子正文 / 标签（备注）”；兼容历史 `id,text` 两列和普通逐行 TXT。
+- 枚举系统识别的麦克风与外置声卡输入，可选择设备、采样率和输入通道。
+- 可设置 16-bit PCM、24-bit PCM（默认）或 32-bit Float，母带、试听切片与最终导出保持同一 Mono WAV 格式。
+- Windows 使用系统音频驱动链路（CPAL/WASAPI）；常见 USB 声卡只要能在 Windows 输入设备中识别即可使用。
+- 开始后先执行 3 秒环境噪声检测，通过后才允许录制句子。
+- 可配置每句前后的连续静音时长（0.2–5.0 秒，默认 1.0 秒）；Rust 引擎对“可开始”与“可完成”双向门控。
+- 主界面和独立领读窗口同步显示黄（检测中）、绿（就绪）、红（录制中）、蓝（尾静音达标）。领读窗口优先打开在外接显示器。
+- Rust 端提取 PCM min/max 包络，WebGL 以固定媒体时间轴渲染实时波形，并显示 Peak / RMS 和写盘状态。
+- 每句支持开始、结束、试听、手动确认、重录、跳过；历史 attempt 不覆盖。
+- 业务事件追加写入 JSONL，状态使用原子快照，WAV 头每秒 checkpoint。
+- 一键导出整轨 `full-track.wav`、选中 attempt 的单句 WAV bundle、`metadata.json` 和 `metadata.csv`。
+- 同时保存操作打点 `recording_started_sample`、首次有效语音 `content_started_sample` 和实际切片起点 `start_sample`，便于后续根据一线规则选择业务时间戳。
+- 快捷键：`Space` 开始/结束/确认，`R` 重录，`P` 试听，`S` 跳过，方向键切句。
+
+## 开发运行
+
+需要 Node.js 22.12+、npm，以及 Rust stable。中国大陆网络可使用 RsProxy 安装 Rust，并在项目的 `.cargo/config.toml` 中使用 sparse 镜像。
+
+```bash
+export RUSTUP_DIST_SERVER=https://rsproxy.cn
+export RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+npm install
+npm run dev
+```
+
+可直接导入 `examples/script.tsv` 体验完整流程。环境检测通过后，按空格录制第一句。
+
+## 验证与打包
+
+```bash
+npm test
+npm run build
+npm run package:dir
+```
+
+Windows 安装包应在 Windows x64 构建机上执行 `npm run package`。Rust sidecar 必须在目标平台编译，不能把 macOS 二进制直接打入 Windows 安装包。
+
+### 推荐采集参数
+
+- 常规高清语音数据：`48,000 Hz / 24-bit PCM / Mono`。
+- 后期处理链路需要较大余量时：`48,000 Hz / 32-bit Float / Mono`。
+- 多输入声卡会显示“输入 1、输入 2…”；软件从所选硬件通道采集并交付单声道 WAV。
+
+位深选项控制实际写入 WAV 的编码，不是只写入元数据。硬件输入会优先使用驱动暴露的高精度采样格式，再转换为所选交付格式。如果声卡只提供低精度输入，选择更高交付位深不会凭空增加硬件有效精度。
+
+当前 Windows 基线是 WASAPI，覆盖无需厂商 SDK 的部署场景。仅提供 ASIO、且不提供可用 Windows 输入端点的特殊声卡不在当前基线内，应作为单独的驱动兼容项目验证。
+
+## 录制数据
+
+一份「录制」对应一个独立、可搬运的本地目录：
+
+```text
+<recording>/
+├── audio/master.wav
+├── metadata/events.jsonl
+├── metadata/items.snapshot.json
+├── preview/*.wav
+├── script/normalized.json
+├── session.json
+└── export/
+    ├── full-track.wav
+    ├── sentences/
+    │   └── <item-id>.wav
+    ├── metadata.csv
+    └── metadata.json
+```
+
+当前是可用 MVP，并非最终完备版。接下来优先补齐 Windows WASAPI 声卡真机长稳测试、异常录制的跨重启恢复和设备热插拔恢复。历史页目前不会伪装支持续录：异常中断的录制只能检查目录，安全停止的录制可以重新导出。
+
+### 本地存储策略
+
+当前不引入 IndexedDB、JSON 数据库或 SQLite。每个录制目录中的 `items.snapshot.json` 是当前状态快照，`events.jsonl` 是追加式操作记录，音频和导出文件与它们一起构成可搬运、可人工检查的完整数据单元。历史录制页直接扫描已授权保存目录，并把数据库式索引视为可选缓存，而不是事实源。
+
+当单个保存位置达到数千份录制，或需要全文搜索、标签、跨录制统计和分页时，再加入 SQLite 作为可从录制目录重建的索引。即使未来增加索引，录制目录格式仍保持独立可恢复。
