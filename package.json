@@ -19,7 +19,7 @@
     "test": "npm run typecheck && npm run test:engine",
     "package:dir": "npm run build && electron-builder --dir",
     "package": "npm run build && electron-builder",
-    "package:win": "npm run build && electron-builder --win nsis --x64"
+    "package:win": "npm run build && electron-builder --win nsis --x64 --publish never"
   },
   "build": {
     "appId": "com.databaker.desktop-recorder",
