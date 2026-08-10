@@ -16,7 +16,8 @@
     "dev": "npm run build:engine && concurrently -k -n renderer,electron -c cyan,magenta \"npm:dev:renderer\" \"npm:dev:electron\"",
     "typecheck": "tsc --noEmit && tsc -p electron/tsconfig.json --noEmit",
     "test:engine": "node scripts/run-cargo.cjs test --manifest-path engine/Cargo.toml",
-    "test": "npm run typecheck && npm run test:engine",
+    "test:engine-protocol": "node scripts/run-cargo.cjs build --manifest-path engine/Cargo.toml && node scripts/smoke-engine.cjs",
+    "test": "npm run typecheck && npm run test:engine && npm run test:engine-protocol",
     "package:dir": "npm run build && electron-builder --dir",
     "package": "npm run build && electron-builder",
     "package:win": "npm run build && electron-builder --win nsis --x64 --publish never"
@@ -38,6 +39,7 @@
     ],
     "mac": {
       "category": "public.app-category.productivity",
+      "icon": "build/icon.icns",
       "target": [
         "dmg",
         "zip"
@@ -48,6 +50,7 @@
     },
     "win": {
       "artifactName": "DataBaker-Recorder-${version}-Windows-${arch}.${ext}",
+      "icon": "build/icon.ico",
       "target": [
         {
           "target": "nsis",

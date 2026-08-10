@@ -7,5 +7,15 @@ export default defineConfig({
   server: {
     port: 5173,
     strictPort: true,
+    watch: {
+      ignored: [
+        '**/engine/target/**',
+        '**/build/**',
+        '**/dist/**',
+        '**/dist-electron/**',
+        '**/doc/**',
+        '**/移动app 参考/**',
+      ],
+    },
   },
 });

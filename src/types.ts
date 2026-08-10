@@ -22,6 +22,8 @@ export type SessionSnapshot = {
   script_name?: string;
   status: string;
   device_name: string;
+  device_id?: string;
+  input_sample_format?: string;
   audio_format: {
     sample_rate: number;
     bit_depth: number;
@@ -31,6 +33,8 @@ export type SessionSnapshot = {
     input_channel?: number;
   };
   master_audio: string;
+  storage_layout_version?: number;
+  segment_frames?: number;
   captured_samples: number;
   committed_samples: number;
   overflow_samples: number;
@@ -61,6 +65,7 @@ export type NoiseCheckProgress = {
 };
 
 export type AudioDevice = {
+  id: string;
   name: string;
   is_default: boolean;
   sample_rates: number[];
@@ -78,6 +83,8 @@ export type Meter = {
   committed_samples: number;
   overflow_samples: number;
   faulted: boolean;
+  storage_status: 'healthy' | 'warning' | 'critical';
+  storage_safe_remaining_seconds: number;
   peak: number;
   rms: number;
   silence_samples: number;
@@ -95,6 +102,7 @@ export type ExportResult = {
   sentences_dir: string;
   exported_count: number;
   skipped_count: number;
+  recovery_warnings?: string[];
 };
 
 export type PrompterCue = 'idle' | 'checking' | 'ready' | 'recording' | 'post-ready' | 'review';

@@ -1,4 +1,4 @@
-import type { Attempt, Meter, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SessionSnapshot } from './types';
+import type { Attempt, AudioDevice, Meter, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SessionSnapshot } from './types';
 
 export function installDevRecorderMock() {
   if ('recorder' in window) return;
@@ -21,7 +21,33 @@ export function installDevRecorderMock() {
   prompterChannel?.addEventListener('message', (event: MessageEvent<PrompterState>) => {
     prompterListeners.forEach((listener) => listener(event.data));
   });
+  const mockDevices: AudioDevice[] = [
+    { id: 'mock:studio-usb-microphone', name: 'Studio USB Microphone', is_default: true, sample_rates: [44_100, 48_000, 96_000], input_channels: [1, 2], configurations: [{ min_sample_rate: 44_100, max_sample_rate: 96_000, channels: 2, sample_format: 'f32' }] },
+    { id: 'mock:built-in-microphone', name: 'Built-in Microphone', is_default: false, sample_rates: [44_100, 48_000], input_channels: [1], configurations: [{ min_sample_rate: 44_100, max_sample_rate: 48_000, channels: 1, sample_format: 'f32' }] },
+  ];
   const previewHistory: RecordingHistoryEntry[] = [{
+    session_id: '朗读采集-20260810-161715',
+    session_dir: '/tmp/DataBaker Recordings/朗读采集-20260810-161715',
+    script_name: '1000.txt',
+    status: 'recording',
+    is_active: false,
+    started_at: '2026-08-10T16:17:15+08:00',
+    updated_at: '2026-08-10T16:19:02+08:00',
+    device_name: 'Studio USB Microphone',
+    sample_rate: 48_000,
+    bit_depth: 16,
+    encoding: 'pcm',
+    input_channel: 1,
+    captured_samples: 6_140_416,
+    overflow_samples: 0,
+    total_items: 3,
+    accepted_items: 0,
+    skipped_items: 0,
+    review_items: 0,
+    pending_items: 3,
+    noise_check: null,
+    export_exists: false,
+  }, {
     session_id: '内部语料_第01批-20260809-154230',
     session_dir: '/tmp/DataBaker Recordings/内部语料_第01批-20260809-154230',
     script_name: '内部语料_第01批.csv',
@@ -86,6 +112,8 @@ export function installDevRecorderMock() {
       committed_samples: Math.max(0, capturedSamples - 2_400),
       overflow_samples: 0,
       faulted: false,
+      storage_status: 'healthy',
+      storage_safe_remaining_seconds: 12 * 60 * 60,
       peak: pulse,
       rms: pulse * .42,
       silence_samples: silenceSamples,
@@ -100,12 +128,18 @@ export function installDevRecorderMock() {
   async function request<T>(command: string, payload: unknown = {}): Promise<T> {
     const data = payload as Record<string, unknown>;
     if (command === 'hello') return { engine_version: 'dev-mock', protocol_version: 1 } as T;
+    if (command === 'get_state_optional') {
+      if (!snapshot) return { active: false } as T;
+      return {
+        active: true,
+        snapshot: snapshotCopy(),
+        session_dir: currentSessionDir,
+        active_attempt: activeAttempt,
+      } as T;
+    }
     if (command === 'list_devices') return {
-      default_device_name: 'Studio USB Microphone',
-      devices: [
-        { name: 'Studio USB Microphone', is_default: true, sample_rates: [44_100, 48_000, 96_000], input_channels: [1, 2], configurations: [{ min_sample_rate: 44_100, max_sample_rate: 96_000, channels: 2, sample_format: 'f32' }] },
-        { name: 'Built-in Microphone', is_default: false, sample_rates: [44_100, 48_000], input_channels: [1], configurations: [{ min_sample_rate: 44_100, max_sample_rate: 48_000, channels: 1, sample_format: 'f32' }] },
-      ],
+      default_device_id: 'mock:studio-usb-microphone',
+      devices: mockDevices,
     } as T;
     if (command === 'start_session') {
       capturedSamples = 0;
@@ -117,15 +151,19 @@ export function installDevRecorderMock() {
       mockSampleRate = Number(data.sample_rate) || 48_000;
       recordingStartedAt = performance.now();
       const items = data.items as ScriptItem[];
+      const requestedDevice = mockDevices.find((device) => device.id === String(data.device_id));
+      if (!requestedDevice) throw new Error('未找到指定的录音设备');
       const now = new Date().toISOString();
       snapshot = {
         schema_version: 1,
         session_id: String(data.session_id),
         script_name: String(data.script_name ?? ''),
         status: 'recording',
-        device_name: String(data.device_name),
+        device_name: requestedDevice.name,
+        device_id: requestedDevice.id,
+        input_sample_format: requestedDevice.configurations?.[0]?.sample_format ?? 'f32',
         audio_format: { sample_rate: Number(data.sample_rate), bit_depth: Number(data.bit_depth ?? 24), encoding: Number(data.bit_depth ?? 24) === 32 ? 'float' : 'pcm', channels: 1, input_channels: 2, input_channel: Number(data.input_channel ?? 1) },
-        master_audio: 'audio/master.wav', captured_samples: 0, committed_samples: 0, overflow_samples: 0,
+        master_audio: 'audio/master.wav', storage_layout_version: 1, segment_frames: Number(data.sample_rate) * 300, captured_samples: 0, committed_samples: 0, overflow_samples: 0,
         started_at: now, updated_at: now,
         noise_check: null,
         silence_duration_ms: Number(data.silence_duration_ms ?? 1_000),
@@ -134,6 +172,45 @@ export function installDevRecorderMock() {
       };
       meterTimer = window.setInterval(emitMeter, 100);
       return { snapshot: snapshotCopy(), session_dir: String(data.session_dir) } as T;
+    }
+    if (command === 'resume_session') {
+      const target = String(data.session_dir ?? '');
+      const recording = previewHistory.find((candidate) => candidate.session_dir === target);
+      if (!recording) throw new Error('Mock 中没有该录制任务');
+      capturedSamples = recording.captured_samples;
+      previousCapturedSamples = capturedSamples;
+      silenceSamples = 0;
+      lastSignalSample = 0;
+      firstAttemptSignalSample = 0;
+      currentSessionDir = target;
+      mockSampleRate = recording.sample_rate;
+      recordingStartedAt = performance.now() - capturedSamples / mockSampleRate * 1_000;
+      snapshot = {
+        schema_version: 1,
+        session_id: recording.session_id,
+        script_name: recording.script_name,
+        status: 'recording',
+        device_name: recording.device_name,
+        device_id: mockDevices.find((device) => device.name === recording.device_name)?.id ?? mockDevices[0].id,
+        input_sample_format: 'f32',
+        audio_format: { sample_rate: recording.sample_rate, bit_depth: recording.bit_depth, encoding: recording.encoding, channels: 1, input_channels: 2, input_channel: recording.input_channel },
+        master_audio: 'audio/master.wav', storage_layout_version: 1, segment_frames: recording.sample_rate * 300, captured_samples: capturedSamples, committed_samples: capturedSamples, overflow_samples: recording.overflow_samples,
+        started_at: recording.started_at, updated_at: new Date().toISOString(),
+        noise_check: null,
+        silence_duration_ms: 1_000,
+        silence_threshold_dbfs: -42,
+        items: Array.from({ length: recording.total_items }, (_, index) => ({
+          id: String(index + 1).padStart(3, '0'),
+          text: `恢复录制测试文本 ${index + 1}`,
+          label: index === 0 ? '自然语气' : '',
+          status: index < recording.accepted_items ? 'accepted' : 'pending',
+          attempts: [],
+          selected_attempt_id: null,
+        })),
+      };
+      window.clearInterval(meterTimer);
+      meterTimer = window.setInterval(emitMeter, 100);
+      return { snapshot: snapshotCopy(), session_dir: target, active_attempt: null, recovery_warnings: [] } as T;
     }
     if (command === 'export_session') {
       const target = String(data.session_dir ?? '');

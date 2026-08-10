@@ -6,7 +6,12 @@ type PendingRequest = {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
+  command: string;
 };
+
+const GRACEFUL_STOP_TIMEOUT_MS = 90_000;
+const SHUTDOWN_REQUEST_TIMEOUT_MS = 80_000;
+const FORCED_EXIT_WAIT_MS = 10_000;
 
 type EngineMessage = {
   protocol_version: number;
@@ -18,77 +23,123 @@ type EngineMessage = {
   payload?: unknown;
 };
 
+export class EngineRequestError extends Error {
+  constructor(
+    message: string,
+    readonly code: string,
+    readonly command: string,
+    readonly requestId: string,
+  ) {
+    super(message);
+    this.name = 'EngineRequestError';
+  }
+}
+
+export class EngineRequestTimeoutError extends Error {
+  constructor(
+    readonly command: string,
+    readonly requestId: string,
+    readonly timeoutMs: number,
+  ) {
+    super(`录音引擎响应超时：${command}`);
+    this.name = 'EngineRequestTimeoutError';
+  }
+}
+
 export class EngineClient extends EventEmitter {
   private child: ChildProcessWithoutNullStreams | undefined;
   private pending = new Map<string, PendingRequest>();
   private sequence = 0;
+  private childGeneration = 0;
+  private stoppingChild: ChildProcessWithoutNullStreams | undefined;
+  private stopPromise: Promise<void> | undefined;
 
   constructor(private readonly executable: string) {
     super();
   }
 
   async start(): Promise<void> {
-    if (this.child) return;
+    if (this.stopPromise) await this.stopPromise;
+    if (this.child && this.child.exitCode === null && !this.child.killed) return;
+    this.child = undefined;
     const child = spawn(this.executable, [], {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     });
+    const generation = ++this.childGeneration;
     this.child = child;
     const lines = createInterface({ input: child.stdout });
-    lines.on('line', (line) => this.handleLine(line));
+    lines.on('line', (line) => this.handleLine(child, generation, line));
     child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (chunk: string) => this.emit('log', chunk.trim()));
-    child.once('error', (error) => this.handleExit(error));
+    child.stderr.on('data', (chunk: string) => {
+      if (this.child === child && this.childGeneration === generation) {
+        this.emit('log', chunk.trim());
+      }
+    });
+    child.stdin.on('error', (error) => {
+      if (this.child === child && this.stoppingChild !== child) {
+        this.emit('log', `录音引擎输入通道异常：${error.message}`);
+      }
+    });
+    child.once('error', (error) => this.handleExit(child, error));
     child.once('exit', (code, signal) => {
-      this.handleExit(new Error(`录音引擎已退出（code=${code ?? '-'}, signal=${signal ?? '-'}）`));
+      this.handleExit(child, new Error(`录音引擎已退出（code=${code ?? '-'}, signal=${signal ?? '-'}）`));
     });
     await this.request('hello', {}, 8_000);
   }
 
+  get running(): boolean {
+    return Boolean(this.child && this.child.exitCode === null && !this.child.killed);
+  }
+
   request(command: string, payload: unknown = {}, timeoutMs = 15_000): Promise<unknown> {
-    if (!this.child || this.child.killed || !this.child.stdin.writable) {
+    const child = this.child;
+    if (!child || child.killed || child.exitCode !== null || !child.stdin.writable) {
       return Promise.reject(new Error('录音引擎未启动'));
     }
     const requestId = `${Date.now()}-${++this.sequence}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(requestId);
-        reject(new Error(`录音引擎响应超时：${command}`));
+        reject(new EngineRequestTimeoutError(command, requestId, timeoutMs));
       }, timeoutMs);
-      this.pending.set(requestId, { resolve, reject, timer });
-      this.child?.stdin.write(`${JSON.stringify({
+      this.pending.set(requestId, { resolve, reject, timer, command });
+      const line = `${JSON.stringify({
         protocol_version: 1,
         request_id: requestId,
         command,
         payload,
-      })}\n`);
-    });
-  }
-
-  async stop(): Promise<void> {
-    const child = this.child;
-    if (!child) return;
-    try {
-      await this.request('shutdown', {}, 10_000);
-    } catch {
-      // The OS process is still closed below even if the graceful request failed.
-    }
-    child.stdin.end();
-    await new Promise<void>((resolve) => {
-      if (child.exitCode !== null) return resolve();
-      const timer = setTimeout(() => {
-        child.kill();
-        resolve();
-      }, 3_000);
-      child.once('exit', () => {
-        clearTimeout(timer);
-        resolve();
+      })}\n`;
+      child.stdin.write(line, (error) => {
+        if (!error) return;
+        const request = this.pending.get(requestId);
+        if (!request) return;
+        clearTimeout(request.timer);
+        this.pending.delete(requestId);
+        request.reject(new Error(`无法向录音引擎发送 ${command}：${error.message}`));
       });
     });
-    this.child = undefined;
   }
 
-  private handleLine(line: string): void {
+  stop(): Promise<void> {
+    if (this.stopPromise) return this.stopPromise;
+    const child = this.child;
+    if (!child) return Promise.resolve();
+    this.stoppingChild = child;
+    const operation = this.stopChild(child).finally(() => {
+      if (this.stoppingChild === child) this.stoppingChild = undefined;
+      if (this.stopPromise === operation) this.stopPromise = undefined;
+    });
+    this.stopPromise = operation;
+    return operation;
+  }
+
+  private handleLine(
+    child: ChildProcessWithoutNullStreams,
+    generation: number,
+    line: string,
+  ): void {
+    if (this.child !== child || this.childGeneration !== generation) return;
     let message: EngineMessage;
     try {
       message = JSON.parse(line) as EngineMessage;
@@ -108,16 +159,68 @@ export class EngineClient extends EventEmitter {
     if (message.ok) {
       request.resolve(message.result);
     } else {
-      request.reject(new Error(message.error?.message || message.error?.code || '录音引擎调用失败'));
+      request.reject(new EngineRequestError(
+        message.error?.message || message.error?.code || '录音引擎调用失败',
+        message.error?.code || 'ENGINE_REQUEST_FAILED',
+        request.command,
+        message.request_id,
+      ));
     }
   }
 
-  private handleExit(error: Error): void {
+  private async stopChild(child: ChildProcessWithoutNullStreams): Promise<void> {
+    const deadline = Date.now() + GRACEFUL_STOP_TIMEOUT_MS;
+    try {
+      await this.request('shutdown', {}, SHUTDOWN_REQUEST_TIMEOUT_MS);
+    } catch (error) {
+      if (error instanceof EngineRequestTimeoutError) {
+        this.emit('log', `录音引擎未在 ${SHUTDOWN_REQUEST_TIMEOUT_MS / 1_000} 秒内完成安全收尾，继续等待至总超时。`);
+      } else if (!this.hasExited(child)) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.emit('log', `录音引擎安全收尾请求失败，将通过关闭输入通道继续收尾：${message}`);
+      }
+    }
+
+    if (!this.hasExited(child) && child.stdin.writable) child.stdin.end();
+    const remaining = Math.max(0, deadline - Date.now());
+    if (await this.waitForExit(child, remaining)) return;
+
+    this.emit('log', `录音引擎安全收尾超过 ${GRACEFUL_STOP_TIMEOUT_MS / 1_000} 秒，现在强制结束子进程。`);
+    child.kill();
+    if (!(await this.waitForExit(child, FORCED_EXIT_WAIT_MS))) {
+      throw new Error('录音引擎强制结束后仍未退出');
+    }
+  }
+
+  private hasExited(child: ChildProcessWithoutNullStreams): boolean {
+    return this.child !== child || child.exitCode !== null || child.signalCode !== null;
+  }
+
+  private waitForExit(child: ChildProcessWithoutNullStreams, timeoutMs: number): Promise<boolean> {
+    if (this.hasExited(child)) return Promise.resolve(true);
+    if (timeoutMs <= 0) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      const onExit = () => {
+        clearTimeout(timer);
+        resolve(true);
+      };
+      const timer = setTimeout(() => {
+        child.removeListener('exit', onExit);
+        resolve(this.hasExited(child));
+      }, timeoutMs);
+      child.once('exit', onExit);
+    });
+  }
+
+  private handleExit(child: ChildProcessWithoutNullStreams, error: Error): void {
+    if (this.child !== child) return;
+    const expected = this.stoppingChild === child;
+    this.child = undefined;
     for (const request of this.pending.values()) {
       clearTimeout(request.timer);
       request.reject(error);
     }
     this.pending.clear();
-    this.emit('offline', error.message);
+    if (!expected) this.emit('offline', error.message);
   }
 }

@@ -47,6 +47,12 @@ jobs:
       - name: Install JavaScript dependencies
         run: npm ci
 
+      - name: Check Rust formatting
+        run: node scripts/run-cargo.cjs fmt --manifest-path engine/Cargo.toml -- --check
+
+      - name: Run strict Rust lints
+        run: node scripts/run-cargo.cjs clippy --manifest-path engine/Cargo.toml --all-targets -- -D warnings
+
       - name: Run type and Rust tests
         run: npm test
 

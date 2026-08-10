@@ -1,8 +1,15 @@
+mod durable_fs;
 mod engine;
 mod protocol;
+mod segmented_wav;
+mod session_lock;
+mod storage_guard;
 mod wav;
 
-use crate::engine::{Engine, NoiseCheckPayload, StartSessionPayload};
+use crate::engine::{
+    Engine, NoiseCheckPayload, ResumeSessionPayload, StartSessionPayload,
+    is_no_active_session_error,
+};
 use crate::protocol::{CommandEnvelope, Emitter, PROTOCOL_VERSION};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -67,15 +74,24 @@ fn main() -> Result<()> {
             continue;
         }
         let request_id = command.request_id.clone();
+        let command_name = command.command.clone();
         match dispatch(&mut engine, command) {
             Ok(result) => emitter.response_ok(&request_id, result),
             Err(error) => {
-                eprintln!("command failed: {error:#}");
-                emitter.response_error(&request_id, "COMMAND_FAILED", format!("{error:#}"));
+                let code = if is_no_active_session_error(&error) {
+                    "NO_ACTIVE_SESSION"
+                } else {
+                    "COMMAND_FAILED"
+                };
+                eprintln!("command {command_name} [{request_id}] failed: {error:#}");
+                emitter.response_error(&request_id, code, format!("{error:#}"));
             }
         }
     }
-    engine.shutdown();
+    if let Err(error) = engine.shutdown() {
+        eprintln!("engine shutdown after stdin EOF failed: {error:#}");
+        return Err(error.context("safely stop recording after stdin EOF"));
+    }
     Ok(())
 }
 
@@ -90,6 +106,11 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
             let payload: StartSessionPayload =
                 serde_json::from_value(command.payload).context("invalid start_session payload")?;
             engine.start_session(payload)
+        }
+        "resume_session" => {
+            let payload: ResumeSessionPayload = serde_json::from_value(command.payload)
+                .context("invalid resume_session payload")?;
+            engine.resume_session(payload)
         }
         "check_noise" => {
             let payload: NoiseCheckPayload = parse(command.payload)?;
@@ -113,19 +134,36 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
             engine.render_attempt(&payload.item_id, &payload.attempt_id)
         }
         "get_state" => engine.get_state(),
+        "get_state_optional" => Ok(engine.get_state_optional()),
         "stop_session" => engine.stop_session(),
         "export_session" => {
             let payload: ExportPayload = parse(command.payload)?;
             engine.export_session(&PathBuf::from(payload.session_dir))
         }
-        "shutdown" => {
-            engine.shutdown();
-            Ok(json!({ "shutting_down": true }))
-        }
+        "shutdown" => shutdown_protocol_response(engine.shutdown()),
         other => Err(anyhow!("unknown command {other}")),
     }
 }
 
+fn shutdown_protocol_response(shutdown: Result<()>) -> Result<Value> {
+    shutdown?;
+    Ok(json!({ "shutting_down": true }))
+}
+
 fn parse<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T> {
     serde_json::from_value(value).context("invalid command payload")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_protocol_does_not_turn_a_stop_failure_into_success() {
+        let error = shutdown_protocol_response(Err(anyhow!(
+            "audio stopped but metadata could not be sealed"
+        )))
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("metadata could not be sealed"));
+    }
 }

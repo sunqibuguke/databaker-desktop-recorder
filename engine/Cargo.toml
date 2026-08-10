@@ -7,8 +7,11 @@ license = "Proprietary"
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
-cpal = "0.15"
+# Keep CPAL 0.18.1 local so the Windows capture-discontinuity fix remains
+# reproducible and does not depend on an unreleased Git revision.
+cpal = { path = "vendor/cpal" }
 crossbeam-channel = "0.5"
+fs2 = "0.4.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
@@ -16,4 +19,3 @@ serde_json = "1"
 lto = "thin"
 codegen-units = 1
 strip = true
-

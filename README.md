@@ -14,7 +14,9 @@ Electron + React + TypeScript 桌面操作台，配套 Rust 原生录音引擎�
 - 主界面和独立领读窗口同步显示黄（检测中）、绿（就绪）、红（录制中）、蓝（尾静音达标）。领读窗口优先打开在外接显示器。
 - Rust 端提取 PCM min/max 包络，WebGL 以固定媒体时间轴渲染实时波形，并显示 Peak / RMS 和写盘状态。
 - 每句支持开始、结束、试听、手动确认、重录、跳过；历史 attempt 不覆盖。
-- 业务事件追加写入 JSONL，状态使用原子快照，WAV 头每秒 checkpoint。
+- 业务事件先同步写入带序号的 JSONL journal，再原子替换快照；启动时可从最新持久化事件重建状态。
+- 母轨默认每 5 分钟封存为一个不再修改的 WAV 段；只有最后活动段会继续写入，且每秒按“先同步音频、再同步 WAV 头”做 checkpoint。
+- 异常启动可自动修复落后/超前的 WAV 头和不完整尾帧；队列溢出、写盘故障或磁盘余量进入安全线后 fail-closed，不再伪造连续时间轴。
 - 一键导出整轨 `full-track.wav`、选中 attempt 的单句 WAV bundle、`metadata.json` 和 `metadata.csv`。
 - 同时保存操作打点 `recording_started_sample`、首次有效语音 `content_started_sample` 和实际切片起点 `start_sample`，便于后续根据一线规则选择业务时间戳。
 - 快捷键：`Space` 开始/结束/确认，`R` 重录，`P` 试听，`S` 跳过，方向键切句。
@@ -60,9 +62,14 @@ Windows 安装包应在 Windows x64 构建机上执行 `npm run package`。Rust 
 
 ```text
 <recording>/
-├── audio/master.wav
+├── audio/
+│   └── segments/
+│       ├── master-000001.wav
+│       ├── master-000002.wav
+│       └── …
 ├── metadata/events.jsonl
 ├── metadata/items.snapshot.json
+├── metadata/session.lock
 ├── preview/*.wav
 ├── script/normalized.json
 ├── session.json
@@ -74,10 +81,10 @@ Windows 安装包应在 Windows x64 构建机上执行 `npm run package`。Rust 
     └── metadata.json
 ```
 
-当前是可用 MVP，并非最终完备版。接下来优先补齐 Windows WASAPI 声卡真机长稳测试、异常录制的跨重启恢复和设备热插拔恢复。历史页目前不会伪装支持续录：异常中断的录制只能检查目录，安全停止的录制可以重新导出。
+当前代码已实现第一版的核心数据安全基线：分段母轨、物理 EOF 恢复、事件重放、会话独占锁、磁盘余量保护、故障数据禁止常规交付，以及 Renderer/引擎异常恢复。正式面向客户采集前仍必须通过 Windows WASAPI + 真实 USB 声卡的长稳、断电、拔设备、磁盘写满和强杀故障注入门禁；未通过时不应宣称生产发布就绪。
 
 ### 本地存储策略
 
-当前不引入 IndexedDB、JSON 数据库或 SQLite。每个录制目录中的 `items.snapshot.json` 是当前状态快照，`events.jsonl` 是追加式操作记录，音频和导出文件与它们一起构成可搬运、可人工检查的完整数据单元。历史录制页直接扫描已授权保存目录，并把数据库式索引视为可选缓存，而不是事实源。
+当前不引入 IndexedDB、JSON 数据库或 SQLite。每个录制目录中的 `items.snapshot.json` 是可替换的当前状态投影，`events.jsonl` 保留最新的完整持久化事件（写入新事件时短暂为旧+新两条），启动时以 journal 序号校验并修复落后快照。分段音频、快照、journal 和导出文件一起构成可搬运、可人工检查的完整数据单元。历史录制页直接扫描已授权保存目录，并把数据库式索引视为可选缓存，而不是事实源。
 
 当单个保存位置达到数千份录制，或需要全文搜索、标签、跨录制统计和分页时，再加入 SQLite 作为可从录制目录重建的索引。即使未来增加索引，录制目录格式仍保持独立可恢复。
