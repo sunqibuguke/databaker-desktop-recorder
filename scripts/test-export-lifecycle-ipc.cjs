@@ -55,6 +55,11 @@ class FakeEngineClient extends EventEmitter {
     this.commands.push({ command, payload, timeout });
     if (command === 'get_state_optional') return { active: false };
     if (command === 'export_session') {
+      assert.equal(
+        payload.expected_session_id,
+        path.basename(payload.session_dir),
+        'export must bind the exact task identity seen in the authorized history list',
+      );
       announceExportStarted();
       await exportGate;
       const exportDir = path.join(payload.session_dir, 'export');
@@ -184,6 +189,8 @@ async function main() {
   const root = await fs.realpath(lexicalRoot);
   const sessionId = 'completed-session';
   const sessionDir = path.join(root, sessionId);
+  const replacedSessionId = 'replaced-before-export';
+  const replacedSessionDir = path.join(root, replacedSessionId);
   await fs.mkdir(path.join(sessionDir, 'metadata'), { recursive: true });
   await fs.writeFile(
     path.join(sessionDir, 'session.json'),
@@ -192,6 +199,15 @@ async function main() {
   await fs.writeFile(
     path.join(sessionDir, 'metadata', 'items.snapshot.json'),
     `${JSON.stringify(validSnapshot(sessionId))}\n`,
+  );
+  await fs.mkdir(path.join(replacedSessionDir, 'metadata'), { recursive: true });
+  await fs.writeFile(
+    path.join(replacedSessionDir, 'session.json'),
+    `${JSON.stringify({ schema_version: 1, session_id: replacedSessionId })}\n`,
+  );
+  await fs.writeFile(
+    path.join(replacedSessionDir, 'metadata', 'items.snapshot.json'),
+    `${JSON.stringify(validSnapshot(replacedSessionId))}\n`,
   );
   process.env.DATABAKER_DEFAULT_OUTPUT = root;
 
@@ -262,7 +278,24 @@ async function main() {
     const event = { sender: window.webContents };
     const list = handlers.get('recordings:list');
     const request = handlers.get('engine:request');
-    assert.equal((await list({}, root)).length, 1);
+    assert.equal((await list({}, root)).length, 2);
+
+    // The list established the original identity. Replacing only one durable
+    // identity source before export must be rejected in Electron, before the
+    // engine can create or overwrite any delivery artifact.
+    await fs.writeFile(
+      path.join(replacedSessionDir, 'session.json'),
+      `${JSON.stringify({ schema_version: 1, session_id: 'foreign-session' })}\n`,
+    );
+    await assert.rejects(
+      request(event, 'export_session', { session_dir: replacedSessionDir }),
+      /多个持久化来源身份不一致/,
+    );
+    assert.equal(
+      engine.commands.some(({ command }) => command === 'export_session'),
+      false,
+      'a replaced task must be rejected before export dispatch',
+    );
 
     let exportSettled = false;
     const exportPromise = request(event, 'export_session', { session_dir: sessionDir })

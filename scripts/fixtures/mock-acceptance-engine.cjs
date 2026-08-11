@@ -385,6 +385,10 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       }
       break;
     case 'export_session': {
+      if (command.payload.expected_session_id !== snapshot.session_id) {
+        error(requestId, 'export session identity mismatch');
+        break;
+      }
       if (faulted) {
         error(requestId, 'faulted session cannot be exported normally');
         break;

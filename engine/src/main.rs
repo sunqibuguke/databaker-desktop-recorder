@@ -33,6 +33,7 @@ struct AttemptPayload {
 #[derive(Deserialize)]
 struct ExportPayload {
     session_dir: String,
+    expected_session_id: String,
 }
 
 #[derive(Deserialize)]
@@ -232,7 +233,10 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
         }
         "export_session" => {
             let payload: ExportPayload = parse(command.payload)?;
-            engine.export_session(&PathBuf::from(payload.session_dir))
+            engine.export_session_expected(
+                &PathBuf::from(payload.session_dir),
+                &payload.expected_session_id,
+            )
         }
         "shutdown" => shutdown_protocol_response(engine.shutdown()),
         other => Err(anyhow!("unknown command {other}")),
@@ -294,7 +298,11 @@ mod tests {
 
     #[test]
     fn identity_bound_protocol_commands_require_an_expected_session_id() {
-        for command in ["resume_session", "seal_interrupted_session"] {
+        for command in [
+            "resume_session",
+            "seal_interrupted_session",
+            "export_session",
+        ] {
             let mut engine = Engine::new(Emitter::new());
             let error = dispatch(
                 &mut engine,

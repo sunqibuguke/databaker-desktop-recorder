@@ -2893,7 +2893,7 @@ async function runReplug(options, runDirectory, report) {
     try {
       const unexpected = await client.request(
         'export_session',
-        { session_dir: beforeDirectory },
+        { session_dir: beforeDirectory, expected_session_id: beforeSessionId },
         120_000,
       );
       report.replug.before.export = { expected_rejection: false, unexpected_result: unexpected };
@@ -3388,14 +3388,24 @@ async function runCapture(options, runDirectory, report) {
 
     if (FAULT_MODES.has(options.mode)) {
       try {
-        const unexpected = await client.request('export_session', { session_dir: sessionDirectory }, 120_000);
+        const unexpected = await client.request(
+          'export_session',
+          { session_dir: sessionDirectory, expected_session_id: sessionId },
+          120_000,
+        );
         report.export = { expected_rejection: false, unexpected_result: unexpected };
       } catch (error) {
         report.export = { expected_rejection: true, error: error.message };
       }
     } else if (options.export && report.stop.result) {
       try {
-        report.export = { result: await client.request('export_session', { session_dir: sessionDirectory }, 30 * 60_000) };
+        report.export = {
+          result: await client.request(
+            'export_session',
+            { session_dir: sessionDirectory, expected_session_id: sessionId },
+            30 * 60_000,
+          ),
+        };
       } catch (error) {
         report.export = { error: error.message };
       }

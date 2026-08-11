@@ -2560,9 +2560,10 @@ async function assertEngineIdleForExport(intent: EngineIntent): Promise<void> {
 
 async function reconciledCompleteExportResult(
   sessionDir: string,
+  expectedSessionId: string,
 ): Promise<Record<string, unknown> | null> {
   const recovered = await loadHistorySnapshot(sessionDir, path.join(sessionDir, 'metadata'));
-  if (!recovered) return null;
+  if (!recovered || recovered.snapshot.session_id !== expectedSessionId) return null;
   const exportDir = path.join(sessionDir, 'export');
   if (!(await hasCompleteExport(exportDir, recovered.snapshot))) return null;
   const statusSource = await readBoundedRegularFile(
@@ -2593,7 +2594,7 @@ async function reconciledCompleteExportResult(
 async function failExportingSession(
   intent: EngineIntent,
   originalError: unknown,
-  canonicalSessionDir: string | null,
+  binding: AuthorizedSessionBinding | null,
 ): Promise<unknown> {
   if (originalError instanceof EngineIntentSupersededError || !ownsEngineGeneration(intent)) {
     throw originalError;
@@ -2612,8 +2613,11 @@ async function failExportingSession(
       ) as EngineOptionalState;
       assertCurrentEngineIntent(intent, ['exporting']);
       if (state.active === true) adoptObservedActiveSession(intent, state);
-      const reconciled = canonicalSessionDir
-        ? await reconciledCompleteExportResult(canonicalSessionDir)
+      if (binding) {
+        await assertAuthorizedSessionUnchanged(binding, [binding.canonicalRoot]);
+      }
+      const reconciled = binding
+        ? await reconciledCompleteExportResult(binding.canonicalPath, binding.sessionId)
         : null;
       assertCurrentEngineIntent(intent, ['exporting']);
       transitionEngineIntent(intent, 'idle', null);
@@ -2640,6 +2644,7 @@ async function exportSession(payload: unknown): Promise<unknown> {
   if (typeof sessionDir !== 'string') throw new Error('录制目录无效');
   assertCanStartOrResume();
   const exportIntent = beginEngineIntent('exporting', path.resolve(sessionDir));
+  let binding: AuthorizedSessionBinding | null = null;
   let canonicalSessionDir: string | null = null;
   const completion = (async () => {
     try {
@@ -2648,20 +2653,38 @@ async function exportSession(payload: unknown): Promise<unknown> {
       if (!canonical) throw new Error('只能导出当前或历史录制目录');
       canonicalSessionDir = canonical;
       transitionEngineIntent(exportIntent, 'exporting', canonical);
+      const expectedSessionId = knownSessionId(canonical);
+      if (!expectedSessionId) throw new Error('无法确认录制任务身份，请刷新任务列表后重试');
+      const authorizedRoots = Array.from(canonicalOutputRoots.values());
+      binding = await bindAuthorizedSession(canonical, authorizedRoots, expectedSessionId);
+      assertCurrentEngineIntent(exportIntent, ['exporting']);
+      attachAuthorizedBinding(exportIntent, binding);
       await exportEngine.start();
       assertCurrentEngineIntent(exportIntent, ['exporting']);
       await assertEngineIdleForExport(exportIntent);
+      await assertAuthorizedSessionUnchanged(binding, authorizedRoots);
+      assertCurrentEngineIntent(exportIntent, ['exporting']);
       const result = await exportEngine.request(
         'export_session',
-        { ...(payload as Record<string, unknown>), session_dir: canonical },
+        {
+          ...(payload as Record<string, unknown>),
+          session_dir: canonical,
+          expected_session_id: binding.sessionId,
+        },
         EXPORT_REQUEST_TIMEOUT_MS,
       );
       assertCurrentEngineIntent(exportIntent, ['exporting']);
+      await assertAuthorizedSessionUnchanged(binding, authorizedRoots);
+      assertCurrentEngineIntent(exportIntent, ['exporting']);
       transitionEngineIntent(exportIntent, 'idle', null);
-      knownSessionDirs.add(canonical);
+      rememberKnownSession(canonical, binding.sessionId);
       return result;
     } catch (error) {
-      return await failExportingSession(exportIntent, error, canonicalSessionDir);
+      if (error instanceof AuthorizedSessionBindingError) {
+        const invalidated = binding?.canonicalPath ?? canonicalSessionDir;
+        if (invalidated) forgetKnownSession(invalidated);
+      }
+      return await failExportingSession(exportIntent, error, binding);
     }
   })();
   activeExportOperation = { intent: exportIntent, completion };

@@ -3167,13 +3167,36 @@ impl Engine {
         }))
     }
 
-    pub fn export_session(&self, session_dir: &Path) -> Result<Value> {
-        self.export_session_inner(session_dir, None)
+    #[cfg(test)]
+    fn export_session(&self, session_dir: &Path) -> Result<Value> {
+        self.export_session_inner_expected(session_dir, None, None)
     }
 
+    pub fn export_session_expected(
+        &self,
+        session_dir: &Path,
+        expected_session_id: &str,
+    ) -> Result<Value> {
+        let expected_session_id = expected_session_id.trim();
+        if expected_session_id.is_empty() {
+            bail!("导出需要明确的录制任务身份");
+        }
+        self.export_session_inner_expected(session_dir, Some(expected_session_id), None)
+    }
+
+    #[cfg(test)]
     fn export_session_inner(
         &self,
         session_dir: &Path,
+        available_bytes_override: Option<u64>,
+    ) -> Result<Value> {
+        self.export_session_inner_expected(session_dir, None, available_bytes_override)
+    }
+
+    fn export_session_inner_expected(
+        &self,
+        session_dir: &Path,
+        expected_session_id: Option<&str>,
         available_bytes_override: Option<u64>,
     ) -> Result<Value> {
         let session_metadata = std::fs::symlink_metadata(session_dir)
@@ -3190,7 +3213,8 @@ impl Engine {
         ensure_no_audio_fault_marker(session_dir, "生成常规交付")?;
         let _session_lock = SessionLock::acquire(session_dir, &Utc::now().to_rfc3339())?;
         let mut journal = read_journal(session_dir)?;
-        let snapshot = load_recovery_snapshot(session_dir, &mut journal)?;
+        let snapshot =
+            load_recovery_snapshot_for_session(session_dir, &mut journal, expected_session_id)?;
         let recovery_warnings = journal.warnings;
         validate_snapshot_for_export(&snapshot)?;
         let storage_kind = MasterStorageKind::from_snapshot(&snapshot)?;
@@ -4156,6 +4180,7 @@ fn read_session_identity(session_dir: &Path, warnings: &mut Vec<String>) -> Opti
         .map(str::to_string)
 }
 
+#[cfg(test)]
 fn load_recovery_snapshot(session_dir: &Path, journal: &mut JournalLog) -> Result<SessionSnapshot> {
     load_recovery_snapshot_for_session(session_dir, journal, None)
 }
@@ -11121,6 +11146,47 @@ mod tests {
                 .as_array()
                 .is_some_and(|warnings| !warnings.is_empty())
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn export_rejects_a_mismatched_expected_identity_before_writing_delivery_files() {
+        let root = test_root("export-identity-mismatch");
+        for directory in ["audio", "script", "preview", "export"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        let master = root.join(LEGACY_MASTER_AUDIO);
+        let mut writer = RecoverableWav::create(&master, 48_000, 1, 24).unwrap();
+        writer.write_samples(&[0.1, 0.2, 0.3, 0.4]).unwrap();
+        writer.finalize().unwrap();
+
+        let mut stopped = test_snapshot();
+        stopped.journal_seq = 1;
+        stopped.status = "stopped".to_string();
+        stopped.captured_samples = 4;
+        stopped.committed_samples = 4;
+        let snapshot_path = root.join("metadata/items.snapshot.json");
+        let journal_path = root.join("metadata/events.jsonl");
+        write_snapshot_file(&snapshot_path, &stopped);
+        write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
+        let audio_before = std::fs::read(&master).unwrap();
+        let snapshot_before = std::fs::read(&snapshot_path).unwrap();
+        let journal_before = std::fs::read(&journal_path).unwrap();
+
+        let error = Engine::new(Emitter::new())
+            .export_session_expected(&root, "different-recording")
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("属于其他录制"));
+        assert_eq!(std::fs::read(&master).unwrap(), audio_before);
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), snapshot_before);
+        assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+        assert!(
+            std::fs::read_dir(root.join("export"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+
         let _ = std::fs::remove_dir_all(root);
     }
 

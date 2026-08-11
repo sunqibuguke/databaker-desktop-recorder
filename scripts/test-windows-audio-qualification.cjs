@@ -364,7 +364,10 @@ function configureReplugFixture(report, requirement, runDirectory, afterDirector
     input_channel: requirement.channel,
   }, { ok: true, result: { snapshot: beforeStart } });
   command('stop_session', {}, { ok: true, result: { snapshot: beforeFinal } });
-  command('export_session', { session_dir: beforeDirectory }, { ok: false, error: 'faulted' });
+  command('export_session', {
+    session_dir: beforeDirectory,
+    expected_session_id: beforeSessionId,
+  }, { ok: false, error: 'faulted' });
   command('resume_session', {
     session_dir: beforeDirectory,
     expected_session_id: beforeSessionId,

@@ -494,9 +494,7 @@ async function main() {
         for (const command of ['resume_session', 'export_session']) {
           const response = await engine.request(command, {
             session_dir: fixtureInfo.killedSession,
-            ...(command === 'resume_session'
-              ? { expected_session_id: 'killed-recording' }
-              : {}),
+            expected_session_id: 'killed-recording',
           });
           assert.equal(response.ok, false, `${command} unexpectedly succeeded`);
           assert.match(response.error.message, /不可忽略的音频采集故障/);
