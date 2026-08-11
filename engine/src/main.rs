@@ -7,7 +7,7 @@ mod storage_guard;
 mod wav;
 
 use crate::engine::{
-    Engine, NoiseCheckPayload, ResumeSessionPayload, StartSessionPayload,
+    Engine, NoiseCheckPayload, ResumeSessionPayload, StartSessionPayload, StopAttemptPayload,
     is_no_active_session_error,
 };
 use crate::protocol::{CommandEnvelope, Emitter, PROTOCOL_VERSION};
@@ -161,7 +161,17 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
             let payload: ItemPayload = parse(command.payload)?;
             engine.start_attempt(&payload.item_id)
         }
-        "stop_attempt" => engine.stop_attempt(),
+        "stop_attempt" => {
+            // Older protocol clients omitted the payload entirely, which
+            // deserializes as JSON null. Preserve their non-forced stop
+            // semantics while accepting the new optional force flag.
+            let payload = if command.payload.is_null() {
+                StopAttemptPayload::default()
+            } else {
+                parse(command.payload)?
+            };
+            engine.stop_attempt(payload.force)
+        }
         "accept_attempt" => {
             let payload: AttemptPayload = parse(command.payload)?;
             engine.accept_attempt(&payload.item_id, &payload.attempt_id)
@@ -224,6 +234,23 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("metadata journal could not be sealed"));
+    }
+
+    #[test]
+    fn stop_attempt_null_payload_keeps_legacy_non_forced_semantics() {
+        let mut engine = Engine::new(Emitter::new());
+        let error = dispatch(
+            &mut engine,
+            CommandEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: "legacy-stop-attempt".to_string(),
+                command: "stop_attempt".to_string(),
+                payload: Value::Null,
+            },
+        )
+        .unwrap_err();
+
+        assert!(is_no_active_session_error(&error), "{error:#}");
     }
 
     #[test]

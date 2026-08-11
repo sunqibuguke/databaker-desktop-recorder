@@ -620,6 +620,18 @@ function testShortProtocolIntegration() {
     assert.equal(report.inspection.full_track.exact_header, true);
     assert.equal(report.inspection.export_metadata.exported.length, 1);
     assert.equal(report.inspection.export_metadata.skipped.length, 0);
+    assert.equal(
+      report.inspection.export_metadata.exported[0].forced_without_tail_silence,
+      false,
+    );
+    assert.equal(
+      report.inspection.export_metadata.exported[0].tail_silence_samples,
+      48_000,
+    );
+    assert.equal(
+      report.inspection.export_metadata.exported[0].required_tail_silence_samples,
+      48_000,
+    );
     assert.equal(report.inspection.export_csv.matches_metadata, true);
     assert.equal(report.inspection.export_sentence_wavs.length, 1);
     assert.equal(

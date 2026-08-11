@@ -61,7 +61,7 @@ function csvCell(value) {
 
 function exportCsv(exported) {
   const lines = [
-    'id,text,label,attempt_id,start_sample,recording_started_sample,content_started_sample,content_started_seconds,end_sample,duration_samples,file',
+    'id,text,label,attempt_id,start_sample,recording_started_sample,content_started_sample,content_started_seconds,end_sample,duration_samples,file,forced_without_tail_silence,tail_silence_samples,required_tail_silence_samples',
   ];
   for (const row of exported) {
     lines.push([
@@ -76,6 +76,9 @@ function exportCsv(exported) {
       row.end_sample,
       row.duration_samples,
       csvCell(row.file),
+      Boolean(row.forced_without_tail_silence),
+      row.tail_silence_samples ?? 0,
+      row.required_tail_silence_samples ?? 0,
     ].join(','));
   }
   return `${lines.join('\n')}\n`;
@@ -264,6 +267,9 @@ createInterface({ input: process.stdin }).on('line', (line) => {
           recording_started_sample: 0,
           content_started_sample: 1,
           end_sample: endSample,
+          forced_without_tail_silence: false,
+          tail_silence_samples: snapshot.audio_format.sample_rate,
+          required_tail_silence_samples: snapshot.audio_format.sample_rate,
           status: 'accepted',
           created_at: new Date().toISOString(),
         };
@@ -332,6 +338,9 @@ createInterface({ input: process.stdin }).on('line', (line) => {
           end_sample: attempt.end_sample,
           duration_samples: durationSamples,
           file: `sentences/${fileName}`,
+          forced_without_tail_silence: Boolean(attempt.forced_without_tail_silence),
+          tail_silence_samples: attempt.tail_silence_samples ?? 0,
+          required_tail_silence_samples: attempt.required_tail_silence_samples ?? 0,
         });
       }
       const metadata = {

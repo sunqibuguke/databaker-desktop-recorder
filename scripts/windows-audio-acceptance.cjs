@@ -31,7 +31,7 @@ const MAX_NORMAL_COMMIT_LAG_SECONDS = 15;
 const POWER_CUT_EVIDENCE_KIND = 'databaker.power-cut-phase-1';
 const POWER_CUT_SESSION_EVIDENCE = path.join('metadata', 'power-cut.acceptance.json');
 const SEGMENT_DESCRIPTOR_KIND = 'databaker.segmented-wav-header';
-const EXPORT_CSV_HEADER = 'id,text,label,attempt_id,start_sample,recording_started_sample,content_started_sample,content_started_seconds,end_sample,duration_samples,file';
+const EXPORT_CSV_HEADER = 'id,text,label,attempt_id,start_sample,recording_started_sample,content_started_sample,content_started_seconds,end_sample,duration_samples,file,forced_without_tail_silence,tail_silence_samples,required_tail_silence_samples';
 
 function testTimeout(name, fallback) {
   if (process.env.NODE_ENV !== 'test') return fallback;
@@ -529,6 +529,9 @@ function expectedExportCsv(exported) {
       integer(row?.end_sample),
       integer(row?.duration_samples),
       exportCsvCell(row?.file),
+      String(Boolean(row?.forced_without_tail_silence)),
+      integer(row?.tail_silence_samples),
+      integer(row?.required_tail_silence_samples),
     ].join(','));
   }
   return `${lines.join('\n')}\n`;

@@ -92,6 +92,22 @@ async function main() {
     await writeJson(path.join(metadataDir, 'items.snapshot.prev'), snapshot('session-a', 3));
     const foreign = snapshot('other-session', 99);
     const latest = snapshot('session-a', 4);
+    latest.items[0] = {
+      ...latest.items[0],
+      status: 'review',
+      attempts: [{
+        attempt_id: '1-a1',
+        start_sample: 0,
+        recording_started_sample: 48_000,
+        content_started_sample: 48_100,
+        end_sample: 96_000,
+        forced_without_tail_silence: true,
+        tail_silence_samples: 12_000,
+        required_tail_silence_samples: 48_000,
+        status: 'recorded',
+        created_at: '2026-08-11T00:00:01Z',
+      }],
+    };
     await fs.writeFile(path.join(metadataDir, 'events.jsonl'), [
       JSON.stringify({ event: 'foreign', journal_seq: 99, snapshot: foreign }),
       '{broken middle line',

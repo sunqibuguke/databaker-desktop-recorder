@@ -331,7 +331,6 @@ export function installDevRecorderMock() {
       return result as T;
     }
     if (command === 'start_attempt') {
-      if (!snapshot.noise_check?.passed) throw new Error('环境噪声检测通过后才能开始录制');
       const required = mockSampleRate * snapshot.silence_duration_ms / 1_000;
       if (silenceSamples < required) throw new Error('开始录制前静音时长不足');
       const item = snapshot.items.find((candidate) => candidate.id === data.item_id)!;
@@ -347,14 +346,32 @@ export function installDevRecorderMock() {
     }
     if (command === 'stop_attempt') {
       if (!activeAttempt) throw new Error('没有正在录制的版本');
-      if (!firstAttemptSignalSample) throw new Error('未检测到本句有效语音');
-      if (silenceSamples < mockSampleRate * snapshot.silence_duration_ms / 1_000) throw new Error('完成前静音时长不足');
-      const attempt: Attempt = { ...activeAttempt, start_sample: Math.max(0, firstAttemptSignalSample - mockSampleRate * snapshot.silence_duration_ms / 1_000), content_started_sample: firstAttemptSignalSample, end_sample: capturedSamples, status: 'recorded', created_at: new Date().toISOString() };
+      const force = Boolean(data.force);
+      if (!firstAttemptSignalSample) {
+        if (!force) throw new Error('未检测到本句有效语音');
+        const itemId = activeAttempt.item_id;
+        activeAttempt = null;
+        return { item_id: itemId, attempt: null, discarded: true, forced: true } as T;
+      }
+      const requiredSilence = mockSampleRate * snapshot.silence_duration_ms / 1_000;
+      const forcedWithoutTailSilence = force && silenceSamples < requiredSilence;
+      if (!force && silenceSamples < requiredSilence) throw new Error('完成前静音时长不足');
+      const attempt: Attempt = {
+        ...activeAttempt,
+        start_sample: Math.max(0, firstAttemptSignalSample - mockSampleRate * snapshot.silence_duration_ms / 1_000),
+        content_started_sample: firstAttemptSignalSample,
+        end_sample: capturedSamples,
+        forced_without_tail_silence: forcedWithoutTailSilence,
+        tail_silence_samples: silenceSamples,
+        required_tail_silence_samples: requiredSilence,
+        status: 'recorded',
+        created_at: new Date().toISOString(),
+      };
       const item = snapshot.items.find((candidate) => candidate.id === activeAttempt!.item_id)!;
       item.attempts.push(attempt);
       item.status = 'review';
       activeAttempt = null;
-      return { item_id: item.id, attempt } as T;
+      return { item_id: item.id, attempt, forced: forcedWithoutTailSilence } as T;
     }
     if (command === 'accept_attempt') {
       const item = snapshot.items.find((candidate) => candidate.id === data.item_id)!;

@@ -401,6 +401,12 @@ function isValidAttempt(value: unknown): boolean {
     && (value.content_started_sample === undefined
       || isNonNegativeSafeInteger(value.content_started_sample))
     && isNonNegativeSafeInteger(value.end_sample)
+    && (value.forced_without_tail_silence === undefined
+      || typeof value.forced_without_tail_silence === 'boolean')
+    && (value.tail_silence_samples === undefined
+      || isNonNegativeSafeInteger(value.tail_silence_samples))
+    && (value.required_tail_silence_samples === undefined
+      || isNonNegativeSafeInteger(value.required_tail_silence_samples))
     && typeof value.status === 'string'
     && typeof value.created_at === 'string';
 }
@@ -1464,7 +1470,7 @@ async function notifyEngineRecovered(
       type: 'warning',
       title: '录音引擎已自动恢复',
       message: '母轨已从最后一个持久化采样点继续录制',
-      detail: '异常时正在录制的句子已标记为不可交付的中断版本。请重新完成环境噪声检测后再开始新的句子。',
+      detail: '异常时正在录制的句子已标记为不可交付的中断版本。请确认实时输入电平，并等待句首静音达标后再开始新的句子。',
       buttons: ['知道了'],
     });
   } catch (uiError) {

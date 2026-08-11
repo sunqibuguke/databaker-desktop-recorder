@@ -70,6 +70,10 @@ const WRITER_QUEUE_CLOSED: u64 = 1 << 63;
 const WRITER_QUEUE_IN_FLIGHT_MASK: u64 = WRITER_QUEUE_CLOSED - 1;
 const WRITER_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(25);
 const WRITER_COMMIT_DEADLINE: Duration = Duration::from_secs(30);
+// A capture callback publishes its signal/silence analysis immediately after
+// its sample block has entered the writer queue. Protocol commands must not
+// classify a fixed capture boundary until that publication catches up.
+const CAPTURE_ANALYSIS_TIMEOUT: Duration = Duration::from_secs(2);
 const CAPTURE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 // A healthy real-time input stream produces non-empty buffers far more often
 // than this, even with unusually large USB-interface buffers. Some Windows
@@ -146,6 +150,17 @@ pub struct Attempt {
     #[serde(default)]
     pub content_started_sample: u64,
     pub end_sample: u64,
+    /// True only when an operator explicitly completed a spoken take before
+    /// the configured tail-silence duration had elapsed.
+    #[serde(default)]
+    pub forced_without_tail_silence: bool,
+    /// Silence available at the fixed stop boundary, measured from the end of
+    /// the most recent above-threshold capture block.
+    #[serde(default)]
+    pub tail_silence_samples: u64,
+    /// Tail-silence requirement in force when this take was completed.
+    #[serde(default)]
+    pub required_tail_silence_samples: u64,
     pub status: String,
     pub created_at: String,
 }
@@ -276,6 +291,12 @@ pub struct NoiseCheckPayload {
     pub threshold_dbfs: f32,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct StopAttemptPayload {
+    #[serde(default)]
+    pub force: bool,
+}
+
 fn default_sample_rate() -> u32 {
     48_000
 }
@@ -353,6 +374,8 @@ struct SilenceMonitor {
     silence_samples: Arc<AtomicU64>,
     last_signal_sample: Arc<AtomicU64>,
     attempt_signal_start_sample: Arc<AtomicU64>,
+    analyzed_samples: Arc<AtomicU64>,
+    analysis_epoch: Arc<AtomicU64>,
     threshold_bits: Arc<AtomicU32>,
     capture_heartbeat: Arc<AtomicU64>,
 }
@@ -366,6 +389,17 @@ struct WriterQueueBudget {
 
 struct WriterQueueLease<'a> {
     enqueue_state: &'a AtomicU64,
+}
+
+struct AnalysisWriteGuard<'a> {
+    epoch: &'a AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CaptureAnalysisSnapshot {
+    boundary: u64,
+    content_started_sample: u64,
+    last_signal_sample: u64,
 }
 
 #[derive(Debug)]
@@ -446,6 +480,34 @@ fn trip_stalled_capture(
 impl Drop for WriterQueueLease<'_> {
     fn drop(&mut self) {
         self.enqueue_state.fetch_sub(1, Ordering::Release);
+    }
+}
+
+impl Drop for AnalysisWriteGuard<'_> {
+    fn drop(&mut self) {
+        // Publish an even epoch only after all analysis fields and the analyzed
+        // sample watermark have been written.
+        self.epoch.fetch_add(1, Ordering::Release);
+    }
+}
+
+fn begin_analysis_write(epoch: &AtomicU64) -> AnalysisWriteGuard<'_> {
+    let mut observed = epoch.load(Ordering::Acquire);
+    loop {
+        if observed & 1 != 0 {
+            std::hint::spin_loop();
+            observed = epoch.load(Ordering::Acquire);
+            continue;
+        }
+        match epoch.compare_exchange_weak(
+            observed,
+            observed.wrapping_add(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return AnalysisWriteGuard { epoch },
+            Err(actual) => observed = actual,
+        }
     }
 }
 
@@ -739,7 +801,10 @@ pub struct RecordingSession {
     peak: Arc<AtomicU32>,
     rms: Arc<AtomicU32>,
     silence_samples: Arc<AtomicU64>,
+    last_signal_sample: Arc<AtomicU64>,
     attempt_signal_start_sample: Arc<AtomicU64>,
+    analyzed_samples: Arc<AtomicU64>,
+    analysis_epoch: Arc<AtomicU64>,
     silence_threshold_bits: Arc<AtomicU32>,
     active_attempt: Option<ActiveAttempt>,
     metadata_fault: Option<String>,
@@ -1189,6 +1254,11 @@ impl Engine {
         let silence_samples = Arc::new(AtomicU64::new(0));
         let last_signal_sample = Arc::new(AtomicU64::new(0));
         let attempt_signal_start_sample = Arc::new(AtomicU64::new(0));
+        // Existing audio was completely classified by its previous capture
+        // process. New callbacks advance this watermark only after publishing
+        // the signal/silence annotations for their accepted sample range.
+        let analyzed_samples = Arc::new(AtomicU64::new(expected_existing_frames));
+        let analysis_epoch = Arc::new(AtomicU64::new(0));
         let silence_threshold_bits =
             Arc::new(AtomicU32::new(snapshot.silence_threshold_dbfs.to_bits()));
         let (waveform_tx, waveform_rx) = bounded::<Vec<[f32; 2]>>(128);
@@ -1255,7 +1325,10 @@ impl Engine {
             peak: peak_bits,
             rms: rms_bits,
             silence_samples,
+            last_signal_sample,
             attempt_signal_start_sample,
+            analyzed_samples,
+            analysis_epoch,
             silence_threshold_bits,
             active_attempt: None,
             metadata_fault: None,
@@ -1309,8 +1382,10 @@ impl Engine {
             session.writer_queue.clone(),
             SilenceMonitor {
                 silence_samples: Arc::clone(&session.silence_samples),
-                last_signal_sample: Arc::clone(&last_signal_sample),
+                last_signal_sample: Arc::clone(&session.last_signal_sample),
                 attempt_signal_start_sample: Arc::clone(&session.attempt_signal_start_sample),
+                analyzed_samples: Arc::clone(&session.analyzed_samples),
+                analysis_epoch: Arc::clone(&session.analysis_epoch),
                 threshold_bits: Arc::clone(&session.silence_threshold_bits),
                 capture_heartbeat: Arc::clone(&session.capture_heartbeat),
             },
@@ -1394,7 +1469,7 @@ impl Engine {
         let peak_thread = Arc::clone(&session.peak);
         let rms_thread = Arc::clone(&session.rms);
         let silence_samples_thread = Arc::clone(&session.silence_samples);
-        let last_signal_sample_thread = Arc::clone(&last_signal_sample);
+        let last_signal_sample_thread = Arc::clone(&session.last_signal_sample);
         let silence_threshold_thread = Arc::clone(&session.silence_threshold_bits);
         let silence_duration_ms = session.snapshot.silence_duration_ms;
         let telemetry_session_dir = session.session_dir.clone();
@@ -1597,14 +1672,6 @@ impl Engine {
         if session.active_attempt.is_some() {
             bail!("an attempt is already recording");
         }
-        if !session
-            .snapshot
-            .noise_check
-            .as_ref()
-            .is_some_and(|result| result.passed)
-        {
-            bail!("ambient noise check must pass before recording an attempt");
-        }
         let item = session
             .snapshot
             .items
@@ -1661,7 +1728,7 @@ impl Engine {
         }))
     }
 
-    pub fn stop_attempt(&mut self) -> Result<Value> {
+    pub fn stop_attempt(&mut self, force: bool) -> Result<Value> {
         let session = self.active_session_mut()?;
         session.ensure_metadata_mutation_allowed()?;
         let active = session
@@ -1694,27 +1761,66 @@ impl Engine {
                 "interrupted": true,
             }));
         }
-        let content_started_sample = session.attempt_signal_start_sample.load(Ordering::Acquire);
+        // Freeze the operator's requested stop boundary first. A callback
+        // reserves its sample range before it publishes signal annotations, so
+        // reading the signal atomics immediately could otherwise discard a
+        // block that the writer has already accepted. The seqlock snapshot may
+        // advance to a callback that was already being analyzed, but its final
+        // boundary and signal fields always come from the same even epoch.
+        let requested_boundary = session.captured.load(Ordering::Acquire);
+        let analysis = session.wait_for_analysis_snapshot(requested_boundary)?;
+        let captured_boundary = analysis.boundary;
+        let observed_content_started_sample = analysis.content_started_sample;
+        let content_started_sample = if observed_content_started_sample == 0
+            || observed_content_started_sample > captured_boundary
+        {
+            0
+        } else {
+            observed_content_started_sample
+        };
         if content_started_sample == 0 {
-            bail!("未检测到本句有效语音，请朗读后再完成");
+            if !force {
+                bail!("未检测到本句有效语音，请朗读后再完成");
+            }
+            session.persist(
+                "attempt_discarded",
+                json!({
+                    "item_id": &active.item_id,
+                    "attempt_id": &active.attempt_id,
+                    "reason": "manual_stop_without_signal"
+                }),
+            )?;
+            // Retain the active attempt if the authoritative journal append
+            // fails so fault sealing can still preserve its sample range.
+            session.active_attempt = None;
+            return Ok(json!({
+                "item_id": active.item_id,
+                "attempt": null,
+                "discarded": true,
+                "forced": true,
+            }));
         }
         let required_silence_samples = session.required_silence_samples();
-        let current_silence_samples = session.silence_samples.load(Ordering::Acquire);
-        if current_silence_samples < required_silence_samples {
+        let last_signal_sample = analysis.last_signal_sample;
+        if last_signal_sample < content_started_sample {
+            bail!("音频信号分析边界不一致，请稍后重试完成本句");
+        }
+        let tail_silence_samples =
+            captured_boundary.saturating_sub(last_signal_sample.min(captured_boundary));
+        if tail_silence_samples < required_silence_samples && !force {
             bail!(
                 "完成本句前需要连续静音 {:.1} 秒；当前 {:.1} 秒",
                 session.snapshot.silence_duration_ms as f64 / 1_000.0,
-                current_silence_samples as f64
-                    / f64::from(session.snapshot.audio_format.sample_rate)
+                tail_silence_samples as f64 / f64::from(session.snapshot.audio_format.sample_rate)
             );
         }
-        let captured_sample = session.captured.load(Ordering::Acquire);
-        let end_sample = match session.wait_until_committed(captured_sample) {
-            Ok(_) => captured_sample,
+        let forced_without_tail_silence = force && tail_silence_samples < required_silence_samples;
+        let end_sample = match session.wait_until_committed(captured_boundary) {
+            Ok(_) => captured_boundary,
             Err(_) if session.faulted.load(Ordering::Acquire) => session
                 .committed
                 .load(Ordering::Acquire)
-                .min(captured_sample),
+                .min(captured_boundary),
             Err(error) => return Err(error),
         };
         if end_sample <= active.start_sample {
@@ -1742,6 +1848,9 @@ impl Engine {
             recording_started_sample: active.recording_started_sample,
             content_started_sample,
             end_sample,
+            forced_without_tail_silence,
+            tail_silence_samples,
+            required_tail_silence_samples: required_silence_samples,
             status: "recorded".to_string(),
             created_at: Utc::now().to_rfc3339(),
         };
@@ -1756,9 +1865,19 @@ impl Engine {
         session.active_attempt = None;
         session.persist(
             "attempt_stopped",
-            json!({ "item_id": active.item_id, "attempt": attempt }),
+            json!({
+                "item_id": active.item_id,
+                "attempt": attempt,
+                "forced": forced_without_tail_silence,
+                "tail_silence_samples": tail_silence_samples,
+                "required_tail_silence_samples": required_silence_samples,
+            }),
         )?;
-        Ok(json!({ "item_id": active.item_id, "attempt": attempt }))
+        Ok(json!({
+            "item_id": active.item_id,
+            "attempt": attempt,
+            "forced": forced_without_tail_silence,
+        }))
     }
 
     pub fn accept_attempt(&mut self, item_id: &str, attempt_id: &str) -> Result<Value> {
@@ -2399,6 +2518,9 @@ impl Engine {
                 "end_sample": attempt.end_sample,
                 "duration_samples": attempt.end_sample - attempt.start_sample,
                 "file": format!("sentences/{}", plan.file_name),
+                "forced_without_tail_silence": attempt.forced_without_tail_silence,
+                "tail_silence_samples": attempt.tail_silence_samples,
+                "required_tail_silence_samples": attempt.required_tail_silence_samples,
             }));
         }
         let metadata = json!({
@@ -3353,6 +3475,9 @@ fn recover_interrupted_attempts(
             recording_started_sample: active.recording_started_sample.min(durable_frames),
             content_started_sample: 0,
             end_sample: durable_frames,
+            forced_without_tail_silence: false,
+            tail_silence_samples: 0,
+            required_tail_silence_samples: 0,
             status: "interrupted".to_string(),
             created_at: active.created_at,
         });
@@ -3393,6 +3518,9 @@ fn mark_active_attempt_interrupted(
         recording_started_sample: active.recording_started_sample.min(durable_end),
         content_started_sample,
         end_sample: durable_end,
+        forced_without_tail_silence: false,
+        tail_silence_samples: 0,
+        required_tail_silence_samples: 0,
         status: "interrupted".to_string(),
         created_at: Utc::now().to_rfc3339(),
     };
@@ -3405,6 +3533,42 @@ impl RecordingSession {
         u64::from(self.snapshot.audio_format.sample_rate)
             .saturating_mul(u64::from(self.snapshot.silence_duration_ms))
             / 1_000
+    }
+
+    fn wait_for_analysis_snapshot(&self, requested: u64) -> Result<CaptureAnalysisSnapshot> {
+        let deadline = Instant::now() + CAPTURE_ANALYSIS_TIMEOUT;
+        loop {
+            let first_epoch = self.analysis_epoch.load(Ordering::Acquire);
+            if first_epoch & 1 != 0 {
+                if Instant::now() >= deadline {
+                    bail!("音频信号分析未及时完成停止边界快照；当前句仍保持录制状态，请稍后重试");
+                }
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            let analyzed = self.analyzed_samples.load(Ordering::Acquire);
+            let content_started_sample = self.attempt_signal_start_sample.load(Ordering::Acquire);
+            let last_signal_sample = self.last_signal_sample.load(Ordering::Acquire);
+            let second_epoch = self.analysis_epoch.load(Ordering::Acquire);
+            if first_epoch == second_epoch && second_epoch & 1 == 0 && analyzed >= requested {
+                return Ok(CaptureAnalysisSnapshot {
+                    boundary: analyzed,
+                    content_started_sample,
+                    last_signal_sample,
+                });
+            }
+            if self.faulted.load(Ordering::Acquire) {
+                bail!(
+                    "音频采集在信号分析到达停止边界前发生故障：目标 {requested}，已分析 {analyzed}"
+                );
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "音频信号分析未及时到达停止边界：目标 {requested}，已分析 {analyzed}；当前句仍保持录制状态，请稍后重试"
+                );
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn checkpoint(&mut self) -> Result<u64> {
@@ -5264,6 +5428,7 @@ fn publish_leased_block(
     // The checked timeline reservation is retained only after the complete
     // finite block has entered the writer queue. Once enqueueing fails, later
     // callbacks are rejected so WAV frames and sample annotations cannot drift.
+    let analysis_write = begin_analysis_write(&silence.analysis_epoch);
     let threshold_dbfs = f32::from_bits(silence.threshold_bits.load(Ordering::Relaxed));
     let threshold_linear = 10f32.powf(threshold_dbfs / 20.0);
     if rms <= threshold_linear {
@@ -5280,6 +5445,13 @@ fn publish_leased_block(
             .last_signal_sample
             .store(block_end, Ordering::Release);
     }
+    // Publish this only after every signal/silence annotation for the accepted
+    // range is visible. `stop_attempt` uses the watermark as the acquire side
+    // of that boundary before deciding whether a take contains speech.
+    silence
+        .analyzed_samples
+        .fetch_max(block_end, Ordering::Release);
+    drop(analysis_write);
     let previous_peak = f32::from_bits(peak_bits.load(Ordering::Relaxed));
     let previous_rms = f32::from_bits(rms_bits.load(Ordering::Relaxed));
     let smoothed_peak = peak.max(previous_peak * 0.86);
@@ -5919,13 +6091,13 @@ fn write_csv(path: &Path, exported: &Value) -> Result<()> {
     let result = (|| -> Result<()> {
         writeln!(
             file,
-            "id,text,label,attempt_id,start_sample,recording_started_sample,content_started_sample,content_started_seconds,end_sample,duration_samples,file"
+            "id,text,label,attempt_id,start_sample,recording_started_sample,content_started_sample,content_started_seconds,end_sample,duration_samples,file,forced_without_tail_silence,tail_silence_samples,required_tail_silence_samples"
         )?;
         if let Some(rows) = exported.as_array() {
             for row in rows {
                 writeln!(
                     file,
-                    "{},{},{},{},{},{},{},{:.6},{},{},{}",
+                    "{},{},{},{},{},{},{},{:.6},{},{},{},{},{},{}",
                     csv_cell(row["id"].as_str().unwrap_or_default()),
                     csv_cell(row["text"].as_str().unwrap_or_default()),
                     csv_cell(row["label"].as_str().unwrap_or_default()),
@@ -5937,6 +6109,13 @@ fn write_csv(path: &Path, exported: &Value) -> Result<()> {
                     row["end_sample"].as_u64().unwrap_or_default(),
                     row["duration_samples"].as_u64().unwrap_or_default(),
                     csv_cell(row["file"].as_str().unwrap_or_default()),
+                    row["forced_without_tail_silence"]
+                        .as_bool()
+                        .unwrap_or_default(),
+                    row["tail_silence_samples"].as_u64().unwrap_or_default(),
+                    row["required_tail_silence_samples"]
+                        .as_u64()
+                        .unwrap_or_default(),
                 )?;
             }
         }
@@ -6002,6 +6181,8 @@ mod tests {
             silence_samples: Arc::new(AtomicU64::new(0)),
             last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
+            analyzed_samples: Arc::new(AtomicU64::new(0)),
+            analysis_epoch: Arc::new(AtomicU64::new(0)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
         };
@@ -6211,13 +6392,189 @@ mod tests {
             peak: Arc::new(AtomicU32::new(0)),
             rms: Arc::new(AtomicU32::new(0)),
             silence_samples: Arc::new(AtomicU64::new(0)),
+            last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
+            analyzed_samples: Arc::new(AtomicU64::new(0)),
+            analysis_epoch: Arc::new(AtomicU64::new(0)),
             silence_threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             active_attempt: None,
             metadata_fault: None,
             stop_requested: false,
             capture_stopped: false,
         }
+    }
+
+    fn prepare_metadata_test_session(root: &Path) -> RecordingSession {
+        let mut snapshot = test_snapshot();
+        snapshot.journal_seq = 1;
+        write_snapshot_file(&root.join("metadata/items.snapshot.json"), &snapshot);
+        write_journal(root, &[sequenced_event("session_started", &snapshot)]);
+        let mut session = metadata_test_session(root);
+        session.snapshot = snapshot;
+        session
+    }
+
+    #[test]
+    fn attempts_no_longer_require_the_legacy_three_window_noise_check() {
+        let root = test_root("start-attempt-without-noise-check");
+        let session = prepare_metadata_test_session(&root);
+        session.silence_samples.store(48_000, Ordering::Release);
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+
+        let started = engine.start_attempt("001").unwrap();
+
+        assert_eq!(started["attempt_id"], "001-a1");
+        assert!(engine.session.as_ref().unwrap().active_attempt.is_some());
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn forced_stop_discards_an_attempt_that_never_received_speech() {
+        let root = test_root("forced-stop-without-speech");
+        let mut session = prepare_metadata_test_session(&root);
+        session.active_attempt = Some(ActiveAttempt {
+            item_id: "001".to_string(),
+            attempt_id: "001-a1".to_string(),
+            start_sample: 0,
+            recording_started_sample: 10,
+        });
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+
+        let stopped = engine.stop_attempt(true).unwrap();
+
+        assert_eq!(stopped["discarded"], true);
+        assert!(stopped["attempt"].is_null());
+        let session = engine.session.as_ref().unwrap();
+        assert!(session.active_attempt.is_none());
+        assert_eq!(session.snapshot.items[0].status, "pending");
+        let journal = read_journal(&root).unwrap();
+        assert_eq!(
+            journal.entries.last().unwrap()["event"],
+            "attempt_discarded"
+        );
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_forced_discard_retains_the_active_attempt_for_fault_sealing() {
+        let root = test_root("forced-discard-journal-failure");
+        let mut session = prepare_metadata_test_session(&root);
+        session.active_attempt = Some(ActiveAttempt {
+            item_id: "001".to_string(),
+            attempt_id: "001-a1".to_string(),
+            start_sample: 0,
+            recording_started_sample: 0,
+        });
+        let event_path = root.join("metadata/events.jsonl");
+        std::fs::remove_file(&event_path).unwrap();
+        std::fs::create_dir(&event_path).unwrap();
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+
+        assert!(engine.stop_attempt(true).is_err());
+
+        let session = engine.session.as_ref().unwrap();
+        assert!(session.active_attempt.is_some());
+        assert!(session.metadata_fault.is_some());
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn analysis_snapshot_never_pairs_an_old_boundary_with_new_signal_fields() {
+        let root = test_root("analysis-snapshot-seqlock");
+        let session = prepare_metadata_test_session(&root);
+        session.captured.store(130, Ordering::Release);
+        session.analyzed_samples.store(100, Ordering::Release);
+        session
+            .attempt_signal_start_sample
+            .store(20, Ordering::Release);
+        session.last_signal_sample.store(80, Ordering::Release);
+        // Model a callback that has started publishing a later signal block.
+        session.analysis_epoch.store(1, Ordering::Release);
+        let analyzed = Arc::clone(&session.analyzed_samples);
+        let last_signal = Arc::clone(&session.last_signal_sample);
+        let epoch = Arc::clone(&session.analysis_epoch);
+        let updater = thread::spawn(move || {
+            last_signal.store(120, Ordering::Release);
+            analyzed.store(130, Ordering::Release);
+            epoch.store(2, Ordering::Release);
+        });
+
+        let snapshot = session.wait_for_analysis_snapshot(100).unwrap();
+
+        updater.join().unwrap();
+        assert_eq!(
+            snapshot,
+            CaptureAnalysisSnapshot {
+                boundary: 130,
+                content_started_sample: 20,
+                last_signal_sample: 120,
+            }
+        );
+        assert_eq!(
+            snapshot
+                .boundary
+                .saturating_sub(snapshot.last_signal_sample.min(snapshot.boundary)),
+            10
+        );
+        drop(session);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn forced_stop_keeps_detected_speech_when_tail_silence_is_short() {
+        let root = test_root("forced-stop-short-tail");
+        let mut session = prepare_metadata_test_session(&root);
+        session.captured.store(100, Ordering::Release);
+        session.committed.store(100, Ordering::Release);
+        session.analyzed_samples.store(100, Ordering::Release);
+        session.last_signal_sample.store(95, Ordering::Release);
+        let (writer_tx, writer_rx) = bounded::<WriterMessage>(1);
+        session.writer_tx = writer_tx;
+        session.writer_join = Some(thread::spawn(move || {
+            if let Ok(WriterMessage::Checkpoint(reply)) = writer_rx.recv() {
+                let _ = reply.send(Ok(100));
+            }
+        }));
+        session
+            .attempt_signal_start_sample
+            .store(50, Ordering::Release);
+        session.active_attempt = Some(ActiveAttempt {
+            item_id: "001".to_string(),
+            attempt_id: "001-a1".to_string(),
+            start_sample: 0,
+            recording_started_sample: 10,
+        });
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+
+        let stopped = engine.stop_attempt(true).unwrap();
+
+        assert_eq!(stopped["forced"], true);
+        assert_eq!(stopped["attempt"]["content_started_sample"], 50);
+        assert_eq!(stopped["attempt"]["end_sample"], 100);
+        assert_eq!(stopped["attempt"]["forced_without_tail_silence"], true);
+        assert_eq!(stopped["attempt"]["tail_silence_samples"], 5);
+        assert_eq!(stopped["attempt"]["required_tail_silence_samples"], 48_000);
+        let session = engine.session.as_ref().unwrap();
+        assert!(session.active_attempt.is_none());
+        assert_eq!(session.snapshot.items[0].status, "review");
+        engine
+            .session
+            .as_mut()
+            .unwrap()
+            .writer_join
+            .take()
+            .unwrap()
+            .join()
+            .unwrap();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn activation_test_session(root: &Path, overflow_samples: u64) -> RecordingSession {
@@ -6282,7 +6639,10 @@ mod tests {
             peak: Arc::new(AtomicU32::new(0)),
             rms: Arc::new(AtomicU32::new(0)),
             silence_samples: Arc::new(AtomicU64::new(0)),
+            last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
+            analyzed_samples: Arc::new(AtomicU64::new(0)),
+            analysis_epoch: Arc::new(AtomicU64::new(0)),
             silence_threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             active_attempt: None,
             metadata_fault: None,
@@ -6653,6 +7013,8 @@ mod tests {
             silence_samples: Arc::new(AtomicU64::new(0)),
             last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
+            analyzed_samples: Arc::new(AtomicU64::new(0)),
+            analysis_epoch: Arc::new(AtomicU64::new(0)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(1)),
         };
@@ -7252,6 +7614,8 @@ mod tests {
             silence_samples: Arc::new(AtomicU64::new(0)),
             last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
+            analyzed_samples: Arc::new(AtomicU64::new(0)),
+            analysis_epoch: Arc::new(AtomicU64::new(0)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
         };
@@ -7536,6 +7900,8 @@ mod tests {
             silence_samples: Arc::new(AtomicU64::new(0)),
             last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
+            analyzed_samples: Arc::new(AtomicU64::new(0)),
+            analysis_epoch: Arc::new(AtomicU64::new(0)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
         };
@@ -7611,6 +7977,8 @@ mod tests {
             silence_samples: Arc::new(AtomicU64::new(9)),
             last_signal_sample: Arc::new(AtomicU64::new(11)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(7)),
+            analyzed_samples: Arc::new(AtomicU64::new(0)),
+            analysis_epoch: Arc::new(AtomicU64::new(0)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
         };
@@ -7690,6 +8058,8 @@ mod tests {
             silence_samples: Arc::new(AtomicU64::new(9)),
             last_signal_sample: Arc::new(AtomicU64::new(80)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(70)),
+            analyzed_samples: Arc::new(AtomicU64::new(0)),
+            analysis_epoch: Arc::new(AtomicU64::new(0)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
         };
@@ -7738,6 +8108,8 @@ mod tests {
             silence_samples: Arc::new(AtomicU64::new(9)),
             last_signal_sample: Arc::new(AtomicU64::new(80)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(70)),
+            analyzed_samples: Arc::new(AtomicU64::new(0)),
+            analysis_epoch: Arc::new(AtomicU64::new(0)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
         };
@@ -7797,6 +8169,8 @@ mod tests {
             silence_samples: Arc::new(AtomicU64::new(0)),
             last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
+            analyzed_samples: Arc::new(AtomicU64::new(0)),
+            analysis_epoch: Arc::new(AtomicU64::new(0)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
         };
@@ -7873,7 +8247,10 @@ mod tests {
             peak: Arc::new(AtomicU32::new(0)),
             rms: Arc::new(AtomicU32::new(0)),
             silence_samples: Arc::new(AtomicU64::new(0)),
+            last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
+            analyzed_samples: Arc::new(AtomicU64::new(0)),
+            analysis_epoch: Arc::new(AtomicU64::new(0)),
             silence_threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             active_attempt: None,
             metadata_fault: None,
@@ -7958,7 +8335,10 @@ mod tests {
             peak: Arc::new(AtomicU32::new(0f32.to_bits())),
             rms: Arc::new(AtomicU32::new(0f32.to_bits())),
             silence_samples: Arc::new(AtomicU64::new(0)),
+            last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample,
+            analyzed_samples: Arc::new(AtomicU64::new(0)),
+            analysis_epoch: Arc::new(AtomicU64::new(0)),
             silence_threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             active_attempt: Some(ActiveAttempt {
                 item_id: "001".to_string(),
@@ -8004,6 +8384,9 @@ mod tests {
             recording_started_sample: 20,
             content_started_sample: 25,
             end_sample: 90,
+            forced_without_tail_silence: false,
+            tail_silence_samples: 0,
+            required_tail_silence_samples: 0,
             status: "interrupted".to_string(),
             created_at: "2026-08-11T00:00:00Z".to_string(),
         });
@@ -8172,6 +8555,9 @@ mod tests {
             "end_sample": 20,
             "duration_samples": 10,
             "file": "sentences/001.wav",
+            "forced_without_tail_silence": true,
+            "tail_silence_samples": 120,
+            "required_tail_silence_samples": 48_000,
         }]);
 
         write_csv(&destination, &rows).unwrap();
@@ -8179,6 +8565,10 @@ mod tests {
         let csv = std::fs::read_to_string(&destination).unwrap();
         assert!(!csv.contains("old generation"));
         assert!(csv.contains("\"hello, \"\"world\"\"\""));
+        assert!(csv.lines().next().unwrap().ends_with(
+            "file,forced_without_tail_silence,tail_silence_samples,required_tail_silence_samples"
+        ));
+        assert!(csv.contains("\"sentences/001.wav\",true,120,48000"));
         assert!(std::fs::read_dir(&root).unwrap().all(|entry| {
             !entry
                 .unwrap()
@@ -8212,12 +8602,34 @@ mod tests {
         stopped.segment_frames = Some(10);
         stopped.captured_samples = 25;
         stopped.committed_samples = 25;
+        stopped.items[0].status = "accepted".to_string();
+        stopped.items[0].selected_attempt_id = Some("001-a1".to_string());
+        stopped.items[0].attempts.push(Attempt {
+            attempt_id: "001-a1".to_string(),
+            start_sample: 0,
+            recording_started_sample: 2,
+            content_started_sample: 5,
+            end_sample: 25,
+            forced_without_tail_silence: true,
+            tail_silence_samples: 2,
+            required_tail_silence_samples: 10,
+            status: "accepted".to_string(),
+            created_at: "2026-08-11T00:00:00Z".to_string(),
+        });
         write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
 
         let result = Engine::new(Emitter::new()).export_session(&root).unwrap();
 
-        assert_eq!(result["exported_count"].as_u64(), Some(0));
+        assert_eq!(result["exported_count"].as_u64(), Some(1));
         assert!(root.join("export/full-track.wav").is_file());
+        let metadata: Value =
+            serde_json::from_slice(&std::fs::read(root.join("export/metadata.json")).unwrap())
+                .unwrap();
+        assert_eq!(metadata["exported"][0]["forced_without_tail_silence"], true);
+        assert_eq!(metadata["exported"][0]["tail_silence_samples"], 2);
+        assert_eq!(metadata["exported"][0]["required_tail_silence_samples"], 10);
+        let csv = std::fs::read_to_string(root.join("export/metadata.csv")).unwrap();
+        assert!(csv.contains(",true,2,10\n"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -8227,6 +8639,24 @@ mod tests {
         value.as_object_mut().unwrap().remove("journal_seq");
         let snapshot: SessionSnapshot = serde_json::from_value(value).unwrap();
         assert_eq!(snapshot.journal_seq, 0);
+    }
+
+    #[test]
+    fn attempt_without_tail_quality_fields_is_backward_compatible() {
+        let attempt: Attempt = serde_json::from_value(json!({
+            "attempt_id": "001-a1",
+            "start_sample": 10,
+            "recording_started_sample": 20,
+            "content_started_sample": 25,
+            "end_sample": 90,
+            "status": "accepted",
+            "created_at": "2026-08-11T00:00:00Z"
+        }))
+        .unwrap();
+
+        assert!(!attempt.forced_without_tail_silence);
+        assert_eq!(attempt.tail_silence_samples, 0);
+        assert_eq!(attempt.required_tail_silence_samples, 0);
     }
 
     #[test]
@@ -8954,7 +9384,10 @@ mod tests {
             peak: Arc::new(AtomicU32::new(0)),
             rms: Arc::new(AtomicU32::new(0)),
             silence_samples: Arc::new(AtomicU64::new(0)),
+            last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
+            analyzed_samples: Arc::new(AtomicU64::new(0)),
+            analysis_epoch: Arc::new(AtomicU64::new(0)),
             silence_threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             active_attempt: None,
             metadata_fault: Some("injected initial persist failure".to_string()),

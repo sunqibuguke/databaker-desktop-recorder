@@ -6,6 +6,10 @@ export type Attempt = {
   recording_started_sample: number;
   content_started_sample: number;
   end_sample: number;
+  /** 该版本由操作员在句尾静音未达标时强制封闭，交付前需要重点试听。 */
+  forced_without_tail_silence?: boolean;
+  tail_silence_samples?: number;
+  required_tail_silence_samples?: number;
   status: string;
   created_at: string;
 };
