@@ -1666,10 +1666,13 @@ mod tests {
                 let active_path = writer.segments().last().unwrap().path.clone();
                 let descriptor_path = segment_descriptor_path(&active_path).unwrap();
                 assert!(descriptor_path.is_file());
+                // Windows keeps the active WAV range locked while the
+                // recoverable writer is alive. Simulate a crashed process by
+                // releasing that handle before inspecting and corrupting it.
+                drop(writer);
                 let before = std::fs::read(&active_path).unwrap();
                 let header_len = usize::try_from(layout.header_len).unwrap();
                 let audio_before = before[header_len..].to_vec();
-                drop(writer);
 
                 let mut raw = OpenOptions::new().write(true).open(&active_path).unwrap();
                 raw.seek(SeekFrom::Start(offset as u64)).unwrap();
