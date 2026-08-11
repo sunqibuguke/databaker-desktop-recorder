@@ -41,7 +41,9 @@ contextBridge.exposeInMainWorld('recorder', {
   saveCapturePreset: (preset: unknown) => ipcRenderer.invoke('capture-presets:save', preset),
   deleteCapturePreset: (id: string) => ipcRenderer.invoke('capture-presets:delete', id),
   setLastCapturePreset: (id: string | null) => ipcRenderer.invoke('capture-presets:select', id),
-  listRecordings: (root: string) => ipcRenderer.invoke('recordings:list', root),
+  listRecordings: (root: string, options?: { offset?: number; limit?: number }) => (
+    ipcRenderer.invoke('recordings:list', root, options)
+  ),
   joinPath: (...parts: string[]) => ipcRenderer.invoke('path:join', ...parts),
   readAudio: (filePath: string) => ipcRenderer.invoke('audio:read', filePath),
   openPath: (target: string) => ipcRenderer.invoke('shell:open-path', target),

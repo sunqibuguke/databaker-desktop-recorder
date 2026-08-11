@@ -300,7 +300,7 @@ async function runScenario() {
     if (scenario === 'live-unsafe-retry') {
       const window = FakeBrowserWindow.instances[0];
       const event = { sender: window.webContents };
-      const rows = await handlers.get('recordings:list')({}, root);
+      const rows = (await handlers.get('recordings:list')({}, root)).recordings;
       assert.equal(rows.length, 1);
       await handlers.get('engine:request')(event, 'resume_session', { session_dir: sessionDir });
     }

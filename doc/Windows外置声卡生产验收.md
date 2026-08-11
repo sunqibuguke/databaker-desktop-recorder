@@ -19,6 +19,8 @@
 
 > `input_sample_format` 是最终交给引擎的数字样本表示，例如 `i16` / `i24` / `i32` / `f32`。`--bit-depth` 是交付 WAV 编码。验收门槛按有效数字精度计算：整数 `n` bit 按 `n`，IEEE-754 `f32` 按 24 bit 有效数字，`f64` 按 53 bit，不会把 `f32` 容器误认为 32 bit 有效精度。Windows shared mode 下，可枚举的客户端格式不得超过 `GetMixFormat` 声明的有效精度；`IsFormatSupported` 只能证明 Windows 音频引擎接受该客户端格式，不能用来把已知的低位深源判成高精度。把低精度硬件输入写成 24-bit 或 32-bit 不会凭空增加有效精度，因此报告会同时保留输入格式与交付编码。验收工具默认要求 16-bit 交付至少 16 bit 有效数字精度，24/32-bit 交付至少 24 bit；可用 `--minimum-input-format-bits` 按项目提高。这仍不能证明声卡 ADC 的 ENOB，声卡型号、驱动版本与厂商规格必须人工归档。
 
+> 同样，`sample_rate` 是 WASAPI shared 客户端的交付采样率。生成 96 kHz WAV 只能证明 Windows 音频引擎向应用交付了 96 kHz 样本，不能单凭元数据证明 ADC/驱动原生 96 kHz，因为 shared mode 可以重采样。项目若要求原生采样率或 bit-perfect，必须单独走 RAW/独占 WASAPI 或 ASIO 路线，并用硬件回环、频谱和时钟测试验收。
+
 > 音频 PCM 仍持续写入活动分段；为避免每秒 `FlushFileBuffers` 对长录音造成抖动，引擎默认约每 10 秒执行一次昂贵的“音频落盘 → WAV 头落盘” checkpoint。磁盘余量查询与 checkpoint 独立，仍每秒执行，频繁完成短句不会推迟安全余量保护。`committed_samples` 表示这个可恢复水位，因此正常验收允许最多 15 秒 committed 延迟；真实断电的默认尾差也是 15 秒，项目可用 `--max-tail-loss-seconds` 放宽，但生产工具不允许超过 30 秒。
 
 ## 2. 安全规则

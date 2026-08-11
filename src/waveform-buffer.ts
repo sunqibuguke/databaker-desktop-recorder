@@ -2,10 +2,11 @@ export const WAVEFORM_BIN_SAMPLES = 64;
 // A wider viewport keeps the live trace readable on production workstations
 // without slowing or otherwise falsifying the authoritative PCM timeline.
 export const WAVEFORM_WINDOW_SECONDS = 20;
-// Keep the live edge inside the canvas instead of drawing it on the clipped
-// right border. This small future gutter makes a new consonant visible on the
-// first packet rather than only after it has travelled into the viewport.
-export const WAVEFORM_LIVE_EDGE_GUTTER_SECONDS = 0.5;
+// Keep the live edge far enough inside the canvas that a new consonant is
+// unmistakably visible on its first packet. With a 20-second viewport this
+// reserves the rightmost 10% as a stable live lane instead of hiding new
+// speech in the clipped last few pixels.
+export const WAVEFORM_LIVE_EDGE_GUTTER_SECONDS = 2;
 // Rust normally publishes a preview packet every 80 ms. Interpolate only up to
 // the authoritative capture cursor. If renderer/IPC congestion creates a much
 // larger gap, snap to that cursor instead of replaying stale data at high speed.

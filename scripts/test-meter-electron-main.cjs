@@ -61,8 +61,9 @@ class FakeWebContents extends EventEmitter {
 class FakeBrowserWindow extends EventEmitter {
   static instances = [];
 
-  constructor() {
+  constructor(options) {
     super();
+    this.options = options;
     this.destroyed = false;
     this.webContents = new FakeWebContents();
     FakeBrowserWindow.instances.push(this);
@@ -202,6 +203,12 @@ async function main() {
     const firstRenderer = firstWindow.webContents;
     const acknowledge = ipcListeners.get(ENGINE_METER_ACK_CHANNEL);
 
+    assert.equal(
+      firstWindow.options?.webPreferences?.backgroundThrottling,
+      false,
+      'the live meter and WebGL scope must not be throttled when the recording window loses focus',
+    );
+
     engine.emit('event', meter(1));
     engine.emit('event', meter(2, { faulted: true, fault_kind: 'device_unavailable' }));
     engine.emit('event', meter(3, { overflow_samples: 256 }));
@@ -295,6 +302,16 @@ async function main() {
     replacementDeliveries = messagesOn(replacementRenderer, ENGINE_METER_CHANNEL);
     assert.equal(replacementDeliveries.length, 2);
     assert.equal(deliveredMeter(replacementDeliveries[1]).payload.sequence, 15);
+
+    const openPrompter = ipcHandlers.get('prompter:open');
+    assert.equal(typeof openPrompter, 'function');
+    await openPrompter({ sender: replacementRenderer });
+    const prompterWindow = FakeBrowserWindow.instances[2];
+    assert.equal(
+      prompterWindow.options?.webPreferences?.backgroundThrottling,
+      false,
+      'prompter cues must not be throttled when the operator focuses the recording window',
+    );
 
     console.log('main process meter IPC integration tests passed');
   } finally {

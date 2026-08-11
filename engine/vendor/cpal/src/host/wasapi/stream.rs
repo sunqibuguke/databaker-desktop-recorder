@@ -20,7 +20,7 @@ use windows::Win32::{
 use crate::{
     host::{
         com::ComString, emit_error, equilibrium::fill_equilibrium, frames_to_duration,
-        latch::Latch, try_emit_error, ErrorCallbackArc,
+        latch::Latch, ErrorCallbackArc,
     },
     traits::StreamTrait,
     Data, Error, ErrorKind, FrameCount, InputCallbackInfo, InputStreamTimestamp,
@@ -849,6 +849,7 @@ fn run_input(
     // it for the lifetime of the input thread.
     let mut silent_buffer = Vec::<u64>::new();
     let mut first_packet_seen = false;
+    let mut previous_capture_packet = None;
     loop {
         match process_commands_and_await_signal(&mut run_ctxt, error_callback) {
             ControlFlow::Break(()) => break,
@@ -863,9 +864,9 @@ fn run_input(
             &run_ctxt.stream,
             capture_client,
             data_callback,
-            error_callback,
             &mut silent_buffer,
             &mut first_packet_seen,
+            &mut previous_capture_packet,
         ) {
             emit_error(error_callback, err);
             break;
@@ -991,9 +992,9 @@ fn process_input(
     stream: &StreamInner,
     capture_client: Audio::IAudioCaptureClient,
     data_callback: &mut dyn FnMut(&Data, &InputCallbackInfo),
-    error_callback: &ErrorCallbackArc,
     silent_buffer: &mut Vec<u64>,
     first_packet_seen: &mut bool,
+    previous_capture_packet: &mut Option<(u64, FrameCount)>,
 ) -> Result<(), Error> {
     unsafe {
         // Get the available data in the shared buffer.
@@ -1028,8 +1029,44 @@ fn process_input(
             // instead of guessing from device_position: an endpoint clock can
             // already be non-zero on startup and can later reset to zero after
             // a real glitch.
-            if capture_packet_has_reportable_discontinuity(first_packet_seen, flags) {
-                let _ = try_emit_error(error_callback, ErrorKind::Xrun.into());
+            let driver_discontinuity =
+                capture_packet_has_reportable_discontinuity(first_packet_seen, flags);
+
+            // `DATA_DISCONTINUITY` is a useful but driver-reported signal.
+            // Check the stream-relative positions as well so a capture gap
+            // that is shorter than the engine's stalled-input timeout cannot
+            // be silently accepted when a driver omits that flag. The first
+            // packet has no predecessor, and therefore establishes the
+            // baseline regardless of its initial device position.
+            let unflagged_position_discontinuity =
+                capture_packet_has_unflagged_position_discontinuity(
+                    previous_capture_packet,
+                    flags,
+                    device_position,
+                    frames_available,
+                );
+            if driver_discontinuity || unflagged_position_discontinuity {
+                // A successful GetBuffer must be paired with ReleaseBuffer
+                // before leaving this iteration. This error is returned to
+                // the run loop (rather than best-effort emitted here), which
+                // guarantees delivery through the stream error callback and
+                // ends this WASAPI input worker.
+                let message = if driver_discontinuity {
+                    "WASAPI capture packet has DATA_DISCONTINUITY"
+                } else {
+                    "WASAPI capture device position jumped without DATA_DISCONTINUITY"
+                };
+                capture_client
+                    .ReleaseBuffer(frames_available)
+                    .map_err(|release_error| {
+                        Error::with_message(
+                            ErrorKind::Xrun,
+                            format!(
+                                "{message}; additionally failed to release capture buffer: {release_error}"
+                            ),
+                        )
+                    })?;
+                return Err(Error::with_message(ErrorKind::Xrun, message));
             }
 
             let byte_count = frames_available as usize * stream.bytes_per_frame as usize;
@@ -1072,7 +1109,44 @@ fn process_input(
 fn capture_packet_has_reportable_discontinuity(first_packet_seen: &mut bool, flags: u32) -> bool {
     let is_first_packet = !*first_packet_seen;
     *first_packet_seen = true;
-    !is_first_packet && flags & Audio::AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0
+    !is_first_packet && capture_packet_has_data_discontinuity(flags)
+}
+
+fn capture_packet_has_data_discontinuity(flags: u32) -> bool {
+    flags & Audio::AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0
+}
+
+/// Returns whether the current capture packet fails to follow the preceding packet.
+///
+/// `IAudioCaptureClient::GetBuffer` reports the stream-relative device position
+/// of the first frame in each packet. Consecutive packets must therefore begin
+/// exactly after the previous packet's frame count. Treat a checked-add overflow
+/// as discontinuous too: losing the baseline would make the check fail-open.
+fn capture_packet_has_position_discontinuity(
+    previous_packet: &mut Option<(u64, FrameCount)>,
+    device_position: u64,
+    frames_available: FrameCount,
+) -> bool {
+    let discontinuity = previous_packet.is_some_and(|(previous_position, previous_frames)| {
+        previous_position.checked_add(previous_frames as u64) != Some(device_position)
+    });
+    *previous_packet = Some((device_position, frames_available));
+    discontinuity
+}
+
+/// A driver-reported discontinuity is handled as its own terminal error. A
+/// timestamp error only says that the instant at which the device position was
+/// recorded is uncertain; it does not make the stream-relative frame position
+/// unusable for this adjacency check. Keep checking it so that flag cannot
+/// mask an unreported capture gap.
+fn capture_packet_has_unflagged_position_discontinuity(
+    previous_packet: &mut Option<(u64, FrameCount)>,
+    flags: u32,
+    device_position: u64,
+    frames_available: FrameCount,
+) -> bool {
+    capture_packet_has_position_discontinuity(previous_packet, device_position, frames_available)
+        && !capture_packet_has_data_discontinuity(flags)
 }
 
 // The loop for writing output data.
@@ -1309,6 +1383,86 @@ mod tests {
         assert!(capture_packet_has_reportable_discontinuity(
             &mut first_packet_seen,
             discontinuity,
+        ));
+    }
+
+    #[test]
+    fn capture_position_discontinuity_ignores_first_packet_and_detects_short_gap() {
+        let mut previous_packet = None;
+
+        // A stream may begin at a non-zero device position.
+        assert!(!capture_packet_has_position_discontinuity(
+            &mut previous_packet,
+            4_096,
+            480,
+        ));
+        assert!(!capture_packet_has_position_discontinuity(
+            &mut previous_packet,
+            4_576,
+            480,
+        ));
+
+        // At 48 kHz this is a 10 ms gap: much shorter than the engine's
+        // five-second stalled-input watchdog, but still an unrecoverable gap.
+        assert!(capture_packet_has_position_discontinuity(
+            &mut previous_packet,
+            5_536,
+            480,
+        ));
+    }
+
+    #[test]
+    fn capture_position_discontinuity_detects_backward_jump_and_overflow() {
+        let mut previous_packet = Some((1_000, 480));
+        assert!(capture_packet_has_position_discontinuity(
+            &mut previous_packet,
+            999,
+            480,
+        ));
+
+        let mut previous_packet = Some((u64::MAX - 10, 11));
+        assert!(capture_packet_has_position_discontinuity(
+            &mut previous_packet,
+            0,
+            480,
+        ));
+    }
+
+    #[test]
+    fn timestamp_error_does_not_mask_an_unflagged_position_gap() {
+        let timestamp_error = Audio::AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32;
+        let mut previous_packet = None;
+
+        assert!(!capture_packet_has_unflagged_position_discontinuity(
+            &mut previous_packet,
+            timestamp_error,
+            2_000,
+            480,
+        ));
+        assert!(capture_packet_has_unflagged_position_discontinuity(
+            &mut previous_packet,
+            timestamp_error,
+            2_960,
+            480,
+        ));
+    }
+
+    #[test]
+    fn position_guard_defers_to_reportable_data_discontinuity() {
+        let data_discontinuity = Audio::AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32;
+        let mut previous_packet = Some((1_000, 480));
+
+        assert!(!capture_packet_has_unflagged_position_discontinuity(
+            &mut previous_packet,
+            data_discontinuity,
+            1_960,
+            480,
+        ));
+
+        let mut first_packet_seen = true;
+        assert!(capture_packet_has_reportable_discontinuity(
+            &mut first_packet_seen,
+            data_discontinuity,
         ));
     }
 }

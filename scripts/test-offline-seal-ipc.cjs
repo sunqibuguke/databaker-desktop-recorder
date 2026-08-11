@@ -303,7 +303,7 @@ async function runScenario() {
     const event = { sender: browserWindow.webContents };
     const list = handlers.get('recordings:list');
     const request = handlers.get('engine:request');
-    const rows = await list({}, root);
+    const rows = (await list({}, root)).recordings;
     assert.equal(rows.length, 1);
 
     const invokeSeal = () => request(event, 'seal_interrupted_session', {

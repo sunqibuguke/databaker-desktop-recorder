@@ -13,7 +13,10 @@ anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 # Keep CPAL 0.18.1 local so the Windows capture-discontinuity fix remains
 # reproducible and does not depend on an unreleased Git revision.
-cpal = { path = "vendor/cpal" }
+# Raise the platform audio callback to its realtime/MMCSS class where CPAL
+# supports it. This is particularly important for Windows USB interfaces under
+# CPU or DPC pressure; capture faults still remain fail-closed.
+cpal = { path = "vendor/cpal", features = ["realtime"] }
 crossbeam-channel = "0.5"
 fs2 = "0.4.3"
 serde = { version = "1", features = ["derive"] }

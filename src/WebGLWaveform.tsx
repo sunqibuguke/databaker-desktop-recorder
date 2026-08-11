@@ -266,6 +266,16 @@ export function WebGLWaveform({ bins, capturedSamples, waveformEndSample, record
         );
       }
 
+      // backgroundThrottling is disabled so telemetry can still be consumed
+      // and acknowledged while recording on another display. Do not spend GPU
+      // time rebuilding an invisible scope when the window is actually hidden;
+      // the authoritative sample cursor above still keeps the next visible
+      // frame current.
+      if (document.visibilityState === 'hidden') {
+        frame = requestAnimationFrame(render);
+        return;
+      }
+
       gl.clearColor(0, 0, 0, 0);
       gl.clear(gl.COLOR_BUFFER_BIT);
       gl.useProgram(program);

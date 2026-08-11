@@ -26,6 +26,10 @@ import {
 } from './capture-fault';
 import { CapturePresetRepository, type CapturePresetDraft } from './capture-presets';
 import {
+  OutputRootPreferenceRepository,
+  type OutputRootPreference,
+} from './output-root-preference';
+import {
   ENGINE_EVENT_CHANNEL,
   ENGINE_METER_ACK_CHANNEL,
   ENGINE_METER_CHANNEL,
@@ -53,6 +57,13 @@ let windowRecoveryPromise: Promise<void> | null = null;
 const forceCloseWindows = new WeakSet<BrowserWindow>();
 const allowedOutputRoots = new Set<string>();
 const canonicalOutputRoots = new Map<string, string>();
+type PersistedOutputRootBinding = Readonly<{
+  canonicalRoot: string;
+  device: bigint;
+  inode: bigint;
+  birthtimeNs: bigint;
+}>;
+const persistedOutputRoots = new Map<string, PersistedOutputRootBinding>();
 const knownSessionDirs = new Set<string>();
 const knownSessionIds = new Map<string, string>();
 const meterBackpressure = new LatestOnlyMeterBackpressure<Electron.WebContents, unknown>(
@@ -187,6 +198,8 @@ const SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024;
 const JOURNAL_MAX_BYTES = 128 * 1024 * 1024;
 const SESSION_IDENTITY_MAX_BYTES = 1024 * 1024;
 const EXPORT_STATUS_MAX_BYTES = 64 * 1024;
+const HISTORY_PAGE_DEFAULT_SIZE = 100;
+const HISTORY_PAGE_MAX_SIZE = 200;
 const EXPORT_REQUEST_TIMEOUT_MS = (() => {
   const productionTimeout = 12 * 60 * 60_000;
   if (process.env.NODE_ENV !== 'test') return productionTimeout;
@@ -455,14 +468,78 @@ function isAllowedNewSession(candidate: string): boolean {
 async function resolveAuthorizedOutputRoot(candidate: string, create: boolean): Promise<string> {
   const lexical = path.resolve(candidate);
   if (!allowedOutputRoots.has(lexical)) throw new Error('只能使用已授权的录制保存目录');
-  if (create) await fs.mkdir(lexical, { recursive: true });
-  const canonical = await fs.realpath(lexical);
+  const persistedBinding = persistedOutputRoots.get(normalizedSessionDir(lexical));
+  // Never recreate a remembered external path. If its volume disappeared,
+  // `/Volumes/name` on macOS or a reused Windows drive letter could otherwise
+  // silently send a new recording to different physical storage.
+  if (create && !persistedBinding) await fs.mkdir(lexical, { recursive: true });
+  let canonical: string;
+  try {
+    canonical = await fs.realpath(lexical);
+  } catch (error) {
+    if (persistedBinding && (error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new Error('上次录制保存位置当前不可用，请重连外置盘后重试');
+    }
+    throw error;
+  }
+  if (persistedBinding) {
+    let metadata: Awaited<ReturnType<typeof fs.lstat>>;
+    try {
+      metadata = await fs.lstat(canonical, { bigint: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new Error('上次录制保存位置当前不可用，请重连外置盘后重试');
+      }
+      throw error;
+    }
+    const hasStableIdentity = persistedBinding.device !== 0n
+      || persistedBinding.inode !== 0n
+      || persistedBinding.birthtimeNs !== 0n;
+    const identityChanged = !isSameSessionDir(canonical, persistedBinding.canonicalRoot)
+      || (persistedBinding.device !== 0n && metadata.dev !== persistedBinding.device)
+      || (persistedBinding.inode !== 0n && metadata.ino !== persistedBinding.inode)
+      || (persistedBinding.birthtimeNs !== 0n
+        && metadata.birthtimeNs !== persistedBinding.birthtimeNs);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink() || !hasStableIdentity || identityChanged) {
+      throw new Error('录制保存位置的磁盘或目录身份已变化，请确认介质后重新选择保存位置');
+    }
+  }
   const remembered = canonicalOutputRoots.get(lexical);
   if (remembered && remembered !== canonical) {
     throw new Error('录制保存目录已发生变化，请重新选择保存位置');
   }
   canonicalOutputRoots.set(lexical, canonical);
   return canonical;
+}
+
+function persistedOutputBinding(preference: OutputRootPreference): PersistedOutputRootBinding {
+  return {
+    canonicalRoot: preference.canonicalRoot,
+    device: BigInt(preference.device),
+    inode: BigInt(preference.inode),
+    birthtimeNs: BigInt(preference.birthtimeNs),
+  };
+}
+
+async function outputRootPreferenceFor(
+  outputRoot: string,
+  canonicalRoot: string,
+): Promise<OutputRootPreference> {
+  const metadata = await fs.lstat(canonicalRoot, { bigint: true });
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error('录制保存位置必须是普通目录');
+  }
+  if (metadata.dev === 0n && metadata.ino === 0n && metadata.birthtimeNs === 0n) {
+    throw new Error('当前文件系统无法提供稳定的目录身份，不能作为生产录制位置');
+  }
+  return {
+    schemaVersion: 2,
+    outputRoot,
+    canonicalRoot,
+    device: metadata.dev.toString(),
+    inode: metadata.ino.toString(),
+    birthtimeNs: metadata.birthtimeNs.toString(),
+  };
 }
 
 async function isInsideKnownSession(candidate: string): Promise<boolean> {
@@ -1152,52 +1229,228 @@ function countItems(items: unknown[], status: string): number {
   }).length;
 }
 
-async function listRecordings(root: string): Promise<unknown[]> {
+type RecordingDirectoryCandidate = {
+  sessionDir: string;
+  metadataDir: string | null;
+  modifiedAtMs: number;
+  issue?: string;
+};
+
+type RecordingDirectoryListing = {
+  sessionDir: string;
+  modifiedAtMs: number;
+  childNames: Set<string> | null;
+  issue?: string;
+};
+
+function historyIssueRow(
+  candidate: RecordingDirectoryCandidate,
+  issue: string,
+  sessionId?: string | null,
+): Record<string, unknown> {
+  // Inspection-only tasks are recognized for opening their directory, but no
+  // trusted session ID is remembered. Resume, seal and export therefore still
+  // fail closed at their identity-binding gates.
+  knownSessionDirs.add(candidate.sessionDir);
+  return {
+    session_id: sessionId || path.basename(candidate.sessionDir),
+    session_dir: candidate.sessionDir,
+    script_name: '原始文件仍保留',
+    status: 'invalid',
+    is_active: false,
+    started_at: '',
+    updated_at: new Date(candidate.modifiedAtMs).toISOString(),
+    device_name: '',
+    sample_rate: 0,
+    bit_depth: 0,
+    encoding: '',
+    input_channel: 0,
+    captured_samples: 0,
+    overflow_samples: 0,
+    total_items: 0,
+    accepted_items: 0,
+    skipped_items: 0,
+    review_items: 0,
+    pending_items: 0,
+    noise_check: null,
+    export_exists: false,
+    history_issue: issue,
+  };
+}
+
+async function listRecordings(
+  root: string,
+  requestedOffset: unknown = 0,
+  requestedLimit: unknown = HISTORY_PAGE_DEFAULT_SIZE,
+): Promise<Record<string, unknown>> {
+  const offset = Number(requestedOffset);
+  const limit = Number(requestedLimit);
+  if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('历史任务偏移量无效');
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > HISTORY_PAGE_MAX_SIZE) {
+    throw new Error(`历史任务每页应为 1–${HISTORY_PAGE_MAX_SIZE} 条`);
+  }
   const resolvedRoot = path.resolve(root);
   if (!isAllowedOutputRoot(resolvedRoot)) throw new Error('只能读取已授权的录制保存目录');
   let canonicalRoot: string;
   try {
     canonicalRoot = await resolveAuthorizedOutputRoot(resolvedRoot, false);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      if (persistedOutputRoots.has(normalizedSessionDir(resolvedRoot))) {
+        throw new Error('上次录制保存位置当前不可用，请重连外置盘后刷新任务');
+      }
+      return {
+        recordings: [],
+        next_offset: null,
+        total_directories: 0,
+        scanned_directories: 0,
+      };
+    }
     throw error;
   }
   let children: import('node:fs').Dirent[];
   try {
     children = await fs.readdir(canonicalRoot, { withFileTypes: true });
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return {
+        recordings: [],
+        next_offset: null,
+        total_directories: 0,
+        scanned_directories: 0,
+      };
+    }
     throw error;
   }
-  const candidates: Array<{ sessionDir: string; metadataDir: string; modifiedAtMs: number }> = [];
+  const directoryCandidates: RecordingDirectoryListing[] = [];
   for (const entry of children) {
     if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
     const lexicalSessionDir = path.join(canonicalRoot, entry.name);
+    let entryStat: Awaited<ReturnType<typeof fs.lstat>>;
+    let sessionDir: string;
     try {
-      const entryStat = await fs.lstat(lexicalSessionDir);
+      entryStat = await fs.lstat(lexicalSessionDir);
       if (!entryStat.isDirectory() || entryStat.isSymbolicLink()) continue;
-      const sessionDir = await fs.realpath(lexicalSessionDir);
-      if (path.dirname(sessionDir) !== canonicalRoot) continue;
-      const metadataDir = path.join(sessionDir, 'metadata');
-      const metadataStat = await fs.lstat(metadataDir);
-      if (metadataStat.isSymbolicLink() || !metadataStat.isDirectory()) continue;
-      if (await fs.realpath(metadataDir) !== metadataDir) continue;
+      sessionDir = await fs.realpath(lexicalSessionDir);
+      if (!isSameSessionDir(path.dirname(sessionDir), canonicalRoot)) continue;
+    } catch {
+      // A moved or linked entry cannot be safely bound to this authorized
+      // root, so it is not exposed as an actionable recording directory.
+      continue;
+    }
+    let childNames: Set<string>;
+    try {
+      childNames = new Set(await fs.readdir(sessionDir));
+    } catch (error) {
+      // An unreadable directory inside a dedicated recording root may still
+      // contain the only surviving audio. Keep it visible as inspection-only
+      // instead of silently classifying it as unrelated.
+      directoryCandidates.push({
+        sessionDir,
+        modifiedAtMs: entryStat.mtimeMs,
+        childNames: null,
+        issue: `任务目录无法读取：${error instanceof Error ? error.message : String(error)}`,
+      });
+      continue;
+    }
+    const looksLikeRecording = ['session.json', 'metadata', 'audio']
+      .some((name) => childNames.has(name));
+    if (!looksLikeRecording) continue;
+    let modifiedAtMs = entryStat.mtimeMs;
+    try {
+      const metadataStat = await fs.lstat(path.join(sessionDir, 'metadata'));
+      if (metadataStat.isDirectory() && !metadataStat.isSymbolicLink()) {
+        modifiedAtMs = Math.max(modifiedAtMs, metadataStat.mtimeMs);
+      }
+    } catch {
+      // Missing/damaged metadata is classified when this directory's page is
+      // inspected. The cheap top-level mtime remains its ordering fallback.
+    }
+    directoryCandidates.push({ sessionDir, modifiedAtMs, childNames });
+  }
+  directoryCandidates.sort((left, right) => right.modifiedAtMs - left.modifiedAtMs);
+  const pageEnd = Math.min(directoryCandidates.length, offset + limit);
+  const pageDirectories = directoryCandidates.slice(offset, pageEnd);
+  const candidates: RecordingDirectoryCandidate[] = [];
+  for (const directory of pageDirectories) {
+    const {
+      sessionDir, modifiedAtMs, childNames, issue,
+    } = directory;
+    if (!childNames || issue) {
       candidates.push({
         sessionDir,
-        metadataDir,
-        modifiedAtMs: Math.max(entryStat.mtimeMs, metadataStat.mtimeMs),
+        metadataDir: null,
+        modifiedAtMs,
+        issue: issue ?? '任务目录无法读取',
       });
-    } catch {
-      // Ignore incomplete or concurrently moved directories.
+      continue;
     }
+    const metadataDir = path.join(sessionDir, 'metadata');
+    let metadataStat: Awaited<ReturnType<typeof fs.lstat>>;
+    try {
+      metadataStat = await fs.lstat(metadataDir);
+    } catch (error) {
+      candidates.push({
+        sessionDir,
+        metadataDir: null,
+        modifiedAtMs,
+        issue: (error as NodeJS.ErrnoException).code === 'ENOENT'
+          ? '任务元数据目录缺失，请检查保留的原始文件'
+          : `任务元数据目录无法检查：${error instanceof Error ? error.message : String(error)}`,
+      });
+      continue;
+    }
+    let canonicalMetadataDir: string | null = null;
+    try {
+      canonicalMetadataDir = await fs.realpath(metadataDir);
+    } catch {
+      // The row below remains inspection-only.
+    }
+    if (metadataStat.isSymbolicLink()
+      || !metadataStat.isDirectory()
+      || !canonicalMetadataDir
+      || !isSameSessionDir(canonicalMetadataDir, metadataDir)) {
+      candidates.push({
+        sessionDir,
+        metadataDir: null,
+        modifiedAtMs: Math.max(modifiedAtMs, metadataStat.mtimeMs),
+        issue: '任务元数据目录类型异常，已禁止自动恢复',
+      });
+      continue;
+    }
+    candidates.push({
+      sessionDir,
+      metadataDir,
+      modifiedAtMs: Math.max(modifiedAtMs, metadataStat.mtimeMs),
+    });
   }
   candidates.sort((left, right) => right.modifiedAtMs - left.modifiedAtMs);
   const rows: Record<string, unknown>[] = [];
   for (const candidate of candidates) {
-    if (rows.length >= 500) break;
     try {
+      if (!candidate.metadataDir || candidate.issue) {
+        rows.push(historyIssueRow(
+          candidate,
+          candidate.issue ?? '任务元数据无法读取',
+          await readSessionIdentity(candidate.sessionDir),
+        ));
+        continue;
+      }
       const recovered = await loadHistorySnapshot(candidate.sessionDir, candidate.metadataDir);
-      if (!recovered) continue;
+      if (!recovered) {
+        const evidence = await readPersistedSessionEvidence(
+          candidate.sessionDir,
+          candidate.metadataDir,
+        );
+        rows.push(historyIssueRow(
+          candidate,
+          evidence.conflictingSessionIds.length > 0
+            ? '多个持久化来源的任务身份不一致，已禁止自动恢复'
+            : '找不到可用的任务快照，请检查保留的原始文件',
+          evidence.sessionId ?? await readSessionIdentity(candidate.sessionDir),
+        ));
+        continue;
+      }
       const snapshot = recovered.snapshot;
       const items = Array.isArray(snapshot.items) ? snapshot.items : [];
       const audioFormat = snapshot.audio_format && typeof snapshot.audio_format === 'object'
@@ -1231,13 +1484,21 @@ async function listRecordings(root: string): Promise<unknown[]> {
         noise_check: snapshot.noise_check ?? null,
         export_exists: exportExists,
       });
-    } catch {
-      // Ignore invalid snapshots without hiding the other recordings.
+    } catch (error) {
+      rows.push(historyIssueRow(
+        candidate,
+        `任务元数据无法读取：${error instanceof Error ? error.message : String(error)}`,
+        await readSessionIdentity(candidate.sessionDir),
+      ));
     }
   }
-  return rows
-    .sort((left, right) => String(right.updated_at).localeCompare(String(left.updated_at)))
-    .slice(0, 200);
+  return {
+    recordings: rows
+      .sort((left, right) => String(right.updated_at).localeCompare(String(left.updated_at))),
+    next_offset: pageEnd < directoryCandidates.length ? pageEnd : null,
+    total_directories: directoryCandidates.length,
+    scanned_directories: pageDirectories.length,
+  };
 }
 
 function sendToMain(channel: string, ...args: unknown[]): void {
@@ -2326,6 +2587,12 @@ async function createWindow(): Promise<BrowserWindow> {
         contextIsolation: true,
         nodeIntegration: false,
         sandbox: true,
+        // Meter state and the WebGL scope are both driven by animation
+        // frames. The operator may focus the prompter on a second display or
+        // cover this window while capture continues; Electron's default
+        // background throttling would otherwise pause the scope and make it
+        // jump several seconds when the window becomes foreground again.
+        backgroundThrottling: false,
       },
     });
     mainWindow = window;
@@ -2426,6 +2693,9 @@ async function createPrompterWindow(): Promise<BrowserWindow> {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // Prompter cues must remain live when the operator focuses the main
+      // recording panel on another display.
+      backgroundThrottling: false,
     },
   });
   prompterWindow.removeMenu();
@@ -2941,6 +3211,30 @@ function registerIpc(): void {
   const capturePresets = new CapturePresetRepository(
     path.join(app.getPath('userData'), 'capture-presets.json'),
   );
+  const outputRootPreference = new OutputRootPreferenceRepository(
+    path.join(app.getPath('userData'), 'output-root.json'),
+  );
+  let outputRootRecoveryWarning: string | null = null;
+  const bindAndRememberOutputRoot = async (
+    candidate: string,
+    createIfMissing: boolean,
+  ): Promise<string> => {
+    const lexical = path.resolve(candidate);
+    if (createIfMissing) await fs.mkdir(lexical, { recursive: true });
+    const canonical = await fs.realpath(lexical);
+    const preference = await outputRootPreferenceFor(lexical, canonical);
+    // Persist before publishing any new live authorization. If validation or
+    // replacement fails, the previous volume binding remains intact.
+    await outputRootPreference.save(preference);
+    allowedOutputRoots.add(lexical);
+    canonicalOutputRoots.set(lexical, canonical);
+    persistedOutputRoots.set(
+      normalizedSessionDir(lexical),
+      persistedOutputBinding(preference),
+    );
+    outputRootRecoveryWarning = null;
+    return lexical;
+  };
   ipcMain.on(ENGINE_METER_ACK_CHANNEL, (event, deliveryId: unknown) => {
     if (!mainWindow
       || mainWindow.isDestroyed()
@@ -3159,21 +3453,69 @@ function registerIpc(): void {
     return { filePath, name: path.basename(filePath), content };
   });
 
-  ipcMain.handle('dialog:choose-output', async () => {
+  ipcMain.handle('dialog:choose-output', async (event) => {
+    assertMainRenderer(event.sender);
     const result = await dialog.showOpenDialog(mainWindow!, {
       title: '选择录制保存目录',
       properties: ['openDirectory', 'createDirectory'],
     });
     const selected = result.canceled ? null : result.filePaths[0] ?? null;
     if (selected) {
-      const lexical = path.resolve(selected);
-      allowedOutputRoots.add(lexical);
-      await resolveAuthorizedOutputRoot(lexical, false);
+      // Explicit user selection is the only operation allowed to accept a new
+      // volume/directory identity for an existing path. Validate and durably
+      // save that replacement before changing live authorization state: a drive
+      // unplug or preference-write failure must leave the previous binding
+      // fail-closed for a subsequent start_session request.
+      return bindAndRememberOutputRoot(selected, false);
     }
-    return selected;
+    return null;
   });
 
-  ipcMain.handle('app:default-output', () => defaultOutputRoot());
+  ipcMain.handle('app:default-output', async (event) => {
+    assertMainRenderer(event.sender);
+    if (outputRootRecoveryWarning) {
+      return { outputRoot: '', warning: outputRootRecoveryWarning };
+    }
+    const configured = path.resolve(defaultOutputRoot());
+    const loaded = await outputRootPreference.load();
+    if (loaded.warning) {
+      console.warn(loaded.warning);
+      outputRootRecoveryWarning = `保存位置记录已损坏。${loaded.warning}。为避免写入错误位置，请重新选择原保存目录。`;
+      return { outputRoot: '', warning: outputRootRecoveryWarning };
+    }
+    const environmentOverride = Boolean(process.env.DATABAKER_DEFAULT_OUTPUT);
+    const storedMatchesConfiguration = Boolean(
+      loaded.preference
+      && (!environmentOverride
+        || isSameSessionDir(loaded.preference.outputRoot, configured)),
+    );
+    if (!storedMatchesConfiguration) {
+      // The first local default, or an explicitly changed administrator
+      // override, receives the same durable volume identity as a dialog
+      // selection. A later drive-letter/path replacement can no longer fall
+      // through the unbound mkdir path.
+      // The built-in Documents default is app-owned and may be created. An
+      // administrator override may name a removable mount, so it must already
+      // exist; auto-creating a missing drive/mount path could redirect audio
+      // onto the system disk.
+      const selected = await bindAndRememberOutputRoot(configured, !environmentOverride);
+      return { outputRoot: selected };
+    }
+    const selected = loaded.preference!.outputRoot;
+    // Authorization is deliberately restored from the app-owned preference,
+    // but canonicalization remains deferred until list/start. A temporarily
+    // disconnected Windows volume must stay visible as the selected path so
+    // the operator can reconnect it and refresh instead of seeing an empty
+    // default folder and assuming the recording disappeared.
+    allowedOutputRoots.add(selected);
+    if (loaded.preference) {
+      persistedOutputRoots.set(
+        normalizedSessionDir(selected),
+        persistedOutputBinding(loaded.preference),
+      );
+    }
+    return { outputRoot: selected };
+  });
   ipcMain.handle('capture-presets:load', (event) => {
     assertMainRenderer(event.sender);
     return capturePresets.load();
@@ -3221,7 +3563,14 @@ function registerIpc(): void {
     latestPrompterState = state;
     prompterWindow?.webContents.send('prompter:state', state);
   });
-  ipcMain.handle('recordings:list', (_event, root: string) => listRecordings(root));
+  ipcMain.handle(
+    'recordings:list',
+    (_event, root: string, options?: { offset?: unknown; limit?: unknown }) => listRecordings(
+      root,
+      options?.offset,
+      options?.limit,
+    ),
+  );
   ipcMain.handle('path:join', (_event, ...parts: string[]) => path.join(...parts));
   ipcMain.handle('audio:read', async (_event, filePath: string) => {
     if (!(await isInsideKnownSession(filePath)) || path.extname(filePath).toLowerCase() !== '.wav') {

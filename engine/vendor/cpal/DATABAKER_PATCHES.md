@@ -4,10 +4,23 @@ This directory vendors CPAL 0.18.1 so Windows builds do not depend on an
 unreleased Git revision or direct GitHub access.
 
 The WASAPI input loop includes the upstream capture-xrun changes from
-RustAudio/cpal pull requests #1268 and #1281. They report
-`AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY` through CPAL's error callback while
-ignoring the undefined flag on the first capture packet. The recorder treats
-that error as a fail-closed recording fault.
+RustAudio/cpal pull requests #1268 and #1281. It ignores the undefined
+`AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY` flag on the first capture packet, but
+releases every later flagged packet and returns a terminal `ErrorKind::Xrun`.
+The recorder treats that error as a fail-closed recording fault.
+
+The input loop also verifies that each packet's stream-relative
+`device_position` starts exactly after the preceding packet. A jump without
+`DATA_DISCONTINUITY` is returned as a terminal `ErrorKind::Xrun`, after the
+packet has been released. This catches short driver/USB delivery gaps that
+would otherwise resume before the recorder's five-second no-callback watchdog.
+`AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR` means that the time at which a device
+position was recorded is uncertain; it does not suppress frame-position
+continuity checking, so it cannot hide an unflagged gap.
+See Microsoft's packet-position and flag contracts:
+https://learn.microsoft.com/windows/win32/api/audioclient/nf-audioclient-iaudiocaptureclient-getbuffer
+and
+https://learn.microsoft.com/windows/win32/api/audioclient/ne-audioclient-_audclnt_bufferflags
 
 It also synthesizes format-correct equilibrium samples when WASAPI sets
 `AUDCLNT_BUFFERFLAGS_SILENT`. Microsoft requires capture clients to ignore the

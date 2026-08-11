@@ -289,7 +289,7 @@ async function runScenario() {
     const event = { sender: window.webContents };
     const list = handlers.get('recordings:list');
     const request = handlers.get('engine:request');
-    assert.equal((await list({}, root)).length, 1, 'history scan captures the trusted session identity');
+    assert.equal((await list({}, root)).recordings.length, 1, 'history scan captures the trusted session identity');
     await request(event, 'resume_session', { session_dir: sessionDir });
 
     if (scenario === 'identity-file-missing') {

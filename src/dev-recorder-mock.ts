@@ -491,7 +491,7 @@ export function installDevRecorderMock() {
       request,
       openScript: async () => null,
       chooseOutput: async () => '/tmp/DataBaker Recordings',
-      defaultOutput: async () => '/tmp/DataBaker Recordings',
+      defaultOutput: async () => ({ outputRoot: '/tmp/DataBaker Recordings' }),
       loadCapturePresets: async () => ({ store: structuredClone(capturePresetStore) }),
       saveCapturePreset: async (draft: CapturePresetDraft) => {
         const preset = { ...draft, id: draft.id || crypto.randomUUID() };
@@ -514,7 +514,7 @@ export function installDevRecorderMock() {
         capturePresetStore = { ...capturePresetStore, lastSelectedPresetId: id };
         return structuredClone(capturePresetStore);
       },
-      listRecordings: async () => {
+      listRecordings: async (_root: string, options?: { offset?: number; limit?: number }) => {
         const rows = [...previewHistory];
         if (snapshot && currentSessionDir) {
           const items = snapshot.items;
@@ -542,7 +542,15 @@ export function installDevRecorderMock() {
             export_exists: currentExportExists,
           });
         }
-        return rows;
+        const offset = Math.max(0, options?.offset ?? 0);
+        const limit = Math.max(1, options?.limit ?? 100);
+        const end = Math.min(rows.length, offset + limit);
+        return {
+          recordings: rows.slice(offset, end),
+          next_offset: end < rows.length ? end : null,
+          total_directories: rows.length,
+          scanned_directories: end - offset,
+        };
       },
       joinPath: async (...parts: string[]) => parts.join('/').replace(/\/+/g, '/'),
       readAudio: async () => new ArrayBuffer(44),

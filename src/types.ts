@@ -216,4 +216,17 @@ export type RecordingHistoryEntry = {
   pending_items: number;
   noise_check: NoiseCheckResult | null;
   export_exists: boolean;
+  history_issue?: string;
+};
+
+export type RecordingHistoryPage = {
+  recordings: RecordingHistoryEntry[];
+  next_offset: number | null;
+  total_directories: number;
+  scanned_directories: number;
+};
+
+export type DefaultOutputResult = {
+  outputRoot: string;
+  warning?: string;
 };

@@ -61,6 +61,98 @@ async function main() {
     );
   }
 
+  // Reproduce the observable studio scenario instead of checking only the
+  // isolated coordinate formula. The engine publishes about every 80 ms and
+  // the renderer paints on the next animation frame. A consonant in the newest
+  // packet must therefore be visible on the right within one packet + one
+  // frame, rather than spending seconds in a second playback queue.
+  {
+    const sampleRate = 48_000;
+    const packetDurationMs = 80;
+    const frameDurationMs = 16;
+    const helloSample = sampleRate * 2;
+    const packetEndSample = helloSample + sampleRate * packetDurationMs / 1_000;
+    const timelineSample = waveform.reconcileWaveformTimelineSample(
+      packetEndSample,
+      packetEndSample,
+      helloSample,
+    );
+    const firstPaintPlayhead = waveform.advanceWaveformPlayhead(
+      helloSample,
+      timelineSample,
+      frameDurationMs,
+      sampleRate,
+    );
+    const helloPositionOnFirstPaint = waveform.waveformSampleHorizontalPosition(
+      helloSample + waveform.WAVEFORM_BIN_SAMPLES / 2,
+      firstPaintPlayhead,
+      sampleRate,
+    );
+    const helloViewportRatio = (helloPositionOnFirstPaint + 1) / 2;
+    assert(
+      helloViewportRatio >= 0.85 && helloViewportRatio <= 0.92,
+      'the newest speech packet must be clearly visible in the live lane on its first paint (<= 96 ms)',
+    );
+  }
+
+  // Drive the same helpers with a deterministic 60-ish FPS clock and 80 ms
+  // capture packets. After two real seconds, a marker must be about two seconds
+  // old on the 20-second viewport. Allow only the current telemetry packet of
+  // lag; never permit accelerated catch-up or multi-second visual latency.
+  {
+    const sampleRate = 48_000;
+    const packetDurationMs = 80;
+    const frameDurationMs = 16;
+    const elapsedMs = 2_000;
+    const markerSample = sampleRate * 3;
+    let latestTimelineSample = markerSample;
+    let playheadSample = markerSample;
+    for (let now = frameDurationMs; now <= elapsedMs; now += frameDurationMs) {
+      if (now % packetDurationMs === 0) {
+        const receivedSample = markerSample + sampleRate * now / 1_000;
+        latestTimelineSample = waveform.reconcileWaveformTimelineSample(
+          receivedSample,
+          receivedSample,
+          latestTimelineSample,
+        );
+        playheadSample = waveform.advanceWaveformPlayhead(
+          playheadSample,
+          latestTimelineSample,
+          0,
+          sampleRate,
+        );
+      }
+      playheadSample = waveform.advanceWaveformPlayhead(
+        playheadSample,
+        latestTimelineSample,
+        frameDurationMs,
+        sampleRate,
+      );
+    }
+    const displayedMarkerAgeMs = (playheadSample - markerSample) / sampleRate * 1_000;
+    assert(
+      displayedMarkerAgeMs >= elapsedMs - packetDurationMs
+        && displayedMarkerAgeMs <= elapsedMs,
+      `two seconds of real time must move the waveform by two seconds, within one ${packetDurationMs} ms packet; got ${displayedMarkerAgeMs} ms`,
+    );
+    const startPosition = waveform.waveformSampleHorizontalPosition(
+      markerSample,
+      markerSample,
+      sampleRate,
+    );
+    const endPosition = waveform.waveformSampleHorizontalPosition(
+      markerSample,
+      playheadSample,
+      sampleRate,
+    );
+    const displayedViewportSeconds = (startPosition - endPosition) / 2
+      * waveform.WAVEFORM_WINDOW_SECONDS;
+    assert(
+      Math.abs(displayedViewportSeconds - displayedMarkerAgeMs / 1_000) < 1e-12,
+      'viewport motion must remain coupled 1:1 to the authoritative PCM clock',
+    );
+  }
+
   assert.equal(
     waveform.reconcileWaveformTimelineSample(192_000, 48_000, null),
     192_000,

@@ -353,7 +353,7 @@ async function main() {
       validSnapshot('outside-task', 'stopped', 1),
     );
     assert.equal(
-      (await handlers.get('recordings:list')({}, root)).some(
+      (await handlers.get('recordings:list')({}, root)).recordings.some(
         (row) => row.session_dir === resumeSessionDir,
       ),
       true,
@@ -543,7 +543,7 @@ async function main() {
       'the unbound start crash must retain its crash-seal obligation',
     );
     assert.equal(
-      (await handlers.get('recordings:list')({}, root)).some(
+      (await handlers.get('recordings:list')({}, root)).recordings.some(
         (row) => row.session_dir === unboundStartSessionDir,
       ),
       true,
@@ -627,7 +627,7 @@ async function main() {
     assert.doesNotMatch(tray.menu[0].label, /后台录音正在进行/,
       'stopping ownership must never be advertised as capture');
 
-    const pendingRows = await handlers.get('recordings:list')({}, root);
+    const pendingRows = (await handlers.get('recordings:list')({}, root)).recordings;
     assert.equal(pendingRows.length, 1);
     assert.equal(pendingRows[0].session_dir, await fs.realpath(sessionDir));
     assert.equal(pendingRows[0].status, 'stopping');
@@ -649,7 +649,7 @@ async function main() {
     assert.equal(stopped.session_dir, await fs.realpath(sessionDir));
     assert.equal(stopped.snapshot.status, 'stopped');
 
-    const finishedRows = await handlers.get('recordings:list')({}, root);
+    const finishedRows = (await handlers.get('recordings:list')({}, root)).recordings;
     assert.equal(finishedRows.length, 1);
     assert.equal(finishedRows[0].status, 'stopped');
     assert.equal(finishedRows[0].is_active, false, 'successful retry must restore the idle intent');

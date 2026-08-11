@@ -3210,8 +3210,12 @@ impl Engine {
         if !metadata_dir_metadata.is_dir() || metadata_dir_metadata.file_type().is_symlink() {
             bail!("recording metadata path must be a real directory");
         }
-        ensure_no_audio_fault_marker(session_dir, "生成常规交付")?;
         let _session_lock = SessionLock::acquire(session_dir, &Utc::now().to_rfc3339())?;
+        // Fault evidence and every mutable recovery projection must be read
+        // under the same task lease. Checking the marker first leaves a race
+        // where another process can fault/seal the session before this export
+        // acquires the lock and then incorrectly publish a normal delivery.
+        ensure_no_audio_fault_marker(session_dir, "生成常规交付")?;
         let mut journal = read_journal(session_dir)?;
         let snapshot =
             load_recovery_snapshot_for_session(session_dir, &mut journal, expected_session_id)?;
@@ -5079,11 +5083,21 @@ impl RecordingSession {
             projection_failures.push(format!("update session summary: {error:#}"));
         }
         // Once the replaceable projections are durable, only the latest full
-        // journal projection is needed. Atomic compaction keeps the log bounded
-        // to one or two entries even for scripts with thousands of sentences:
-        // a crash before replacement leaves the old+new pair, while a crash
-        // after replacement leaves the latest self-contained event.
+        // journal projection is normally needed. Keep an open attempt's
+        // `attempt_started` event until that attempt is closed: active-attempt
+        // timing is intentionally reconstructed from the journal after a
+        // crash, and a later `session_stopping` projection must not erase it.
+        // Atomic compaction otherwise keeps the log bounded to one or two
+        // entries even for scripts with thousands of sentences: a crash before
+        // replacement leaves the old+new pair, while a crash after replacement
+        // leaves the latest self-contained event.
+        let active_attempt_remains_open = self.active_attempt.is_some()
+            && !matches!(
+                event,
+                "attempt_stopped" | "attempt_discarded" | "attempt_interrupted"
+            );
         if projection_failures.is_empty()
+            && !active_attempt_remains_open
             && let Err(error) = atomic_json_line(&event_path, &event_value)
         {
             projection_failures.push(format!("compact journal: {error:#}"));
@@ -8553,6 +8567,7 @@ mod tests {
     #[test]
     fn forced_stop_discards_an_attempt_that_never_received_speech() {
         let root = test_root("forced-stop-without-speech");
+        std::fs::create_dir_all(root.join("script")).unwrap();
         let mut session = prepare_metadata_test_session(&root);
         session.active_attempt = Some(ActiveAttempt {
             item_id: "001".to_string(),
@@ -8571,6 +8586,7 @@ mod tests {
         assert!(session.active_attempt.is_none());
         assert_eq!(session.snapshot.items[0].status, "pending");
         let journal = read_journal(&root).unwrap();
+        assert_eq!(journal.entries.len(), 1);
         assert_eq!(
             journal.entries.last().unwrap()["event"],
             "attempt_discarded"
@@ -9724,6 +9740,32 @@ mod tests {
 
         let export_error = engine.export_session(&root).unwrap_err();
         assert!(format!("{export_error:#}").contains("禁止生成常规交付"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn export_acquires_the_task_lease_before_consulting_fault_evidence() {
+        let root = test_root("export-lock-before-fault-marker");
+        for name in ["audio", "script", "preview", "export"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        persist_audio_fault_marker(&root, "injected xrun", 123);
+        let owner = SessionLock::acquire(&root, "2026-08-12T00:00:00Z").unwrap();
+
+        let engine = Engine::new(Emitter::new());
+        let locked_error = engine
+            .export_session_expected(&root, "export-lock-before-fault-marker")
+            .unwrap_err();
+        assert!(
+            format!("{locked_error:#}").contains("already open in another recorder process"),
+            "export inspected mutable fault evidence before the task lease: {locked_error:#}"
+        );
+
+        drop(owner);
+        let fault_error = engine
+            .export_session_expected(&root, "export-lock-before-fault-marker")
+            .unwrap_err();
+        assert!(format!("{fault_error:#}").contains("禁止生成常规交付"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -12255,6 +12297,59 @@ mod tests {
         assert_eq!(journal.entries[0]["journal_seq"], 8);
         let source = std::fs::read_to_string(root.join("metadata/events.jsonl")).unwrap();
         assert_eq!(source.lines().count(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn open_attempt_survives_a_later_stopping_checkpoint_until_it_is_closed() {
+        let root = test_root("open-attempt-journal-retention");
+        std::fs::create_dir_all(root.join("script")).unwrap();
+        let mut session = prepare_metadata_test_session(&root);
+        session.captured.store(120, Ordering::Release);
+        session.committed.store(120, Ordering::Release);
+        session.active_attempt = Some(ActiveAttempt {
+            item_id: "001".to_string(),
+            attempt_id: "001-a1".to_string(),
+            start_sample: 10,
+            recording_started_sample: 20,
+        });
+        session
+            .persist(
+                "attempt_started",
+                json!({
+                    "item_id": "001",
+                    "attempt_id": "001-a1",
+                    "start_sample": 10,
+                    "recording_started_sample": 20,
+                    "head_silence_armed_sample": 20,
+                    "required_head_silence_samples": 48,
+                }),
+            )
+            .unwrap();
+        session.snapshot.status = "stopping".to_string();
+        session
+            .persist("session_stopping", json!({ "reason": "stop_timeout" }))
+            .unwrap();
+
+        let journal = read_journal(&root).unwrap();
+        assert_eq!(journal.entries.len(), 3);
+        assert!(journal.entries.iter().any(|entry| {
+            entry["event"] == "attempt_started" && entry["payload"]["attempt_id"] == "001-a1"
+        }));
+        let mut recovered = session.snapshot.clone();
+        let warnings = recover_interrupted_attempts(&journal, &mut recovered, 120).unwrap();
+        assert_eq!(recovered.items[0].attempts.len(), 1);
+        assert_eq!(recovered.items[0].attempts[0].attempt_id, "001-a1");
+        assert_eq!(recovered.items[0].attempts[0].status, "interrupted");
+        assert!(!warnings.is_empty());
+
+        session.active_attempt = None;
+        session.snapshot.status = "stopped".to_string();
+        session.persist("session_stopped", json!({})).unwrap();
+        let compacted = read_journal(&root).unwrap();
+        assert_eq!(compacted.entries.len(), 1);
+        assert_eq!(compacted.entries[0]["event"], "session_stopped");
+        drop(session);
         let _ = std::fs::remove_dir_all(root);
     }
 

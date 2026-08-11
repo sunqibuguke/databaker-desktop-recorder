@@ -278,7 +278,7 @@ async function main() {
     const event = { sender: window.webContents };
     const list = handlers.get('recordings:list');
     const request = handlers.get('engine:request');
-    assert.equal((await list({}, root)).length, 2);
+    assert.equal((await list({}, root)).recordings.length, 2);
 
     // The list established the original identity. Replacing only one durable
     // identity source before export must be rejected in Electron, before the
