@@ -13,6 +13,19 @@ const GRACEFUL_STOP_TIMEOUT_MS = 90_000;
 const SHUTDOWN_REQUEST_TIMEOUT_MS = 80_000;
 const FORCED_EXIT_WAIT_MS = 10_000;
 
+type EngineClientOptions = Readonly<{
+  args?: readonly string[];
+  gracefulStopTimeoutMs?: number;
+  shutdownRequestTimeoutMs?: number;
+  forcedExitWaitMs?: number;
+}>;
+
+export type EngineStoppedOutcome = Readonly<{
+  safe: boolean;
+  code: number | null;
+  signal: NodeJS.Signals | null;
+}>;
+
 type EngineMessage = {
   protocol_version: number;
   request_id?: string;
@@ -46,6 +59,34 @@ export class EngineRequestTimeoutError extends Error {
   }
 }
 
+export class EngineSafeStopTimeoutError extends Error {
+  constructor(readonly timeoutMs: number) {
+    super(`录音引擎超过 ${Math.round(timeoutMs / 1_000)} 秒仍未完成安全封存`);
+    this.name = 'EngineSafeStopTimeoutError';
+  }
+}
+
+export class EngineUnsafeStopError extends Error {
+  constructor(
+    readonly outcome: EngineStoppedOutcome,
+    readonly shutdownConfirmed: boolean,
+    readonly shutdownError: unknown,
+  ) {
+    const shutdownDetail = shutdownConfirmed
+      ? '引擎已确认封存，但进程未正常退出'
+      : shutdownError instanceof Error
+        ? shutdownError.message
+        : shutdownError === null
+          ? '引擎未返回安全停止确认'
+          : String(shutdownError);
+    const exitDetail = outcome.signal
+      ? `signal=${outcome.signal}`
+      : `code=${outcome.code ?? '-'}`;
+    super(`录音引擎已退出，但安全封存未获确认（${exitDetail}）：${shutdownDetail}`);
+    this.name = 'EngineUnsafeStopError';
+  }
+}
+
 export class EngineClient extends EventEmitter {
   private child: ChildProcessWithoutNullStreams | undefined;
   private pending = new Map<string, PendingRequest>();
@@ -53,8 +94,13 @@ export class EngineClient extends EventEmitter {
   private childGeneration = 0;
   private stoppingChild: ChildProcessWithoutNullStreams | undefined;
   private stopPromise: Promise<void> | undefined;
+  private readonly shutdownConfirmedChildren = new WeakSet<ChildProcessWithoutNullStreams>();
+  private readonly stoppedOutcomes = new WeakMap<ChildProcessWithoutNullStreams, EngineStoppedOutcome>();
 
-  constructor(private readonly executable: string) {
+  constructor(
+    private readonly executable: string,
+    private readonly options: EngineClientOptions = {},
+  ) {
     super();
   }
 
@@ -62,7 +108,7 @@ export class EngineClient extends EventEmitter {
     if (this.stopPromise) await this.stopPromise;
     if (this.child && this.child.exitCode === null && !this.child.killed) return;
     this.child = undefined;
-    const child = spawn(this.executable, [], {
+    const child = spawn(this.executable, [...(this.options.args ?? [])], {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     });
@@ -81,9 +127,19 @@ export class EngineClient extends EventEmitter {
         this.emit('log', `录音引擎输入通道异常：${error.message}`);
       }
     });
-    child.once('error', (error) => this.handleExit(child, error));
+    child.once('error', (error) => this.handleExit(
+      child,
+      error,
+      child.exitCode,
+      child.signalCode,
+    ));
     child.once('exit', (code, signal) => {
-      this.handleExit(child, new Error(`录音引擎已退出（code=${code ?? '-'}, signal=${signal ?? '-'}）`));
+      this.handleExit(
+        child,
+        new Error(`录音引擎已退出（code=${code ?? '-'}, signal=${signal ?? '-'}）`),
+        code,
+        signal,
+      );
     });
     await this.request('hello', {}, 8_000);
   }
@@ -127,11 +183,36 @@ export class EngineClient extends EventEmitter {
     if (!child) return Promise.resolve();
     this.stoppingChild = child;
     const operation = this.stopChild(child).finally(() => {
-      if (this.stoppingChild === child) this.stoppingChild = undefined;
+      // A safe-stop timeout deliberately leaves the child alive and keeps it
+      // marked as stopping. If it exits later, handleExit emits a structured
+      // outcome instead of treating the expected exit as a fresh engine crash.
+      if (this.stoppingChild === child && this.hasExited(child)) {
+        this.stoppingChild = undefined;
+      }
       if (this.stopPromise === operation) this.stopPromise = undefined;
     });
     this.stopPromise = operation;
     return operation;
+  }
+
+  async forceStop(): Promise<void> {
+    if (this.stopPromise) {
+      try {
+        await this.stopPromise;
+        return;
+      } catch {
+        // The safe-stop deadline expired. A caller may proceed only after an
+        // explicit user confirmation; this method is never called implicitly.
+      }
+    }
+    const child = this.child;
+    if (!child || this.hasExited(child)) return;
+    this.stoppingChild = child;
+    child.kill();
+    const timeoutMs = this.options.forcedExitWaitMs ?? FORCED_EXIT_WAIT_MS;
+    if (!(await this.waitForExit(child, timeoutMs))) {
+      throw new Error('录音引擎强制结束后仍未退出');
+    }
   }
 
   private handleLine(
@@ -156,7 +237,12 @@ export class EngineClient extends EventEmitter {
     if (!request) return;
     clearTimeout(request.timer);
     this.pending.delete(message.request_id);
-    if (message.ok) {
+    if (message.ok === true) {
+      if (request.command === 'shutdown' && this.stoppingChild === child) {
+        // Mark the acknowledgement before resolving the request promise. The
+        // process can exit immediately after writing this protocol response.
+        this.shutdownConfirmedChildren.add(child);
+      }
       request.resolve(message.result);
     } else {
       request.reject(new EngineRequestError(
@@ -169,12 +255,19 @@ export class EngineClient extends EventEmitter {
   }
 
   private async stopChild(child: ChildProcessWithoutNullStreams): Promise<void> {
-    const deadline = Date.now() + GRACEFUL_STOP_TIMEOUT_MS;
+    const gracefulTimeoutMs = this.options.gracefulStopTimeoutMs ?? GRACEFUL_STOP_TIMEOUT_MS;
+    const shutdownTimeoutMs = Math.min(
+      gracefulTimeoutMs,
+      this.options.shutdownRequestTimeoutMs ?? SHUTDOWN_REQUEST_TIMEOUT_MS,
+    );
+    const deadline = Date.now() + gracefulTimeoutMs;
+    let shutdownError: unknown = null;
     try {
-      await this.request('shutdown', {}, SHUTDOWN_REQUEST_TIMEOUT_MS);
+      await this.request('shutdown', {}, shutdownTimeoutMs);
     } catch (error) {
+      shutdownError = error;
       if (error instanceof EngineRequestTimeoutError) {
-        this.emit('log', `录音引擎未在 ${SHUTDOWN_REQUEST_TIMEOUT_MS / 1_000} 秒内完成安全收尾，继续等待至总超时。`);
+        this.emit('log', `录音引擎未在 ${shutdownTimeoutMs / 1_000} 秒内完成安全收尾，继续等待至总超时。`);
       } else if (!this.hasExited(child)) {
         const message = error instanceof Error ? error.message : String(error);
         this.emit('log', `录音引擎安全收尾请求失败，将通过关闭输入通道继续收尾：${message}`);
@@ -183,12 +276,19 @@ export class EngineClient extends EventEmitter {
 
     if (!this.hasExited(child) && child.stdin.writable) child.stdin.end();
     const remaining = Math.max(0, deadline - Date.now());
-    if (await this.waitForExit(child, remaining)) return;
+    if (!(await this.waitForExit(child, remaining))) {
+      this.emit('log', `录音引擎安全收尾超过 ${gracefulTimeoutMs / 1_000} 秒，已保留子进程继续封存，不会自动强制结束。`);
+      throw new EngineSafeStopTimeoutError(gracefulTimeoutMs);
+    }
 
-    this.emit('log', `录音引擎安全收尾超过 ${GRACEFUL_STOP_TIMEOUT_MS / 1_000} 秒，现在强制结束子进程。`);
-    child.kill();
-    if (!(await this.waitForExit(child, FORCED_EXIT_WAIT_MS))) {
-      throw new Error('录音引擎强制结束后仍未退出');
+    const outcome = this.stoppedOutcomes.get(child) ?? {
+      safe: false,
+      code: child.exitCode,
+      signal: child.signalCode,
+    };
+    const shutdownConfirmed = this.shutdownConfirmedChildren.has(child);
+    if (!shutdownConfirmed || !outcome.safe) {
+      throw new EngineUnsafeStopError(outcome, shutdownConfirmed, shutdownError);
     }
   }
 
@@ -200,27 +300,50 @@ export class EngineClient extends EventEmitter {
     if (this.hasExited(child)) return Promise.resolve(true);
     if (timeoutMs <= 0) return Promise.resolve(false);
     return new Promise((resolve) => {
-      const onExit = () => {
+      const onSettled = () => {
         clearTimeout(timer);
+        child.removeListener('exit', onSettled);
+        child.removeListener('error', onSettled);
         resolve(true);
       };
       const timer = setTimeout(() => {
-        child.removeListener('exit', onExit);
+        child.removeListener('exit', onSettled);
+        child.removeListener('error', onSettled);
         resolve(this.hasExited(child));
       }, timeoutMs);
-      child.once('exit', onExit);
+      child.once('exit', onSettled);
+      child.once('error', onSettled);
     });
   }
 
-  private handleExit(child: ChildProcessWithoutNullStreams, error: Error): void {
+  private handleExit(
+    child: ChildProcessWithoutNullStreams,
+    error: Error,
+    code: number | null,
+    signal: NodeJS.Signals | null,
+  ): void {
     if (this.child !== child) return;
     const expected = this.stoppingChild === child;
+    const outcome: EngineStoppedOutcome = {
+      safe: expected
+        && this.shutdownConfirmedChildren.has(child)
+        && code === 0
+        && signal === null,
+      code,
+      signal,
+    };
+    this.stoppedOutcomes.set(child, outcome);
     this.child = undefined;
     for (const request of this.pending.values()) {
       clearTimeout(request.timer);
       request.reject(error);
     }
     this.pending.clear();
-    if (!expected) this.emit('offline', error.message);
+    if (expected) {
+      this.stoppingChild = undefined;
+      this.emit('stopped', outcome);
+    } else {
+      this.emit('offline', error.message);
+    }
   }
 }

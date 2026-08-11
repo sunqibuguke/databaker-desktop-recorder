@@ -46,13 +46,23 @@ npm run package:dir
 
 Windows 安装包应在 Windows x64 构建机上执行 `npm run package`。Rust sidecar 必须在目标平台编译，不能把 macOS 二进制直接打入 Windows 安装包。
 
+### Windows 外置声卡生产验收
+
+源码环境可直接枚举引擎识别的声卡：
+
+```bash
+npm run acceptance:audio -- --mode inventory
+```
+
+Windows 安装包会把验收工具、启动器和文档放在 `resources/acceptance/`。工具覆盖 16/24/32-bit 短录、2–8 小时长稳、USB 拔出和专用测试卷磁盘保护，会保存设备 ID、请求/实际音频参数、WAV 属性、进度和故障证据。完整命令和 PASS/FAIL 标准见 [Windows 外置声卡生产验收](doc/Windows外置声卡生产验收.md)。
+
 ### 推荐采集参数
 
 - 常规高清语音数据：`48,000 Hz / 24-bit PCM / Mono`。
 - 后期处理链路需要较大余量时：`48,000 Hz / 32-bit Float / Mono`。
 - 多输入声卡会显示“输入 1、输入 2…”；软件从所选硬件通道采集并交付单声道 WAV。
 
-位深选项控制实际写入 WAV 的编码，不是只写入元数据。硬件输入会优先使用驱动暴露的高精度采样格式，再转换为所选交付格式。如果声卡只提供低精度输入，选择更高交付位深不会凭空增加硬件有效精度。
+位深选项控制实际写入 WAV 的编码，不是只写入元数据。硬件输入会优先使用驱动暴露的高精度采样格式，再转换为所选交付格式。如果声卡只提供低精度输入，选择更高交付位深不会凭空增加硬件有效精度。Windows 验收工具因此会分别记录驱动输入格式与交付 WAV 位深，并在 24/32-bit 验收中默认拒绝明显仅有 16-bit 表示的输入；声卡 ADC 有效位数仍需根据硬件规格和专业测量归档。
 
 当前 Windows 基线是 WASAPI，覆盖无需厂商 SDK 的部署场景。仅提供 ASIO、且不提供可用 Windows 输入端点的特殊声卡不在当前基线内，应作为单独的驱动兼容项目验证。
 
@@ -74,9 +84,9 @@ Windows 安装包应在 Windows x64 构建机上执行 `npm run package`。Rust 
 ├── script/normalized.json
 ├── session.json
 └── export/
-    ├── full-track.wav
-    ├── sentences/
-    │   └── <item-id>.wav
+├── full-track.wav
+├── sentences/
+│   └── <六位顺序>-<item-id>.wav
     ├── metadata.csv
     └── metadata.json
 ```

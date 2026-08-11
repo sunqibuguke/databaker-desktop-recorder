@@ -1,7 +1,14 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, screen, shell, Tray } from 'electron';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { EngineClient, EngineRequestError } from './engine-client';
+import {
+  EngineClient,
+  EngineRequestError,
+  EngineRequestTimeoutError,
+  EngineSafeStopTimeoutError,
+  EngineUnsafeStopError,
+  type EngineStoppedOutcome,
+} from './engine-client';
 
 let mainWindow: BrowserWindow | null = null;
 let prompterWindow: BrowserWindow | null = null;
@@ -10,6 +17,12 @@ let engine: EngineClient | null = null;
 let recordingTray: Tray | null = null;
 let closeDecisionPromise: Promise<void> | null = null;
 let safeExitPromise: Promise<void> | null = null;
+let exportExitPromise: Promise<void> | null = null;
+let quitWhenEngineStops = false;
+let idleWhenEngineStopsGeneration: number | null = null;
+let unsafeEngineStopPromise: Promise<void> | null = null;
+let forceExitConfirmed = false;
+let appQuitReleased = false;
 let engineRecoveryPromise: Promise<void> | null = null;
 let pendingEngineRecovery: EngineRecoveryJob | null = null;
 let windowCreationPromise: Promise<BrowserWindow> | null = null;
@@ -18,8 +31,9 @@ const forceCloseWindows = new WeakSet<BrowserWindow>();
 const allowedOutputRoots = new Set<string>();
 const canonicalOutputRoots = new Map<string, string>();
 const knownSessionDirs = new Set<string>();
+const knownSessionIds = new Map<string, string>();
 
-type EnginePhase = 'idle' | 'starting' | 'active' | 'stopping' | 'recovering' | 'quitting';
+type EnginePhase = 'idle' | 'starting' | 'active' | 'stopping' | 'recovering' | 'sealing' | 'exporting' | 'quitting';
 
 type EngineIntent = Readonly<{
   generation: number;
@@ -38,6 +52,21 @@ type EngineRecoveryJob = {
   originalError: string;
 };
 
+type PendingCrashSeal = {
+  sessionDir: string;
+  expectedSessionId: string | null;
+  originalError: string;
+};
+
+let pendingCrashSeal: PendingCrashSeal | null = null;
+
+type ActiveExportOperation = {
+  intent: EngineIntent;
+  completion: Promise<unknown>;
+};
+
+let activeExportOperation: ActiveExportOperation | null = null;
+
 type HistorySnapshotCandidate = {
   snapshot: Record<string, unknown>;
   journalSeq: number;
@@ -45,6 +74,21 @@ type HistorySnapshotCandidate = {
   ordinal: number;
   modifiedAtMs: number;
 };
+
+export type AuthorizedSessionBinding = Readonly<{
+  canonicalPath: string;
+  canonicalRoot: string;
+  sessionId: string;
+  device: bigint;
+  inode: bigint;
+}>;
+
+export class AuthorizedSessionBindingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AuthorizedSessionBindingError';
+  }
+}
 
 let engineIntentSequence = 0;
 let engineIntent: EngineIntent = {
@@ -86,6 +130,12 @@ const SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024;
 const JOURNAL_MAX_BYTES = 128 * 1024 * 1024;
 const SESSION_IDENTITY_MAX_BYTES = 1024 * 1024;
 const EXPORT_STATUS_MAX_BYTES = 64 * 1024;
+const EXPORT_REQUEST_TIMEOUT_MS = (() => {
+  const productionTimeout = 12 * 60 * 60_000;
+  if (process.env.NODE_ENV !== 'test') return productionTimeout;
+  const override = Number(process.env.DATABAKER_TEST_EXPORT_TIMEOUT_MS);
+  return Number.isSafeInteger(override) && override >= 100 ? override : productionTimeout;
+})();
 
 const allowedCommands = new Set([
   'hello',
@@ -101,6 +151,7 @@ const allowedCommands = new Set([
   'render_attempt',
   'get_state',
   'stop_session',
+  'seal_interrupted_session',
   'export_session',
 ]);
 
@@ -157,6 +208,15 @@ function isQuitting(): boolean {
   return engineIntent.phase === 'quitting';
 }
 
+function releaseApplicationQuit(): void {
+  // This is the sole release gate for an application quit. Keep it set after
+  // confirmation because Electron may close windows asynchronously after
+  // app.quit() returns; at this point the engine is safely stopped or the
+  // operator explicitly accepted the force/unconfirmed-exit consequence.
+  appQuitReleased = true;
+  app.quit();
+}
+
 function normalizedSessionDir(sessionDir: string): string {
   const normalized = path.normalize(path.resolve(sessionDir));
   return process.platform === 'win32' ? normalized.toLocaleLowerCase('en-US') : normalized;
@@ -164,6 +224,39 @@ function normalizedSessionDir(sessionDir: string): string {
 
 function isSameSessionDir(left: string, right: string): boolean {
   return normalizedSessionDir(left) === normalizedSessionDir(right);
+}
+
+function rememberKnownSession(sessionDir: string, sessionId: string): void {
+  knownSessionDirs.add(sessionDir);
+  knownSessionIds.set(normalizedSessionDir(sessionDir), sessionId);
+}
+
+function forgetKnownSession(sessionDir: string): void {
+  knownSessionDirs.delete(sessionDir);
+  knownSessionIds.delete(normalizedSessionDir(sessionDir));
+}
+
+function knownSessionId(sessionDir: string): string | null {
+  return knownSessionIds.get(normalizedSessionDir(sessionDir)) ?? null;
+}
+
+function crashSealMatches(sessionDir: string): boolean {
+  return Boolean(
+    pendingCrashSeal && isSameSessionDir(pendingCrashSeal.sessionDir, sessionDir),
+  );
+}
+
+function clearCrashSealObligation(sessionDir: string): void {
+  if (crashSealMatches(sessionDir)) pendingCrashSeal = null;
+}
+
+function retainCrashSealObligation(sessionDir: string, originalError: string): void {
+  const existing = crashSealMatches(sessionDir) ? pendingCrashSeal : null;
+  pendingCrashSeal = {
+    sessionDir,
+    expectedSessionId: existing?.expectedSessionId ?? knownSessionId(sessionDir),
+    originalError: existing?.originalError ?? originalError,
+  };
 }
 
 function intentTracksLiveSession(intent = engineIntent): boolean {
@@ -184,23 +277,31 @@ function operationBusyMessage(): string {
     case 'active': return '当前已有录音任务进行中';
     case 'stopping': return '录音任务正在安全停止，请稍候';
     case 'recovering': return '录音引擎正在恢复，请稍候';
+    case 'sealing': return '中断任务正在修复并封存，请稍候';
+    case 'exporting': return '录音交付正在导出，请等待完成';
     case 'quitting': return '应用正在安全退出';
     default: return '录音操作暂时不可用';
   }
 }
 
-function assertCanStartOrResume(): void {
+function assertCanStartOrResume(allowPendingCrashSeal = false): void {
   if (engineIntent.phase !== 'idle') throw new Error(operationBusyMessage());
+  if (pendingCrashSeal && !allowPendingCrashSeal) {
+    throw new Error('上次引擎异常退出的录制任务尚未确认封存，请先在历史任务中修复并封存');
+  }
 }
 
 function assertCanMutateActiveSession(command: string): void {
-  if (['hello', 'list_devices', 'get_state_optional', 'export_session'].includes(command)) return;
+  if (engineIntent.phase === 'exporting') throw new Error(operationBusyMessage());
+  if (['hello', 'list_devices', 'get_state_optional'].includes(command)) return;
   if (engineIntent.phase === 'starting'
     || engineIntent.phase === 'stopping'
     || engineIntent.phase === 'recovering'
+    || engineIntent.phase === 'sealing'
     || engineIntent.phase === 'quitting') {
     throw new Error(operationBusyMessage());
   }
+  if (command === 'export_session') return;
 }
 
 function engineExecutable(): string {
@@ -459,8 +560,109 @@ async function readSessionIdentity(sessionDir: string): Promise<string | null> {
   }
 }
 
-export async function hasCompleteExport(exportDir: string): Promise<boolean> {
+export async function bindAuthorizedSession(
+  candidate: string,
+  authorizedRoots: readonly string[],
+  expectedSessionId: string,
+): Promise<AuthorizedSessionBinding> {
   try {
+    const lexical = path.resolve(candidate);
+    const metadata = await fs.lstat(lexical, { bigint: true });
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      throw new AuthorizedSessionBindingError('录制任务目录不是普通目录');
+    }
+    const canonicalPath = await fs.realpath(lexical);
+    if (!isSameSessionDir(canonicalPath, lexical)) {
+      throw new AuthorizedSessionBindingError('录制任务目录已被链接到其他位置');
+    }
+    const canonicalRoot = await fs.realpath(path.dirname(canonicalPath));
+    const rootAuthorized = authorizedRoots.some((root) => isSameSessionDir(root, canonicalRoot));
+    if (!rootAuthorized || !isSameSessionDir(path.dirname(canonicalPath), canonicalRoot)) {
+      throw new AuthorizedSessionBindingError('录制任务已离开授权的保存位置，请重新选择保存目录');
+    }
+    const sessionId = await readSessionIdentity(canonicalPath);
+    if (!sessionId || sessionId !== expectedSessionId) {
+      throw new AuthorizedSessionBindingError('录制任务身份与历史列表不一致，请刷新任务后重试');
+    }
+    return {
+      canonicalPath,
+      canonicalRoot,
+      sessionId,
+      device: metadata.dev,
+      inode: metadata.ino,
+    };
+  } catch (error) {
+    if (error instanceof AuthorizedSessionBindingError) throw error;
+    throw new AuthorizedSessionBindingError(
+      `无法重新确认录制任务目录：${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+export async function assertAuthorizedSessionUnchanged(
+  binding: AuthorizedSessionBinding,
+  authorizedRoots: readonly string[],
+): Promise<void> {
+  const current = await bindAuthorizedSession(
+    binding.canonicalPath,
+    authorizedRoots,
+    binding.sessionId,
+  );
+  if ((binding.device !== 0n && current.device !== 0n && binding.device !== current.device)
+    || (binding.inode !== 0n && current.inode !== 0n && binding.inode !== current.inode)) {
+    throw new AuthorizedSessionBindingError('录制任务目录在操作前被替换，请刷新任务后重试');
+  }
+}
+
+function exportSourceForSnapshot(snapshot: Record<string, unknown>): Record<string, unknown> | null {
+  if (!isNonNegativeSafeInteger(snapshot.journal_seq)
+    || !isNonNegativeSafeInteger(snapshot.committed_samples)
+    || !Array.isArray(snapshot.items)) return null;
+  const selectedAttempts: Array<{ id: string; attempt_id: string | null }> = [];
+  for (const item of snapshot.items) {
+    if (!isRecord(item)
+      || typeof item.id !== 'string'
+      || (item.selected_attempt_id !== undefined
+        && item.selected_attempt_id !== null
+        && typeof item.selected_attempt_id !== 'string')) return null;
+    selectedAttempts.push({
+      id: item.id,
+      attempt_id: typeof item.selected_attempt_id === 'string' ? item.selected_attempt_id : null,
+    });
+  }
+  return {
+    journal_seq: snapshot.journal_seq,
+    committed_samples: snapshot.committed_samples,
+    selected_attempts: selectedAttempts,
+  };
+}
+
+function exportSourceMatchesSnapshot(
+  source: unknown,
+  snapshot: Record<string, unknown>,
+): boolean {
+  const expected = exportSourceForSnapshot(snapshot);
+  if (!expected || !isRecord(source)) return false;
+  if (source.journal_seq !== expected.journal_seq
+    || source.committed_samples !== expected.committed_samples
+    || !Array.isArray(source.selected_attempts)) return false;
+  const expectedSelections = expected.selected_attempts as Array<{ id: string; attempt_id: string | null }>;
+  if (source.selected_attempts.length !== expectedSelections.length) return false;
+  return source.selected_attempts.every((selection, index) => isRecord(selection)
+    && selection.id === expectedSelections[index].id
+    && selection.attempt_id === expectedSelections[index].attempt_id);
+}
+
+export async function hasCompleteExport(
+  exportDir: string,
+  currentSnapshot?: Record<string, unknown>,
+): Promise<boolean> {
+  try {
+    if (!currentSnapshot
+      || currentSnapshot.status !== 'stopped'
+      || currentSnapshot.audio_fault_marker === true
+      || !isNonNegativeSafeInteger(currentSnapshot.overflow_samples)
+      || currentSnapshot.overflow_samples !== 0) return false;
     const directory = await fs.lstat(exportDir);
     if (!directory.isDirectory() || directory.isSymbolicLink()) return false;
     if (!isSameSessionDir(await fs.realpath(exportDir), exportDir)) return false;
@@ -479,10 +681,12 @@ export async function hasCompleteExport(exportDir: string): Promise<boolean> {
       try {
         const status = JSON.parse(source.bytes.toString('utf8')) as unknown;
         if (!isRecord(status)
-          || status.schema_version !== 1
+          || status.schema_version !== 2
           || status.status !== 'complete'
           || typeof status.export_id !== 'string'
-          || status.export_id.trim() === '') return false;
+          || status.export_id.trim() === ''
+          || status.session_id !== currentSnapshot.session_id
+          || !exportSourceMatchesSnapshot(status.source, currentSnapshot)) return false;
       } catch {
         return false;
       }
@@ -501,11 +705,10 @@ export async function hasCompleteExport(exportDir: string): Promise<boolean> {
       return sentencesComplete;
     }
 
-    // Exports created before status.json was introduced remain visible when
-    // their legacy completion artifact is intact. Once a status file exists,
-    // only an explicit `complete` commit marker can make the bundle visible.
-    const metadata = await fs.lstat(path.join(exportDir, 'metadata.json'));
-    return metadata.isFile() && !metadata.isSymbolicLink();
+    // Legacy bundles do not prove which durable snapshot they contain. Keep
+    // them on disk, but require a fresh export before marking the current task
+    // as deliverable.
+    return false;
   } catch {
     return false;
   }
@@ -656,8 +859,8 @@ async function listRecordings(root: string): Promise<unknown[]> {
         ? snapshot.audio_format as Record<string, unknown>
         : {};
       const exportDir = path.join(candidate.sessionDir, 'export');
-      const exportExists = await hasCompleteExport(exportDir);
-      knownSessionDirs.add(candidate.sessionDir);
+      const exportExists = await hasCompleteExport(exportDir, snapshot);
+      rememberKnownSession(candidate.sessionDir, String(snapshot.session_id));
       rows.push({
         session_id: snapshot.session_id,
         session_dir: candidate.sessionDir,
@@ -695,10 +898,21 @@ async function listRecordings(root: string): Promise<unknown[]> {
 function sendToMain(channel: string, ...args: unknown[]): void {
   const window = mainWindow;
   if (!window || window.isDestroyed() || window.webContents.isDestroyed()) return;
-  window.webContents.send(channel, ...args);
+  try {
+    window.webContents.send(channel, ...args);
+  } catch (error) {
+    // UI notification failures must never abort engine recovery, crash-seal
+    // bookkeeping, or another data-safety transition in the main process.
+    console.error(`无法向主面板发送 ${channel}：`, error);
+  }
 }
 
 async function hasActiveEngineSession(): Promise<boolean> {
+  if (engineIntent.phase === 'sealing' || engineIntent.phase === 'exporting') {
+    if (engine?.running) return true;
+    transitionEngineIntent(engineIntent, 'idle', null);
+    return false;
+  }
   if (intentTracksLiveSession()) return true;
   if (isQuitting()) return Boolean(engineIntent.sessionDir);
   if (!engine?.running) return false;
@@ -773,9 +987,247 @@ async function showMainWindow(): Promise<BrowserWindow> {
   return window;
 }
 
+function describeEngineExit(outcome: EngineStoppedOutcome): string {
+  return outcome.signal
+    ? `退出信号：${outcome.signal}`
+    : `退出代码：${outcome.code ?? '未知'}`;
+}
+
+function handleUnsafeEngineStop(
+  outcome: EngineStoppedOutcome,
+  originalError?: unknown,
+): Promise<void> {
+  if (forceExitConfirmed) return Promise.resolve();
+  if (unsafeEngineStopPromise) return unsafeEngineStopPromise;
+
+  const interruptedSessionDir = engineIntent.sessionDir;
+  if (interruptedSessionDir) {
+    retainCrashSealObligation(
+      interruptedSessionDir,
+      originalError instanceof Error
+        ? originalError.message
+        : originalError === undefined ? describeEngineExit(outcome) : String(originalError),
+    );
+  }
+  quitWhenEngineStops = false;
+  idleWhenEngineStopsGeneration = null;
+  pendingEngineRecovery = null;
+  const errorDetail = originalError instanceof Error
+    ? `\n\n${originalError.message}`
+    : originalError === undefined
+      ? ''
+      : `\n\n${String(originalError)}`;
+  const sessionDetail = interruptedSessionDir
+    ? `\n\n受影响任务：${interruptedSessionDir}`
+    : '';
+  const offlineMessage = `录音引擎已退出，但安全封存未获确认（${describeEngineExit(outcome)}）`;
+  const recoveryIntent = beginEngineIntent('idle', null);
+  clearBackgroundRecordingStatus();
+  sendToMain('engine:offline', offlineMessage);
+
+  const operation = (async () => {
+    const options: Electron.MessageBoxOptions = {
+      type: 'warning',
+      title: '安全封存未确认',
+      message: '录音引擎已退出，软件已阻止自动退出',
+      detail: `已持久化的母轨分段仍然保留，但最后的封存结果不能确认。请保留应用并在历史任务中检查或修复，不要将该任务当作正常完成。\n\n${describeEngineExit(outcome)}${sessionDetail}${errorDetail}`,
+      buttons: ['保留应用并检查任务', '确认退出（封存未确认）'],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true,
+    };
+    let window: BrowserWindow | null = null;
+    try {
+      window = await showMainWindow();
+      if (ownsEngineGeneration(recoveryIntent)) {
+        window.setTitle('DataBaker 音频采集 — 安全封存未确认');
+        window.setProgressBar(-1);
+      }
+    } catch (windowError) {
+      console.error('无法在引擎异常退出后打开主面板：', windowError);
+    }
+    const result = window && !window.isDestroyed()
+      ? await dialog.showMessageBox(window, options)
+      : await dialog.showMessageBox(options);
+    if (!ownsEngineGeneration(recoveryIntent)) return;
+    if (result.response === 1) {
+      beginEngineIntent('quitting', null);
+      clearBackgroundRecordingStatus();
+      releaseApplicationQuit();
+      return;
+    }
+
+    try {
+      await engine?.start();
+      if (!ownsEngineGeneration(recoveryIntent)) return;
+      sendToMain('engine:event', {
+        protocol_version: 1,
+        event: 'engine_restarted_after_unconfirmed_stop',
+        payload: {
+          session_dir: interruptedSessionDir,
+          exit_code: outcome.code,
+          exit_signal: outcome.signal,
+        },
+      });
+    } catch (restartError) {
+      if (!ownsEngineGeneration(recoveryIntent)) return;
+      const message = restartError instanceof Error ? restartError.message : String(restartError);
+      sendToMain('engine:offline', `录音引擎无法重新启动：${message}`);
+      console.error('安全封存未确认后，录音引擎重新启动失败：', restartError);
+    }
+  })();
+  const tracked = operation.finally(() => {
+    if (unsafeEngineStopPromise === tracked) unsafeEngineStopPromise = null;
+  });
+  unsafeEngineStopPromise = tracked;
+  return tracked;
+}
+
+function requestQuitAfterExport(source: string): Promise<void> {
+  if (exportExitPromise) return exportExitPromise;
+  const exportIntent = engineIntent;
+  const observedExport = activeExportOperation;
+  const alreadyConfirmed = source === '主窗口关闭选择';
+  const operation = (async () => {
+    if (!alreadyConfirmed) {
+      const options: Electron.MessageBoxOptions = {
+        type: 'info',
+        title: '录音交付正在导出',
+        message: '导出尚未完成，现在不能直接结束引擎',
+        detail: '请等待整轨和分句文件全部落盘后再安全退出。取消退出不会取消当前导出。',
+        buttons: ['取消退出', '等待导出完成后退出'],
+        defaultId: 1,
+        cancelId: 0,
+        noLink: true,
+      };
+      const result = mainWindow && !mainWindow.isDestroyed()
+        ? await dialog.showMessageBox(mainWindow, options)
+        : await dialog.showMessageBox(options);
+      if (result.response !== 1) return;
+    }
+
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.setTitle('DataBaker 音频采集 — 等待导出完成');
+      mainWindow.setProgressBar(2);
+    }
+    if (recordingTray) {
+      recordingTray.setToolTip('DataBaker 音频采集 — 导出完成后退出');
+      recordingTray.setContextMenu(recordingTrayMenu('正在导出，完成后安全退出…', false));
+    }
+
+    if (!observedExport || observedExport.intent.generation !== exportIntent.generation) {
+      if (!isCurrentEngineIntent(exportIntent, ['exporting'])) {
+        await performSafeStopAndQuit(`${source}（导出已结束）`);
+        return;
+      }
+      const options: Electron.MessageBoxOptions = {
+        type: 'warning',
+        title: '导出状态无法确认',
+        message: '软件已阻止自动退出',
+        detail: '录音引擎可能仍在写入交付文件。请保留应用运行并检查导出目录。',
+        buttons: ['保留应用'],
+        defaultId: 0,
+        noLink: true,
+      };
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        await dialog.showMessageBox(mainWindow, options);
+      } else {
+        await dialog.showMessageBox(options);
+      }
+      return;
+    }
+
+    try {
+      await observedExport.completion;
+    } catch (error) {
+      console.error('退出前的导出操作未成功：', error);
+    }
+    if (isCurrentEngineIntent(exportIntent, ['exporting'])) {
+      const options: Electron.MessageBoxOptions = {
+        type: 'warning',
+        title: '导出结果尚未确认',
+        message: '软件已阻止自动退出',
+        detail: '引擎尚未证明导出已结束，因此不会强制中断写入。',
+        buttons: ['保留应用'],
+        defaultId: 0,
+        noLink: true,
+      };
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        await dialog.showMessageBox(mainWindow, options);
+      } else {
+        await dialog.showMessageBox(options);
+      }
+      return;
+    }
+    await performSafeStopAndQuit(`${source}（导出已结束）`);
+  })();
+  const tracked = operation.finally(() => {
+    if (exportExitPromise === tracked) exportExitPromise = null;
+  });
+  exportExitPromise = tracked;
+  return tracked;
+}
+
 function requestSafeStopAndQuit(source: string): Promise<void> {
+  if (unsafeEngineStopPromise) return unsafeEngineStopPromise;
   if (safeExitPromise) return safeExitPromise;
-  const quitIntent = beginEngineIntent('quitting', engineIntent.sessionDir);
+  if (exportExitPromise) return exportExitPromise;
+  if (engineIntent.phase === 'exporting') return requestQuitAfterExport(source);
+  return performSafeStopAndQuit(source);
+}
+
+async function showCrashSealUnconfirmedGate(
+  obligation: PendingCrashSeal,
+  error: unknown,
+  intent: EngineIntent,
+): Promise<void> {
+  quitWhenEngineStops = false;
+  if (isCurrentEngineIntent(intent, ['sealing', 'quitting'])) {
+    transitionEngineIntent(intent, 'idle', null);
+  }
+  const detail = error instanceof Error ? error.message : String(error);
+  const message = '引擎异常退出后的母轨封存未能确认';
+  sendToMain('engine:offline', `${message}：${detail}`);
+  console.error(`${message}：`, error);
+  const options: Electron.MessageBoxOptions = {
+    type: 'warning',
+    title: '中断任务封存未确认',
+    message: '软件已阻止自动退出',
+    detail: `受影响任务：${obligation.sessionDir}\n\n已落盘的母轨分段仍然保留，但离线封存未得到身份、路径和持久化结果的完整确认。本次退出已取消，请在历史任务中检查并使用“修复并封存”。\n\n${detail}\n\n原始引擎错误：${obligation.originalError}`,
+    buttons: ['保留应用并检查任务'],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+  };
+  let window: BrowserWindow | null = null;
+  try {
+    window = await showMainWindow();
+    if (!window.isDestroyed()) {
+      window.setTitle('DataBaker 音频采集 — 中断任务封存未确认');
+      window.setProgressBar(-1);
+    }
+  } catch (windowError) {
+    console.error('无法在封存未确认后打开主面板：', windowError);
+  }
+  if (window && !window.isDestroyed()) {
+    await dialog.showMessageBox(window, options);
+  } else {
+    await dialog.showMessageBox(options);
+  }
+}
+
+function performSafeStopAndQuit(source: string): Promise<void> {
+  // The warning dialog is itself the operator acknowledgement gate. A second
+  // quit request (for example after closing the last window) must not bypass
+  // it merely because the failed engine process is no longer running.
+  if (unsafeEngineStopPromise) return unsafeEngineStopPromise;
+  if (safeExitPromise) return safeExitPromise;
+  quitWhenEngineStops = false;
+  const crashSealObligation = pendingCrashSeal;
+  const quitIntent = beginEngineIntent(
+    crashSealObligation ? 'sealing' : 'quitting',
+    crashSealObligation?.sessionDir ?? engineIntent.sessionDir,
+  );
   pendingEngineRecovery = null;
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.setTitle('DataBaker 音频采集 — 正在安全停止');
@@ -786,23 +1238,113 @@ function requestSafeStopAndQuit(source: string): Promise<void> {
     recordingTray.setContextMenu(recordingTrayMenu('正在安全停止并封存母轨…', false));
   }
   console.log(`开始安全退出（${source}）`);
-  safeExitPromise = (async () => {
+  const operation = (async () => {
+    if (crashSealObligation) {
+      try {
+        if (!crashSealObligation.expectedSessionId) {
+          throw new Error('异常退出前未能保留可信的录制任务身份');
+        }
+        const sealed = await executeAuthorizedOfflineSeal(
+          quitIntent,
+          crashSealObligation.sessionDir,
+          crashSealObligation.expectedSessionId,
+        );
+        assertCurrentEngineIntent(quitIntent, ['sealing']);
+        rememberKnownSession(sealed.canonical, crashSealObligation.expectedSessionId);
+        clearCrashSealObligation(sealed.canonical);
+        transitionEngineIntent(quitIntent, 'quitting', sealed.canonical);
+      } catch (error) {
+        await showCrashSealUnconfirmedGate(crashSealObligation, error, quitIntent);
+        return;
+      }
+    }
     try {
       await engine?.stop();
       assertCurrentEngineIntent(quitIntent, ['quitting']);
     } catch (error) {
-      if (!(error instanceof EngineIntentSupersededError)) {
-        console.error('录音引擎未能完成安全收尾：', error);
+      if (error instanceof EngineIntentSupersededError || !ownsEngineGeneration(quitIntent)) {
+        return;
       }
-    } finally {
-      if (ownsEngineGeneration(quitIntent)) {
-        transitionEngineIntent(quitIntent, 'quitting', null);
+      if (error instanceof EngineUnsafeStopError) {
+        console.error('录音引擎已退出，但安全封存未获确认：', error);
+        await handleUnsafeEngineStop(error.outcome, error);
+        return;
       }
-      clearBackgroundRecordingStatus();
-      app.quit();
+      console.error('录音引擎未能在安全时限内完成收尾：', error);
+      transitionEngineIntent(quitIntent, 'stopping', quitIntent.sessionDir);
+      quitWhenEngineStops = true;
+      if (!engine?.running) {
+        quitWhenEngineStops = false;
+        beginEngineIntent('quitting', null);
+        clearBackgroundRecordingStatus();
+        releaseApplicationQuit();
+        return;
+      }
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.setTitle('DataBaker 音频采集 — 仍在安全封存');
+        mainWindow.setProgressBar(2);
+      }
+      ensureRecordingTray('⚠ 音频仍在安全封存…');
+      const detail = error instanceof EngineSafeStopTimeoutError
+        ? '已封存的母轨分段仍然安全。强制退出可能丢失尚未写入的尾部音频，因此软件不会自动强制结束。'
+        : `已封存的母轨分段仍然安全。强制退出可能丢失尾部音频。\n\n${error instanceof Error ? error.message : String(error)}`;
+      const options: Electron.MessageBoxOptions = {
+        type: 'warning',
+        title: '音频仍在封存',
+        message: '安全停止超时，录音引擎已保留运行',
+        detail,
+        buttons: ['继续等待', '强制退出（可能丢失尾部）'],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+      };
+      const result = mainWindow && !mainWindow.isDestroyed()
+        ? await dialog.showMessageBox(mainWindow, options)
+        : await dialog.showMessageBox(options);
+      if (!ownsEngineGeneration(quitIntent)) return;
+      if (!engine?.running) {
+        quitWhenEngineStops = false;
+        beginEngineIntent('quitting', null);
+        clearBackgroundRecordingStatus();
+        releaseApplicationQuit();
+        return;
+      }
+      if (result.response !== 1) return;
+
+      const forceIntent = beginEngineIntent('quitting', quitIntent.sessionDir);
+      try {
+        forceExitConfirmed = true;
+        await engine.forceStop();
+        assertCurrentEngineIntent(forceIntent, ['quitting']);
+        quitWhenEngineStops = false;
+        transitionEngineIntent(forceIntent, 'quitting', null);
+        clearBackgroundRecordingStatus();
+        releaseApplicationQuit();
+        forceExitConfirmed = false;
+      } catch (forceError) {
+        forceExitConfirmed = false;
+        if (!ownsEngineGeneration(forceIntent)) return;
+        console.error('用户确认强制退出后，引擎仍未退出：', forceError);
+        transitionEngineIntent(forceIntent, 'stopping', forceIntent.sessionDir);
+        ensureRecordingTray('⚠ 录音引擎仍在运行…');
+      }
+      return;
     }
+    if (!ownsEngineGeneration(quitIntent)) return;
+    quitWhenEngineStops = false;
+    transitionEngineIntent(quitIntent, 'quitting', null);
+    clearBackgroundRecordingStatus();
+    releaseApplicationQuit();
   })();
-  return safeExitPromise;
+  const tracked = operation.finally(() => {
+    if (safeExitPromise !== tracked) return;
+    safeExitPromise = null;
+    if (quitWhenEngineStops && engineIntent.phase === 'stopping' && !engine?.running) {
+      void requestSafeStopAndQuit('延迟的音频封存已完成');
+    }
+  });
+  safeExitPromise = tracked;
+  return tracked;
 }
 
 async function requestSessionWithReconciliation(
@@ -904,7 +1446,7 @@ async function runEngineRecovery(job: EngineRecoveryJob): Promise<void> {
       );
       assertCurrentEngineIntent(intent, ['recovering']);
       transitionEngineIntent(intent, 'active', sessionDir);
-      knownSessionDirs.add(sessionDir);
+      clearCrashSealObligation(sessionDir);
       sendToMain('engine:event', {
         protocol_version: 1,
         event: 'engine_recovered',
@@ -942,6 +1484,11 @@ async function runEngineRecovery(job: EngineRecoveryJob): Promise<void> {
   transitionEngineIntent(intent, 'idle', null);
   clearBackgroundRecordingStatus();
   sendToMain('engine:offline', latestError);
+  sendToMain('engine:event', {
+    protocol_version: 1,
+    event: 'engine_recovery_failed',
+    payload: { session_dir: sessionDir, error: latestError },
+  });
   void notifyEngineRecoveryFailed(intent, latestError);
 }
 
@@ -978,12 +1525,28 @@ async function handleMainWindowClose(window: BrowserWindow): Promise<void> {
     closeWindowWithoutPrompt(window);
     return;
   }
+  const sealingOfflineTask = engineIntent.phase === 'sealing';
+  const exportingTask = engineIntent.phase === 'exporting';
   const result = await dialog.showMessageBox(window, {
     type: 'warning',
-    title: '录音正在进行',
-    message: '持续母轨仍在录制，关闭面板不应该无声地继续。',
-    detail: '取消可继续使用录音面板；后台录音会保留引擎并在系统托盘持续显示；安全停止会先封存 WAV 再退出。',
-    buttons: ['取消', '继续后台录音', '安全停止并退出'],
+    title: exportingTask
+      ? '录音交付正在导出'
+      : sealingOfflineTask ? '任务正在离线封存' : '录音正在进行',
+    message: exportingTask
+      ? '整轨和分句文件仍在写入，关闭面板不应该中断交付。'
+      : sealingOfflineTask
+        ? '中断任务仍在修复并封存，关闭面板不应该隐藏其进度。'
+        : '持续母轨仍在录制，关闭面板不应该无声地继续。',
+    detail: exportingTask
+      ? '取消可继续查看；后台运行会保留引擎；导出完成后退出会等待交付状态持久化，再安全结束引擎。'
+      : sealingOfflineTask
+        ? '取消可继续查看；后台运行会保留引擎并在系统托盘显示；安全停止并退出会等待当前封存完成。'
+        : '取消可继续使用录音面板；后台录音会保留引擎并在系统托盘持续显示；安全停止会先封存 WAV 再退出。',
+    buttons: [
+      '取消',
+      exportingTask ? '继续后台导出' : sealingOfflineTask ? '继续后台封存' : '继续后台录音',
+      exportingTask ? '导出完成后退出' : '安全停止并退出',
+    ],
     defaultId: 0,
     cancelId: 0,
     noLink: true,
@@ -997,7 +1560,9 @@ async function handleMainWindowClose(window: BrowserWindow): Promise<void> {
     }
     window.hide();
     prompterWindow?.close();
-    ensureRecordingTray();
+    ensureRecordingTray(exportingTask
+      ? '录音交付正在后台导出…'
+      : sealingOfflineTask ? '中断任务正在后台修复并封存…' : undefined);
     return;
   }
   await requestSafeStopAndQuit('主窗口关闭选择');
@@ -1071,18 +1636,22 @@ async function createWindow(): Promise<BrowserWindow> {
     window.removeMenu();
     let unresponsiveTimer: NodeJS.Timeout | null = null;
     window.on('close', (event) => {
-      if (isQuitting() || forceCloseWindows.has(window)) return;
+      if (appQuitReleased || forceCloseWindows.has(window)) return;
       event.preventDefault();
+      if (isQuitting() || safeExitPromise || exportExitPromise || unsafeEngineStopPromise) {
+        void requestSafeStopAndQuit('主窗口重复关闭');
+        return;
+      }
       promptForMainWindowClose(window);
     });
     if (process.platform === 'win32') {
       window.on('query-session-end', (event) => {
-        if (isQuitting()) return;
+        if (appQuitReleased) return;
         event.preventDefault();
         void requestSafeStopAndQuit('Windows 系统会话结束');
       });
       window.on('session-end', () => {
-        if (!isQuitting()) void requestSafeStopAndQuit('Windows 系统会话强制结束');
+        if (!appQuitReleased) void requestSafeStopAndQuit('Windows 系统会话强制结束');
       });
     }
     window.on('closed', () => {
@@ -1177,6 +1746,260 @@ function assertMainRenderer(sender: Electron.WebContents): void {
   if (!mainWindow || mainWindow.isDestroyed() || sender !== mainWindow.webContents) {
     throw new Error('只能从主录制面板操作领读窗口');
   }
+}
+
+function adoptObservedActiveSession(intent: EngineIntent, state: EngineOptionalState): never {
+  if (state.active !== true || typeof state.session_dir !== 'string') {
+    throw new Error('录音引擎返回了无效的活动任务状态');
+  }
+  const activeSessionDir = path.resolve(state.session_dir);
+  transitionEngineIntent(intent, 'active', activeSessionDir);
+  knownSessionDirs.add(activeSessionDir);
+  throw new EngineSessionConflictError(activeSessionDir);
+}
+
+async function assertEngineIdleForOfflineSeal(intent: EngineIntent): Promise<void> {
+  if (!engine) throw new Error('录音引擎不可用');
+  const state = await engine.request('get_state_optional', {}, 5_000) as EngineOptionalState;
+  assertCurrentEngineIntent(intent, ['sealing']);
+  if (state.active === true) adoptObservedActiveSession(intent, state);
+}
+
+async function confirmOfflineSealResult(
+  result: unknown,
+  binding: AuthorizedSessionBinding,
+): Promise<Record<string, unknown>> {
+  if (!isRecord(result)
+    || typeof result.session_dir !== 'string'
+    || !isSameSessionDir(result.session_dir, binding.canonicalPath)
+    || !isNonNegativeSafeInteger(result.durable_frames)
+    || typeof result.no_op !== 'boolean') {
+    throw new Error('录音引擎未返回可确认的离线封存结果');
+  }
+  const responseSnapshot = parseValidSnapshot(result.snapshot);
+  if (!responseSnapshot
+    || responseSnapshot.session_id !== binding.sessionId
+    || (responseSnapshot.status !== 'stopped' && responseSnapshot.status !== 'faulted')
+    || responseSnapshot.captured_samples !== result.durable_frames
+    || responseSnapshot.committed_samples !== result.durable_frames) {
+    throw new Error('离线封存结果与录制任务身份或母轨水位不一致');
+  }
+
+  // The protocol acknowledgement is necessary but not sufficient for the
+  // quit gate. Re-read the authoritative on-disk projection/journal and prove
+  // that the exact bound session reached the acknowledged durable generation.
+  const persisted = await loadHistorySnapshot(
+    binding.canonicalPath,
+    path.join(binding.canonicalPath, 'metadata'),
+  );
+  if (!persisted
+    || persisted.snapshot.session_id !== binding.sessionId
+    || persisted.snapshot.status !== responseSnapshot.status
+    || persisted.snapshot.journal_seq !== responseSnapshot.journal_seq
+    || persisted.snapshot.captured_samples !== result.durable_frames
+    || persisted.snapshot.committed_samples !== result.durable_frames) {
+    throw new Error('离线封存已返回，但磁盘上未能确认同一代持久化结果');
+  }
+  return result;
+}
+
+async function executeAuthorizedOfflineSeal(
+  intent: EngineIntent,
+  sessionDir: string,
+  expectedSessionId: string,
+): Promise<{ canonical: string; result: Record<string, unknown> }> {
+  if (!engine) throw new Error('录音引擎不可用');
+  const canonical = await resolveKnownSession(sessionDir);
+  assertCurrentEngineIntent(intent, ['sealing']);
+  if (!canonical) throw new Error('只能修复已授权保存位置中的录制任务');
+  transitionEngineIntent(intent, 'sealing', canonical);
+  const authorizedRoots = Array.from(canonicalOutputRoots.values());
+  const binding = await bindAuthorizedSession(canonical, authorizedRoots, expectedSessionId);
+  assertCurrentEngineIntent(intent, ['sealing']);
+
+  // Starting the protocol sidecar does not open an input device. Only
+  // start_session/resume_session do that; this path remains an offline repair.
+  await engine.start();
+  assertCurrentEngineIntent(intent, ['sealing']);
+  await assertEngineIdleForOfflineSeal(intent);
+  await assertAuthorizedSessionUnchanged(binding, authorizedRoots);
+  assertCurrentEngineIntent(intent, ['sealing']);
+  const rawResult = await engine.request(
+    'seal_interrupted_session',
+    { session_dir: canonical },
+    120_000,
+  );
+  assertCurrentEngineIntent(intent, ['sealing']);
+  await assertAuthorizedSessionUnchanged(binding, authorizedRoots);
+  assertCurrentEngineIntent(intent, ['sealing']);
+  const result = await confirmOfflineSealResult(rawResult, binding);
+  assertCurrentEngineIntent(intent, ['sealing']);
+  return { canonical, result };
+}
+
+async function assertEngineIdleForExport(intent: EngineIntent): Promise<void> {
+  if (!engine) throw new Error('录音引擎不可用');
+  const state = await engine.request('get_state_optional', {}, 5_000) as EngineOptionalState;
+  assertCurrentEngineIntent(intent, ['exporting']);
+  if (state.active === true) adoptObservedActiveSession(intent, state);
+}
+
+async function reconciledCompleteExportResult(
+  sessionDir: string,
+): Promise<Record<string, unknown> | null> {
+  const recovered = await loadHistorySnapshot(sessionDir, path.join(sessionDir, 'metadata'));
+  if (!recovered) return null;
+  const exportDir = path.join(sessionDir, 'export');
+  if (!(await hasCompleteExport(exportDir, recovered.snapshot))) return null;
+  const statusSource = await readBoundedRegularFile(
+    path.join(exportDir, 'status.json'),
+    EXPORT_STATUS_MAX_BYTES,
+  );
+  if (!statusSource) return null;
+  const status = JSON.parse(statusSource.bytes.toString('utf8')) as unknown;
+  if (!isRecord(status)
+    || status.schema_version !== 2
+    || status.status !== 'complete'
+    || status.session_id !== recovered.snapshot.session_id
+    || !exportSourceMatchesSnapshot(status.source, recovered.snapshot)
+    || !isNonNegativeSafeInteger(status.exported_count)
+    || !isNonNegativeSafeInteger(status.skipped_count)) return null;
+  return {
+    export_dir: exportDir,
+    master_file: path.join(exportDir, 'full-track.wav'),
+    sentences_dir: path.join(exportDir, 'sentences'),
+    exported_count: status.exported_count,
+    skipped_count: status.skipped_count,
+    recovery_warnings: ['导出超过界面等待时限，已根据引擎空闲状态和当前快照确认交付完整。'],
+    reconciled_after_timeout: true,
+    export_confirmed_complete: true,
+  };
+}
+
+async function failExportingSession(
+  intent: EngineIntent,
+  originalError: unknown,
+  canonicalSessionDir: string | null,
+): Promise<unknown> {
+  if (originalError instanceof EngineIntentSupersededError || !ownsEngineGeneration(intent)) {
+    throw originalError;
+  }
+  if (originalError instanceof EngineSessionConflictError) throw originalError;
+
+  if (originalError instanceof EngineRequestTimeoutError && engine?.running) {
+    try {
+      // The Rust protocol loop is synchronous. If a very long export ever
+      // reaches the request deadline, this probe queues behind it and keeps
+      // the exclusive intent until the engine can prove the command ended.
+      const state = await engine.request(
+        'get_state_optional',
+        {},
+        EXPORT_REQUEST_TIMEOUT_MS,
+      ) as EngineOptionalState;
+      assertCurrentEngineIntent(intent, ['exporting']);
+      if (state.active === true) adoptObservedActiveSession(intent, state);
+      const reconciled = canonicalSessionDir
+        ? await reconciledCompleteExportResult(canonicalSessionDir)
+        : null;
+      assertCurrentEngineIntent(intent, ['exporting']);
+      transitionEngineIntent(intent, 'idle', null);
+      if (reconciled) return reconciled;
+    } catch (reconciliationError) {
+      if (reconciliationError instanceof EngineIntentSupersededError
+        || !ownsEngineGeneration(intent)) throw originalError;
+      if (reconciliationError instanceof EngineSessionConflictError) throw reconciliationError;
+      // Keep the exporting phase fail-closed: start/resume/seal/duplicate
+      // export and app exit remain blocked until the engine outcome is known.
+      throw new EngineStateReconciliationError(originalError, reconciliationError);
+    }
+    throw originalError;
+  }
+
+  transitionEngineIntent(intent, 'idle', null);
+  throw originalError;
+}
+
+async function exportSession(payload: unknown): Promise<unknown> {
+  if (!engine) throw new Error('录音引擎不可用');
+  const exportEngine = engine;
+  const sessionDir = (payload as { session_dir?: unknown })?.session_dir;
+  if (typeof sessionDir !== 'string') throw new Error('录制目录无效');
+  assertCanStartOrResume();
+  const exportIntent = beginEngineIntent('exporting', path.resolve(sessionDir));
+  let canonicalSessionDir: string | null = null;
+  const completion = (async () => {
+    try {
+      const canonical = await resolveKnownSession(sessionDir);
+      assertCurrentEngineIntent(exportIntent, ['exporting']);
+      if (!canonical) throw new Error('只能导出当前或历史录制目录');
+      canonicalSessionDir = canonical;
+      transitionEngineIntent(exportIntent, 'exporting', canonical);
+      await exportEngine.start();
+      assertCurrentEngineIntent(exportIntent, ['exporting']);
+      await assertEngineIdleForExport(exportIntent);
+      const result = await exportEngine.request(
+        'export_session',
+        { ...(payload as Record<string, unknown>), session_dir: canonical },
+        EXPORT_REQUEST_TIMEOUT_MS,
+      );
+      assertCurrentEngineIntent(exportIntent, ['exporting']);
+      transitionEngineIntent(exportIntent, 'idle', null);
+      knownSessionDirs.add(canonical);
+      return result;
+    } catch (error) {
+      return await failExportingSession(exportIntent, error, canonicalSessionDir);
+    }
+  })();
+  activeExportOperation = { intent: exportIntent, completion };
+  try {
+    return await completion;
+  } finally {
+    if (activeExportOperation?.intent.generation === exportIntent.generation) {
+      activeExportOperation = null;
+    }
+  }
+}
+
+async function failSealingSession(intent: EngineIntent, originalError: unknown): Promise<never> {
+  if (originalError instanceof EngineIntentSupersededError || !ownsEngineGeneration(intent)) {
+    throw originalError;
+  }
+  if (originalError instanceof EngineSessionConflictError) throw originalError;
+  if (!engine?.running) {
+    transitionEngineIntent(intent, 'idle', null);
+    throw originalError;
+  }
+
+  let state: EngineOptionalState;
+  try {
+    state = await engine.request('get_state_optional', {}, 5_000) as EngineOptionalState;
+    assertCurrentEngineIntent(intent, ['sealing']);
+  } catch (reconciliationError) {
+    if (reconciliationError instanceof EngineIntentSupersededError
+      || !ownsEngineGeneration(intent)) throw originalError;
+    transitionEngineIntent(intent, 'stopping', intent.sessionDir);
+    try {
+      await engine.stop();
+      assertCurrentEngineIntent(intent, ['stopping']);
+      await engine.start();
+      assertCurrentEngineIntent(intent, ['stopping']);
+      transitionEngineIntent(intent, 'idle', null);
+    } catch (stopError) {
+      if (ownsEngineGeneration(intent)) {
+        if (engine.running) {
+          idleWhenEngineStopsGeneration = intent.generation;
+        } else {
+          transitionEngineIntent(intent, 'idle', null);
+        }
+      }
+      throw new EngineStateReconciliationError(originalError, stopError);
+    }
+    throw originalError;
+  }
+
+  if (state.active === true) adoptObservedActiveSession(intent, state);
+  transitionEngineIntent(intent, 'idle', null);
+  throw originalError;
 }
 
 async function failStartingSession(intent: EngineIntent, error: unknown): Promise<never> {
@@ -1322,8 +2145,19 @@ function registerIpc(): void {
             new Error('新录制目录越过了已授权的保存位置'),
           );
         }
+        const requestedSessionId = (payload as { session_id?: unknown }).session_id;
+        const persistedSessionId = await readSessionIdentity(canonical);
+        assertCurrentEngineIntent(startIntent, ['starting']);
+        if (typeof requestedSessionId !== 'string'
+          || requestedSessionId.trim() === ''
+          || persistedSessionId !== requestedSessionId) {
+          return await rejectStartedSession(
+            startIntent,
+            new Error('新建录制任务的持久化身份无法确认'),
+          );
+        }
         transitionEngineIntent(startIntent, 'active', canonical);
-        knownSessionDirs.add(canonical);
+        rememberKnownSession(canonical, requestedSessionId);
         return result;
       } catch (error) {
         return await failStartingSession(startIntent, error);
@@ -1332,7 +2166,10 @@ function registerIpc(): void {
     if (command === 'resume_session') {
       const sessionDir = (payload as { session_dir?: unknown })?.session_dir;
       if (typeof sessionDir !== 'string') throw new Error('录制目录无效');
-      assertCanStartOrResume();
+      // Resuming the exact interrupted task is itself a production recovery
+      // path. Keep the quit obligation until resume_session is confirmed, then
+      // clear it below; unrelated sessions remain blocked.
+      assertCanStartOrResume(crashSealMatches(sessionDir));
       const resumeIntent = beginEngineIntent('starting', path.resolve(sessionDir));
       try {
         const canonical = await resolveKnownSession(sessionDir);
@@ -1357,26 +2194,55 @@ function registerIpc(): void {
         );
         assertCurrentEngineIntent(resumeIntent, ['starting']);
         transitionEngineIntent(resumeIntent, 'active', canonical);
+        clearCrashSealObligation(canonical);
         return result;
       } catch (error) {
         return await failStartingSession(resumeIntent, error);
       }
     }
-    if (command === 'stop_session') return await stopActiveSession();
-    assertCanMutateActiveSession(command);
-    let safePayload = payload;
-    if (command === 'export_session') {
-      const sessionDir = (payload as { session_dir?: unknown })?.session_dir;
-      const canonical = typeof sessionDir === 'string' ? await resolveKnownSession(sessionDir) : null;
-      if (!canonical) {
-        throw new Error('只能导出当前或历史录制目录');
+    if (command === 'seal_interrupted_session') {
+      const { session_dir: sessionDir, session_id: expectedSessionId } = (payload as {
+        session_dir?: unknown;
+        session_id?: unknown;
+      }) ?? {};
+      if (typeof sessionDir !== 'string') throw new Error('录制目录无效');
+      if (typeof expectedSessionId !== 'string' || expectedSessionId.trim() === '') {
+        throw new Error('录制任务身份无效，请刷新任务后重试');
       }
-      safePayload = { ...(payload as Record<string, unknown>), session_dir: canonical };
+      assertCanStartOrResume(crashSealMatches(sessionDir));
+      const sealIntent = beginEngineIntent('sealing', path.resolve(sessionDir));
+      let canonical: string | null = null;
+      try {
+        const sealed = await executeAuthorizedOfflineSeal(
+          sealIntent,
+          sessionDir,
+          expectedSessionId,
+        );
+        canonical = sealed.canonical;
+        transitionEngineIntent(sealIntent, 'idle', null);
+        rememberKnownSession(canonical, expectedSessionId);
+        clearCrashSealObligation(canonical);
+        return sealed.result;
+      } catch (error) {
+        if (error instanceof AuthorizedSessionBindingError) {
+          const invalidated = canonical ?? await resolveKnownSession(sessionDir);
+          if (invalidated) forgetKnownSession(invalidated);
+        }
+        return await failSealingSession(sealIntent, error);
+      }
     }
-    const timeout = command === 'export_session' ? 120_000 : 20_000;
+    if (command === 'stop_session') {
+      assertCanMutateActiveSession(command);
+      return await stopActiveSession();
+    }
+    if (command === 'export_session') {
+      return await exportSession(payload);
+    }
+    assertCanMutateActiveSession(command);
+    const timeout = 20_000;
     const commandIntent = engineIntent;
     try {
-      const result = await engine.request(command, safePayload, timeout);
+      const result = await engine.request(command, payload, timeout);
       if (command === 'get_state_optional'
         && ownsEngineGeneration(commandIntent)
         && !isQuitting()) {
@@ -1499,9 +2365,40 @@ app.whenReady().then(async () => {
     const interruptedIntent = engineIntent;
     if (interruptedIntent.phase === 'stopping' || interruptedIntent.phase === 'quitting') return;
     if (interruptedIntent.sessionDir && SESSION_LIVE_PHASES.includes(interruptedIntent.phase)) {
+      retainCrashSealObligation(interruptedIntent.sessionDir, message);
       void recoverEngineAfterCrash(interruptedIntent.sessionDir, message);
     } else if (ownsEngineGeneration(interruptedIntent)) {
       transitionEngineIntent(interruptedIntent, 'idle', null);
+    }
+  });
+  engine.on('stopped', (outcome: EngineStoppedOutcome) => {
+    if (!outcome.safe) {
+      if (!forceExitConfirmed) void handleUnsafeEngineStop(outcome);
+      return;
+    }
+    if (idleWhenEngineStopsGeneration === engineIntent.generation
+      && engineIntent.phase === 'stopping') {
+      const completedIntent = engineIntent;
+      idleWhenEngineStopsGeneration = null;
+      void engine?.start().then(() => {
+        if (!isCurrentEngineIntent(completedIntent, ['stopping'])) return;
+        transitionEngineIntent(completedIntent, 'idle', null);
+        sendToMain('engine:event', {
+          protocol_version: 1,
+          event: 'offline_seal_cleanup_finished',
+          payload: {},
+        });
+      }).catch((error) => {
+        if (!ownsEngineGeneration(completedIntent)) return;
+        transitionEngineIntent(completedIntent, 'idle', null);
+        sendToMain('engine:offline', `离线封存清理完成，但录音引擎无法重新启动：${error instanceof Error ? error.message : String(error)}`);
+      });
+      return;
+    }
+    // Only a stop that originated in requestSafeStopAndQuit may complete an
+    // application quit. Other reconciliation stops must never close the app.
+    if (quitWhenEngineStops && engineIntent.phase === 'stopping' && !safeExitPromise) {
+      void requestSafeStopAndQuit('延迟的音频封存已完成');
     }
   });
   engine.on('log', (message) => console.error(`[engine] ${message}`));
@@ -1519,11 +2416,26 @@ app.on('activate', () => {
 });
 
 app.on('window-all-closed', () => {
+  const keepBackgroundEngine = Boolean(
+    engine?.running
+      && (intentTracksLiveSession()
+        || engineIntent.phase === 'sealing'
+        || engineIntent.phase === 'exporting'
+        || engineIntent.phase === 'stopping'),
+  );
+  if (keepBackgroundEngine) {
+    ensureRecordingTray(engineIntent.phase === 'exporting'
+      ? '录音交付正在后台导出…'
+      : engineIntent.phase === 'sealing'
+        ? '中断任务正在后台修复并封存…'
+        : '● 后台录音正在进行');
+    return;
+  }
   if (process.platform !== 'darwin') app.quit();
 });
 
 app.on('before-quit', (event) => {
-  if (isQuitting()) return;
+  if (appQuitReleased) return;
   event.preventDefault();
   void requestSafeStopAndQuit('应用退出');
 });

@@ -2,8 +2,13 @@ use crate::durable_fs::{durable_replace, sync_directory, sync_parent_directory};
 use crate::protocol::Emitter;
 use crate::segmented_wav::{PreparedWavExport, SegmentedWav};
 use crate::session_lock::SessionLock;
-use crate::storage_guard::{StorageReport, StorageStatus, check_storage};
-use crate::wav::{RecoverableWav, WavEncoding, slice_wav_mono, validate_standard_wav_size};
+use crate::storage_guard::{
+    AtomicExportStep, StorageReport, StorageStatus, check_storage, evaluate_atomic_export_space,
+};
+use crate::wav::{
+    RecoverableWav, WavEncoding, automatic_wav_container_name, automatic_wav_file_size,
+    slice_wav_mono, standard_wav_file_size, validate_standard_wav_size,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -53,7 +58,9 @@ const WRITER_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
 // a subsequent safe-stop request until the 90-second process kill budget.
 const PREVIEW_RENDER_TIMEOUT: Duration = Duration::from_secs(15);
 const AUDIO_FAULT_MARKER: &str = "metadata/audio-fault.json";
-static EXPORT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const EXPORT_METADATA_BASE_HEADROOM_BYTES: u64 = 4 * 1024 * 1024;
+const EXPORT_FILE_ALLOCATION_HEADROOM_BYTES: u64 = 64 * 1024;
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
 pub struct NoActiveSessionError;
@@ -374,6 +381,32 @@ impl WriterQueueBudget {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct CaptureBlockError {
+    reason: String,
+    dropped_frames: u64,
+}
+
+fn saturating_atomic_add(counter: &AtomicU64, value: u64) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        Some(current.saturating_add(value))
+    });
+}
+
+fn reserve_counter_range(counter: &AtomicU64, amount: u64) -> Option<(u64, u64)> {
+    counter
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            current.checked_add(amount)
+        })
+        .ok()
+        .map(|start| {
+            let end = start
+                .checked_add(amount)
+                .expect("checked atomic counter update returned an overflowing range");
+            (start, end)
+        })
+}
+
 #[derive(Debug)]
 struct InterruptedAttemptStart {
     item_id: String,
@@ -445,6 +478,14 @@ enum WriterMessage {
 enum MasterStorageKind {
     LegacySingleWav,
     SegmentedWav,
+}
+
+#[derive(Debug)]
+struct SentenceExportPlan {
+    item_index: usize,
+    attempt_index: usize,
+    file_name: String,
+    file_bytes: u64,
 }
 
 impl MasterStorageKind {
@@ -972,7 +1013,9 @@ impl Engine {
         let (waveform_tx, waveform_rx) = bounded::<Vec<[f32; 2]>>(128);
         let telemetry_stop = Arc::new(AtomicBool::new(false));
 
+        let writer_captured = Arc::clone(&captured);
         let writer_committed = Arc::clone(&committed);
+        let writer_overflow = Arc::clone(&overflow);
         let writer_path = master_path.clone();
         let writer_storage_dir = session_dir.clone();
         let sample_rate = snapshot.audio_format.sample_rate;
@@ -994,7 +1037,9 @@ impl Engine {
                     storage_kind,
                     max_frames_per_segment,
                     &writer_storage_dir,
+                    writer_captured,
                     writer_committed,
+                    writer_overflow,
                     writer_faulted,
                     writer_storage_status,
                     writer_storage_remaining,
@@ -1273,10 +1318,9 @@ impl Engine {
             .iter()
             .find(|item| item.id == item_id)
             .ok_or_else(|| anyhow!("unknown item id {item_id}"))?;
-        let file_stem = safe_file_name(item_id);
         let mut sequence = item.attempts.len() + 1;
         let attempt_id = loop {
-            let candidate = format!("{file_stem}-a{sequence}");
+            let candidate = bounded_wav_stem(item_id, &format!("-a{sequence}"))?;
             if !item
                 .attempts
                 .iter()
@@ -1494,7 +1538,7 @@ impl Engine {
         let destination = session
             .session_dir
             .join("preview")
-            .join(format!("{}.wav", safe_file_name(attempt_id)));
+            .join(format!("{}.wav", bounded_wav_stem(attempt_id, "")?));
         session.render_range(&destination, attempt.start_sample, attempt.end_sample)?;
         Ok(json!({ "file_path": destination }))
     }
@@ -1550,7 +1594,259 @@ impl Engine {
         result
     }
 
+    /// Finalize a recording left active by a process or machine crash without
+    /// opening an input device. The physical WAV EOF is authoritative: repair
+    /// and durably checkpoint it before committing the recovered metadata.
+    pub fn seal_interrupted_session(&self, session_dir: &Path) -> Result<Value> {
+        self.seal_interrupted_session_inner(session_dir, JournalAppendFault::None)
+    }
+
+    fn seal_interrupted_session_inner(
+        &self,
+        session_dir: &Path,
+        journal_fault: JournalAppendFault,
+    ) -> Result<Value> {
+        if self.session.is_some() {
+            bail!("当前引擎仍有录制进行中，请先安全结束后再离线封存");
+        }
+        validate_offline_session_tree(session_dir)?;
+        let _session_lock = SessionLock::acquire(session_dir, &Utc::now().to_rfc3339())?;
+        let mut journal = read_journal(session_dir)?;
+        let journal_requires_rewrite =
+            journal.truncate_to.is_some() || !journal.warnings.is_empty();
+        let mut snapshot = load_recovery_snapshot(session_dir, &mut journal)?;
+        validate_offline_seal_snapshot(&snapshot)?;
+        let storage_kind = MasterStorageKind::from_snapshot(&snapshot)?;
+        let master_relative = Path::new(&snapshot.master_audio);
+        if master_relative.is_absolute()
+            || master_relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            bail!("snapshot master_audio must be a safe relative path");
+        }
+        let master_path = session_dir.join(master_relative);
+        let source_metadata = std::fs::symlink_metadata(&master_path)
+            .with_context(|| format!("inspect source audio {}", master_path.display()))?;
+        let valid_source = match storage_kind {
+            MasterStorageKind::LegacySingleWav => source_metadata.is_file(),
+            MasterStorageKind::SegmentedWav => source_metadata.is_dir(),
+        };
+        if !valid_source || source_metadata.file_type().is_symlink() {
+            bail!("recording source audio has an invalid type");
+        }
+
+        let has_authoritative_seal = journal.entries.iter().rev().any(|entry| {
+            entry.get("event").and_then(Value::as_str) == Some("session_interrupted_sealed")
+                && entry.get("journal_seq").and_then(Value::as_u64) == Some(snapshot.journal_seq)
+                && entry
+                    .get("snapshot")
+                    .and_then(|value| value.get("session_id"))
+                    .and_then(Value::as_str)
+                    == Some(snapshot.session_id.as_str())
+        });
+
+        // This is the only step allowed to mutate audio. `open_append` repairs
+        // an incomplete final frame and stale RIFF counters; `finalize` makes
+        // that physical recovery durable. Neither path writes PCM samples.
+        let max_frames_per_segment = storage_layout_segment_frames(&snapshot)?;
+        let durable_frames = match storage_kind {
+            MasterStorageKind::LegacySingleWav => RecoverableWav::open_append(
+                &master_path,
+                snapshot.audio_format.sample_rate,
+                1,
+                snapshot.audio_format.bit_depth,
+            )?
+            .finalize()?,
+            MasterStorageKind::SegmentedWav => SegmentedWav::resume(
+                &master_path,
+                snapshot.audio_format.sample_rate,
+                1,
+                snapshot.audio_format.bit_depth,
+                max_frames_per_segment,
+            )?
+            .finalize()?,
+        };
+        if let Err(error) = validate_attempt_boundaries(&snapshot, durable_frames) {
+            let final_marker_exists =
+                std::fs::symlink_metadata(session_dir.join(AUDIO_FAULT_MARKER)).is_ok();
+            let marker_persisted = final_marker_exists
+                || persist_audio_fault_marker(
+                    session_dir,
+                    &format!("offline seal found invalid attempt boundaries: {error:#}"),
+                    durable_frames,
+                );
+            if marker_persisted {
+                return Err(
+                    error.context("母轨已物理修复，但句子时间戳与持久音频不一致，已写入故障标记")
+                );
+            }
+            return Err(error.context("母轨已物理修复，但句子时间戳无效且故障标记未能持久化"));
+        }
+
+        let original_captured_samples = snapshot.captured_samples;
+        let original_committed_samples = snapshot.committed_samples;
+        let interrupted_before = snapshot
+            .items
+            .iter()
+            .flat_map(|item| item.attempts.iter())
+            .filter(|attempt| attempt.status == "interrupted")
+            .count();
+        let mut warnings = journal.warnings.clone();
+        let interrupted_warnings =
+            recover_interrupted_attempts(&journal, &mut snapshot, durable_frames)?;
+        let has_interrupted_recovery = !interrupted_warnings.is_empty();
+        warnings.extend(interrupted_warnings);
+        let interrupted_after = snapshot
+            .items
+            .iter()
+            .flat_map(|item| item.attempts.iter())
+            .filter(|attempt| attempt.status == "interrupted")
+            .count();
+        let recovered_attempts = interrupted_after.saturating_sub(interrupted_before);
+        let mut marker_present = audio_fault_marker_present(session_dir)?;
+        let recorded_fault =
+            marker_present || snapshot.status == "faulted" || snapshot.overflow_samples > 0;
+        let claimed_final = snapshot.status == "stopped" || has_authoritative_seal;
+        let final_audio_mismatch = claimed_final
+            && (original_captured_samples != durable_frames
+                || original_committed_samples != durable_frames);
+        let final_status_consistent = if recorded_fault {
+            snapshot.status == "faulted" && has_authoritative_seal
+        } else {
+            snapshot.status == "stopped"
+        };
+        if claimed_final
+            && !final_audio_mismatch
+            && !has_interrupted_recovery
+            && recovered_attempts == 0
+            && final_status_consistent
+            && !journal_requires_rewrite
+        {
+            return Ok(json!({
+                "session_dir": session_dir,
+                "snapshot": snapshot,
+                "durable_frames": durable_frames,
+                "recovered_attempts": 0,
+                "fault_preserved": recorded_fault,
+                "no_op": true,
+                "warnings": warnings,
+            }));
+        }
+
+        if final_audio_mismatch && !marker_present {
+            marker_present = persist_audio_fault_marker(
+                session_dir,
+                "offline seal found a finalized snapshot whose sample watermarks did not match the physical WAV",
+                durable_frames,
+            );
+            if !marker_present {
+                bail!("母轨物理长度与已封存快照不一致，且故障标记未能持久化");
+            }
+            warnings.push(
+                "已封存快照的样本水位与物理 WAV 不一致，已保留物理母轨并标记故障。".to_string(),
+            );
+        }
+        let fault_preserved =
+            marker_present || snapshot.status == "faulted" || snapshot.overflow_samples > 0;
+        let previous_status = snapshot.status.clone();
+        snapshot.status = if fault_preserved {
+            "faulted".to_string()
+        } else {
+            "stopped".to_string()
+        };
+        snapshot.captured_samples = durable_frames;
+        snapshot.committed_samples = durable_frames;
+        snapshot.updated_at = Utc::now().to_rfc3339();
+        snapshot.journal_seq = snapshot
+            .journal_seq
+            .checked_add(1)
+            .context("journal sequence overflow")?;
+        let event_value = json!({
+            "journal_seq": snapshot.journal_seq,
+            "event": "session_interrupted_sealed",
+            "at": snapshot.updated_at,
+            "payload": {
+                "previous_status": previous_status,
+                "durable_frames": durable_frames,
+                "recovered_attempts": recovered_attempts,
+                "fault_preserved": fault_preserved,
+            },
+            "captured_samples": snapshot.captured_samples,
+            "committed_samples": snapshot.committed_samples,
+            "snapshot": &snapshot,
+        });
+        let event_path = session_dir.join("metadata/events.jsonl");
+        if let Err(failure) = append_journal_event(&event_path, &event_value, journal_fault) {
+            let final_marker_exists =
+                std::fs::symlink_metadata(session_dir.join(AUDIO_FAULT_MARKER)).is_ok();
+            let marker_persisted = final_marker_exists
+                || persist_audio_fault_marker(
+                    session_dir,
+                    &format!("offline seal journal durability failure: {failure}"),
+                    durable_frames,
+                );
+            if marker_persisted {
+                return Err(anyhow!(failure)
+                    .context("母轨已物理封存，但恢复元数据未能写入权威事件日志，已写入故障标记"));
+            }
+            return Err(
+                anyhow!(failure).context("母轨已物理封存，但恢复元数据日志与故障标记均未能持久化")
+            );
+        }
+
+        // The durable full-snapshot journal event above is authoritative.
+        // These files are replaceable projections; failures remain visible as
+        // warnings but must not turn a committed recovery into a false error.
+        let mut projection_failures = Vec::<String>::new();
+        if let Err(error) =
+            atomic_snapshot_json(&session_dir.join("metadata/items.snapshot.json"), &snapshot)
+        {
+            projection_failures.push(format!("update items snapshot: {error:#}"));
+        }
+        if let Err(error) =
+            atomic_json(&session_dir.join("script/normalized.json"), &snapshot.items)
+        {
+            projection_failures.push(format!("update normalized script: {error:#}"));
+        }
+        if let Err(error) = atomic_json(
+            &session_dir.join("session.json"),
+            &session_summary_value(&snapshot),
+        ) {
+            projection_failures.push(format!("update session summary: {error:#}"));
+        }
+        if projection_failures.is_empty()
+            && let Err(error) = atomic_json_line(&event_path, &event_value)
+        {
+            projection_failures.push(format!("compact journal: {error:#}"));
+        }
+        warnings.extend(projection_failures);
+        for warning in warnings.iter().skip(journal.warnings.len()) {
+            eprintln!(
+                "offline seal projection/recovery warning for {} seq {}: {warning}",
+                snapshot.session_id, snapshot.journal_seq
+            );
+        }
+        Ok(json!({
+            "session_dir": session_dir,
+            "snapshot": snapshot,
+            "durable_frames": durable_frames,
+            "recovered_attempts": recovered_attempts,
+            "fault_preserved": fault_preserved,
+            "no_op": false,
+            "warnings": warnings,
+        }))
+    }
+
     pub fn export_session(&self, session_dir: &Path) -> Result<Value> {
+        self.export_session_inner(session_dir, None)
+    }
+
+    fn export_session_inner(
+        &self,
+        session_dir: &Path,
+        available_bytes_override: Option<u64>,
+    ) -> Result<Value> {
         let session_metadata = std::fs::symlink_metadata(session_dir)
             .with_context(|| format!("inspect recording directory {}", session_dir.display()))?;
         if !session_metadata.is_dir() || session_metadata.file_type().is_symlink() {
@@ -1626,10 +1922,12 @@ impl Engine {
         if physical_frames != snapshot.committed_samples {
             bail!("母轨物理帧数与已提交水位不一致，必须先恢复并安全结束录制后再交付。");
         }
-        // A long segmented master can be perfectly healthy while no longer
-        // fitting in one standard RIFF/WAVE. Reject it before copying gigabytes
-        // into a temporary full-track file that can never be finalized.
-        validate_standard_wav_size(physical_frames, 1, snapshot.audio_format.bit_depth)?;
+        let full_track_container = match storage_kind {
+            MasterStorageKind::LegacySingleWav => "riff",
+            MasterStorageKind::SegmentedWav => {
+                automatic_wav_container_name(physical_frames, 1, snapshot.audio_format.bit_depth)?
+            }
+        };
         let sentences_dir = export_dir.join("sentences");
         match std::fs::symlink_metadata(&sentences_dir) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
@@ -1639,20 +1937,123 @@ impl Engine {
             }
             Err(error) => return Err(error.into()),
         }
+
         let export_id = format!("{}-{}", std::process::id(), Utc::now().timestamp_micros());
         let export_started_at = Utc::now().to_rfc3339();
-        let export_status_path = export_dir.join("status.json");
-        atomic_json(
-            &export_status_path,
-            &json!({
-                "schema_version": 1,
-                "status": "in_progress",
-                "export_id": export_id,
-                "session_id": snapshot.session_id,
-                "started_at": export_started_at,
-            }),
-        )?;
+        let export_source = json!({
+            "journal_seq": snapshot.journal_seq,
+            "committed_samples": snapshot.committed_samples,
+            "selected_attempts": snapshot.items.iter().map(|item| json!({
+                "id": item.id,
+                "attempt_id": item.selected_attempt_id,
+            })).collect::<Vec<_>>(),
+        });
+        let in_progress_status = json!({
+            "schema_version": 2,
+            "status": "in_progress",
+            "export_id": export_id,
+            "session_id": snapshot.session_id,
+            "source": export_source,
+            "started_at": export_started_at,
+        });
+        let mut sentence_plans = Vec::<SentenceExportPlan>::new();
+        let mut skipped = Vec::<Value>::new();
+        let mut used_file_names = std::collections::HashSet::<String>::new();
+        for (item_index, item) in snapshot.items.iter().enumerate() {
+            let Some(selected) = item.selected_attempt_id.as_deref() else {
+                skipped.push(json!({ "id": item.id, "reason": item.status }));
+                continue;
+            };
+            let attempt_index = item
+                .attempts
+                .iter()
+                .position(|attempt| attempt.attempt_id == selected)
+                .with_context(|| format!("条目 {} 选中的录音版本不存在", item.id))?;
+            let attempt = &item.attempts[attempt_index];
+            let file_name =
+                allocate_sentence_file_name(&item.id, item_index, &mut used_file_names)?;
+            let file_bytes = standard_wav_file_size(
+                attempt.end_sample - attempt.start_sample,
+                1,
+                snapshot.audio_format.bit_depth,
+            )?;
+            sentence_plans.push(SentenceExportPlan {
+                item_index,
+                attempt_index,
+                file_name,
+                file_bytes,
+            });
+        }
+
         let master_output = export_dir.join("full-track.wav");
+        let export_status_path = export_dir.join("status.json");
+        let export_metadata_path = export_dir.join("metadata.json");
+        let export_csv_path = export_dir.join("metadata.csv");
+        let planned_master_bytes =
+            automatic_wav_file_size(physical_frames, 1, snapshot.audio_format.bit_depth)?
+                .max(source_metadata.len());
+        let mut storage_steps = Vec::<AtomicExportStep>::new();
+        storage_steps.push(AtomicExportStep {
+            new_bytes: planned_export_allocation(serialized_json_file_size(&in_progress_status)?)?,
+            replaced_bytes: existing_export_allocation(existing_export_file_size(
+                &export_status_path,
+                "已有导出状态",
+            )?),
+        });
+        // Once status.json is in_progress, remove every old sentence WAV as a
+        // separate generation before writing any new sentence. This avoids
+        // both Unicode filesystem aliases and double-crediting an old file as
+        // the replacement target for more than one planned name.
+        let existing_sentence_sizes = existing_sentence_wav_sizes(&sentences_dir)?;
+        for old_bytes in existing_sentence_sizes {
+            storage_steps.push(AtomicExportStep {
+                new_bytes: 0,
+                replaced_bytes: old_bytes,
+            });
+        }
+        storage_steps.push(AtomicExportStep {
+            new_bytes: planned_export_allocation(planned_master_bytes)?,
+            replaced_bytes: existing_export_allocation(existing_export_file_size(
+                &master_output,
+                "已有整轨导出",
+            )?),
+        });
+        for plan in &sentence_plans {
+            storage_steps.push(AtomicExportStep {
+                new_bytes: planned_export_allocation(plan.file_bytes)?,
+                // All prior sentence WAVs are removed before this phase.
+                replaced_bytes: 0,
+            });
+        }
+        existing_export_file_size(&export_metadata_path, "已有导出元数据")?;
+        existing_export_file_size(&export_csv_path, "已有 CSV 元数据")?;
+        storage_steps.push(AtomicExportStep {
+            new_bytes: export_metadata_headroom(&snapshot)?,
+            replaced_bytes: 0,
+        });
+        let storage = check_storage(
+            &export_dir,
+            snapshot.audio_format.sample_rate,
+            1,
+            snapshot.audio_format.bit_depth,
+        )?;
+        let available_bytes = available_bytes_override.unwrap_or(storage.available_bytes);
+        let export_space = evaluate_atomic_export_space(
+            available_bytes,
+            storage.critical_threshold_bytes,
+            &storage_steps,
+        )?;
+        if !export_space.can_export {
+            bail!(
+                "导出磁盘空间不足：required={} 字节，available={} 字节，reserve={} 字节（导出峰值新增 {} 字节）。未写入导出文件，原始母轨保持不变。",
+                export_space.required_available_bytes,
+                export_space.available_bytes,
+                export_space.critical_reserve_bytes,
+                export_space.peak_additional_bytes,
+            );
+        }
+        atomic_json(&export_status_path, &in_progress_status)?;
+        remove_all_sentence_wavs(&sentences_dir)?;
         match segmented_source.as_mut() {
             Some(source) => {
                 source.export_whole(&master_output)?;
@@ -1662,24 +2063,10 @@ impl Engine {
             }
         }
         let mut exported = Vec::new();
-        let mut skipped = Vec::new();
-        let mut used_file_names = std::collections::HashSet::new();
-        for (item_index, item) in snapshot.items.iter().enumerate() {
-            let Some(selected) = item.selected_attempt_id.as_deref() else {
-                skipped.push(json!({ "id": item.id, "reason": item.status }));
-                continue;
-            };
-            let Some(attempt) = item.attempts.iter().find(|a| a.attempt_id == selected) else {
-                skipped.push(json!({ "id": item.id, "reason": "selected_attempt_missing" }));
-                continue;
-            };
-            let stem = safe_file_name(&item.id);
-            let mut file_name = format!("{stem}.wav");
-            if !used_file_names.insert(file_name.to_lowercase()) {
-                file_name = format!("{stem}-{}.wav", item_index + 1);
-                used_file_names.insert(file_name.to_lowercase());
-            }
-            let output = sentences_dir.join(&file_name);
+        for plan in &sentence_plans {
+            let item = &snapshot.items[plan.item_index];
+            let attempt = &item.attempts[plan.attempt_index];
+            let output = sentences_dir.join(&plan.file_name);
             match segmented_source.as_mut() {
                 Some(source) => {
                     source.export_range(&output, attempt.start_sample, attempt.end_sample)?;
@@ -1707,10 +2094,9 @@ impl Engine {
                     / f64::from(snapshot.audio_format.sample_rate),
                 "end_sample": attempt.end_sample,
                 "duration_samples": attempt.end_sample - attempt.start_sample,
-                "file": format!("sentences/{file_name}"),
+                "file": format!("sentences/{}", plan.file_name),
             }));
         }
-        remove_stale_sentence_wavs(&sentences_dir, &used_file_names)?;
         let metadata = json!({
             "schema_version": 1,
             "session_id": snapshot.session_id,
@@ -1726,12 +2112,14 @@ impl Engine {
                 "duration_ms": snapshot.silence_duration_ms,
                 "threshold_dbfs": snapshot.silence_threshold_dbfs,
             },
+            "source": export_source,
             "full_track": "full-track.wav",
+            "full_track_container": full_track_container,
             "exported": exported,
             "skipped": skipped,
         });
-        atomic_json(&export_dir.join("metadata.json"), &metadata)?;
-        write_csv(&export_dir.join("metadata.csv"), &metadata["exported"])?;
+        atomic_json(&export_metadata_path, &metadata)?;
+        write_csv(&export_csv_path, &metadata["exported"])?;
         let exported_count = metadata["exported"].as_array().map_or(0, Vec::len);
         let skipped_count = metadata["skipped"].as_array().map_or(0, Vec::len);
         // This small commit marker is always the last published file. Readers
@@ -1740,10 +2128,11 @@ impl Engine {
         atomic_json(
             &export_status_path,
             &json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "status": "complete",
                 "export_id": export_id,
                 "session_id": snapshot.session_id,
+                "source": export_source,
                 "started_at": export_started_at,
                 "completed_at": Utc::now().to_rfc3339(),
                 "exported_count": exported_count,
@@ -1753,10 +2142,17 @@ impl Engine {
         Ok(json!({
             "export_dir": export_dir,
             "master_file": master_output,
+            "master_container": full_track_container,
             "sentences_dir": sentences_dir,
             "exported_count": exported_count,
             "skipped_count": skipped_count,
             "recovery_warnings": recovery_warnings,
+            "storage_preflight": {
+                "available_bytes": export_space.available_bytes,
+                "required_available_bytes": export_space.required_available_bytes,
+                "critical_reserve_bytes": export_space.critical_reserve_bytes,
+                "peak_additional_bytes": export_space.peak_additional_bytes,
+            },
         }))
     }
 
@@ -1778,6 +2174,108 @@ impl Engine {
     fn active_session_mut(&mut self) -> Result<&mut RecordingSession> {
         self.session.as_mut().ok_or_else(no_active_session_error)
     }
+}
+
+fn validate_offline_session_tree(session_dir: &Path) -> Result<()> {
+    let session_metadata = std::fs::symlink_metadata(session_dir)
+        .with_context(|| format!("inspect recording directory {}", session_dir.display()))?;
+    if session_metadata.file_type().is_symlink() || !session_metadata.is_dir() {
+        bail!("recording path must be a real directory, not a symbolic link");
+    }
+    for name in ["audio", "metadata", "script"] {
+        let directory = session_dir.join(name);
+        let metadata = std::fs::symlink_metadata(&directory)
+            .with_context(|| format!("inspect {}", directory.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!("recording {name} path must be a real directory");
+        }
+    }
+    for name in ["preview", "export"] {
+        let directory = session_dir.join(name);
+        match std::fs::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => bail!("recording {name} path must be a real directory when present"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", directory.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_offline_seal_snapshot(snapshot: &SessionSnapshot) -> Result<()> {
+    if snapshot.schema_version != 1 || snapshot.session_id.trim().is_empty() {
+        bail!("录制任务快照版本或录制 ID 无效");
+    }
+    if !matches!(
+        snapshot.status.as_str(),
+        "recording" | "stopping" | "stopped" | "faulted"
+    ) {
+        bail!("录制任务状态无效，不能离线封存");
+    }
+    if snapshot.items.is_empty() {
+        bail!("录制任务没有可恢复的脚本条目");
+    }
+    if snapshot.audio_format.sample_rate == 0
+        || snapshot.audio_format.channels != 1
+        || snapshot.audio_format.input_channels == 0
+        || snapshot.audio_format.input_channel == 0
+        || snapshot.audio_format.input_channel > snapshot.audio_format.input_channels
+    {
+        bail!("录制任务的音频通道配置无效");
+    }
+    let output_encoding = WavEncoding::for_bit_depth(snapshot.audio_format.bit_depth)?;
+    if snapshot.audio_format.encoding != output_encoding.name() {
+        bail!("录制任务的位深与编码不一致");
+    }
+    if !(200..=5_000).contains(&snapshot.silence_duration_ms)
+        || !snapshot.silence_threshold_dbfs.is_finite()
+        || !(-96.0..=-6.0).contains(&snapshot.silence_threshold_dbfs)
+    {
+        bail!("录制任务的静音检测参数无效");
+    }
+    storage_layout_segment_frames(snapshot)?;
+    Ok(())
+}
+
+fn validate_attempt_boundaries(snapshot: &SessionSnapshot, durable_frames: u64) -> Result<()> {
+    let invalid = snapshot
+        .items
+        .iter()
+        .flat_map(|item| item.attempts.iter())
+        .any(|attempt| {
+            attempt.start_sample > durable_frames
+                || attempt.recording_started_sample > durable_frames
+                || attempt.content_started_sample > durable_frames
+                || attempt.end_sample > durable_frames
+                || (attempt.status == "interrupted" && attempt.end_sample < attempt.start_sample)
+                || (attempt.status != "interrupted" && attempt.end_sample <= attempt.start_sample)
+        });
+    if invalid {
+        bail!("录制任务包含超出母音频范围或长度无效的句子时间戳");
+    }
+    Ok(())
+}
+
+fn session_summary_value(snapshot: &SessionSnapshot) -> Value {
+    json!({
+        "schema_version": snapshot.schema_version,
+        "journal_seq": snapshot.journal_seq,
+        "session_id": snapshot.session_id,
+        "script_name": snapshot.script_name,
+        "status": snapshot.status,
+        "device_name": snapshot.device_name,
+        "device_id": snapshot.device_id,
+        "input_sample_format": snapshot.input_sample_format,
+        "audio_format": snapshot.audio_format,
+        "storage_layout_version": snapshot.storage_layout_version,
+        "segment_frames": snapshot.segment_frames,
+        "silence_duration_ms": snapshot.silence_duration_ms,
+        "silence_threshold_dbfs": snapshot.silence_threshold_dbfs,
+        "started_at": snapshot.started_at,
+        "updated_at": snapshot.updated_at,
+    })
 }
 
 fn validate_snapshot_for_export(snapshot: &SessionSnapshot) -> Result<()> {
@@ -2838,6 +3336,23 @@ fn storage_check_requires_stop(consecutive_failures: &mut u8, succeeded: bool) -
     *consecutive_failures >= 3
 }
 
+fn audio_fault_marker_present(session_dir: &Path) -> Result<bool> {
+    let marker = session_dir.join(AUDIO_FAULT_MARKER);
+    let temporary = marker.with_extension("tmp");
+    for candidate in [&marker, &temporary] {
+        match std::fs::symlink_metadata(candidate) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("inspect audio fault marker {}", candidate.display())
+                });
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn ensure_no_audio_fault_marker(session_dir: &Path, operation: &str) -> Result<()> {
     let marker = session_dir.join(AUDIO_FAULT_MARKER);
     let temporary = marker.with_extension("tmp");
@@ -2859,13 +3374,76 @@ fn ensure_no_audio_fault_marker(session_dir: &Path, operation: &str) -> Result<(
 }
 
 fn persist_audio_fault_marker(session_dir: &Path, reason: &str, committed_frames: u64) -> bool {
+    persist_audio_fault_marker_inner(session_dir, reason, committed_frames, false)
+}
+
+fn persist_audio_fault_marker_inner(
+    session_dir: &Path,
+    reason: &str,
+    committed_frames: u64,
+    stop_after_synced_temporary: bool,
+) -> bool {
     let marker = session_dir.join(AUDIO_FAULT_MARKER);
+    let temporary = marker.with_extension("tmp");
+    // An interrupted fixed temporary is already sufficient to fail closed.
+    // Never replace it: it may be the only durable evidence from a crash
+    // between syncing the candidate and publishing the final name.
+    match std::fs::symlink_metadata(&temporary) {
+        Ok(_) => return true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            eprintln!(
+                "could not inspect audio fault marker {}: {error}",
+                temporary.display()
+            );
+            return false;
+        }
+    }
+    // A later checkpoint may refine the durable frame count and diagnostic
+    // reason. A regular final marker can be replaced through the same fixed
+    // temporary: the old final remains visible until the new candidate is
+    // synced, so there is no crash window without fault evidence.
+    match std::fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => return true,
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            eprintln!(
+                "could not inspect audio fault marker {}: {error}",
+                marker.display()
+            );
+            return false;
+        }
+    }
     let value = json!({
         "reason": reason,
         "committed_frames": committed_frames,
         "timestamp": Utc::now().to_rfc3339(),
     });
-    if let Err(error) = atomic_json(&marker, &value) {
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .with_context(|| format!("create audio fault marker {}", temporary.display()))?;
+        serde_json::to_writer_pretty(&mut file, &value)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        // The fixed, no-follow `create_new` temporary is itself a recovery
+        // marker. Make its directory entry durable before replacing the final
+        // name so a crash in either phase remains fail-closed.
+        sync_parent_directory(&temporary)?;
+        if stop_after_synced_temporary {
+            bail!("injected stop after synced audio fault temporary");
+        }
+        durable_replace(&temporary, &marker)
+    })();
+    if let Err(error) = result {
+        // Do not remove the temporary on error. Even a partial candidate means
+        // the recorder failed while trying to persist a fault and must block
+        // resume/export until a human inspects the source audio.
         eprintln!(
             "could not persist audio fault marker {}: {error:#}",
             marker.display()
@@ -2909,6 +3487,38 @@ fn set_writer_storage_check_overrides(
         .lock()
         .unwrap()
         .insert(directory.to_path_buf(), outcomes.into_iter().collect());
+}
+
+#[cfg(test)]
+struct WriterWriteFailureGate {
+    entered: Sender<()>,
+    release: Receiver<()>,
+}
+
+#[cfg(test)]
+fn writer_write_failure_gates()
+-> &'static std::sync::Mutex<HashMap<PathBuf, WriterWriteFailureGate>> {
+    static GATES: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, WriterWriteFailureGate>>> =
+        std::sync::OnceLock::new();
+    GATES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn write_audio_samples(
+    writer: &mut AudioWriterBackend,
+    _storage_directory: &Path,
+    samples: &[f32],
+) -> Result<()> {
+    #[cfg(test)]
+    if let Some(gate) = writer_write_failure_gates()
+        .lock()
+        .unwrap()
+        .remove(_storage_directory)
+    {
+        let _ = gate.entered.send(());
+        let _ = gate.release.recv();
+        bail!("injected audio write failure");
+    }
+    writer.write_samples(samples)
 }
 
 fn writer_storage_check_due(storage_directory: &Path, last_checkpoint: Instant) -> bool {
@@ -3004,7 +3614,9 @@ fn writer_loop(
     storage_kind: MasterStorageKind,
     max_frames_per_segment: u64,
     storage_directory: &Path,
+    captured: Arc<AtomicU64>,
     committed: Arc<AtomicU64>,
+    overflow: Arc<AtomicU64>,
     faulted: Arc<AtomicBool>,
     storage_status: Arc<AtomicU32>,
     storage_safe_remaining_seconds: Arc<AtomicU64>,
@@ -3059,27 +3671,44 @@ fn writer_loop(
         match message {
             WriterMessage::Samples(samples) => {
                 queue.release(samples.len() as u64);
-                if let Err(error) = writer.write_samples(&samples) {
-                    let message = format!("audio write failed: {error:#}");
-                    eprintln!("{message}");
+                if let Err(error) = write_audio_samples(&mut writer, storage_directory, &samples) {
+                    let base_reason = format!("audio write failed: {error:#}");
+                    eprintln!("{base_reason}");
                     faulted.store(true, Ordering::Release);
-                    latch_audio_fault_marker(
+                    // Reject new callbacks and wait through every callback that
+                    // already entered before measuring accepted audio. The
+                    // remaining channel backlog cannot be written safely after
+                    // a storage error, so it is accounted as lost explicitly.
+                    queue.close_and_wait();
+                    persist_audio_fault_marker(
                         storage_directory,
-                        &mut latched_fault_reason,
-                        &message,
+                        &base_reason,
                         committed.load(Ordering::Acquire),
                     );
-                    if let Ok(frames) = writer.checkpoint() {
-                        committed.store(frames, Ordering::Release);
+                    let mut checkpoint_failure = None::<String>;
+                    let durable_frames = match writer.checkpoint() {
+                        Ok(frames) => {
+                            committed.store(frames, Ordering::Release);
+                            frames
+                        }
+                        Err(checkpoint_error) => {
+                            checkpoint_failure = Some(format!("{checkpoint_error:#}"));
+                            committed.load(Ordering::Acquire)
+                        }
+                    };
+                    let accepted_frames = captured.load(Ordering::Acquire);
+                    let lost_frames = accepted_frames.saturating_sub(durable_frames);
+                    saturating_atomic_add(&overflow, lost_frames);
+                    queue.queued_frames.store(0, Ordering::Release);
+                    let mut message = format!(
+                        "{base_reason}; accepted_frames={accepted_frames}; durable_frames={durable_frames}; lost_frames={lost_frames}"
+                    );
+                    if let Some(checkpoint_error) = checkpoint_failure {
+                        message.push_str(&format!("; checkpoint_failed={checkpoint_error}"));
                     }
-                    latch_audio_fault_marker(
-                        storage_directory,
-                        &mut latched_fault_reason,
-                        &message,
-                        committed.load(Ordering::Acquire),
-                    );
+                    persist_audio_fault_marker(storage_directory, &message, durable_frames);
                     if let Some(reply) = pending_stop_reply.take() {
-                        let _ = reply.send(Err(message));
+                        let _ = reply.send(Err(message.clone()));
                     }
                     break;
                 }
@@ -3658,30 +4287,49 @@ where
     Ok(device.build_input_stream(
         *config,
         move |data: &[T], _| {
+            // Some backends can wake the callback without exposing a packet.
+            // It carries no timeline information and must not consume queue
+            // budget or place a zero-frame message in the unbounded channel.
+            if data.is_empty() {
+                return;
+            }
             // Register the callback before doing any conversion or metering.
             // A clean stop closes this gate and waits for every callback that
             // already entered it, so a callback descheduled during conversion
             // cannot silently lose the device's final buffer.
             let Some(enqueue_lease) = queue.enter() else {
+                if faulted.load(Ordering::Acquire) {
+                    saturating_atomic_add(&overflow, data.len().div_ceil(channels) as u64);
+                }
                 return;
             };
-            let mono = convert_frames(data, channels, input_channel_index, convert);
-            publish_leased_block(
-                mono,
-                &writer,
-                &captured,
-                &overflow,
-                &faulted,
-                &peak_bits,
-                &rms_bits,
-                &queue,
-                enqueue_lease,
-                &silence,
-            );
+            match convert_frames(data, channels, input_channel_index, convert) {
+                Ok(mono) => publish_leased_block(
+                    mono,
+                    &writer,
+                    &captured,
+                    &overflow,
+                    &faulted,
+                    &peak_bits,
+                    &rms_bits,
+                    &queue,
+                    enqueue_lease,
+                    &silence,
+                ),
+                Err(error) => fail_capture_block(
+                    error.reason,
+                    error.dropped_frames,
+                    &writer,
+                    &overflow,
+                    &faulted,
+                    &queue,
+                    enqueue_lease,
+                ),
+            }
         },
         move |error| {
-            error_queue.close_and_wait();
             error_emitter.store(true, Ordering::Release);
+            error_queue.close_and_wait();
             eprintln!("audio stream error: {error}");
             let _ = error_writer.try_send(WriterMessage::FaultAndStop(format!(
                 "audio input stream failed: {error}"
@@ -3696,14 +4344,40 @@ fn convert_frames<T: Copy>(
     channels: usize,
     input_channel_index: usize,
     convert: impl Fn(T) -> f32,
-) -> Vec<f32> {
-    if channels == 0 || input_channel_index >= channels {
-        return Vec::new();
+) -> std::result::Result<Vec<f32>, CaptureBlockError> {
+    if input.is_empty() {
+        return Ok(Vec::new());
     }
-    input
-        .chunks_exact(channels)
-        .map(|frame| convert(frame[input_channel_index]).clamp(-1.0, 1.0))
-        .collect()
+    if channels == 0 || input_channel_index >= channels {
+        return Err(CaptureBlockError {
+            reason: "audio callback exposed an invalid channel configuration".to_string(),
+            dropped_frames: input.len() as u64,
+        });
+    }
+    let dropped_frames = input.len().div_ceil(channels) as u64;
+    if !input.len().is_multiple_of(channels) {
+        return Err(CaptureBlockError {
+            reason: format!(
+                "audio callback returned {} samples that do not form complete {channels}-channel frames",
+                input.len()
+            ),
+            dropped_frames,
+        });
+    }
+    let mut mono = Vec::with_capacity(input.len() / channels);
+    for (frame_index, frame) in input.chunks_exact(channels).enumerate() {
+        let sample = convert(frame[input_channel_index]);
+        if !sample.is_finite() {
+            return Err(CaptureBlockError {
+                reason: format!(
+                    "audio callback returned a non-finite sample at frame {frame_index}"
+                ),
+                dropped_frames,
+            });
+        }
+        mono.push(sample.clamp(-1.0, 1.0));
+    }
+    Ok(mono)
 }
 
 fn normalize_i24_raw(raw: i32, left_aligned_in_i32: bool) -> f32 {
@@ -3729,6 +4403,28 @@ fn u24_to_f32(sample: U24) -> f32 {
     normalize_u24_raw(sample.inner(), cfg!(target_os = "windows"))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn fail_capture_block(
+    reason: String,
+    dropped_frames: u64,
+    writer: &Sender<WriterMessage>,
+    overflow: &AtomicU64,
+    faulted: &AtomicBool,
+    queue: &WriterQueueBudget,
+    enqueue_lease: WriterQueueLease<'_>,
+) {
+    faulted.store(true, Ordering::Release);
+    saturating_atomic_add(overflow, dropped_frames);
+    // Drop this callback's lease before waiting. Once every older callback has
+    // left its enqueue path, the fault sentinel is guaranteed to sit behind
+    // every Samples message that was accepted before the bad block.
+    drop(enqueue_lease);
+    queue.close_and_wait();
+    let _ = writer.try_send(WriterMessage::FaultAndStop(format!(
+        "{reason}; dropped_frames={dropped_frames}"
+    )));
+}
+
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn publish_block(
@@ -3743,9 +4439,12 @@ fn publish_block(
     silence: &SilenceMonitor,
 ) {
     let frames = mono.len() as u64;
+    if frames == 0 {
+        return;
+    }
     let Some(enqueue_lease) = queue.enter() else {
-        if overflow.load(Ordering::Acquire) > 0 {
-            overflow.fetch_add(frames, Ordering::Release);
+        if faulted.load(Ordering::Acquire) {
+            saturating_atomic_add(overflow, frames);
         }
         return;
     };
@@ -3777,6 +4476,22 @@ fn publish_leased_block(
     silence: &SilenceMonitor,
 ) {
     let frames = mono.len() as u64;
+    if frames == 0 {
+        drop(enqueue_lease);
+        return;
+    }
+    if mono.iter().any(|sample| !sample.is_finite()) {
+        fail_capture_block(
+            "audio callback produced a non-finite normalized sample".to_string(),
+            frames,
+            writer,
+            overflow,
+            faulted,
+            queue,
+            enqueue_lease,
+        );
+        return;
+    }
     let mut peak = 0f32;
     let mut square_sum = 0f64;
     for sample in &mono {
@@ -3790,32 +4505,59 @@ fn publish_leased_block(
         (square_sum / mono.len() as f64).sqrt() as f32
     };
     if !queue.reserve(frames) {
-        overflow.fetch_add(frames, Ordering::Release);
-        faulted.store(true, Ordering::Release);
-        drop(enqueue_lease);
-        queue.close_and_wait();
-        let _ = writer.try_send(WriterMessage::FaultAndStop(
+        fail_capture_block(
             "audio writer queue exceeded its 20 second frame budget".to_string(),
-        ));
+            frames,
+            writer,
+            overflow,
+            faulted,
+            queue,
+            enqueue_lease,
+        );
         return;
     }
+    let Some((block_start, block_end)) = reserve_counter_range(captured, frames) else {
+        queue.release(frames);
+        fail_capture_block(
+            "audio capture timeline counter overflow".to_string(),
+            frames,
+            writer,
+            overflow,
+            faulted,
+            queue,
+            enqueue_lease,
+        );
+        return;
+    };
     if writer.try_send(WriterMessage::Samples(mono)).is_err() {
         queue.release(frames);
-        overflow.fetch_add(frames, Ordering::Release);
-        faulted.store(true, Ordering::Release);
-        drop(enqueue_lease);
-        queue.close_and_wait();
+        let rollback_succeeded = captured
+            .compare_exchange(block_end, block_start, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        let reason = if rollback_succeeded {
+            "audio writer channel disconnected before accepting the callback block".to_string()
+        } else {
+            "audio writer channel disconnected and the capture timeline reservation could not be rolled back"
+                .to_string()
+        };
+        fail_capture_block(
+            reason,
+            frames,
+            writer,
+            overflow,
+            faulted,
+            queue,
+            enqueue_lease,
+        );
         return;
     }
-    // The global timeline advances only after the complete block has entered
-    // the writer queue. Once enqueueing fails, later callbacks are rejected so
-    // physical WAV frames and all sample-based annotations cannot diverge.
-    let block_start = captured.fetch_add(frames, Ordering::Release);
-    let block_end = block_start + frames;
+    // The checked timeline reservation is retained only after the complete
+    // finite block has entered the writer queue. Once enqueueing fails, later
+    // callbacks are rejected so WAV frames and sample annotations cannot drift.
     let threshold_dbfs = f32::from_bits(silence.threshold_bits.load(Ordering::Relaxed));
     let threshold_linear = 10f32.powf(threshold_dbfs / 20.0);
     if rms <= threshold_linear {
-        silence.silence_samples.fetch_add(frames, Ordering::Release);
+        saturating_atomic_add(&silence.silence_samples, frames);
     } else {
         silence.silence_samples.store(0, Ordering::Release);
         let _ = silence.attempt_signal_start_sample.compare_exchange(
@@ -4068,60 +4810,70 @@ fn snapshot_file_is_valid(path: &Path) -> bool {
 }
 
 fn atomic_snapshot_json(path: &Path, value: &SessionSnapshot) -> Result<()> {
-    let temporary = path.with_extension("tmp");
+    let (temporary, mut file) = create_unique_temporary_file(path, "snapshot")?;
     let previous = path.with_extension("prev");
-    let mut file = File::create(&temporary)?;
-    serde_json::to_writer_pretty(&mut file, value)?;
-    file.write_all(b"\n")?;
-    file.flush()?;
-    file.sync_all()?;
-    // File destructors run at the end of the scope, not necessarily after the
-    // last use. MoveFileExW rejects an open source handle on Windows.
-    drop(file);
+    let result = (|| -> Result<()> {
+        serde_json::to_writer_pretty(&mut file, value)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        file.sync_all()?;
+        // File destructors run at the end of the scope, not necessarily after
+        // the last use. MoveFileExW rejects an open source handle on Windows.
+        drop(file);
 
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            bail!("snapshot path {} is not a regular file", path.display());
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                bail!("snapshot path {} is not a regular file", path.display());
+            }
+            Ok(_) if snapshot_file_is_valid(path) => {
+                // Rotate the last known-good generation without copying it. If
+                // the process dies between the two renames, recovery can use
+                // `prev`; the authoritative journal retains the newer state.
+                durable_replace(path, &previous)?;
+            }
+            Ok(_) => {
+                // Do not overwrite a known-good previous generation with a
+                // corrupt final file. The synced temporary replaces the bad
+                // final directly.
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
-        Ok(_) if snapshot_file_is_valid(path) => {
-            // Rotate the last known-good generation without copying it. If the
-            // process dies between the two renames, recovery can use `prev` or
-            // the already-synced `tmp` generation.
-            durable_replace(path, &previous)?;
-        }
-        Ok(_) => {
-            // Do not overwrite a known-good previous generation with a corrupt
-            // final file. The synced temporary will replace the bad final.
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    durable_replace(&temporary, path)?;
-    Ok(())
+        durable_replace(&temporary, path)?;
+        Ok(())
+    })();
+    remove_failed_temporary(&temporary, result.is_err());
+    result
 }
 
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    let temporary = path.with_extension("tmp");
-    let mut file = File::create(&temporary)?;
-    serde_json::to_writer_pretty(&mut file, value)?;
-    file.write_all(b"\n")?;
-    file.flush()?;
-    file.sync_all()?;
-    drop(file);
-    durable_replace(&temporary, path)?;
-    Ok(())
+    let (temporary, mut file) = create_unique_temporary_file(path, "json")?;
+    let result = (|| -> Result<()> {
+        serde_json::to_writer_pretty(&mut file, value)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        durable_replace(&temporary, path)?;
+        Ok(())
+    })();
+    remove_failed_temporary(&temporary, result.is_err());
+    result
 }
 
 fn atomic_json_line(path: &Path, value: &impl Serialize) -> Result<()> {
-    let temporary = path.with_extension("compact.tmp");
-    let mut file = File::create(&temporary)?;
-    serde_json::to_writer(&mut file, value)?;
-    file.write_all(b"\n")?;
-    file.flush()?;
-    file.sync_all()?;
-    drop(file);
-    durable_replace(&temporary, path)?;
-    Ok(())
+    let (temporary, mut file) = create_unique_temporary_file(path, "compact")?;
+    let result = (|| -> Result<()> {
+        serde_json::to_writer(&mut file, value)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        durable_replace(&temporary, path)?;
+        Ok(())
+    })();
+    remove_failed_temporary(&temporary, result.is_err());
+    result
 }
 
 fn safe_file_name(value: &str) -> String {
@@ -4144,7 +4896,15 @@ fn safe_file_name(value: &str) -> String {
     if sanitized.is_empty() {
         return "item".to_string();
     }
-    let upper = sanitized.to_ascii_uppercase();
+    // Win32 reserves device names even when an extension follows (for
+    // example `CON.txt` and `COM1.take`). Check the stem before the first dot,
+    // trimming the spaces/dots that Win32 ignores at that boundary.
+    let upper = sanitized
+        .split('.')
+        .next()
+        .unwrap_or(&sanitized)
+        .trim_end_matches(['.', ' '])
+        .to_ascii_uppercase();
     let reserved = matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
         || (upper.len() == 4
             && (upper.starts_with("COM") || upper.starts_with("LPT"))
@@ -4155,22 +4915,207 @@ fn safe_file_name(value: &str) -> String {
     sanitized
 }
 
-fn remove_stale_sentence_wavs(
-    directory: &Path,
-    expected_file_names: &std::collections::HashSet<String>,
-) -> Result<()> {
+const MAX_SENTENCE_FILE_NAME_UTF16_UNITS: usize = 200;
+const MAX_SENTENCE_FILE_NAME_UTF8_BYTES: usize = 200;
+
+fn truncate_portable_file_stem(
+    value: &str,
+    maximum_utf8_bytes: usize,
+    maximum_utf16_units: usize,
+) -> String {
+    let mut utf8_bytes = 0usize;
+    let mut utf16_units = 0usize;
+    value
+        .chars()
+        .take_while(|character| {
+            let next_utf8_bytes = utf8_bytes.saturating_add(character.len_utf8());
+            let next_utf16_units = utf16_units.saturating_add(character.len_utf16());
+            if next_utf8_bytes > maximum_utf8_bytes || next_utf16_units > maximum_utf16_units {
+                return false;
+            }
+            utf8_bytes = next_utf8_bytes;
+            utf16_units = next_utf16_units;
+            true
+        })
+        .collect()
+}
+
+fn bounded_wav_stem(value: &str, suffix: &str) -> Result<String> {
+    let fixed_utf8_bytes = suffix
+        .len()
+        .checked_add(".wav".len())
+        .context("WAV file suffix length overflow")?;
+    let fixed_utf16_units = suffix
+        .encode_utf16()
+        .count()
+        .checked_add(".wav".encode_utf16().count())
+        .context("WAV file suffix length overflow")?;
+    let maximum_utf8_bytes = MAX_SENTENCE_FILE_NAME_UTF8_BYTES
+        .checked_sub(fixed_utf8_bytes)
+        .context("WAV file suffix is too long")?;
+    let maximum_utf16_units = MAX_SENTENCE_FILE_NAME_UTF16_UNITS
+        .checked_sub(fixed_utf16_units)
+        .context("WAV file suffix is too long")?;
+    let mut stem = truncate_portable_file_stem(
+        &safe_file_name(value),
+        maximum_utf8_bytes,
+        maximum_utf16_units,
+    );
+    stem = stem.trim_end_matches(['.', ' ']).to_string();
+    if stem.is_empty() {
+        stem = "item".to_string();
+    }
+    stem.push_str(suffix);
+    Ok(stem)
+}
+
+/// A conservative, ASCII-only comparison key for portable file bookkeeping.
+/// Unicode is upper-cased before byte escaping, which deliberately folds
+/// Windows-equivalent cases such as sigma/final-sigma without relying on the
+/// host filesystem's locale. Planned sentence names also carry a unique ASCII
+/// sequence prefix, so NFC/NFD aliases cannot target the same real path.
+fn portable_file_name_key(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut key = String::with_capacity(value.len());
+    for character in value.chars().flat_map(char::to_uppercase) {
+        if character.is_ascii() && character != '%' {
+            key.push(character);
+            continue;
+        }
+        let mut encoded = [0u8; 4];
+        for byte in character.encode_utf8(&mut encoded).as_bytes() {
+            key.push('%');
+            key.push(char::from(HEX[usize::from(byte >> 4)]));
+            key.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    key
+}
+
+fn allocate_sentence_file_name(
+    item_id: &str,
+    item_index: usize,
+    used_file_names: &mut std::collections::HashSet<String>,
+) -> Result<String> {
+    let item_number = item_index
+        .checked_add(1)
+        .context("sentence export item number overflow")?;
+    let prefix = format!("{item_number:06}-");
+    let suffix = ".wav";
+    let reserved_utf8_bytes = prefix
+        .len()
+        .checked_add(suffix.len())
+        .context("sentence export fixed name length overflow")?;
+    let reserved_utf16_units = prefix
+        .encode_utf16()
+        .count()
+        .checked_add(suffix.encode_utf16().count())
+        .context("sentence export fixed name length overflow")?;
+    let maximum_stem_utf8_bytes = MAX_SENTENCE_FILE_NAME_UTF8_BYTES
+        .checked_sub(reserved_utf8_bytes)
+        .context("sentence export prefix is too long")?;
+    let maximum_stem_utf16_units = MAX_SENTENCE_FILE_NAME_UTF16_UNITS
+        .checked_sub(reserved_utf16_units)
+        .context("sentence export prefix is too long")?;
+    let mut bounded_stem = truncate_portable_file_stem(
+        &safe_file_name(item_id),
+        maximum_stem_utf8_bytes,
+        maximum_stem_utf16_units,
+    );
+    bounded_stem = bounded_stem.trim_end_matches(['.', ' ']).to_string();
+    if bounded_stem.is_empty() {
+        bounded_stem = "item".to_string();
+    }
+    let candidate = format!("{prefix}{bounded_stem}{suffix}");
+    if !used_file_names.insert(portable_file_name_key(&candidate)) {
+        bail!("sentence export sequence prefix collision for item {item_number}");
+    }
+    Ok(candidate)
+}
+
+fn existing_export_file_size(path: &Path, description: &str) -> Result<Option<u64>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            bail!("{description}必须是普通文件：{}", path.display());
+        }
+        Ok(metadata) => Ok(Some(metadata.len())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect {description} {}", path.display()))
+        }
+    }
+}
+
+fn planned_export_allocation(logical_bytes: u64) -> Result<u64> {
+    logical_bytes
+        .checked_add(EXPORT_FILE_ALLOCATION_HEADROOM_BYTES)
+        .context("export file allocation estimate overflow")
+}
+
+fn existing_export_allocation(logical_bytes: Option<u64>) -> u64 {
+    // Do not credit estimated allocation padding on an old file: its actual
+    // allocation unit is not available portably (notably on Windows), so only
+    // its measured logical bytes are guaranteed to be reclaimed.
+    logical_bytes.unwrap_or(0)
+}
+
+fn existing_sentence_wav_sizes(directory: &Path) -> Result<Vec<u64>> {
+    let mut sizes = Vec::new();
+    for entry in std::fs::read_dir(directory)
+        .with_context(|| format!("inspect sentence exports {}", directory.display()))?
+    {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let file_name = file_name
+            .to_str()
+            .context("sentence export contains a non-Unicode file name")?;
+        if !portable_file_name_key(file_name).ends_with(".WAV") {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("inspect stale sentence export {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!(
+                "stale sentence export must be a regular file: {}",
+                path.display()
+            );
+        }
+        sizes.push(metadata.len());
+    }
+    Ok(sizes)
+}
+
+fn export_metadata_headroom(snapshot: &SessionSnapshot) -> Result<u64> {
+    // JSON + worst-case CSV escaping can coexist at the end of an export.
+    // Keep additional fixed and per-file allocation headroom for status files,
+    // filesystem block rounding, and serializer punctuation.
+    let snapshot_bytes = u64::try_from(serde_json::to_vec(snapshot)?.len())?;
+    let content_headroom = snapshot_bytes
+        .checked_mul(3)
+        .context("export metadata headroom overflow")?;
+    EXPORT_METADATA_BASE_HEADROOM_BYTES
+        .checked_add(content_headroom)
+        .context("export metadata safety headroom overflow")
+}
+
+fn serialized_json_file_size(value: &impl Serialize) -> Result<u64> {
+    u64::try_from(serde_json::to_vec_pretty(value)?.len())?
+        .checked_add(1)
+        .context("serialized JSON file size overflow")
+}
+
+fn remove_all_sentence_wavs(directory: &Path) -> Result<()> {
     let mut removed_any = false;
     for entry in std::fs::read_dir(directory)
         .with_context(|| format!("inspect sentence exports {}", directory.display()))?
     {
         let entry = entry?;
         let file_name = entry.file_name();
-        let Some(file_name) = file_name.to_str() else {
-            continue;
-        };
-        if !file_name.to_ascii_lowercase().ends_with(".wav")
-            || expected_file_names.contains(&file_name.to_ascii_lowercase())
-        {
+        let file_name = file_name
+            .to_str()
+            .context("sentence export contains a non-Unicode file name")?;
+        if !portable_file_name_key(file_name).ends_with(".WAV") {
             continue;
         }
         let path = entry.path();
@@ -4192,13 +5137,13 @@ fn remove_stale_sentence_wavs(
     Ok(())
 }
 
-fn create_unique_export_temp(path: &Path, operation: &str) -> Result<(PathBuf, File)> {
+fn create_unique_temporary_file(path: &Path, operation: &str) -> Result<(PathBuf, File)> {
     let file_name = path
         .file_name()
-        .context("export destination has no file name")?;
+        .context("atomic destination has no file name")?;
     let timestamp = Utc::now().timestamp_micros();
     for _ in 0..128 {
-        let sequence = EXPORT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let mut temporary_name = OsString::from(".");
         temporary_name.push(file_name);
         temporary_name.push(format!(
@@ -4215,11 +5160,23 @@ fn create_unique_export_temp(path: &Path, operation: &str) -> Result<(PathBuf, F
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(error)
-                    .with_context(|| format!("create temporary export {}", temporary.display()));
+                    .with_context(|| format!("create temporary file {}", temporary.display()));
             }
         }
     }
-    bail!("could not allocate a unique temporary export file")
+    bail!("could not allocate a unique temporary file")
+}
+
+fn remove_failed_temporary(temporary: &Path, failed: bool) {
+    if !failed {
+        return;
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(temporary)
+        && metadata.is_file()
+        && !metadata.file_type().is_symlink()
+    {
+        let _ = std::fs::remove_file(temporary);
+    }
 }
 
 fn write_csv(path: &Path, exported: &Value) -> Result<()> {
@@ -4231,7 +5188,7 @@ fn write_csv(path: &Path, exported: &Value) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let (temporary, mut file) = create_unique_export_temp(path, "csv")?;
+    let (temporary, mut file) = create_unique_temporary_file(path, "csv")?;
     let result = (|| -> Result<()> {
         writeln!(
             file,
@@ -4262,13 +5219,7 @@ fn write_csv(path: &Path, exported: &Value) -> Result<()> {
         durable_replace(&temporary, path)?;
         Ok(())
     })();
-    if result.is_err()
-        && let Ok(metadata) = std::fs::symlink_metadata(&temporary)
-        && metadata.is_file()
-        && !metadata.file_type().is_symlink()
-    {
-        let _ = std::fs::remove_file(&temporary);
-    }
+    remove_failed_temporary(&temporary, result.is_err());
     result
 }
 
@@ -4350,7 +5301,9 @@ mod tests {
         let (done_tx, done_rx) = bounded(1);
         let writer_path = path.clone();
         let writer_storage_dir = root.clone();
+        let writer_captured = Arc::clone(&captured);
         let writer_committed = Arc::clone(&committed);
+        let writer_overflow = Arc::clone(&overflow);
         let writer_faulted = Arc::clone(&faulted);
         let writer_queue = queue.clone();
         let storage_status = Arc::new(AtomicU32::new(0));
@@ -4365,7 +5318,9 @@ mod tests {
                 MasterStorageKind::LegacySingleWav,
                 48_000 * STORAGE_LAYOUT_V1_DEFAULT_SEGMENT_SECONDS,
                 &writer_storage_dir,
+                writer_captured,
                 writer_committed,
+                writer_overflow,
                 writer_faulted,
                 writer_storage_status,
                 Arc::new(AtomicU64::new(u64::MAX)),
@@ -4459,6 +5414,52 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    fn write_open_attempt_metadata(root: &Path, snapshot: &SessionSnapshot) {
+        write_snapshot_file(&root.join("metadata/items.snapshot.json"), snapshot);
+        write_journal(
+            root,
+            &[json!({
+                "journal_seq": snapshot.journal_seq,
+                "event": "attempt_started",
+                "at": "2026-08-10T12:00:00Z",
+                "payload": {
+                    "item_id": "001",
+                    "attempt_id": "001-a1",
+                    "start_sample": 1,
+                    "recording_started_sample": 2,
+                },
+                "captured_samples": snapshot.captured_samples,
+                "committed_samples": snapshot.committed_samples,
+                "snapshot": snapshot,
+            })],
+        );
+    }
+
+    fn offline_seal_fixture(name: &str) -> (PathBuf, SessionSnapshot, Vec<u8>) {
+        let root = test_root(name);
+        for name in ["audio", "script"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        // Deliberately omit optional preview/export directories: crash
+        // recovery must not depend on delivery or UI projections.
+        let master = root.join(LEGACY_MASTER_AUDIO);
+        let mut writer = RecoverableWav::create(&master, 48_000, 1, 24).unwrap();
+        writer.write_samples(&[0.125, -0.25, 0.5]).unwrap();
+        assert_eq!(writer.finalize().unwrap(), 3);
+        let complete_wav = std::fs::read(&master).unwrap();
+        let mut file = OpenOptions::new().append(true).open(&master).unwrap();
+        file.write_all(&[0x55, 0xaa]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let mut snapshot = test_snapshot();
+        snapshot.journal_seq = 1;
+        snapshot.captured_samples = 2;
+        snapshot.committed_samples = 2;
+        write_open_attempt_metadata(&root, &snapshot);
+        (root, snapshot, complete_wav)
+    }
+
     fn metadata_test_session(root: &Path) -> RecordingSession {
         let (writer_tx, _writer_rx) = bounded::<WriterMessage>(1);
         RecordingSession {
@@ -4493,19 +5494,130 @@ mod tests {
         assert_eq!(safe_file_name("中文 / 01"), "中文 _ 01");
         assert_eq!(safe_file_name("///"), "___");
         assert_eq!(safe_file_name("CON"), "_CON");
+        assert_eq!(safe_file_name("CON.txt"), "_CON.txt");
+        assert_eq!(safe_file_name("com1.take"), "_com1.take");
+        assert_eq!(safe_file_name("LPT9 .wav"), "_LPT9 .wav");
         assert_eq!(safe_file_name("hello. "), "hello");
+    }
+
+    #[test]
+    fn sentence_export_file_names_have_unique_portable_prefixes_and_bounded_lengths() {
+        let mut used = std::collections::HashSet::new();
+        let first = allocate_sentence_file_name("A-3", 0, &mut used).unwrap();
+        let second = allocate_sentence_file_name("a", 1, &mut used).unwrap();
+        let third = allocate_sentence_file_name("A", 2, &mut used).unwrap();
+        let sigma = allocate_sentence_file_name("σ", 3, &mut used).unwrap();
+        let final_sigma = allocate_sentence_file_name("ς", 4, &mut used).unwrap();
+        let nfc = allocate_sentence_file_name("é", 5, &mut used).unwrap();
+        let nfd = allocate_sentence_file_name("e\u{301}", 6, &mut used).unwrap();
+
+        assert_eq!(first, "000001-A-3.wav");
+        assert_eq!(second, "000002-a.wav");
+        assert_eq!(third, "000003-A.wav");
+        assert_eq!(sigma, "000004-σ.wav");
+        assert_eq!(final_sigma, "000005-ς.wav");
+        assert_eq!(nfc, "000006-é.wav");
+        assert_eq!(nfd, "000007-e\u{301}.wav");
+        // Windows folds sigma/final-sigma. The conservative key sees that
+        // equivalence, while the unique ASCII item prefixes keep the actual
+        // planned paths distinct on every filesystem.
+        assert_eq!(
+            portable_file_name_key("000004-σ.wav").trim_start_matches("000004-"),
+            portable_file_name_key("000005-ς.wav").trim_start_matches("000005-")
+        );
+        assert_ne!(&sigma[..7], &final_sigma[..7]);
+        assert_ne!(&nfc[..7], &nfd[..7]);
+
+        let long = allocate_sentence_file_name(&"声".repeat(400), 7, &mut used).unwrap();
+        assert!(long.len() <= MAX_SENTENCE_FILE_NAME_UTF8_BYTES);
+        assert!(long.encode_utf16().count() <= MAX_SENTENCE_FILE_NAME_UTF16_UNITS);
+        assert!(long.ends_with(".wav"));
+
+        let attempt = bounded_wav_stem(&"声".repeat(400), "-a123").unwrap();
+        assert!(format!("{attempt}.wav").len() <= MAX_SENTENCE_FILE_NAME_UTF8_BYTES);
+        assert!(
+            format!("{attempt}.wav").encode_utf16().count() <= MAX_SENTENCE_FILE_NAME_UTF16_UNITS
+        );
+        assert!(attempt.ends_with("-a123"));
+
+        let legacy_preview = bounded_wav_stem(&"🎧".repeat(300), "").unwrap();
+        assert!(format!("{legacy_preview}.wav").len() <= MAX_SENTENCE_FILE_NAME_UTF8_BYTES);
+        assert!(
+            format!("{legacy_preview}.wav").encode_utf16().count()
+                <= MAX_SENTENCE_FILE_NAME_UTF16_UNITS
+        );
+
+        let long_emoji = allocate_sentence_file_name(&"🎤".repeat(400), 8, &mut used).unwrap();
+        assert!(long_emoji.len() <= MAX_SENTENCE_FILE_NAME_UTF8_BYTES);
+        assert!(long_emoji.encode_utf16().count() <= MAX_SENTENCE_FILE_NAME_UTF16_UNITS);
+    }
+
+    #[test]
+    fn sentence_generation_removes_all_old_wavs_before_new_outputs() {
+        let root = test_root("sentence-generation-cleanup");
+        std::fs::create_dir_all(&root).unwrap();
+        let names = [
+            "000001-σ.wav",
+            "000002-ς.WAV",
+            "000003-é.wav",
+            "000004-e\u{301}.wav",
+        ];
+        for (index, name) in names.iter().enumerate() {
+            std::fs::write(root.join(name), vec![0u8; index + 1]).unwrap();
+        }
+        std::fs::write(root.join("keep.txt"), b"not a sentence wav").unwrap();
+
+        let mut sizes = existing_sentence_wav_sizes(&root).unwrap();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![1, 2, 3, 4]);
+        remove_all_sentence_wavs(&root).unwrap();
+
+        for name in names {
+            assert!(!root.join(name).exists());
+        }
+        assert!(root.join("keep.txt").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn export_allocation_headroom_is_never_credited_to_old_files() {
+        assert_eq!(
+            planned_export_allocation(1_000).unwrap(),
+            1_000 + EXPORT_FILE_ALLOCATION_HEADROOM_BYTES
+        );
+        assert_eq!(existing_export_allocation(Some(1_000)), 1_000);
+        assert_eq!(existing_export_allocation(None), 0);
     }
 
     #[test]
     fn frame_conversion_selects_requested_channel() {
         assert_eq!(
-            convert_frames(&[1i16, 2, 3, 4], 2, 0, |sample| f32::from(sample) / 4.0),
+            convert_frames(&[1i16, 2, 3, 4], 2, 0, |sample| f32::from(sample) / 4.0).unwrap(),
             vec![0.25, 0.75]
         );
         assert_eq!(
-            convert_frames(&[1i16, 2, 3, 4], 2, 1, |sample| f32::from(sample) / 4.0),
+            convert_frames(&[1i16, 2, 3, 4], 2, 1, |sample| f32::from(sample) / 4.0).unwrap(),
             vec![0.5, 1.0]
         );
+    }
+
+    #[test]
+    fn frame_conversion_rejects_incomplete_and_non_finite_blocks() {
+        assert!(
+            convert_frames::<f32>(&[], 2, 0, |sample| sample)
+                .unwrap()
+                .is_empty()
+        );
+
+        let incomplete = convert_frames(&[1i16, 2, 3], 2, 0, f32::from).unwrap_err();
+        assert_eq!(incomplete.dropped_frames, 2);
+        assert!(incomplete.reason.contains("complete 2-channel frames"));
+
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let error = convert_frames(&[invalid], 1, 0, |sample| sample).unwrap_err();
+            assert_eq!(error.dropped_frames, 1);
+            assert!(error.reason.contains("non-finite"));
+        }
     }
 
     #[test]
@@ -4620,12 +5732,73 @@ mod tests {
     }
 
     #[test]
+    fn synced_audio_fault_temporary_survives_publish_crash_and_fails_closed() {
+        let root = test_root("audio-fault-synced-temporary");
+        for name in ["audio", "script", "preview", "export"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let marker = root.join(AUDIO_FAULT_MARKER);
+        let temporary = marker.with_extension("tmp");
+
+        assert!(!persist_audio_fault_marker_inner(
+            &root,
+            "injected device xrun",
+            456,
+            true,
+        ));
+        assert!(!marker.exists());
+        assert!(temporary.is_file());
+        let temporary_before = std::fs::read(&temporary).unwrap();
+        let evidence: Value = serde_json::from_slice(&temporary_before).unwrap();
+        assert_eq!(evidence["reason"].as_str(), Some("injected device xrun"));
+        assert_eq!(evidence["committed_frames"].as_u64(), Some(456));
+        assert!(
+            evidence["timestamp"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+
+        // The synced fixed temporary is itself durable fault evidence. Readers
+        // must reject the session even though the final rename never happened.
+        assert!(audio_fault_marker_present(&root).unwrap());
+        assert!(ensure_no_audio_fault_marker(&root, "继续录制").is_err());
+        let mut engine = Engine::new(Emitter::new());
+        let resume_error = engine
+            .resume_session(ResumeSessionPayload {
+                session_dir: root.to_string_lossy().into_owned(),
+            })
+            .unwrap_err();
+        assert!(format!("{resume_error:#}").contains("禁止继续录制"));
+        let export_error = engine.export_session(&root).unwrap_err();
+        assert!(format!("{export_error:#}").contains("禁止生成常规交付"));
+
+        // Re-reporting a later fault must not replace the first evidence or
+        // allocate an unrecognized unique temporary name.
+        assert!(persist_audio_fault_marker(
+            &root,
+            "later fault must not replace the first one",
+            999,
+        ));
+        assert!(!marker.exists());
+        assert_eq!(std::fs::read(&temporary).unwrap(), temporary_before);
+        let marker_files = std::fs::read_dir(root.join("metadata"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(marker_files, vec![OsString::from("audio-fault.tmp")]);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn writer_advances_durable_watermark_only_after_sync() {
         let root = test_root("durable-watermark");
         let path = root.join("audio/master.wav");
         let (writer_tx, writer_rx) = bounded::<WriterMessage>(4);
         let committed = Arc::new(AtomicU64::new(0));
         let faulted = Arc::new(AtomicBool::new(false));
+        let writer_captured = Arc::new(AtomicU64::new(0));
+        let writer_overflow = Arc::new(AtomicU64::new(0));
         let (ready_tx, ready_rx) = bounded(1);
         let (waveform_tx, waveform_rx) = bounded(1);
         let committed_thread = Arc::clone(&committed);
@@ -4642,7 +5815,9 @@ mod tests {
                 MasterStorageKind::LegacySingleWav,
                 48_000 * STORAGE_LAYOUT_V1_DEFAULT_SEGMENT_SECONDS,
                 &writer_storage_dir,
+                writer_captured,
                 committed_thread,
+                writer_overflow,
                 faulted_thread,
                 Arc::new(AtomicU32::new(0)),
                 Arc::new(AtomicU64::new(u64::MAX)),
@@ -4686,13 +5861,17 @@ mod tests {
         let root = test_root("stop-waits-for-late-callback");
         let path = root.join("audio/master.wav");
         let (writer_tx, writer_rx) = unbounded::<WriterMessage>();
+        let captured = Arc::new(AtomicU64::new(4));
         let committed = Arc::new(AtomicU64::new(0));
+        let overflow = Arc::new(AtomicU64::new(0));
         let faulted = Arc::new(AtomicBool::new(false));
         let queue = test_writer_queue();
         let (ready_tx, ready_rx) = bounded(1);
         let writer_path = path.clone();
         let writer_storage_dir = root.clone();
+        let writer_captured = Arc::clone(&captured);
         let writer_committed = Arc::clone(&committed);
+        let writer_overflow = Arc::clone(&overflow);
         let writer_faulted = Arc::clone(&faulted);
         let writer_queue = queue.clone();
         let join = thread::spawn(move || {
@@ -4705,7 +5884,9 @@ mod tests {
                 MasterStorageKind::LegacySingleWav,
                 48_000 * STORAGE_LAYOUT_V1_DEFAULT_SEGMENT_SECONDS,
                 &writer_storage_dir,
+                writer_captured,
                 writer_committed,
+                writer_overflow,
                 writer_faulted,
                 Arc::new(AtomicU32::new(0)),
                 Arc::new(AtomicU64::new(u64::MAX)),
@@ -4768,13 +5949,19 @@ mod tests {
         let root = test_root("capture-fault-finalize");
         let path = root.join("audio/master.wav");
         let (writer_tx, writer_rx) = unbounded::<WriterMessage>();
+        let captured = Arc::new(AtomicU64::new(4));
         let committed = Arc::new(AtomicU64::new(0));
+        let overflow = Arc::new(AtomicU64::new(0));
         let faulted = Arc::new(AtomicBool::new(false));
+        let queue = test_writer_queue();
         let (ready_tx, ready_rx) = bounded(1);
         let writer_path = path.clone();
         let writer_storage_dir = root.clone();
+        let writer_captured = Arc::clone(&captured);
         let writer_committed = Arc::clone(&committed);
+        let writer_overflow = Arc::clone(&overflow);
         let writer_faulted = Arc::clone(&faulted);
+        let writer_queue = queue.clone();
         let join = thread::spawn(move || {
             writer_loop(
                 writer_rx,
@@ -4785,16 +5972,19 @@ mod tests {
                 MasterStorageKind::LegacySingleWav,
                 48_000 * STORAGE_LAYOUT_V1_DEFAULT_SEGMENT_SECONDS,
                 &writer_storage_dir,
+                writer_captured,
                 writer_committed,
+                writer_overflow,
                 writer_faulted,
                 Arc::new(AtomicU32::new(0)),
                 Arc::new(AtomicU64::new(u64::MAX)),
-                test_writer_queue(),
+                writer_queue,
                 disconnected_waveform_sender(),
                 ready_tx,
             )
         });
         assert_eq!(ready_rx.recv().unwrap().unwrap(), 0);
+        assert!(queue.reserve(4));
         writer_tx
             .send(WriterMessage::Samples(vec![0.1, 0.2, 0.3, 0.4]))
             .unwrap();
@@ -4806,7 +5996,9 @@ mod tests {
         join.join().unwrap();
 
         assert!(faulted.load(Ordering::Acquire));
+        assert_eq!(overflow.load(Ordering::Acquire), 0);
         assert_eq!(committed.load(Ordering::Acquire), 4);
+        assert_eq!(queue.queued_frames.load(Ordering::Acquire), 0);
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 12);
         let marker: Value =
@@ -4818,6 +6010,125 @@ mod tests {
                 .contains("injected device disconnect")
         );
         assert_eq!(marker["committed_frames"].as_u64(), Some(4));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn writer_failure_closes_the_gate_and_accounts_an_inflight_backlog() {
+        let root = test_root("writer-failure-backlog-accounting");
+        let path = root.join("audio/master.wav");
+        let (writer_tx, writer_rx) = unbounded::<WriterMessage>();
+        let captured = Arc::new(AtomicU64::new(0));
+        let committed = Arc::new(AtomicU64::new(0));
+        let overflow = Arc::new(AtomicU64::new(0));
+        let faulted = Arc::new(AtomicBool::new(false));
+        let queue = test_writer_queue();
+        let peak = AtomicU32::new(0f32.to_bits());
+        let rms = AtomicU32::new(0f32.to_bits());
+        let silence = SilenceMonitor {
+            silence_samples: Arc::new(AtomicU64::new(0)),
+            last_signal_sample: Arc::new(AtomicU64::new(0)),
+            attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
+            threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+        };
+        let (write_entered_tx, write_entered_rx) = bounded(1);
+        let (release_write_tx, release_write_rx) = bounded(1);
+        writer_write_failure_gates().lock().unwrap().insert(
+            root.clone(),
+            WriterWriteFailureGate {
+                entered: write_entered_tx,
+                release: release_write_rx,
+            },
+        );
+
+        let (ready_tx, ready_rx) = bounded(1);
+        let writer_path = path.clone();
+        let writer_storage_dir = root.clone();
+        let writer_captured = Arc::clone(&captured);
+        let writer_committed = Arc::clone(&committed);
+        let writer_overflow = Arc::clone(&overflow);
+        let writer_faulted = Arc::clone(&faulted);
+        let writer_queue = queue.clone();
+        let join = thread::spawn(move || {
+            writer_loop(
+                writer_rx,
+                &writer_path,
+                48_000,
+                24,
+                false,
+                MasterStorageKind::LegacySingleWav,
+                48_000 * STORAGE_LAYOUT_V1_DEFAULT_SEGMENT_SECONDS,
+                &writer_storage_dir,
+                writer_captured,
+                writer_committed,
+                writer_overflow,
+                writer_faulted,
+                Arc::new(AtomicU32::new(0)),
+                Arc::new(AtomicU64::new(u64::MAX)),
+                writer_queue,
+                disconnected_waveform_sender(),
+                ready_tx,
+            )
+        });
+        assert_eq!(ready_rx.recv().unwrap().unwrap(), 0);
+
+        publish_block(
+            vec![0.1; 4],
+            &writer_tx,
+            &captured,
+            &overflow,
+            &faulted,
+            &peak,
+            &rms,
+            &queue,
+            &silence,
+        );
+        write_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+
+        // This callback entered before the writer observed its failure. It must
+        // be allowed to finish queueing, then counted as accepted-but-lost.
+        let late_lease = queue.enter().unwrap();
+        release_write_tx.send(()).unwrap();
+        let close_deadline = Instant::now() + Duration::from_secs(5);
+        while queue.enqueue_state.load(Ordering::Acquire) & WRITER_QUEUE_CLOSED == 0
+            && Instant::now() < close_deadline
+        {
+            thread::yield_now();
+        }
+        assert_ne!(
+            queue.enqueue_state.load(Ordering::Acquire) & WRITER_QUEUE_CLOSED,
+            0
+        );
+        publish_leased_block(
+            vec![0.2; 2],
+            &writer_tx,
+            &captured,
+            &overflow,
+            &faulted,
+            &peak,
+            &rms,
+            &queue,
+            late_lease,
+            &silence,
+        );
+        join.join().unwrap();
+
+        assert!(faulted.load(Ordering::Acquire));
+        assert_eq!(captured.load(Ordering::Acquire), 6);
+        assert_eq!(committed.load(Ordering::Acquire), 0);
+        assert_eq!(overflow.load(Ordering::Acquire), 6);
+        assert_eq!(queue.queued_frames.load(Ordering::Acquire), 0);
+        let marker: Value =
+            serde_json::from_slice(&std::fs::read(root.join(AUDIO_FAULT_MARKER)).unwrap()).unwrap();
+        let reason = marker["reason"].as_str().unwrap();
+        assert!(reason.contains("accepted_frames=6"), "{reason}");
+        assert!(reason.contains("durable_frames=0"), "{reason}");
+        assert!(reason.contains("lost_frames=6"), "{reason}");
+        assert_eq!(marker["committed_frames"].as_u64(), Some(0));
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 0);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -4843,7 +6154,9 @@ mod tests {
                 MasterStorageKind::SegmentedWav,
                 3,
                 &writer_storage_dir,
+                Arc::new(AtomicU64::new(10)),
                 writer_committed,
+                Arc::new(AtomicU64::new(0)),
                 writer_faulted,
                 Arc::new(AtomicU32::new(0)),
                 Arc::new(AtomicU64::new(u64::MAX)),
@@ -4921,7 +6234,9 @@ mod tests {
         let preview = root.join("preview/blocked.wav");
         std::fs::create_dir_all(preview.parent().unwrap()).unwrap();
         let (writer_tx, writer_rx) = unbounded::<WriterMessage>();
+        let captured = Arc::new(AtomicU64::new(3));
         let committed = Arc::new(AtomicU64::new(0));
+        let overflow = Arc::new(AtomicU64::new(0));
         let faulted = Arc::new(AtomicBool::new(false));
         let queued_frames = Arc::new(AtomicU64::new(0));
         let queue = WriterQueueBudget {
@@ -4932,7 +6247,9 @@ mod tests {
         let (ready_tx, ready_rx) = bounded(1);
         let writer_path = path.clone();
         let writer_storage_dir = root.clone();
+        let writer_captured = Arc::clone(&captured);
         let writer_committed = Arc::clone(&committed);
+        let writer_overflow = Arc::clone(&overflow);
         let writer_faulted = Arc::clone(&faulted);
         let writer_queue = queue.clone();
         let (waveform_tx, _waveform_rx) = bounded(128);
@@ -4946,7 +6263,9 @@ mod tests {
                 MasterStorageKind::SegmentedWav,
                 48_000 * STORAGE_LAYOUT_V1_DEFAULT_SEGMENT_SECONDS,
                 &writer_storage_dir,
+                writer_captured,
                 writer_committed,
+                writer_overflow,
                 writer_faulted,
                 Arc::new(AtomicU32::new(0)),
                 Arc::new(AtomicU64::new(u64::MAX)),
@@ -4987,8 +6306,6 @@ mod tests {
             .unwrap();
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
-        let captured = AtomicU64::new(3);
-        let overflow = AtomicU64::new(0);
         let peak = AtomicU32::new(0f32.to_bits());
         let rms = AtomicU32::new(0f32.to_bits());
         let silence = SilenceMonitor {
@@ -5048,8 +6365,133 @@ mod tests {
         assert_eq!(queue.queued_frames.load(Ordering::Acquire), 0);
         let master = std::fs::read(path.join("master-000001.wav")).unwrap();
         let rendered = std::fs::read(&preview).unwrap();
-        assert_eq!(&rendered[44..], &master[44..53]);
+        let rendered_data_bytes =
+            usize::try_from(u32::from_le_bytes(rendered[40..44].try_into().unwrap())).unwrap();
+        assert_eq!(rendered_data_bytes, 9);
+        assert_eq!(&rendered[44..44 + rendered_data_bytes], &master[44..53]);
+        assert_eq!(&rendered[44 + rendered_data_bytes..], &[0]);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn empty_callback_block_does_not_enter_the_writer_channel() {
+        let (writer, receiver) = unbounded::<WriterMessage>();
+        let captured = AtomicU64::new(17);
+        let overflow = AtomicU64::new(0);
+        let faulted = AtomicBool::new(false);
+        let peak = AtomicU32::new(0.25f32.to_bits());
+        let rms = AtomicU32::new(0.125f32.to_bits());
+        let queue = test_writer_queue();
+        let silence = SilenceMonitor {
+            silence_samples: Arc::new(AtomicU64::new(9)),
+            last_signal_sample: Arc::new(AtomicU64::new(11)),
+            attempt_signal_start_sample: Arc::new(AtomicU64::new(7)),
+            threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+        };
+
+        publish_block(
+            Vec::new(),
+            &writer,
+            &captured,
+            &overflow,
+            &faulted,
+            &peak,
+            &rms,
+            &queue,
+            &silence,
+        );
+
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(captured.load(Ordering::Acquire), 17);
+        assert_eq!(overflow.load(Ordering::Acquire), 0);
+        assert!(!faulted.load(Ordering::Acquire));
+        assert_eq!(queue.queued_frames.load(Ordering::Acquire), 0);
+        assert_eq!(queue.enqueue_state.load(Ordering::Acquire), 0);
+        assert_eq!(f32::from_bits(peak.load(Ordering::Relaxed)), 0.25);
+        assert_eq!(f32::from_bits(rms.load(Ordering::Relaxed)), 0.125);
+        assert_eq!(silence.silence_samples.load(Ordering::Acquire), 9);
+    }
+
+    #[test]
+    fn malformed_capture_blocks_fault_before_samples_or_timeline_updates() {
+        let errors = [
+            convert_frames(&[1i16, 2, 3], 2, 0, f32::from).unwrap_err(),
+            convert_frames(&[f32::NAN], 1, 0, |sample| sample).unwrap_err(),
+        ];
+        for error in errors {
+            let (writer, receiver) = unbounded::<WriterMessage>();
+            let captured = AtomicU64::new(23);
+            let overflow = AtomicU64::new(0);
+            let faulted = AtomicBool::new(false);
+            let queue = test_writer_queue();
+            let lease = queue.enter().unwrap();
+
+            fail_capture_block(
+                error.reason,
+                error.dropped_frames,
+                &writer,
+                &overflow,
+                &faulted,
+                &queue,
+                lease,
+            );
+
+            match receiver.try_recv().unwrap() {
+                WriterMessage::FaultAndStop(reason) => {
+                    assert!(reason.contains("dropped_frames="));
+                }
+                _ => panic!("malformed callback enqueued normal audio"),
+            }
+            assert!(receiver.try_recv().is_err());
+            assert_eq!(captured.load(Ordering::Acquire), 23);
+            assert_eq!(overflow.load(Ordering::Acquire), error.dropped_frames);
+            assert!(faulted.load(Ordering::Acquire));
+            assert!(queue.enter().is_none());
+            assert_eq!(queue.queued_frames.load(Ordering::Acquire), 0);
+        }
+    }
+
+    #[test]
+    fn capture_timeline_overflow_fails_closed_without_enqueuing_samples() {
+        let (writer, receiver) = unbounded::<WriterMessage>();
+        let captured = AtomicU64::new(u64::MAX - 1);
+        let overflow = AtomicU64::new(0);
+        let faulted = AtomicBool::new(false);
+        let peak = AtomicU32::new(0.25f32.to_bits());
+        let rms = AtomicU32::new(0.125f32.to_bits());
+        let queue = test_writer_queue();
+        let silence = SilenceMonitor {
+            silence_samples: Arc::new(AtomicU64::new(9)),
+            last_signal_sample: Arc::new(AtomicU64::new(80)),
+            attempt_signal_start_sample: Arc::new(AtomicU64::new(70)),
+            threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+        };
+
+        publish_block(
+            vec![0.1, 0.2],
+            &writer,
+            &captured,
+            &overflow,
+            &faulted,
+            &peak,
+            &rms,
+            &queue,
+            &silence,
+        );
+
+        match receiver.try_recv().unwrap() {
+            WriterMessage::FaultAndStop(reason) => assert!(reason.contains("counter overflow")),
+            _ => panic!("counter overflow enqueued normal audio"),
+        }
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(captured.load(Ordering::Acquire), u64::MAX - 1);
+        assert_eq!(overflow.load(Ordering::Acquire), 2);
+        assert!(faulted.load(Ordering::Acquire));
+        assert_eq!(queue.queued_frames.load(Ordering::Acquire), 0);
+        assert_eq!(silence.silence_samples.load(Ordering::Acquire), 9);
+        assert_eq!(silence.last_signal_sample.load(Ordering::Acquire), 80);
+        assert_eq!(f32::from_bits(peak.load(Ordering::Relaxed)), 0.25);
+        assert_eq!(f32::from_bits(rms.load(Ordering::Relaxed)), 0.125);
     }
 
     #[test]
@@ -5155,7 +6597,9 @@ mod tests {
         let (ready_tx, ready_rx) = bounded(1);
         let writer_path = master_path.clone();
         let writer_storage_dir = root.clone();
+        let writer_captured = Arc::clone(&captured);
         let writer_committed = Arc::clone(&committed);
+        let writer_overflow = Arc::clone(&overflow);
         let writer_faulted = Arc::clone(&faulted);
         let writer_queue = queue.clone();
         let writer_join = thread::spawn(move || {
@@ -5168,7 +6612,9 @@ mod tests {
                 MasterStorageKind::LegacySingleWav,
                 48_000 * STORAGE_LAYOUT_V1_DEFAULT_SEGMENT_SECONDS,
                 &writer_storage_dir,
+                writer_captured,
                 writer_committed,
+                writer_overflow,
                 writer_faulted,
                 Arc::new(AtomicU32::new(0)),
                 Arc::new(AtomicU64::new(u64::MAX)),
@@ -5228,7 +6674,9 @@ mod tests {
         let overflow = Arc::new(AtomicU64::new(1));
         let faulted = Arc::new(AtomicBool::new(true));
         let (ready_tx, ready_rx) = bounded(1);
+        let writer_captured = Arc::clone(&captured);
         let writer_committed = Arc::clone(&committed);
+        let writer_overflow = Arc::clone(&overflow);
         let writer_faulted = Arc::clone(&faulted);
         let writer_path = master_path.clone();
         let writer_storage_dir = root.clone();
@@ -5242,7 +6690,9 @@ mod tests {
                 MasterStorageKind::LegacySingleWav,
                 48_000 * STORAGE_LAYOUT_V1_DEFAULT_SEGMENT_SECONDS,
                 &writer_storage_dir,
+                writer_captured,
                 writer_committed,
+                writer_overflow,
                 writer_faulted,
                 Arc::new(AtomicU32::new(0)),
                 Arc::new(AtomicU64::new(u64::MAX)),
@@ -5360,22 +6810,113 @@ mod tests {
         let result = Engine::new(Emitter::new()).export_session(&root).unwrap();
 
         assert!(root.join("export/full-track.wav").is_file());
+        assert_eq!(result["master_container"], "riff");
         assert!(root.join("export/metadata.csv").is_file());
         assert!(!root.join("export/sentences/stale.wav").exists());
         let status: Value =
             serde_json::from_slice(&std::fs::read(root.join("export/status.json")).unwrap())
                 .unwrap();
         assert_eq!(status["status"], "complete");
+        assert_eq!(status["schema_version"], 2);
+        assert_eq!(status["session_id"], stopped.session_id);
+        assert_eq!(status["source"]["journal_seq"], stopped.journal_seq);
+        assert_eq!(
+            status["source"]["committed_samples"],
+            stopped.committed_samples
+        );
+        assert_eq!(
+            status["source"]["selected_attempts"],
+            json!([{ "id": "001", "attempt_id": null }])
+        );
         assert!(
             status["export_id"]
                 .as_str()
                 .is_some_and(|id| !id.is_empty())
         );
+        let metadata: Value =
+            serde_json::from_slice(&std::fs::read(root.join("export/metadata.json")).unwrap())
+                .unwrap();
+        assert_eq!(metadata["full_track_container"], "riff");
         assert!(
             result["recovery_warnings"]
                 .as_array()
                 .is_some_and(|warnings| !warnings.is_empty())
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn export_space_preflight_fails_before_status_or_audio_output_and_preserves_master() {
+        let root = test_root("export-space-preflight");
+        for directory in ["audio", "script", "preview", "export"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        let master = root.join(LEGACY_MASTER_AUDIO);
+        let mut writer = RecoverableWav::create(&master, 48_000, 1, 24).unwrap();
+        writer.write_samples(&[0.1, 0.2, 0.3, 0.4]).unwrap();
+        writer.finalize().unwrap();
+        let master_before = std::fs::read(&master).unwrap();
+        let mut stopped = test_snapshot();
+        stopped.journal_seq = 1;
+        stopped.status = "stopped".to_string();
+        stopped.captured_samples = 4;
+        stopped.committed_samples = 4;
+        write_snapshot_file(&root.join("metadata/items.snapshot.json"), &stopped);
+        write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
+
+        let error = Engine::new(Emitter::new())
+            .export_session_inner(&root, Some(0))
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("导出磁盘空间不足"), "{message}");
+        assert!(message.contains("required="), "{message}");
+        assert!(message.contains("available=0"), "{message}");
+        assert!(message.contains("reserve="), "{message}");
+        assert_eq!(std::fs::read(&master).unwrap(), master_before);
+        assert!(!root.join("export/status.json").exists());
+        assert!(!root.join("export/full-track.wav").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_reexport_does_not_refresh_an_older_complete_marker() {
+        let root = test_root("failed-reexport-preserves-old-marker");
+        for directory in ["audio", "script", "preview", "export"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        let master = root.join(LEGACY_MASTER_AUDIO);
+        let mut writer = RecoverableWav::create(&master, 48_000, 1, 24).unwrap();
+        writer.write_samples(&[0.1, 0.2, 0.3, 0.4]).unwrap();
+        writer.finalize().unwrap();
+        let mut stopped = test_snapshot();
+        stopped.journal_seq = 2;
+        stopped.status = "stopped".to_string();
+        stopped.captured_samples = 4;
+        stopped.committed_samples = 4;
+        write_snapshot_file(&root.join("metadata/items.snapshot.json"), &stopped);
+        write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
+
+        let status_path = root.join("export/status.json");
+        let old_status = serde_json::to_vec_pretty(&json!({
+            "schema_version": 2,
+            "status": "complete",
+            "export_id": "older-export",
+            "session_id": stopped.session_id,
+            "source": {
+                "journal_seq": 1,
+                "committed_samples": 2,
+                "selected_attempts": [{ "id": "001", "attempt_id": null }],
+            },
+        }))
+        .unwrap();
+        std::fs::write(&status_path, &old_status).unwrap();
+
+        let error = Engine::new(Emitter::new())
+            .export_session_inner(&root, Some(0))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("导出磁盘空间不足"));
+        assert_eq!(std::fs::read(status_path).unwrap(), old_status);
+        assert!(!root.join("export/full-track.wav").exists());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -5605,6 +7146,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn atomic_json_publishers_do_not_follow_legacy_fixed_temporary_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_root("atomic-json-temp-symlink");
+        let victim = root.join("outside-victim.txt");
+        std::fs::write(&victim, b"must remain unchanged").unwrap();
+
+        let json_path = root.join("metadata/value.json");
+        let legacy_json_temp = json_path.with_extension("tmp");
+        symlink(&victim, &legacy_json_temp).unwrap();
+        atomic_json(&json_path, &json!({ "safe": true })).unwrap();
+
+        let line_path = root.join("metadata/events.jsonl");
+        let legacy_line_temp = line_path.with_extension("compact.tmp");
+        symlink(&victim, &legacy_line_temp).unwrap();
+        atomic_json_line(&line_path, &json!({ "safe": true })).unwrap();
+
+        let snapshot_path = root.join("metadata/items.snapshot.json");
+        let legacy_snapshot_temp = snapshot_path.with_extension("tmp");
+        symlink(&victim, &legacy_snapshot_temp).unwrap();
+        atomic_snapshot_json(&snapshot_path, &test_snapshot()).unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"must remain unchanged");
+        assert!(
+            std::fs::symlink_metadata(&legacy_json_temp)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::symlink_metadata(&legacy_line_temp)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            std::fs::symlink_metadata(&legacy_snapshot_temp)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn recovery_uses_last_full_projection_for_duplicate_sequence() {
         let root = test_root("journal-duplicate-sequence");
@@ -5824,10 +7412,14 @@ mod tests {
         std::fs::create_dir_all(root.join("audio")).unwrap();
         let master_path = root.join("audio/master.wav");
         let (writer_tx, writer_rx) = unbounded::<WriterMessage>();
+        let captured = Arc::new(AtomicU64::new(1));
         let committed = Arc::new(AtomicU64::new(0));
+        let overflow = Arc::new(AtomicU64::new(0));
         let faulted = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = bounded(1);
+        let writer_captured = Arc::clone(&captured);
         let writer_committed = Arc::clone(&committed);
+        let writer_overflow = Arc::clone(&overflow);
         let writer_faulted = Arc::clone(&faulted);
         let writer_path = master_path.clone();
         let writer_storage_dir = root.clone();
@@ -5841,7 +7433,9 @@ mod tests {
                 MasterStorageKind::LegacySingleWav,
                 48_000 * STORAGE_LAYOUT_V1_DEFAULT_SEGMENT_SECONDS,
                 &writer_storage_dir,
+                writer_captured,
                 writer_committed,
+                writer_overflow,
                 writer_faulted,
                 Arc::new(AtomicU32::new(0)),
                 Arc::new(AtomicU64::new(u64::MAX)),
@@ -5870,9 +7464,9 @@ mod tests {
             writer_join: Some(writer_join),
             telemetry_join: Some(telemetry_join),
             telemetry_stop,
-            captured: Arc::new(AtomicU64::new(1)),
+            captured,
             committed,
-            overflow: Arc::new(AtomicU64::new(0)),
+            overflow,
             faulted,
             peak: Arc::new(AtomicU32::new(0)),
             rms: Arc::new(AtomicU32::new(0)),
@@ -6148,6 +7742,331 @@ mod tests {
         let warnings = recover_interrupted_attempts(&journal, &mut snapshot, 120).unwrap();
         assert!(warnings.is_empty());
         assert_eq!(snapshot.items[0].attempts.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offline_seal_repairs_wav_recovers_attempt_and_is_metadata_idempotent() {
+        let (root, _original, complete_wav) = offline_seal_fixture("offline-seal");
+        let master = root.join(LEGACY_MASTER_AUDIO);
+        assert_eq!(
+            std::fs::metadata(&master).unwrap().len(),
+            complete_wav.len() as u64 + 2
+        );
+
+        let engine = Engine::new(Emitter::new());
+        let result = engine.seal_interrupted_session(&root).unwrap();
+        assert_eq!(result["no_op"].as_bool(), Some(false));
+        assert_eq!(result["durable_frames"].as_u64(), Some(3));
+        assert_eq!(result["recovered_attempts"].as_u64(), Some(1));
+        let sealed: SessionSnapshot = serde_json::from_value(result["snapshot"].clone()).unwrap();
+        assert_eq!(sealed.status, "stopped");
+        assert_eq!(sealed.captured_samples, 3);
+        assert_eq!(sealed.committed_samples, 3);
+        assert_eq!(sealed.journal_seq, 2);
+        assert_eq!(sealed.items[0].attempts.len(), 1);
+        let attempt = &sealed.items[0].attempts[0];
+        assert_eq!(attempt.status, "interrupted");
+        assert_eq!(attempt.start_sample, 1);
+        assert_eq!(attempt.recording_started_sample, 2);
+        assert_eq!(attempt.end_sample, 3);
+
+        let repaired = std::fs::read(&master).unwrap();
+        assert_eq!(repaired, complete_wav, "offline seal must not append PCM");
+        assert_eq!(u32::from_le_bytes(repaired[4..8].try_into().unwrap()), 45);
+        assert_eq!(u32::from_le_bytes(repaired[40..44].try_into().unwrap()), 9);
+        let journal = read_journal(&root).unwrap();
+        assert_eq!(journal.entries.len(), 1);
+        assert_eq!(
+            journal.entries[0]["event"].as_str(),
+            Some("session_interrupted_sealed")
+        );
+        assert_eq!(journal.entries[0]["journal_seq"].as_u64(), Some(2));
+        let summary: Value =
+            serde_json::from_slice(&std::fs::read(root.join("session.json")).unwrap()).unwrap();
+        assert_eq!(summary["status"].as_str(), Some("stopped"));
+        assert_eq!(summary["journal_seq"].as_u64(), Some(2));
+        let normalized: Vec<ItemState> =
+            serde_json::from_slice(&std::fs::read(root.join("script/normalized.json")).unwrap())
+                .unwrap();
+        assert_eq!(normalized[0].attempts[0].status, "interrupted");
+
+        let journal_before_retry = std::fs::read(root.join("metadata/events.jsonl")).unwrap();
+        let retry = engine.seal_interrupted_session(&root).unwrap();
+        assert_eq!(retry["no_op"].as_bool(), Some(true));
+        assert_eq!(retry["durable_frames"].as_u64(), Some(3));
+        assert_eq!(
+            std::fs::read(root.join("metadata/events.jsonl")).unwrap(),
+            journal_before_retry
+        );
+        assert_eq!(std::fs::read(&master).unwrap(), complete_wav);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offline_seal_repairs_the_active_segment_without_creating_audio() {
+        let root = test_root("offline-seal-segmented");
+        for name in ["audio", "script"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let segments = root.join(SEGMENTED_MASTER_AUDIO);
+        let segment_frames = 48_000 * STORAGE_LAYOUT_V1_DEFAULT_SEGMENT_SECONDS;
+        let mut writer = SegmentedWav::create(&segments, 48_000, 1, 24, segment_frames).unwrap();
+        writer.write_samples(&[0.125, -0.25, 0.5]).unwrap();
+        assert_eq!(writer.finalize().unwrap(), 3);
+        let active = segments.join("master-000001.wav");
+        let complete_segment = std::fs::read(&active).unwrap();
+        let mut file = OpenOptions::new().append(true).open(&active).unwrap();
+        file.write_all(&[0x55, 0xaa]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let mut snapshot = test_snapshot();
+        snapshot.journal_seq = 1;
+        snapshot.master_audio = SEGMENTED_MASTER_AUDIO.to_string();
+        snapshot.segment_frames = Some(segment_frames);
+        snapshot.captured_samples = 2;
+        snapshot.committed_samples = 2;
+        write_open_attempt_metadata(&root, &snapshot);
+        let entries_before = std::fs::read_dir(&segments).unwrap().count();
+
+        let result = Engine::new(Emitter::new())
+            .seal_interrupted_session(&root)
+            .unwrap();
+        assert_eq!(result["durable_frames"].as_u64(), Some(3));
+        assert_eq!(result["recovered_attempts"].as_u64(), Some(1));
+        assert_eq!(std::fs::read(&active).unwrap(), complete_segment);
+        assert_eq!(
+            std::fs::read_dir(&segments).unwrap().count(),
+            entries_before
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offline_seal_preserves_existing_audio_fault_and_overflow() {
+        let (root, mut snapshot, _) = offline_seal_fixture("offline-seal-fault");
+        snapshot.status = "faulted".to_string();
+        snapshot.overflow_samples = 7;
+        write_open_attempt_metadata(&root, &snapshot);
+        let marker = root.join(AUDIO_FAULT_MARKER);
+        atomic_json(
+            &marker,
+            &json!({
+                "reason": "preexisting device xrun",
+                "committed_frames": 2,
+                "timestamp": "2026-08-10T12:00:00Z",
+            }),
+        )
+        .unwrap();
+        let marker_before = std::fs::read(&marker).unwrap();
+
+        let result = Engine::new(Emitter::new())
+            .seal_interrupted_session(&root)
+            .unwrap();
+        let sealed: SessionSnapshot = serde_json::from_value(result["snapshot"].clone()).unwrap();
+        assert_eq!(sealed.status, "faulted");
+        assert_eq!(sealed.overflow_samples, 7);
+        assert_eq!(result["fault_preserved"].as_bool(), Some(true));
+        assert_eq!(std::fs::read(marker).unwrap(), marker_before);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offline_seal_never_reports_stopped_snapshot_as_clean_when_marker_exists() {
+        let (root, mut snapshot, _) = offline_seal_fixture("offline-seal-stopped-marker");
+        snapshot.status = "stopped".to_string();
+        snapshot.captured_samples = 3;
+        snapshot.committed_samples = 3;
+        write_snapshot_file(&root.join("metadata/items.snapshot.json"), &snapshot);
+        write_journal(&root, &[sequenced_event("session_stopped", &snapshot)]);
+        let marker = root.join(AUDIO_FAULT_MARKER);
+        atomic_json(
+            &marker,
+            &json!({
+                "reason": "preexisting xrun",
+                "committed_frames": 3,
+                "timestamp": "2026-08-10T12:00:00Z",
+            }),
+        )
+        .unwrap();
+        let marker_before = std::fs::read(&marker).unwrap();
+
+        let result = Engine::new(Emitter::new())
+            .seal_interrupted_session(&root)
+            .unwrap();
+        assert_eq!(result["no_op"].as_bool(), Some(false));
+        assert_eq!(result["fault_preserved"].as_bool(), Some(true));
+        let sealed: SessionSnapshot = serde_json::from_value(result["snapshot"].clone()).unwrap();
+        assert_eq!(sealed.status, "faulted");
+        assert_eq!(std::fs::read(marker).unwrap(), marker_before);
+
+        let retry = Engine::new(Emitter::new())
+            .seal_interrupted_session(&root)
+            .unwrap();
+        assert_eq!(retry["no_op"].as_bool(), Some(true));
+        assert_eq!(retry["snapshot"]["status"].as_str(), Some("faulted"));
+        assert_eq!(retry["fault_preserved"].as_bool(), Some(true));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offline_seal_never_reports_stopped_snapshot_as_clean_when_overflow_exists() {
+        let (root, mut snapshot, _) = offline_seal_fixture("offline-seal-stopped-overflow");
+        snapshot.status = "stopped".to_string();
+        snapshot.captured_samples = 3;
+        snapshot.committed_samples = 3;
+        snapshot.overflow_samples = 9;
+        write_snapshot_file(&root.join("metadata/items.snapshot.json"), &snapshot);
+        write_journal(&root, &[sequenced_event("session_stopped", &snapshot)]);
+
+        let result = Engine::new(Emitter::new())
+            .seal_interrupted_session(&root)
+            .unwrap();
+        assert_eq!(result["no_op"].as_bool(), Some(false));
+        assert_eq!(result["fault_preserved"].as_bool(), Some(true));
+        let sealed: SessionSnapshot = serde_json::from_value(result["snapshot"].clone()).unwrap();
+        assert_eq!(sealed.status, "faulted");
+        assert_eq!(sealed.overflow_samples, 9);
+
+        let retry = Engine::new(Emitter::new())
+            .seal_interrupted_session(&root)
+            .unwrap();
+        assert_eq!(retry["no_op"].as_bool(), Some(true));
+        assert_eq!(retry["snapshot"]["status"].as_str(), Some("faulted"));
+        assert_eq!(retry["snapshot"]["overflow_samples"].as_u64(), Some(9));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offline_seal_rewrites_a_torn_journal_instead_of_no_oping() {
+        let (root, mut snapshot, complete_wav) = offline_seal_fixture("offline-seal-torn-journal");
+        snapshot.status = "stopped".to_string();
+        snapshot.captured_samples = 3;
+        snapshot.committed_samples = 3;
+        write_snapshot_file(&root.join("metadata/items.snapshot.json"), &snapshot);
+        write_journal(&root, &[sequenced_event("session_stopped", &snapshot)]);
+        let journal_path = root.join("metadata/events.jsonl");
+        let mut journal_file = OpenOptions::new().append(true).open(&journal_path).unwrap();
+        journal_file.write_all(b"{\"event\":\"torn").unwrap();
+        journal_file.sync_all().unwrap();
+        drop(journal_file);
+
+        let result = Engine::new(Emitter::new())
+            .seal_interrupted_session(&root)
+            .unwrap();
+        assert_eq!(result["no_op"].as_bool(), Some(false));
+        assert!(
+            result["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| {
+                    warning
+                        .as_str()
+                        .is_some_and(|warning| warning.contains("最后一行不完整"))
+                })
+        );
+        let repaired_journal = read_journal(&root).unwrap();
+        assert!(repaired_journal.warnings.is_empty());
+        assert_eq!(repaired_journal.entries.len(), 1);
+        assert_eq!(
+            repaired_journal.entries[0]["event"].as_str(),
+            Some("session_interrupted_sealed")
+        );
+        assert_eq!(
+            std::fs::read(root.join(LEGACY_MASTER_AUDIO)).unwrap(),
+            complete_wav
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offline_seal_journal_failure_fault_marks_without_advancing_projection() {
+        let (root, original, complete_wav) = offline_seal_fixture("offline-seal-journal-fault");
+        let journal_path = root.join("metadata/events.jsonl");
+        let journal_before = std::fs::read(&journal_path).unwrap();
+        let error = Engine::new(Emitter::new())
+            .seal_interrupted_session_inner(&root, JournalAppendFault::DuringWrite)
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("已写入故障标记"), "{error:#}");
+        assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+        let projected: SessionSnapshot = serde_json::from_slice(
+            &std::fs::read(root.join("metadata/items.snapshot.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(projected.journal_seq, original.journal_seq);
+        assert_eq!(projected.status, "recording");
+        assert!(root.join(AUDIO_FAULT_MARKER).is_file());
+        assert_eq!(
+            std::fs::read(root.join(LEGACY_MASTER_AUDIO)).unwrap(),
+            complete_wav
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offline_seal_honors_the_session_lock() {
+        let (root, _, _) = offline_seal_fixture("offline-seal-lock");
+        let lock = SessionLock::acquire(&root, "2026-08-11T00:00:00Z").unwrap();
+        let error = Engine::new(Emitter::new())
+            .seal_interrupted_session(&root)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("lock"),
+            "unexpected lock failure: {error:#}"
+        );
+        drop(lock);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offline_seal_projection_failure_is_only_a_warning_after_journal_commit() {
+        let (root, _, _) = offline_seal_fixture("offline-seal-projection-warning");
+        std::fs::create_dir(root.join("metadata/items.snapshot.prev")).unwrap();
+
+        let result = Engine::new(Emitter::new())
+            .seal_interrupted_session(&root)
+            .unwrap();
+        assert_eq!(result["no_op"].as_bool(), Some(false));
+        let warnings = result["warnings"].as_array().unwrap();
+        assert!(warnings.iter().any(|warning| {
+            warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("update items snapshot"))
+        }));
+        let mut journal = read_journal(&root).unwrap();
+        let recovered = load_recovery_snapshot(&root, &mut journal).unwrap();
+        assert_eq!(recovered.journal_seq, 2);
+        assert_eq!(recovered.status, "stopped");
+        assert_eq!(recovered.committed_samples, 3);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offline_seal_does_not_trust_stopped_snapshot_with_wrong_audio_watermark() {
+        let (root, mut snapshot, complete_wav) =
+            offline_seal_fixture("offline-seal-stopped-mismatch");
+        snapshot.status = "stopped".to_string();
+        snapshot.captured_samples = 4;
+        snapshot.committed_samples = 4;
+        write_snapshot_file(&root.join("metadata/items.snapshot.json"), &snapshot);
+        write_journal(&root, &[sequenced_event("session_stopped", &snapshot)]);
+
+        let result = Engine::new(Emitter::new())
+            .seal_interrupted_session(&root)
+            .unwrap();
+        assert_eq!(result["no_op"].as_bool(), Some(false));
+        assert_eq!(result["durable_frames"].as_u64(), Some(3));
+        let sealed: SessionSnapshot = serde_json::from_value(result["snapshot"].clone()).unwrap();
+        assert_eq!(sealed.status, "faulted");
+        assert_eq!(sealed.captured_samples, 3);
+        assert_eq!(sealed.committed_samples, 3);
+        assert!(root.join(AUDIO_FAULT_MARKER).is_file());
+        assert_eq!(
+            std::fs::read(root.join(LEGACY_MASTER_AUDIO)).unwrap(),
+            complete_wav
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

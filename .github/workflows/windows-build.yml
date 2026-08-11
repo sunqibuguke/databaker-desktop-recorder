@@ -61,6 +61,30 @@ jobs:
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
 
+      - name: Verify packaged acceptance toolkit
+        shell: pwsh
+        run: |
+          $resources = Join-Path "dist/win-unpacked" "resources"
+          $acceptance = Join-Path $resources "acceptance/windows-audio-acceptance.cjs"
+          $launcher = Join-Path $resources "acceptance/run-windows-audio-acceptance.ps1"
+          $engine = Join-Path $resources "bin/recorder-engine.exe"
+          foreach ($required in @($acceptance, $launcher, $engine)) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+              throw "Packaged acceptance resource is missing: $required"
+            }
+          }
+          $hostExecutable = Get-ChildItem -LiteralPath "dist/win-unpacked" -Filter "*.exe" -File |
+            Where-Object { $_.Name -notmatch "(?i)unins|uninstall|update" } |
+            Select-Object -First 1
+          if ($null -eq $hostExecutable) {
+            throw "Packaged Electron executable was not found"
+          }
+          $env:ELECTRON_RUN_AS_NODE = "1"
+          & $hostExecutable.FullName $acceptance --help | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw "Packaged acceptance toolkit failed to start (exit $LASTEXITCODE)"
+          }
+
       - name: Upload Windows installer
         uses: actions/upload-artifact@v6
         with:

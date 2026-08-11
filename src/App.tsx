@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import appLogo from '../assets/brand/databaker-recorder-logo.png';
+import { engineRecoveryFailure, planHistoryRecovery } from './history-recovery';
 import { parseScript } from './script-parser';
 import { WebGLWaveform } from './WebGLWaveform';
-import type { Attempt, AudioDevice, EngineEvent, ExportResult, ItemState, Meter, NoiseCheckProgress, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SessionSnapshot } from './types';
+import type { Attempt, AudioDevice, EngineEvent, ExportResult, ItemState, Meter, NoiseCheckProgress, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SealInterruptedSessionResult, SessionSnapshot } from './types';
 
 type Phase = 'home' | 'setup' | 'running' | 'finished';
 type EngineStatus = 'connecting' | 'ready' | 'offline';
@@ -206,10 +207,14 @@ function RecorderApp() {
   const [historyFilter, setHistoryFilter] = useState<HistoryFilter>('all');
   const [historyLoading, setHistoryLoading] = useState(true);
   const [resumingSessionDir, setResumingSessionDir] = useState('');
+  const [sealingSessionDir, setSealingSessionDir] = useState('');
+  const [sealConfirmRecording, setSealConfirmRecording] = useState<RecordingHistoryEntry | null>(null);
   const [resumeError, setResumeError] = useState<{ sessionDir: string; message: string } | null>(null);
   const [resumedFromHistory, setResumedFromHistory] = useState(false);
   const audioRef = useRef<HTMLAudioElement>(null);
   const resumeOperationRef = useRef(false);
+  const sealOperationRef = useRef(false);
+  const outputDirRef = useRef('');
 
   const filteredRecordings = useMemo(() => recordings.filter((recording) => (
     recordingMatchesFilter(recording, historyFilter)
@@ -378,6 +383,7 @@ function RecorderApp() {
     let active = true;
     window.recorder.defaultOutput().then((value) => {
       if (!active) return;
+      outputDirRef.current = value;
       setOutputDir(value);
       void refreshRecordings(value);
     }).catch((caught) => {
@@ -397,6 +403,7 @@ function RecorderApp() {
     });
     const unsubscribeEvent = window.recorder.onEngineEvent((raw) => {
       const message = raw as EngineEvent;
+      const terminalRecoveryFailure = engineRecoveryFailure(message);
       if (message.event === 'meter') {
         const nextMeter = message.payload as Meter;
         setMeter(nextMeter);
@@ -421,6 +428,43 @@ function RecorderApp() {
           enterRunningSession(payload.state, true);
           setNotice('录音引擎已自动恢复；异常时的当前句已标记为中断，请重新做噪声检测。');
         }
+      } else if (terminalRecoveryFailure) {
+        resumeOperationRef.current = false;
+        sealOperationRef.current = false;
+        setEngineStatus('offline');
+        setResumedFromHistory(false);
+        setResumingSessionDir('');
+        setSealingSessionDir('');
+        setResumeError(null);
+        setSealConfirmRecording(null);
+        setPhase('home');
+        setSnapshot(null);
+        setSessionDir('');
+        setCurrentIndex(0);
+        setRecording(false);
+        setAttemptStartSample(0);
+        setAttemptRecordingStartedSample(0);
+        setReviewAttemptId(null);
+        setMeter(emptyMeter);
+        setNoiseGateOpen(false);
+        setNoiseCheckPhase('idle');
+        setNoiseCheckProgress(null);
+        setNoiseCheckSamples([]);
+        setNoiseCheckResult(null);
+        setExportResult(null);
+        setAudioUrl((current) => {
+          if (current) URL.revokeObjectURL(current);
+          return '';
+        });
+        setFinishConfirmOpen(false);
+        setBusy('');
+        setDataSafetyAlert('');
+        setError(`录音引擎连续三次自动恢复失败：${terminalRecoveryFailure.error}。已返回任务列表，已落盘母音频仍保留；请使用“修复并封存”。`);
+        setNotice('已返回任务列表。已落盘母音频仍保留，请使用“修复并封存”。');
+        void refreshRecordings(outputDirRef.current);
+      } else if (message.event === 'offline_seal_cleanup_finished') {
+        setEngineStatus('ready');
+        setNotice('离线封存的后台清理已完成，可以刷新任务或重试。');
       }
     });
     const unsubscribeOffline = window.recorder.onEngineOffline((message) => {
@@ -435,6 +479,10 @@ function RecorderApp() {
     // Initial engine discovery only runs when the renderer mounts.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    outputDirRef.current = outputDir;
+  }, [outputDir]);
 
   useEffect(() => () => {
     if (audioUrl) URL.revokeObjectURL(audioUrl);
@@ -742,7 +790,7 @@ function RecorderApp() {
   }
 
   async function resumeHistoricalRecording(recording: RecordingHistoryEntry) {
-    if (resumeOperationRef.current) return;
+    if (resumeOperationRef.current || sealOperationRef.current) return;
     if (recording.overflow_samples > 0) {
       setError('该任务记录过写盘溢出，不能直接续接母轨；请先检查原始文件。');
       return;
@@ -752,6 +800,7 @@ function RecorderApp() {
     setResumeError(null);
     setBusy('正在校验母音频并恢复录制…');
     setError('');
+    setDataSafetyAlert('');
     let resumed: RunningSessionState;
     try {
       resumed = await window.recorder.request<RunningSessionState>('resume_session', {
@@ -768,6 +817,7 @@ function RecorderApp() {
       setResumingSessionDir('');
     }
     setBusy('');
+    setEngineStatus('ready');
     setResumedFromHistory(true);
     enterRunningSession(resumed, true);
     const noiseRun = await beginNoiseCheck(resumed.snapshot.silence_threshold_dbfs);
@@ -777,6 +827,50 @@ function RecorderApp() {
       setError(message);
       setResumeError({ sessionDir: recording.session_dir, message });
     }
+  }
+
+  async function sealHistoricalRecording(recording: RecordingHistoryEntry) {
+    if (sealOperationRef.current || resumeOperationRef.current) return;
+    sealOperationRef.current = true;
+    setSealingSessionDir(recording.session_dir);
+    setBusy('正在修复并封存已落盘的母音频…');
+    setError('');
+    setDataSafetyAlert('');
+    let sealed: SealInterruptedSessionResult;
+    try {
+      sealed = await window.recorder.request<SealInterruptedSessionResult>(
+        'seal_interrupted_session',
+        { session_dir: recording.session_dir, session_id: recording.session_id },
+      );
+    } catch (caught) {
+      const message = `无法封存“${recording.session_id}”：${errorMessage(caught)}`;
+      setError(message);
+      setResumeError({ sessionDir: recording.session_dir, message });
+      return;
+    } finally {
+      sealOperationRef.current = false;
+      setSealingSessionDir('');
+      setBusy('');
+    }
+    setResumeError(null);
+    setEngineStatus('ready');
+    await refreshRecordings();
+    const warning = recoveryWarning('封存时发现存储异常', sealed.warnings);
+    const durableDuration = formatDuration(sealed.durable_frames, recording.sample_rate);
+    if (sealed.fault_preserved || sealed.snapshot.status === 'faulted') {
+      setDataSafetyAlert(
+        `已保留 ${durableDuration} 可恢复母音频，但任务仍带有采集故障标记；不会生成常规交付，请人工检查原始分段。`,
+      );
+      return;
+    }
+    if (warning) setDataSafetyAlert(`${warning}。已落盘的母音频仍已封存，请抽检。`);
+    const recovered = sealed.recovered_attempts
+      ? `，${sealed.recovered_attempts} 个未闭合录音版本已标记为异常中断`
+      : '';
+    const canExportNow = recording.pending_items + recording.review_items === 0;
+    setNotice(sealed.no_op
+      ? `“${recording.session_id}”已处于安全封存状态${canExportNow ? '，现在可以生成交付' : ''}`
+      : `“${recording.session_id}”已封存 ${durableDuration} 母音频${recovered}${canExportNow ? '，现在可以生成交付' : ''}`);
   }
 
   async function returnToActiveRecording() {
@@ -847,6 +941,7 @@ function RecorderApp() {
     setResumedFromHistory(false);
     setResumeError(null);
     setResumingSessionDir('');
+    setSealConfirmRecording(null);
     setPhase('setup');
     setSnapshot(null);
     setSessionDir('');
@@ -880,10 +975,13 @@ function RecorderApp() {
     setResumedFromHistory(false);
     setResumingSessionDir('');
     setResumeError(null);
+    setSealConfirmRecording(null);
     setPhase('home');
     setSnapshot(null);
     setSessionDir('');
     setRecording(false);
+    setAttemptStartSample(0);
+    setAttemptRecordingStartedSample(0);
     setReviewAttemptId(null);
     setMeter(emptyMeter);
     setNoiseGateOpen(false);
@@ -900,6 +998,10 @@ function RecorderApp() {
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
+      if (sealConfirmRecording) {
+        if (event.key === 'Escape' && !sealingSessionDir) setSealConfirmRecording(null);
+        return;
+      }
       if (noiseGateOpen) {
         if (event.key === 'Escape' && noiseCheckPhase === 'passed') setNoiseGateOpen(false);
         return;
@@ -946,7 +1048,7 @@ function RecorderApp() {
       <main className="home-main" data-testid="recordings-workspace">
         <header className="home-titlebar">
           <div><h1>录制任务</h1><p>从脚本开始一次采集，或查看本机已有任务。</p></div>
-          <button data-testid="new-recording" className="home-primary" onClick={beginNewRecording}><Icon name="plus" size={16} />新建录制</button>
+          <button data-testid="new-recording" className="home-primary" onClick={beginNewRecording} disabled={Boolean(busy)}><Icon name="plus" size={16} />新建录制</button>
         </header>
 
         <section className="home-controls" aria-label="任务筛选与存储位置">
@@ -955,22 +1057,21 @@ function RecorderApp() {
               <span>{filter.label}</span><em>{recordings.filter((recording) => recordingMatchesFilter(recording, filter.id)).length}</em>
             </button>)}
           </nav>
-          <div className="home-storage"><Icon name="folder" size={14} /><span>保存到</span><code title={outputDir}>{outputDir || '正在读取默认位置…'}</code><button onClick={() => void chooseOutput()}>更改</button><button title="刷新任务" aria-label="刷新任务" onClick={() => void refreshRecordings()}><Icon name="refresh" size={14} /></button></div>
+          <div className="home-storage"><Icon name="folder" size={14} /><span>保存到</span><code title={outputDir}>{outputDir || '正在读取默认位置…'}</code><button onClick={() => void chooseOutput()} disabled={Boolean(busy)}>更改</button><button title="刷新任务" aria-label="刷新任务" onClick={() => void refreshRecordings()} disabled={Boolean(busy)}><Icon name="refresh" size={14} /></button></div>
         </section>
 
         <section className="home-list" aria-label="录制任务列表">
           <div className="home-list-header"><span>任务</span><span>进度</span><span>更新时间</span><span>状态</span><span /></div>
           {historyLoading && <div className="home-empty"><Icon name="refresh" size={20} /><strong>正在读取录制任务</strong></div>}
-          {!historyLoading && !filteredRecordings.length && <div className="home-empty"><span className="home-empty-icon"><Icon name="microphone" size={24} /></span><strong>{recordings.length ? '这里还没有任务' : '开始第一条录制任务'}</strong><p>{recordings.length ? '切换到其他状态查看已有任务。' : '导入三列 CSV 或 TXT，配置设备后即可开始采集。'}</p>{!recordings.length && <button className="home-primary" onClick={beginNewRecording}><Icon name="plus" size={15} />新建录制</button>}</div>}
+          {!historyLoading && !filteredRecordings.length && <div className="home-empty"><span className="home-empty-icon"><Icon name="microphone" size={24} /></span><strong>{recordings.length ? '这里还没有任务' : '开始第一条录制任务'}</strong><p>{recordings.length ? '切换到其他状态查看已有任务。' : '导入三列 CSV 或 TXT，配置设备后即可开始采集。'}</p>{!recordings.length && <button className="home-primary" onClick={beginNewRecording} disabled={Boolean(busy)}><Icon name="plus" size={15} />新建录制</button>}</div>}
           {!historyLoading && filteredRecordings.map((recording) => {
             const state = recordingState(recording);
             const handled = recording.accepted_items + recording.skipped_items;
             const progress = recording.total_items ? handled / recording.total_items * 100 : 0;
             const isResuming = resumingSessionDir === recording.session_dir;
+            const isSealing = sealingSessionDir === recording.session_dir;
             const rowResumeError = resumeError?.sessionDir === recording.session_dir ? resumeError.message : '';
-            const resumable = recording.overflow_samples === 0
-              && recording.pending_items + recording.review_items > 0
-              && (recording.status === 'recording' || recording.status === 'stopped');
+            const recoveryPlan = planHistoryRecovery(recording);
             return <article key={recording.session_dir} className={`home-recording-row ${rowResumeError ? 'has-error' : ''}`}>
               <div className="home-recording-name"><i className={`recording-dot ${state.kind}`} /><div><strong>{recording.session_id}</strong><small>{recording.script_name || '未记录源文件'} · {recording.sample_rate ? `${recording.sample_rate.toLocaleString()} Hz / ${recording.bit_depth}-bit` : '格式未知'}</small></div></div>
               <div className="home-recording-progress"><span><b>{handled}</b><small> / {recording.total_items}</small></span><i><em style={{ width: `${progress}%` }} /></i></div>
@@ -980,21 +1081,33 @@ function RecorderApp() {
                 <button title="打开任务目录" aria-label={`打开 ${recording.session_id} 的任务目录`} onClick={() => void run('正在打开录制目录…', () => window.recorder.openPath(recording.session_dir))}><Icon name="folder" size={15} /></button>
                 {recording.is_active
                   ? <button className="row-primary" onClick={() => void returnToActiveRecording()} disabled={Boolean(busy)}>返回录制</button>
-                  : resumable
-                    ? <button data-testid="resume-recording" className={`row-primary resume ${isResuming ? 'working' : ''}`} aria-busy={isResuming} onClick={() => void resumeHistoricalRecording(recording)} disabled={Boolean(busy) || Boolean(resumingSessionDir)}>{isResuming ? <><i />恢复中…</> : recording.status === 'recording' ? '恢复录制' : '继续录制'}</button>
+                  : recoveryPlan.primary === 'resume'
+                    ? <>{recording.status === 'stopped' && recording.accepted_items > 0 && (recording.export_exists
+                      ? <button title="查看已有交付" aria-label={`查看 ${recording.session_id} 的已有交付`} onClick={() => void openRecordingExport(recording)}><Icon name="export" size={15} /></button>
+                      : <button title="生成已完成条目的交付" aria-label={`生成 ${recording.session_id} 已完成条目的交付`} onClick={() => void exportHistoricalRecording(recording)} disabled={Boolean(busy)}><Icon name="export" size={15} /></button>)}<button data-testid="resume-recording" className={`row-primary resume ${isResuming ? 'working' : ''}`} aria-busy={isResuming} onClick={() => void resumeHistoricalRecording(recording)} disabled={Boolean(busy) || Boolean(resumingSessionDir) || Boolean(sealingSessionDir)}>{isResuming ? <><i />恢复中…</> : recording.status === 'recording' ? '恢复录制' : '继续录制'}</button>{recoveryPlan.secondary === 'seal' && <button data-testid="seal-recording" className="row-secondary-seal" aria-busy={isSealing} onClick={() => setSealConfirmRecording(recording)} disabled={Boolean(busy) || Boolean(resumingSessionDir) || Boolean(sealingSessionDir)}>{isSealing ? '封存中…' : '修复并封存'}</button>}</>
+                    : recoveryPlan.primary === 'seal'
+                      ? <button data-testid="seal-recording" className="row-primary seal" aria-busy={isSealing} onClick={() => setSealConfirmRecording(recording)} disabled={Boolean(busy) || Boolean(resumingSessionDir) || Boolean(sealingSessionDir)}>{isSealing ? '封存中…' : '修复并封存'}</button>
                     : recording.export_exists
                   ? <button className="row-primary" onClick={() => void openRecordingExport(recording)}>查看交付</button>
                   : recording.status === 'stopped'
                     ? <button className="row-primary" onClick={() => void exportHistoricalRecording(recording)} disabled={Boolean(busy)}>生成交付</button>
                     : <button className="row-primary" onClick={() => void run('正在打开录制目录…', () => window.recorder.openPath(recording.session_dir))}>检查文件</button>}
               </div>
-              {rowResumeError && <div className="home-row-error" role="alert"><strong>恢复未完成</strong><span>{rowResumeError}</span><button onClick={() => setResumeError(null)}>关闭</button></div>}
+              {rowResumeError && <div className="home-row-error" role="alert"><strong>恢复未完成</strong><span title={rowResumeError}>{rowResumeError}</span><div className="home-row-error-actions"><button data-testid="seal-recording" className="seal" aria-busy={isSealing} onClick={() => setSealConfirmRecording(recording)} disabled={Boolean(busy) || Boolean(resumingSessionDir) || Boolean(sealingSessionDir)}>{isSealing ? '封存中…' : '修复并封存'}</button><button onClick={() => setResumeError(null)} disabled={Boolean(busy)}>关闭</button></div></div>}
             </article>;
           })}
         </section>
 
         {(error || dataSafetyAlert || busy || notice) && <div className={`home-notice ${error || dataSafetyAlert ? 'error' : ''}`}><i />{error || dataSafetyAlert || busy || notice}</div>}
       </main>
+      {sealConfirmRecording && <div className="dialog-backdrop" role="presentation">
+        <section className="studio-dialog seal-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="seal-confirm-title">
+          <header><span className="dialog-icon"><Icon name="history" size={19} /></span><div><small>OFFLINE RECOVERY</small><h2 id="seal-confirm-title">修复并封存中断任务？</h2></div></header>
+          <p>系统会先确认当前没有活跃录音，再修复已落盘 WAV 头和未闭合版本，并把任务写成可恢复的安全状态。</p>
+          <div className="dialog-warning">任务：{sealConfirmRecording.session_id}<br />此操作不会覆盖母音频，也不会自动生成交付。封存后，已完成任务可直接生成交付；未完成任务仍可继续录制。</div>
+          <footer><button className="button" onClick={() => setSealConfirmRecording(null)} disabled={Boolean(busy)}>取消</button><button data-testid="confirm-seal-recording" className="button primary" onClick={() => { const recording = sealConfirmRecording; setSealConfirmRecording(null); void sealHistoricalRecording(recording); }} disabled={Boolean(busy)}>确认修复并封存</button></footer>
+        </section>
+      </div>}
     </div>;
   }
 

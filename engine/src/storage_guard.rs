@@ -33,6 +33,25 @@ pub struct StorageReport {
     pub critical_threshold_bytes: u64,
 }
 
+/// One sequential atomic publication in an export. `new_bytes` is the fully
+/// written temporary that must coexist with the current destination;
+/// `replaced_bytes` is reclaimed only after that temporary is published. A
+/// removal-only step uses zero `new_bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AtomicExportStep {
+    pub new_bytes: u64,
+    pub replaced_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportSpaceReport {
+    pub available_bytes: u64,
+    pub critical_reserve_bytes: u64,
+    pub peak_additional_bytes: u64,
+    pub required_available_bytes: u64,
+    pub can_export: bool,
+}
+
 /// Queries the filesystem containing `directory` and evaluates its recording headroom.
 /// The directory must already exist so the operating system can resolve its volume.
 pub fn check_storage(
@@ -90,6 +109,40 @@ pub fn evaluate_available_space(
         startup_required_bytes,
         warning_threshold_bytes,
         critical_threshold_bytes,
+    })
+}
+
+/// Computes the peak additional allocation of sequential atomic replacements.
+/// Unlike summing a whole new bundle, this credits each old destination only
+/// after its replacement is published, matching the real export order.
+pub fn evaluate_atomic_export_space(
+    available_bytes: u64,
+    critical_reserve_bytes: u64,
+    steps: &[AtomicExportStep],
+) -> Result<ExportSpaceReport> {
+    let mut published_bytes = 0u64;
+    let mut reclaimed_bytes = 0u64;
+    let mut peak_additional_bytes = 0u64;
+    for step in steps {
+        let transient_published = published_bytes
+            .checked_add(step.new_bytes)
+            .context("export temporary byte total overflow")?;
+        peak_additional_bytes =
+            peak_additional_bytes.max(transient_published.saturating_sub(reclaimed_bytes));
+        published_bytes = transient_published;
+        reclaimed_bytes = reclaimed_bytes
+            .checked_add(step.replaced_bytes)
+            .context("export reclaimed byte total overflow")?;
+    }
+    let required_available_bytes = critical_reserve_bytes
+        .checked_add(peak_additional_bytes)
+        .context("export required storage overflow")?;
+    Ok(ExportSpaceReport {
+        available_bytes,
+        critical_reserve_bytes,
+        peak_additional_bytes,
+        required_available_bytes,
+        can_export: available_bytes >= required_available_bytes,
     })
 }
 

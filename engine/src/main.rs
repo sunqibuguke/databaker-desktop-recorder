@@ -136,6 +136,10 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
         "get_state" => engine.get_state(),
         "get_state_optional" => Ok(engine.get_state_optional()),
         "stop_session" => engine.stop_session(),
+        "seal_interrupted_session" => {
+            let payload: ExportPayload = parse(command.payload)?;
+            engine.seal_interrupted_session(&PathBuf::from(payload.session_dir))
+        }
         "export_session" => {
             let payload: ExportPayload = parse(command.payload)?;
             engine.export_session(&PathBuf::from(payload.session_dir))
@@ -157,6 +161,9 @@ fn parse<T: for<'de> Deserialize<'de>>(value: Value) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::{AudioFormat, ItemState, SessionSnapshot};
+    use crate::wav::RecoverableWav;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn shutdown_protocol_does_not_turn_a_stop_failure_into_success() {
@@ -165,5 +172,79 @@ mod tests {
         )))
         .unwrap_err();
         assert!(format!("{error:#}").contains("metadata could not be sealed"));
+    }
+
+    #[test]
+    fn production_seal_command_succeeds_without_opening_an_audio_device() {
+        let root = std::env::temp_dir().join(format!(
+            "recorder-engine-protocol-seal-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        for name in ["audio", "metadata", "script"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let master = root.join("audio/master.wav");
+        let mut writer = RecoverableWav::create(&master, 48_000, 1, 24).unwrap();
+        writer.write_samples(&[0.25, -0.25]).unwrap();
+        writer.finalize().unwrap();
+        let snapshot = SessionSnapshot {
+            schema_version: 1,
+            journal_seq: 1,
+            session_id: "protocol-seal".to_string(),
+            script_name: "test.csv".to_string(),
+            status: "stopped".to_string(),
+            device_name: "disconnected interface".to_string(),
+            device_id: "missing:device".to_string(),
+            input_sample_format: "f32".to_string(),
+            audio_format: AudioFormat {
+                sample_rate: 48_000,
+                bit_depth: 24,
+                encoding: "pcm".to_string(),
+                channels: 1,
+                input_channels: 1,
+                input_channel: 1,
+            },
+            master_audio: "audio/master.wav".to_string(),
+            storage_layout_version: 1,
+            segment_frames: Some(48_000 * 300),
+            captured_samples: 2,
+            committed_samples: 2,
+            overflow_samples: 0,
+            started_at: "2026-08-10T11:00:00Z".to_string(),
+            updated_at: "2026-08-10T12:00:00Z".to_string(),
+            noise_check: None,
+            silence_duration_ms: 1_000,
+            silence_threshold_dbfs: -42.0,
+            items: vec![ItemState {
+                id: "001".to_string(),
+                text: "测试文本".to_string(),
+                label: String::new(),
+                status: "accepted".to_string(),
+                attempts: Vec::new(),
+                selected_attempt_id: None,
+            }],
+        };
+        std::fs::write(
+            root.join("metadata/items.snapshot.json"),
+            serde_json::to_vec_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
+        let mut engine = Engine::new(Emitter::new());
+        let result = dispatch(
+            &mut engine,
+            CommandEnvelope {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: "seal-1".to_string(),
+                command: "seal_interrupted_session".to_string(),
+                payload: json!({ "session_dir": root.to_string_lossy() }),
+            },
+        )
+        .unwrap();
+        assert_eq!(result["no_op"].as_bool(), Some(true));
+        assert_eq!(result["durable_frames"].as_u64(), Some(2));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

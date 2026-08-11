@@ -7,6 +7,8 @@ use std::path::Path;
 
 const PCM_HEADER_LEN: u64 = 44;
 const FLOAT_HEADER_LEN: u64 = 56;
+const RF64_DS64_CHUNK_DATA_LEN: u32 = 28;
+const RF64_HEADER_GROWTH: u64 = 36;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WavEncoding {
@@ -50,30 +52,272 @@ fn bytes_per_sample(bit_depth: u16) -> Result<u16> {
     Ok(bit_depth / 8)
 }
 
-/// Rejects a standard RIFF/WAVE render before any multi-gigabyte copy starts.
-/// The segmented master remains the durable source of truth for recordings
-/// whose continuous timeline no longer fits in a single 32-bit RIFF container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WavExportMode {
+    /// Sentence bundles and previews stay ordinary RIFF/WAVE. They should
+    /// remain maximally compatible and are expected to be much smaller than
+    /// the continuous master timeline.
+    StandardRiff,
+    /// Full-track delivery stays RIFF below the 4 GiB boundary and switches to
+    /// RF64 only when the exact final frame count requires 64-bit chunk sizes.
+    AutoRf64,
+    #[cfg(test)]
+    ForceRf64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WavContainer {
+    Riff,
+    Rf64,
+}
+
+#[derive(Debug)]
+struct WavExportPlan {
+    container: WavContainer,
+    encoding: WavEncoding,
+    header: Vec<u8>,
+    frame_bytes: u64,
+    data_bytes: u64,
+    padding_bytes: u64,
+    frames: u64,
+}
+
+impl WavExportPlan {
+    fn new(
+        sample_rate: u32,
+        channels: u16,
+        bit_depth: u16,
+        frames: u64,
+        mode: WavExportMode,
+    ) -> Result<Self> {
+        if sample_rate == 0 {
+            bail!("sample rate must be greater than zero");
+        }
+        if channels == 0 {
+            bail!("channel count must be greater than zero");
+        }
+        let encoding = WavEncoding::for_bit_depth(bit_depth)?;
+        let sample_bytes = bytes_per_sample(bit_depth)?;
+        let block_align = channels
+            .checked_mul(sample_bytes)
+            .context("WAV block alignment overflow")?;
+        let frame_bytes = u64::from(block_align);
+        let data_bytes = frames
+            .checked_mul(frame_bytes)
+            .context("WAV data size overflow")?;
+        let padding_bytes = data_bytes % 2;
+        let standard_riff_size = encoding
+            .header_len()
+            .checked_sub(8)
+            .and_then(|header| header.checked_add(data_bytes))
+            .and_then(|size| size.checked_add(padding_bytes))
+            .context("WAV RIFF size overflow")?;
+        let container = match mode {
+            WavExportMode::StandardRiff => {
+                if standard_riff_size > u64::from(u32::MAX) {
+                    bail!("audio range exceeds the standard RIFF/WAVE 4 GiB limit");
+                }
+                WavContainer::Riff
+            }
+            WavExportMode::AutoRf64 => {
+                if standard_riff_size <= u64::from(u32::MAX) {
+                    WavContainer::Riff
+                } else {
+                    WavContainer::Rf64
+                }
+            }
+            #[cfg(test)]
+            WavExportMode::ForceRf64 => WavContainer::Rf64,
+        };
+        let header_len = match container {
+            WavContainer::Riff => encoding.header_len(),
+            WavContainer::Rf64 => encoding
+                .header_len()
+                .checked_add(RF64_HEADER_GROWTH)
+                .context("RF64 header size overflow")?,
+        };
+        let riff_size = header_len
+            .checked_sub(8)
+            .and_then(|header| header.checked_add(data_bytes))
+            .and_then(|size| size.checked_add(padding_bytes))
+            .context("WAV RIFF size overflow")?;
+        let byte_rate = sample_rate
+            .checked_mul(u32::from(block_align))
+            .context("WAV byte rate overflow")?;
+        let mut header = Vec::with_capacity(usize::try_from(header_len)?);
+        match container {
+            WavContainer::Riff => {
+                header.extend_from_slice(b"RIFF");
+                header.extend_from_slice(&u32::try_from(riff_size)?.to_le_bytes());
+                header.extend_from_slice(b"WAVE");
+            }
+            WavContainer::Rf64 => {
+                header.extend_from_slice(b"RF64");
+                header.extend_from_slice(&u32::MAX.to_le_bytes());
+                header.extend_from_slice(b"WAVE");
+                header.extend_from_slice(b"ds64");
+                header.extend_from_slice(&RF64_DS64_CHUNK_DATA_LEN.to_le_bytes());
+                header.extend_from_slice(&riff_size.to_le_bytes());
+                header.extend_from_slice(&data_bytes.to_le_bytes());
+                header.extend_from_slice(&frames.to_le_bytes());
+                header.extend_from_slice(&0u32.to_le_bytes());
+            }
+        }
+        header.extend_from_slice(b"fmt ");
+        header.extend_from_slice(&16u32.to_le_bytes());
+        header.extend_from_slice(&encoding.format_code().to_le_bytes());
+        header.extend_from_slice(&channels.to_le_bytes());
+        header.extend_from_slice(&sample_rate.to_le_bytes());
+        header.extend_from_slice(&byte_rate.to_le_bytes());
+        header.extend_from_slice(&block_align.to_le_bytes());
+        header.extend_from_slice(&bit_depth.to_le_bytes());
+        if encoding == WavEncoding::Float {
+            header.extend_from_slice(b"fact");
+            header.extend_from_slice(&4u32.to_le_bytes());
+            let fact_frames = match container {
+                WavContainer::Riff => u32::try_from(frames)?,
+                WavContainer::Rf64 => u32::MAX,
+            };
+            header.extend_from_slice(&fact_frames.to_le_bytes());
+        }
+        header.extend_from_slice(b"data");
+        let data_size = match container {
+            WavContainer::Riff => u32::try_from(data_bytes)?,
+            WavContainer::Rf64 => u32::MAX,
+        };
+        header.extend_from_slice(&data_size.to_le_bytes());
+        if header.len() as u64 != header_len {
+            bail!("WAV header layout does not match its declared size");
+        }
+        Ok(Self {
+            container,
+            encoding,
+            header,
+            frame_bytes,
+            data_bytes,
+            padding_bytes,
+            frames,
+        })
+    }
+
+    fn file_bytes(&self) -> Result<u64> {
+        (self.header.len() as u64)
+            .checked_add(self.data_bytes)
+            .and_then(|bytes| bytes.checked_add(self.padding_bytes))
+            .context("WAV export file size overflow")
+    }
+}
+
+pub(crate) fn standard_wav_file_size(frames: u64, channels: u16, bit_depth: u16) -> Result<u64> {
+    WavExportPlan::new(1, channels, bit_depth, frames, WavExportMode::StandardRiff)?.file_bytes()
+}
+
+pub(crate) fn automatic_wav_file_size(frames: u64, channels: u16, bit_depth: u16) -> Result<u64> {
+    WavExportPlan::new(1, channels, bit_depth, frames, WavExportMode::AutoRf64)?.file_bytes()
+}
+
+pub(crate) fn automatic_wav_container_name(
+    frames: u64,
+    channels: u16,
+    bit_depth: u16,
+) -> Result<&'static str> {
+    let plan = WavExportPlan::new(1, channels, bit_depth, frames, WavExportMode::AutoRf64)?;
+    Ok(match plan.container {
+        WavContainer::Riff => "riff",
+        WavContainer::Rf64 => "rf64",
+    })
+}
+
+/// Streaming writer for immutable export temporaries. Unlike the crash-
+/// recoverable recording writer, it knows the exact final frame count before
+/// copying begins, so an RF64 header can be written once with final `ds64`
+/// values and the completed temporary can then be atomically published.
+pub(crate) struct WavExportWriter {
+    file: File,
+    plan: WavExportPlan,
+    written_data_bytes: u64,
+}
+
+impl WavExportWriter {
+    pub(crate) fn create_new(
+        path: &Path,
+        sample_rate: u32,
+        channels: u16,
+        bit_depth: u16,
+        frames: u64,
+        mode: WavExportMode,
+    ) -> Result<Self> {
+        let plan = WavExportPlan::new(sample_rate, channels, bit_depth, frames, mode)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create audio export directory {}", parent.display()))?;
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .with_context(|| format!("create WAV export {}", path.display()))?;
+        file.write_all(&plan.header)?;
+        Ok(Self {
+            file,
+            plan,
+            written_data_bytes: 0,
+        })
+    }
+
+    pub(crate) fn write_encoded_samples(&mut self, bytes: &[u8]) -> Result<()> {
+        if !(bytes.len() as u64).is_multiple_of(self.plan.frame_bytes) {
+            bail!("encoded export audio does not contain complete channel frames");
+        }
+        if self.plan.encoding == WavEncoding::Float {
+            for sample in bytes.chunks_exact(std::mem::size_of::<f32>()) {
+                let value = f32::from_le_bytes(sample.try_into().expect("f32 chunk size"));
+                if !value.is_finite() {
+                    bail!("WAV export contains a non-finite 32-bit Float sample");
+                }
+            }
+        }
+        let next_data_bytes = self
+            .written_data_bytes
+            .checked_add(bytes.len() as u64)
+            .context("WAV export byte counter overflow")?;
+        if next_data_bytes > self.plan.data_bytes {
+            bail!("WAV export received more audio than its declared frame count");
+        }
+        self.file.write_all(bytes)?;
+        self.written_data_bytes = next_data_bytes;
+        Ok(())
+    }
+
+    pub(crate) fn finalize(mut self) -> Result<u64> {
+        if self.written_data_bytes != self.plan.data_bytes {
+            bail!(
+                "WAV export ended before its declared frame count: wrote {} of {} bytes",
+                self.written_data_bytes,
+                self.plan.data_bytes
+            );
+        }
+        if self.plan.padding_bytes != 0 {
+            self.file.write_all(&[0])?;
+        }
+        self.file.flush()?;
+        self.file.sync_all()?;
+        let expected_file_len = (self.plan.header.len() as u64)
+            .checked_add(self.plan.data_bytes)
+            .and_then(|size| size.checked_add(self.plan.padding_bytes))
+            .context("WAV export file size overflow")?;
+        if self.file.metadata()?.len() != expected_file_len {
+            bail!("WAV export physical size does not match its header");
+        }
+        Ok(self.plan.frames)
+    }
+}
+
+/// Validates that a range can remain an ordinary RIFF/WAVE. Recording segments,
+/// sentence files, and previews use this compatibility limit; full-track
+/// exports instead select RF64 automatically when needed.
 pub(crate) fn validate_standard_wav_size(frames: u64, channels: u16, bit_depth: u16) -> Result<()> {
-    if channels == 0 {
-        bail!("channel count must be greater than zero");
-    }
-    let encoding = WavEncoding::for_bit_depth(bit_depth)?;
-    let frame_bytes = u64::from(bytes_per_sample(bit_depth)?)
-        .checked_mul(u64::from(channels))
-        .context("WAV frame size overflow")?;
-    let data_bytes = frames
-        .checked_mul(frame_bytes)
-        .context("WAV data size overflow")?;
-    let riff_size = encoding
-        .header_len()
-        .checked_sub(8)
-        .and_then(|header| header.checked_add(data_bytes))
-        .context("WAV RIFF size overflow")?;
-    if riff_size > u64::from(u32::MAX) {
-        bail!(
-            "整轨大小超过标准 RIFF/WAV 4 GiB 上限，当前版本不能生成单个 full-track.wav；分段母轨仍完整，请按分段交付或缩短录制时长。"
-        );
-    }
+    WavExportPlan::new(1, channels, bit_depth, frames, WavExportMode::StandardRiff)?;
     Ok(())
 }
 
@@ -243,6 +487,9 @@ impl RecoverableWav {
     }
 
     pub fn write_samples(&mut self, samples: &[f32]) -> Result<()> {
+        if samples.iter().any(|sample| !sample.is_finite()) {
+            bail!("WAV sample block contains a non-finite value");
+        }
         let bytes_per_sample = usize::from(bytes_per_sample(self.bit_depth)?);
         let mut encoded = Vec::with_capacity(samples.len() * bytes_per_sample);
         for sample in samples {
@@ -340,7 +587,28 @@ impl RecoverableWav {
     }
 
     pub fn checkpoint(&mut self) -> Result<u64> {
-        let end = self.file.stream_position()?;
+        let sample_bytes = u64::from(bytes_per_sample(self.bit_depth)?);
+        let expected_end = self
+            .samples_written
+            .checked_mul(sample_bytes)
+            .and_then(|data_bytes| self.encoding.header_len().checked_add(data_bytes))
+            .context("WAV checkpoint size overflow")?;
+        let physical_end = self.file.metadata()?.len();
+        if physical_end < expected_end {
+            bail!(
+                "WAV audio is shorter than the writer's committed sample count: expected at least {expected_end} bytes, found {physical_end}"
+            );
+        }
+        if physical_end > expected_end {
+            // A failed `write_all` may leave a complete-frame-aligned prefix of
+            // the rejected callback at EOF. The in-memory sample counter is the
+            // acceptance boundary, so discard every byte beyond it before a
+            // checkpoint can make that ambiguous prefix recoverable.
+            self.file
+                .set_len(expected_end)
+                .context("truncate unaccepted WAV tail before checkpoint")?;
+        }
+        self.file.seek(SeekFrom::Start(expected_end))?;
         // Data must reach durable storage before the header is allowed to claim
         // it exists. A crash between these phases therefore leaves a stale
         // header, which open_append repairs from the complete physical EOF.
@@ -354,7 +622,7 @@ impl RecoverableWav {
         })();
         // Always restore the append position, including after a header I/O
         // failure, so an ignored checkpoint error cannot overwrite audio.
-        let seek_result = self.file.seek(SeekFrom::Start(end));
+        let seek_result = self.file.seek(SeekFrom::Start(expected_end));
         header_result?;
         seek_result?;
         Ok(self.frames_written())
@@ -451,7 +719,14 @@ pub fn slice_wav_mono(
     let temporary = wav_export_temp_path(destination, "slicing")?;
     prepare_wav_export_temp(&temporary)?;
     let result = (|| -> Result<()> {
-        let mut output = RecoverableWav::create_new(&temporary, sample_rate, 1, bit_depth)?;
+        let mut output = WavExportWriter::create_new(
+            &temporary,
+            sample_rate,
+            1,
+            bit_depth,
+            end_frame - start_frame,
+            WavExportMode::StandardRiff,
+        )?;
         let mut remaining = end_byte - start_byte;
         // 48 KiB is divisible by 2, 3, and 4 bytes per sample.
         let mut bytes = vec![0u8; 48 * 1024];
@@ -560,6 +835,140 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ParsedTestWav {
+        rf64: bool,
+        riff_size: u64,
+        data_size: u64,
+        sample_count: u64,
+        format_code: u16,
+        channels: u16,
+        sample_rate: u32,
+        bit_depth: u16,
+        fact_frames: Option<u32>,
+        payload: Vec<u8>,
+    }
+
+    /// Independent chunk walker used by export tests. It does not share header
+    /// offsets with `WavExportPlan`, so it catches malformed ordering, sizes,
+    /// RF64 sentinels, and missing word-alignment padding.
+    fn parse_test_wav(path: &Path) -> ParsedTestWav {
+        let bytes = std::fs::read(path).unwrap();
+        assert!(bytes.len() >= 12);
+        let rf64 = match &bytes[0..4] {
+            b"RIFF" => false,
+            b"RF64" => true,
+            other => panic!("unexpected WAV container: {other:?}"),
+        };
+        assert_eq!(&bytes[8..12], b"WAVE");
+        let mut position = 12usize;
+        let mut ds64_data_size = None;
+        let mut ds64_sample_count = None;
+        let riff_size = if rf64 {
+            assert_eq!(
+                u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+                u32::MAX
+            );
+            assert_eq!(&bytes[position..position + 4], b"ds64");
+            assert_eq!(
+                u32::from_le_bytes(bytes[position + 4..position + 8].try_into().unwrap()),
+                RF64_DS64_CHUNK_DATA_LEN
+            );
+            let size = u64::from_le_bytes(bytes[position + 8..position + 16].try_into().unwrap());
+            ds64_data_size = Some(u64::from_le_bytes(
+                bytes[position + 16..position + 24].try_into().unwrap(),
+            ));
+            ds64_sample_count = Some(u64::from_le_bytes(
+                bytes[position + 24..position + 32].try_into().unwrap(),
+            ));
+            assert_eq!(
+                u32::from_le_bytes(bytes[position + 32..position + 36].try_into().unwrap()),
+                0
+            );
+            position += 8 + usize::try_from(RF64_DS64_CHUNK_DATA_LEN).unwrap();
+            size
+        } else {
+            u64::from(u32::from_le_bytes(bytes[4..8].try_into().unwrap()))
+        };
+        let mut format = None;
+        let mut fact_frames = None;
+        loop {
+            assert!(position + 8 <= bytes.len());
+            let chunk_id = &bytes[position..position + 4];
+            let chunk_size_32 =
+                u32::from_le_bytes(bytes[position + 4..position + 8].try_into().unwrap());
+            let payload_start = position + 8;
+            if chunk_id == b"data" {
+                let data_size = if chunk_size_32 == u32::MAX {
+                    assert!(rf64);
+                    ds64_data_size.unwrap()
+                } else {
+                    u64::from(chunk_size_32)
+                };
+                let payload_end = payload_start + usize::try_from(data_size).unwrap();
+                let physical_end = payload_end + usize::try_from(data_size % 2).unwrap();
+                assert_eq!(physical_end, bytes.len());
+                assert_eq!(riff_size + 8, bytes.len() as u64);
+                if data_size % 2 != 0 {
+                    assert_eq!(bytes[payload_end], 0);
+                }
+                let (format_code, channels, sample_rate, block_align, bit_depth) = format.unwrap();
+                let sample_count = ds64_sample_count
+                    .or_else(|| fact_frames.map(u64::from))
+                    .unwrap_or(data_size / u64::from(block_align));
+                return ParsedTestWav {
+                    rf64,
+                    riff_size,
+                    data_size,
+                    sample_count,
+                    format_code,
+                    channels,
+                    sample_rate,
+                    bit_depth,
+                    fact_frames,
+                    payload: bytes[payload_start..payload_end].to_vec(),
+                };
+            }
+            let chunk_size = usize::try_from(chunk_size_32).unwrap();
+            let payload_end = payload_start + chunk_size;
+            assert!(payload_end <= bytes.len());
+            if chunk_id == b"fmt " {
+                assert_eq!(chunk_size, 16);
+                format = Some((
+                    u16::from_le_bytes(bytes[payload_start..payload_start + 2].try_into().unwrap()),
+                    u16::from_le_bytes(
+                        bytes[payload_start + 2..payload_start + 4]
+                            .try_into()
+                            .unwrap(),
+                    ),
+                    u32::from_le_bytes(
+                        bytes[payload_start + 4..payload_start + 8]
+                            .try_into()
+                            .unwrap(),
+                    ),
+                    u16::from_le_bytes(
+                        bytes[payload_start + 12..payload_start + 14]
+                            .try_into()
+                            .unwrap(),
+                    ),
+                    u16::from_le_bytes(
+                        bytes[payload_start + 14..payload_start + 16]
+                            .try_into()
+                            .unwrap(),
+                    ),
+                ));
+            } else if chunk_id == b"fact" {
+                assert_eq!(chunk_size, 4);
+                fact_frames = Some(u32::from_le_bytes(
+                    bytes[payload_start..payload_end].try_into().unwrap(),
+                ));
+            } else {
+                panic!("unexpected WAV chunk: {chunk_id:?}");
+            }
+            position = payload_end + chunk_size % 2;
+        }
+    }
+
     #[test]
     fn writes_and_slices_every_supported_bit_depth() {
         for (bit_depth, header_len, bytes_per_sample, format_code) in
@@ -572,15 +981,19 @@ mod tests {
             let mut writer = RecoverableWav::create(&source, 48_000, 1, bit_depth).unwrap();
             writer.write_samples(&samples).unwrap();
             writer.finalize().unwrap();
-            slice_wav_mono(&source, &slice, 48_000, bit_depth, 1, 5).unwrap();
+            slice_wav_mono(&source, &slice, 48_000, bit_depth, 1, 4).unwrap();
 
             let source_bytes = std::fs::read(&source).unwrap();
             let slice_bytes = std::fs::read(&slice).unwrap();
+            let slice_data_bytes = 3 * bytes_per_sample;
             assert_eq!(
                 source_bytes.len(),
                 header_len + samples.len() * bytes_per_sample
             );
-            assert_eq!(slice_bytes.len(), header_len + 4 * bytes_per_sample);
+            assert_eq!(
+                slice_bytes.len(),
+                header_len + slice_data_bytes + slice_data_bytes % 2
+            );
             assert_eq!(
                 u16::from_le_bytes([source_bytes[20], source_bytes[21]]),
                 format_code
@@ -590,10 +1003,38 @@ mod tests {
                 bit_depth
             );
             assert_eq!(
-                &slice_bytes[header_len..],
-                &source_bytes[header_len + bytes_per_sample..header_len + 5 * bytes_per_sample]
+                &slice_bytes[header_len..header_len + slice_data_bytes],
+                &source_bytes[header_len + bytes_per_sample..header_len + 4 * bytes_per_sample]
             );
+            if slice_data_bytes % 2 != 0 {
+                assert_eq!(slice_bytes.last(), Some(&0));
+            }
             let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn recoverable_writer_rejects_non_finite_samples_before_writing_any_payload() {
+        for bit_depth in [16, 24, 32] {
+            for (name, invalid) in [
+                ("nan", f32::NAN),
+                ("positive-infinity", f32::INFINITY),
+                ("negative-infinity", f32::NEG_INFINITY),
+            ] {
+                let root = test_root(&format!("non-finite-{bit_depth}-{name}"));
+                let path = root.join("invalid.wav");
+                let mut writer = RecoverableWav::create(&path, 48_000, 1, bit_depth).unwrap();
+                let initial_len = std::fs::metadata(&path).unwrap().len();
+
+                let error = writer.write_samples(&[0.25, invalid, -0.25]).unwrap_err();
+                assert!(format!("{error:#}").contains("non-finite"));
+                assert_eq!(writer.frames_written(), 0);
+                assert_eq!(std::fs::metadata(&path).unwrap().len(), initial_len);
+
+                writer.write_samples(&[0.5]).unwrap();
+                assert_eq!(writer.finalize().unwrap(), 1);
+                let _ = std::fs::remove_dir_all(root);
+            }
         }
     }
 
@@ -779,6 +1220,31 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_discards_an_unaccepted_tail_even_when_it_contains_complete_frames() {
+        for bit_depth in [16, 24, 32] {
+            let root = test_root(&format!("checkpoint-unaccepted-tail-{bit_depth}"));
+            let path = root.join("source.wav");
+            let mut writer = RecoverableWav::create(&path, 48_000, 1, bit_depth).unwrap();
+            writer.write_samples(&[0.1, 0.2]).unwrap();
+
+            // Model a short/failed write that placed one whole encoded frame on
+            // disk but returned before `samples_written` accepted that frame.
+            writer
+                .file
+                .write_all(&vec![0x7f; usize::from(bit_depth / 8)])
+                .unwrap();
+            assert_eq!(writer.checkpoint().unwrap(), 2);
+            drop(writer);
+
+            assert_header_matches_physical_eof(&path, bit_depth, 2);
+            let resumed = RecoverableWav::open_append(&path, 48_000, 1, bit_depth).unwrap();
+            assert_eq!(resumed.frames_written(), 2);
+            drop(resumed);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
     fn repairs_a_header_that_is_ahead_of_physical_audio() {
         for bit_depth in [16, 24, 32] {
             let root = test_root(&format!("append-header-ahead-{bit_depth}"));
@@ -833,19 +1299,210 @@ mod tests {
     }
 
     #[test]
-    fn preflights_standard_riff_size_without_writing_a_file() {
+    fn export_file_size_includes_header_data_and_word_padding_at_every_bit_depth() {
+        assert_eq!(standard_wav_file_size(1, 1, 16).unwrap(), 44 + 2);
+        assert_eq!(standard_wav_file_size(1, 1, 24).unwrap(), 44 + 3 + 1);
+        assert_eq!(standard_wav_file_size(1, 1, 32).unwrap(), 56 + 4);
+        assert_eq!(standard_wav_file_size(2, 1, 24).unwrap(), 44 + 6);
+    }
+
+    #[test]
+    fn auto_export_uses_riff_at_the_boundary_and_rf64_immediately_above_it() {
         for bit_depth in [16, 24, 32] {
             let encoding = WavEncoding::for_bit_depth(bit_depth).unwrap();
             let frame_bytes = u64::from(bytes_per_sample(bit_depth).unwrap());
             let maximum_data_bytes = u64::from(u32::MAX) - (encoding.header_len() - 8);
-            let maximum_frames = maximum_data_bytes / frame_bytes;
+            let mut maximum_frames = maximum_data_bytes / frame_bytes;
+            while validate_standard_wav_size(maximum_frames, 1, bit_depth).is_err() {
+                maximum_frames -= 1;
+            }
 
             validate_standard_wav_size(maximum_frames, 1, bit_depth).unwrap();
-            let error = validate_standard_wav_size(maximum_frames + 1, 1, bit_depth)
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("4 GiB"));
-            assert!(error.contains("full-track.wav"));
+            assert!(validate_standard_wav_size(maximum_frames + 1, 1, bit_depth).is_err());
+            assert_eq!(
+                automatic_wav_container_name(maximum_frames, 1, bit_depth).unwrap(),
+                "riff"
+            );
+            assert_eq!(
+                automatic_wav_container_name(maximum_frames + 1, 1, bit_depth).unwrap(),
+                "rf64"
+            );
+
+            let riff = WavExportPlan::new(
+                48_000,
+                1,
+                bit_depth,
+                maximum_frames,
+                WavExportMode::AutoRf64,
+            )
+            .unwrap();
+            assert_eq!(&riff.header[0..4], b"RIFF");
+            assert_eq!(riff.header.len() as u64, encoding.header_len());
+
+            let rf64_frames = maximum_frames + 1;
+            let rf64 =
+                WavExportPlan::new(48_000, 1, bit_depth, rf64_frames, WavExportMode::AutoRf64)
+                    .unwrap();
+            let data_bytes = rf64_frames * frame_bytes;
+            let header_len = encoding.header_len() + RF64_HEADER_GROWTH;
+            let riff_size = header_len - 8 + data_bytes + data_bytes % 2;
+            assert_eq!(rf64.header.len() as u64, header_len);
+            assert_eq!(
+                automatic_wav_file_size(rf64_frames, 1, bit_depth).unwrap(),
+                header_len + data_bytes + data_bytes % 2
+            );
+            assert_eq!(&rf64.header[0..4], b"RF64");
+            assert_eq!(
+                u32::from_le_bytes(rf64.header[4..8].try_into().unwrap()),
+                u32::MAX
+            );
+            assert_eq!(&rf64.header[8..12], b"WAVE");
+            assert_eq!(&rf64.header[12..16], b"ds64");
+            assert_eq!(
+                u32::from_le_bytes(rf64.header[16..20].try_into().unwrap()),
+                RF64_DS64_CHUNK_DATA_LEN
+            );
+            assert_eq!(
+                u64::from_le_bytes(rf64.header[20..28].try_into().unwrap()),
+                riff_size
+            );
+            assert_eq!(
+                u64::from_le_bytes(rf64.header[28..36].try_into().unwrap()),
+                data_bytes
+            );
+            assert_eq!(
+                u64::from_le_bytes(rf64.header[36..44].try_into().unwrap()),
+                rf64_frames
+            );
+            assert_eq!(
+                u32::from_le_bytes(rf64.header[44..48].try_into().unwrap()),
+                0
+            );
+            assert_eq!(&rf64.header[48..52], b"fmt ");
+            let data_marker = if encoding == WavEncoding::Float {
+                assert_eq!(&rf64.header[72..76], b"fact");
+                assert_eq!(
+                    u32::from_le_bytes(rf64.header[80..84].try_into().unwrap()),
+                    u32::MAX
+                );
+                84
+            } else {
+                72
+            };
+            assert_eq!(&rf64.header[data_marker..data_marker + 4], b"data");
+            assert_eq!(
+                u32::from_le_bytes(
+                    rf64.header[data_marker + 4..data_marker + 8]
+                        .try_into()
+                        .unwrap()
+                ),
+                u32::MAX
+            );
+        }
+    }
+
+    #[test]
+    fn export_writer_keeps_small_files_as_reader_compatible_riff() {
+        for bit_depth in [16, 24, 32] {
+            let root = test_root(&format!("small-export-{bit_depth}"));
+            let path = root.join("small.wav");
+            let frames = 3u64;
+            let data = vec![0u8; usize::try_from(frames * u64::from(bit_depth / 8)).unwrap()];
+            let mut writer = WavExportWriter::create_new(
+                &path,
+                48_000,
+                1,
+                bit_depth,
+                frames,
+                WavExportMode::AutoRf64,
+            )
+            .unwrap();
+            writer.write_encoded_samples(&data).unwrap();
+            assert_eq!(writer.finalize().unwrap(), frames);
+            let parsed = parse_test_wav(&path);
+            assert!(!parsed.rf64);
+            assert_eq!(
+                parsed.riff_size + 8,
+                std::fs::metadata(&path).unwrap().len()
+            );
+            assert_eq!(parsed.data_size, data.len() as u64);
+            assert_eq!(parsed.sample_count, frames);
+            assert_eq!(parsed.format_code, if bit_depth == 32 { 3 } else { 1 });
+            assert_eq!(parsed.channels, 1);
+            assert_eq!(parsed.sample_rate, 48_000);
+            assert_eq!(parsed.bit_depth, bit_depth);
+            assert_eq!(
+                parsed.fact_frames,
+                (bit_depth == 32).then_some(u32::try_from(frames).unwrap())
+            );
+            assert_eq!(parsed.payload, data);
+
+            let reader = RecoverableWav::open_append(&path, 48_000, 1, bit_depth).unwrap();
+            assert_eq!(reader.frames_written(), frames);
+            drop(reader);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn float_export_writer_rejects_non_finite_encoded_payloads() {
+        for (name, invalid) in [
+            ("nan", f32::NAN),
+            ("positive-infinity", f32::INFINITY),
+            ("negative-infinity", f32::NEG_INFINITY),
+        ] {
+            let root = test_root(&format!("non-finite-export-{name}"));
+            let path = root.join("invalid.wav");
+            let mut writer =
+                WavExportWriter::create_new(&path, 48_000, 1, 32, 1, WavExportMode::StandardRiff)
+                    .unwrap();
+            let initial_len = std::fs::metadata(&path).unwrap().len();
+
+            let error = writer
+                .write_encoded_samples(&invalid.to_le_bytes())
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("non-finite"));
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), initial_len);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn export_writer_streams_rf64_payload_after_the_ds64_header() {
+        for bit_depth in [16, 24, 32] {
+            let root = test_root(&format!("forced-rf64-export-{bit_depth}"));
+            let path = root.join("large-layout.wav");
+            let frames = 3u64;
+            let data = (0..usize::try_from(frames * u64::from(bit_depth / 8)).unwrap())
+                .map(|value| value as u8)
+                .collect::<Vec<_>>();
+            let mut writer = WavExportWriter::create_new(
+                &path,
+                48_000,
+                1,
+                bit_depth,
+                frames,
+                WavExportMode::ForceRf64,
+            )
+            .unwrap();
+            writer.write_encoded_samples(&data).unwrap();
+            assert_eq!(writer.finalize().unwrap(), frames);
+
+            let parsed = parse_test_wav(&path);
+            assert!(parsed.rf64);
+            assert_eq!(
+                parsed.riff_size + 8,
+                std::fs::metadata(&path).unwrap().len()
+            );
+            assert_eq!(parsed.data_size, data.len() as u64);
+            assert_eq!(parsed.sample_count, frames);
+            assert_eq!(parsed.format_code, if bit_depth == 32 { 3 } else { 1 });
+            assert_eq!(parsed.channels, 1);
+            assert_eq!(parsed.sample_rate, 48_000);
+            assert_eq!(parsed.bit_depth, bit_depth);
+            assert_eq!(parsed.fact_frames, (bit_depth == 32).then_some(u32::MAX));
+            assert_eq!(parsed.payload, data);
+            let _ = std::fs::remove_dir_all(root);
         }
     }
 }

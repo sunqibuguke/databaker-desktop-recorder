@@ -1,5 +1,5 @@
 use crate::durable_fs::{durable_rename, durable_replace, sync_directory};
-use crate::wav::{RecoverableWav, validate_standard_wav_size};
+use crate::wav::{RecoverableWav, WavExportMode, WavExportWriter};
 use anyhow::{Context, Result, bail};
 use std::ffi::OsString;
 use std::fs::File;
@@ -102,6 +102,7 @@ pub(crate) struct PreparedWavExport {
     bit_depth: u16,
     frames: u64,
     parts: Vec<PreparedExportPart>,
+    mode: WavExportMode,
 }
 
 impl PreparedWavExport {
@@ -130,6 +131,7 @@ impl PreparedWavExport {
             bit_depth,
             frames,
             parts: vec![PreparedExportPart::EncodedFrames(bytes)],
+            mode: WavExportMode::StandardRiff,
         })
     }
 
@@ -146,14 +148,20 @@ impl PreparedWavExport {
             bit_depth,
             frames,
             parts,
+            mode,
         } = self;
-        validate_standard_wav_size(frames, channels, bit_depth)?;
         let layout = WavLayout::for_bit_depth(bit_depth)?;
         let frame_bytes = layout.frame_bytes(channels)?;
         let temporary = prepare_export_temp(&destination)?;
         let result = (|| -> Result<u64> {
-            let mut output =
-                RecoverableWav::create_new(&temporary, sample_rate, channels, bit_depth)?;
+            let mut output = WavExportWriter::create_new(
+                &temporary,
+                sample_rate,
+                channels,
+                bit_depth,
+                frames,
+                mode,
+            )?;
             for part in parts {
                 match part {
                     PreparedExportPart::ClosedSegment(part) => {
@@ -377,6 +385,9 @@ impl SegmentedWav {
         if !samples.len().is_multiple_of(channels) {
             bail!("sample block does not contain complete channel frames");
         }
+        if samples.iter().any(|sample| !sample.is_finite()) {
+            bail!("segmented WAV sample block contains a non-finite value");
+        }
         let mut sample_offset = 0usize;
         while sample_offset < samples.len() {
             let active_frames = self.active_ref()?.frames_written();
@@ -469,7 +480,7 @@ impl SegmentedWav {
     }
 
     /// Writes a standard single RIFF/WAVE for a continuous global frame range.
-    /// The existing RIFF 4 GiB limit remains enforced by `RecoverableWav`.
+    /// Sentence and preview ranges deliberately retain the 4 GiB RIFF limit.
     pub fn export_range(
         &mut self,
         destination: &Path,
@@ -522,6 +533,7 @@ impl SegmentedWav {
             bit_depth: self.bit_depth,
             frames: end_frame - start_frame,
             parts: prepared_parts,
+            mode: WavExportMode::StandardRiff,
         })
     }
 
@@ -542,10 +554,13 @@ impl SegmentedWav {
                 bit_depth: self.bit_depth,
                 frames: 0,
                 parts: Vec::new(),
+                mode: WavExportMode::AutoRf64,
             }
             .write();
         }
-        self.export_range(destination, 0, end_frame)
+        let mut prepared = self.prepare_export_range(destination, 0, end_frame)?;
+        prepared.mode = WavExportMode::AutoRf64;
+        prepared.write()
     }
 
     pub fn finalize(mut self) -> Result<u64> {
@@ -924,7 +939,7 @@ fn copy_closed_part(
     part: &SegmentRange,
     header_len: u64,
     frame_bytes: u64,
-    output: &mut RecoverableWav,
+    output: &mut WavExportWriter,
 ) -> Result<()> {
     let mut source = File::open(&part.path)
         .with_context(|| format!("open WAV segment {}", part.path.display()))?;
@@ -969,7 +984,15 @@ mod tests {
 
     fn audio_bytes(path: &Path, bit_depth: u16) -> Vec<u8> {
         let layout = WavLayout::for_bit_depth(bit_depth).unwrap();
-        std::fs::read(path).unwrap()[usize::try_from(layout.header_len).unwrap()..].to_vec()
+        let bytes = std::fs::read(path).unwrap();
+        let data_bytes = usize::try_from(u32::from_le_bytes(
+            bytes[layout.data_size_offset..layout.data_size_offset + 4]
+                .try_into()
+                .unwrap(),
+        ))
+        .unwrap();
+        let start = usize::try_from(layout.header_len).unwrap();
+        bytes[start..start + data_bytes].to_vec()
     }
 
     #[test]
@@ -1018,6 +1041,23 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn non_finite_block_is_rejected_before_crossing_a_segment_boundary() {
+        let root = test_root("non-finite-boundary");
+        let segment_dir = root.join("segments");
+        let mut writer = SegmentedWav::create(&segment_dir, 48_000, 1, 32, 3).unwrap();
+        writer.write_samples(&[0.1, 0.2]).unwrap();
+
+        let error = writer.write_samples(&[0.3, f32::NAN]).unwrap_err();
+        assert!(format!("{error:#}").contains("non-finite"));
+        assert_eq!(writer.global_frames(), 2);
+        assert_eq!(writer.segments().len(), 1);
+
+        writer.write_samples(&[0.4]).unwrap();
+        assert_eq!(writer.finalize().unwrap(), 3);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -48,6 +48,28 @@ export function installDevRecorderMock() {
     noise_check: null,
     export_exists: false,
   }, {
+    session_id: '样本补录-20260810-143522',
+    session_dir: '/tmp/DataBaker Recordings/样本补录-20260810-143522',
+    script_name: '补录清单.csv',
+    status: 'recording',
+    is_active: false,
+    started_at: '2026-08-10T14:35:22+08:00',
+    updated_at: '2026-08-10T15:04:09+08:00',
+    device_name: 'Studio USB Microphone',
+    sample_rate: 48_000,
+    bit_depth: 24,
+    encoding: 'pcm',
+    input_channel: 1,
+    captured_samples: 82_560_000,
+    overflow_samples: 0,
+    total_items: 20,
+    accepted_items: 18,
+    skipped_items: 2,
+    review_items: 0,
+    pending_items: 0,
+    noise_check: null,
+    export_exists: false,
+  }, {
     session_id: '内部语料_第01批-20260809-154230',
     session_dir: '/tmp/DataBaker Recordings/内部语料_第01批-20260809-154230',
     script_name: '内部语料_第01批.csv',
@@ -172,6 +194,52 @@ export function installDevRecorderMock() {
       };
       meterTimer = window.setInterval(emitMeter, 100);
       return { snapshot: snapshotCopy(), session_dir: String(data.session_dir) } as T;
+    }
+    if (command === 'seal_interrupted_session') {
+      const target = String(data.session_dir ?? '');
+      const recording = previewHistory.find((candidate) => candidate.session_dir === target);
+      if (!recording) throw new Error('Mock 中没有该录制任务');
+      if (String(data.session_id ?? '') !== recording.session_id) throw new Error('Mock 录制任务身份不匹配');
+      if (snapshot?.status === 'recording') throw new Error(`当前已有录音任务进行中：${currentSessionDir}`);
+      const noOp = recording.status === 'stopped' || recording.status === 'faulted';
+      recording.status = recording.overflow_samples > 0 ? 'faulted' : 'stopped';
+      recording.updated_at = new Date().toISOString();
+      const sealedSnapshot: SessionSnapshot = {
+        schema_version: 1,
+        session_id: recording.session_id,
+        script_name: recording.script_name,
+        status: recording.status,
+        device_name: recording.device_name,
+        input_sample_format: 'f32',
+        audio_format: { sample_rate: recording.sample_rate, bit_depth: recording.bit_depth, encoding: recording.encoding, channels: 1, input_channels: 2, input_channel: recording.input_channel },
+        master_audio: 'audio/master.wav', storage_layout_version: 1, segment_frames: recording.sample_rate * 300,
+        captured_samples: recording.captured_samples, committed_samples: recording.captured_samples, overflow_samples: recording.overflow_samples,
+        started_at: recording.started_at, updated_at: recording.updated_at,
+        noise_check: recording.noise_check,
+        silence_duration_ms: 1_000,
+        silence_threshold_dbfs: -42,
+        items: Array.from({ length: recording.total_items }, (_, index) => ({
+          id: String(index + 1).padStart(3, '0'),
+          text: `恢复录制测试文本 ${index + 1}`,
+          label: index === 0 ? '自然语气' : '',
+          status: index < recording.accepted_items
+            ? 'accepted'
+            : index < recording.accepted_items + recording.skipped_items
+              ? 'skipped'
+              : 'pending',
+          attempts: [],
+          selected_attempt_id: null,
+        })),
+      };
+      return {
+        session_dir: target,
+        snapshot: sealedSnapshot,
+        durable_frames: recording.captured_samples,
+        recovered_attempts: 0,
+        fault_preserved: recording.status === 'faulted',
+        no_op: noOp,
+        warnings: [],
+      } as T;
     }
     if (command === 'resume_session') {
       const target = String(data.session_dir ?? '');

@@ -96,13 +96,29 @@ export type Meter = {
 
 export type EngineEvent = { event: string; payload: unknown; protocol_version: number };
 
+export type EngineRecoveryFailedPayload = {
+  session_dir: string;
+  error: string;
+};
+
 export type ExportResult = {
   export_dir: string;
   master_file: string;
+  master_container?: 'riff' | 'rf64';
   sentences_dir: string;
   exported_count: number;
   skipped_count: number;
   recovery_warnings?: string[];
+};
+
+export type SealInterruptedSessionResult = {
+  session_dir: string;
+  snapshot: SessionSnapshot;
+  durable_frames: number;
+  recovered_attempts?: number;
+  fault_preserved?: boolean;
+  no_op: boolean;
+  warnings?: string[];
 };
 
 export type PrompterCue = 'idle' | 'checking' | 'ready' | 'recording' | 'post-ready' | 'review';

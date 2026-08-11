@@ -621,6 +621,10 @@ fn run_input(
         emit_error(error_callback, err);
     }
 
+    // WASAPI may represent a silent capture packet with no usable data
+    // pointer. Keep one aligned scratch allocation for those packets and reuse
+    // it for the lifetime of the input thread.
+    let mut silent_buffer = Vec::<u64>::new();
     loop {
         match process_commands_and_await_signal(&mut run_ctxt, error_callback) {
             ControlFlow::Break(()) => break,
@@ -636,11 +640,27 @@ fn run_input(
             capture_client,
             data_callback,
             error_callback,
+            &mut silent_buffer,
         ) {
             emit_error(error_callback, err);
             break;
         }
     }
+}
+
+fn prepare_silent_capture_buffer(
+    storage: &mut Vec<u64>,
+    byte_count: usize,
+    sample_format: SampleFormat,
+) -> *mut () {
+    let words = byte_count.div_ceil(mem::size_of::<u64>());
+    storage.resize(words, 0);
+    // A `Vec<u64>` provides sufficient alignment for every WASAPI sample type
+    // supported by this backend, including f64/i64 and CPAL's i32-backed I24.
+    let bytes =
+        unsafe { std::slice::from_raw_parts_mut(storage.as_mut_ptr().cast::<u8>(), byte_count) };
+    fill_equilibrium(bytes, sample_format);
+    storage.as_mut_ptr().cast::<()>()
 }
 
 fn run_output(
@@ -741,6 +761,7 @@ fn process_input(
     capture_client: Audio::IAudioCaptureClient,
     data_callback: &mut dyn FnMut(&Data, &InputCallbackInfo),
     error_callback: &ErrorCallbackArc,
+    silent_buffer: &mut Vec<u64>,
 ) -> Result<(), Error> {
     unsafe {
         // Get the available data in the shared buffer.
@@ -780,11 +801,28 @@ fn process_input(
                 let _ = try_emit_error(error_callback, ErrorKind::Xrun.into());
             }
 
-            debug_assert!(!buffer.is_null());
-
-            let data = buffer as *mut ();
-            let len = frames_available as usize * stream.bytes_per_frame as usize
-                / stream.sample_format.sample_size();
+            let byte_count = frames_available as usize * stream.bytes_per_frame as usize;
+            let sample_size = stream.sample_format.sample_size();
+            debug_assert_eq!(byte_count % sample_size, 0);
+            let len = byte_count / sample_size;
+            let data = if flags & Audio::AUDCLNT_BUFFERFLAGS_SILENT.0 as u32 != 0 {
+                // Microsoft requires clients to ignore the packet's actual
+                // bytes when SILENT is set. The pointer may be null, and even a
+                // non-null buffer does not contain values that may be captured.
+                prepare_silent_capture_buffer(silent_buffer, byte_count, stream.sample_format)
+            } else if buffer.is_null() {
+                // Never construct CPAL Data from a null non-empty pointer: its
+                // typed callback wrapper creates a Rust slice immediately.
+                capture_client
+                    .ReleaseBuffer(frames_available)
+                    .context("Failed to release invalid capture buffer")?;
+                return Err(Error::with_message(
+                    ErrorKind::BackendError,
+                    "WASAPI returned a null capture buffer without the SILENT flag",
+                ));
+            } else {
+                buffer.cast::<()>()
+            };
             let data = Data::from_parts(data, len, stream.sample_format);
 
             // The `qpc_position` is in 100 nanosecond units. Convert it to nanoseconds.
@@ -899,4 +937,35 @@ fn output_timestamp(
     let padding = stream.max_frames_in_buffer - frames_available;
     let playback = callback + (frames_to_duration(padding, sample_rate) + stream.stream_latency);
     Ok(OutputStreamTimestamp { callback, playback })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn silent_capture_buffer_is_aligned_and_uses_sample_equilibrium() {
+        let mut storage = Vec::<u64>::new();
+
+        let pointer = prepare_silent_capture_buffer(&mut storage, 7, SampleFormat::U8);
+        assert_eq!((pointer as usize) % mem::align_of::<u64>(), 0);
+        let data = unsafe { Data::from_parts(pointer, 7, SampleFormat::U8) };
+        assert_eq!(data.as_slice::<u8>().unwrap(), &[0x80; 7]);
+
+        let pointer = prepare_silent_capture_buffer(
+            &mut storage,
+            4 * mem::size_of::<i16>(),
+            SampleFormat::I16,
+        );
+        let data = unsafe { Data::from_parts(pointer, 4, SampleFormat::I16) };
+        assert_eq!(data.as_slice::<i16>().unwrap(), &[0; 4]);
+
+        let pointer = prepare_silent_capture_buffer(
+            &mut storage,
+            3 * mem::size_of::<f64>(),
+            SampleFormat::F64,
+        );
+        let data = unsafe { Data::from_parts(pointer, 3, SampleFormat::F64) };
+        assert_eq!(data.as_slice::<f64>().unwrap(), &[0.0; 3]);
+    }
 }

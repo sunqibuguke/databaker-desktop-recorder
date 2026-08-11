@@ -2,7 +2,8 @@
 mod storage_guard;
 
 use storage_guard::{
-    StorageStatus, audio_bytes_per_second, check_storage, evaluate_available_space,
+    AtomicExportStep, StorageStatus, audio_bytes_per_second, check_storage,
+    evaluate_atomic_export_space, evaluate_available_space,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -96,5 +97,104 @@ fn queries_available_space_for_a_real_directory() {
     assert_eq!(
         report.remaining_recording_seconds,
         report.available_bytes / report.bytes_per_second
+    );
+}
+
+#[test]
+fn export_space_accepts_the_exact_reserve_plus_peak_boundary() {
+    let steps = [
+        AtomicExportStep {
+            new_bytes: 1_000,
+            replaced_bytes: 0,
+        },
+        AtomicExportStep {
+            new_bytes: 400,
+            replaced_bytes: 0,
+        },
+    ];
+    let exact = evaluate_atomic_export_space(2_400, 1_000, &steps).unwrap();
+    assert_eq!(exact.peak_additional_bytes, 1_400);
+    assert_eq!(exact.required_available_bytes, 2_400);
+    assert!(exact.can_export);
+
+    let below = evaluate_atomic_export_space(2_399, 1_000, &steps).unwrap();
+    assert!(!below.can_export);
+}
+
+#[test]
+fn reexport_peak_credits_each_replaced_file_without_requiring_a_second_bundle() {
+    let fresh = [
+        AtomicExportStep {
+            new_bytes: 1_000,
+            replaced_bytes: 0,
+        },
+        AtomicExportStep {
+            new_bytes: 400,
+            replaced_bytes: 0,
+        },
+        AtomicExportStep {
+            new_bytes: 300,
+            replaced_bytes: 0,
+        },
+        AtomicExportStep {
+            new_bytes: 100,
+            replaced_bytes: 0,
+        },
+    ];
+    let replacement = [
+        AtomicExportStep {
+            new_bytes: 1_000,
+            replaced_bytes: 1_000,
+        },
+        AtomicExportStep {
+            new_bytes: 400,
+            replaced_bytes: 400,
+        },
+        AtomicExportStep {
+            new_bytes: 300,
+            replaced_bytes: 300,
+        },
+        AtomicExportStep {
+            new_bytes: 100,
+            replaced_bytes: 0,
+        },
+    ];
+    assert_eq!(
+        evaluate_atomic_export_space(u64::MAX, 0, &fresh)
+            .unwrap()
+            .peak_additional_bytes,
+        1_800
+    );
+    assert_eq!(
+        evaluate_atomic_export_space(u64::MAX, 0, &replacement)
+            .unwrap()
+            .peak_additional_bytes,
+        1_000
+    );
+}
+
+#[test]
+fn export_space_calculation_rejects_counter_overflow() {
+    let steps = [
+        AtomicExportStep {
+            new_bytes: u64::MAX,
+            replaced_bytes: u64::MAX,
+        },
+        AtomicExportStep {
+            new_bytes: 1,
+            replaced_bytes: 0,
+        },
+    ];
+    assert!(evaluate_atomic_export_space(u64::MAX, 0, &steps).is_err());
+    assert!(
+        evaluate_atomic_export_space(
+            u64::MAX,
+            u64::MAX,
+            &[AtomicExportStep {
+                new_bytes: 1,
+                replaced_bytes: 0,
+            }],
+        )
+        .is_err()
     );
 }

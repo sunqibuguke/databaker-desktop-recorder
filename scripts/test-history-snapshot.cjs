@@ -26,7 +26,12 @@ Module._load = function loadWithElectronStub(request, parent, isMain) {
   };
 };
 
-const { hasCompleteExport, loadHistorySnapshot } = require('../dist-electron/main.js');
+const {
+  assertAuthorizedSessionUnchanged,
+  bindAuthorizedSession,
+  hasCompleteExport,
+  loadHistorySnapshot,
+} = require('../dist-electron/main.js');
 Module._load = originalLoad;
 
 function snapshot(sessionId, journalSeq, status = 'recording') {
@@ -98,27 +103,102 @@ async function main() {
     assert.equal(recovered?.snapshot.session_id, 'session-a');
     assert.equal(recovered?.snapshot.journal_seq, 4);
 
+    const binding = await bindAuthorizedSession(sessionDir, [root], 'session-a');
+    await assertAuthorizedSessionUnchanged(binding, [root]);
+    await assert.rejects(
+      bindAuthorizedSession(sessionDir, [root], 'wrong-session'),
+      /身份与历史列表不一致/,
+    );
+    await assert.rejects(
+      bindAuthorizedSession(sessionDir, [path.dirname(root)], 'session-a'),
+      /离开授权的保存位置/,
+    );
+
+    const replaceableSession = path.join(root, 'session-replaceable');
+    await fs.mkdir(replaceableSession);
+    await writeJson(path.join(replaceableSession, 'session.json'), {
+      schema_version: 1,
+      session_id: 'session-replaceable',
+    });
+    const replaceableBinding = await bindAuthorizedSession(
+      replaceableSession,
+      [root],
+      'session-replaceable',
+    );
+    await fs.rename(replaceableSession, `${replaceableSession}-old`);
+    await fs.mkdir(replaceableSession);
+    await writeJson(path.join(replaceableSession, 'session.json'), {
+      schema_version: 1,
+      session_id: 'session-replaceable',
+    });
+    await assert.rejects(
+      assertAuthorizedSessionUnchanged(replaceableBinding, [root]),
+      /操作前被替换/,
+    );
+
     const exportDir = path.join(sessionDir, 'export');
+    const exportSnapshot = snapshot('session-a', 4, 'stopped');
     await fs.mkdir(exportDir);
     await writeJson(path.join(exportDir, 'metadata.json'), { schema_version: 1 });
-    assert.equal(await hasCompleteExport(exportDir), true, 'legacy export remains compatible');
+    assert.equal(
+      await hasCompleteExport(exportDir, exportSnapshot),
+      false,
+      'legacy export must be regenerated against the current snapshot',
+    );
     await writeJson(path.join(exportDir, 'status.json'), {
-      schema_version: 1,
+      schema_version: 2,
       status: 'in_progress',
       export_id: 'export-a',
+      session_id: 'session-a',
+      source: {
+        journal_seq: 4,
+        committed_samples: 0,
+        selected_attempts: [{ id: '1', attempt_id: null }],
+      },
     });
-    assert.equal(await hasCompleteExport(exportDir), false, 'partial export stays hidden');
+    assert.equal(await hasCompleteExport(exportDir, exportSnapshot), false, 'partial export stays hidden');
     await fs.writeFile(path.join(exportDir, 'full-track.wav'), 'audio');
     await fs.writeFile(path.join(exportDir, 'metadata.csv'), 'id,text\n');
     await fs.mkdir(path.join(exportDir, 'sentences'));
     await writeJson(path.join(exportDir, 'status.json'), {
-      schema_version: 1,
+      schema_version: 2,
       status: 'complete',
       export_id: 'export-a',
+      session_id: 'session-a',
+      source: {
+        journal_seq: 4,
+        committed_samples: 0,
+        selected_attempts: [{ id: '1', attempt_id: null }],
+      },
     });
-    assert.equal(await hasCompleteExport(exportDir), true, 'committed export is visible');
+    assert.equal(await hasCompleteExport(exportDir, exportSnapshot), true, 'committed export is visible');
+    assert.equal(
+      await hasCompleteExport(exportDir, { ...exportSnapshot, status: 'faulted', audio_fault_marker: true }),
+      false,
+      'a fault marker always revokes normal deliverable status',
+    );
+    assert.equal(
+      await hasCompleteExport(exportDir, { ...exportSnapshot, overflow_samples: 1 }),
+      false,
+      'an overflow always revokes normal deliverable status',
+    );
+    const resumedSnapshot = { ...exportSnapshot, journal_seq: 5, committed_samples: 48_000 };
+    assert.equal(
+      await hasCompleteExport(exportDir, resumedSnapshot),
+      false,
+      'an older complete marker cannot publish audio from before a resumed recording',
+    );
+    const reselectionSnapshot = {
+      ...exportSnapshot,
+      items: exportSnapshot.items.map((item) => ({ ...item, selected_attempt_id: '1-a2' })),
+    };
+    assert.equal(
+      await hasCompleteExport(exportDir, reselectionSnapshot),
+      false,
+      'an older complete marker cannot publish a different selected attempt',
+    );
     await fs.writeFile(path.join(exportDir, 'status.json'), '{broken');
-    assert.equal(await hasCompleteExport(exportDir), false, 'corrupt marker cannot publish export');
+    assert.equal(await hasCompleteExport(exportDir, exportSnapshot), false, 'corrupt marker cannot publish export');
 
     await fs.writeFile(path.join(metadataDir, 'audio-fault.tmp'), '{incomplete');
     const faulted = await loadHistorySnapshot(sessionDir, metadataDir);
