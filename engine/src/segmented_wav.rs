@@ -1407,7 +1407,11 @@ mod tests {
     use super::*;
     use std::fs::OpenOptions;
     use std::io::Write;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    const CRASH_WRITER_ROOT_ENV: &str = "DATABAKER_SEGMENTED_WAV_CRASH_WRITER_ROOT";
+    const CRASH_WRITER_HELPER_TEST: &str = "segmented_wav::tests::subprocess_crash_writer_helper";
 
     fn test_root(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -1433,6 +1437,103 @@ mod tests {
         .unwrap();
         let start = usize::try_from(layout.header_len).unwrap();
         bytes[start..start + data_bytes].to_vec()
+    }
+
+    #[test]
+    fn subprocess_crash_writer_helper() {
+        let Some(root) = std::env::var_os(CRASH_WRITER_ROOT_ENV).map(PathBuf::from) else {
+            return;
+        };
+        let segment_dir = root.join("segments");
+        let mut writer = SegmentedWav::create(&segment_dir, 48_000, 1, 24, 4).unwrap();
+        writer
+            .write_samples(&[-0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75])
+            .unwrap();
+
+        // The first segment was finalized by rollover, while the second has
+        // physical PCM beyond its deliberately stale WAV header. Tell the
+        // parent only after both states are observable from another process.
+        std::fs::write(root.join("writer-ready"), b"ready").unwrap();
+        loop {
+            std::hint::black_box(writer.global_frames());
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    #[test]
+    fn resumes_a_real_segment_writer_after_external_process_kill() {
+        let root = test_root("external-kill");
+        let segment_dir = root.join("segments");
+        let active_path = segment_dir.join("master-000002.wav");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(CRASH_WRITER_HELPER_TEST)
+            .arg("--nocapture")
+            .env(CRASH_WRITER_ROOT_ENV, &root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("crash writer helper exited before it could be killed: {status}");
+            }
+            let pcm_is_visible =
+                std::fs::metadata(&active_path).is_ok_and(|metadata| metadata.len() >= 44 + 3 * 3);
+            if root.join("writer-ready").is_file() && pcm_is_visible {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("timed out waiting for the crash writer helper");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        child.kill().unwrap();
+        let killed = child.wait().unwrap();
+        assert!(!killed.success());
+
+        let closed_path = segment_dir.join("master-000001.wav");
+        let closed_before_resume = std::fs::read(&closed_path).unwrap();
+        let mut resumed = SegmentedWav::resume(&segment_dir, 48_000, 1, 24, 4).unwrap();
+        assert_eq!(resumed.global_frames(), 7);
+        assert_eq!(
+            resumed
+                .segments()
+                .iter()
+                .map(|segment| (segment.frames, segment.active))
+                .collect::<Vec<_>>(),
+            vec![(4, false), (3, true)]
+        );
+
+        resumed.write_samples(&[0.875]).unwrap();
+        assert_eq!(resumed.checkpoint().unwrap(), 8);
+        assert_eq!(std::fs::read(&closed_path).unwrap(), closed_before_resume);
+
+        let recovered_export = root.join("recovered.wav");
+        assert_eq!(resumed.export_whole(&recovered_export).unwrap(), 8);
+
+        let reference_dir = root.join("reference");
+        let mut reference = SegmentedWav::create(&reference_dir, 48_000, 1, 24, 4).unwrap();
+        reference
+            .write_samples(&[-0.75, -0.5, -0.25, 0.0, 0.25, 0.5, 0.75, 0.875])
+            .unwrap();
+        reference.checkpoint().unwrap();
+        let reference_export = root.join("reference.wav");
+        assert_eq!(reference.export_whole(&reference_export).unwrap(), 8);
+        assert_eq!(
+            std::fs::read(&recovered_export).unwrap(),
+            std::fs::read(&reference_export).unwrap()
+        );
+
+        drop(reference);
+        drop(resumed);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
