@@ -44,6 +44,7 @@ type EngineIntent = Readonly<{
 type EngineOptionalState = {
   active?: unknown;
   session_dir?: unknown;
+  snapshot?: unknown;
   [key: string]: unknown;
 };
 
@@ -119,7 +120,10 @@ class EngineStateReconciliationError extends Error {
 }
 
 class EngineSessionConflictError extends Error {
-  constructor(readonly sessionDir: string) {
+  constructor(
+    readonly sessionDir: string,
+    readonly phase: 'active' | 'stopping' = 'active',
+  ) {
     super(`录音引擎正在处理另一个任务：${sessionDir}`);
     this.name = 'EngineSessionConflictError';
   }
@@ -370,6 +374,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value));
 }
 
+function observedActiveSnapshotStatus(state: EngineOptionalState): string | null {
+  return isRecord(state.snapshot) && typeof state.snapshot.status === 'string'
+    ? state.snapshot.status
+    : null;
+}
+
+function observedLivePhase(state: EngineOptionalState): 'active' | 'stopping' {
+  return observedActiveSnapshotStatus(state) === 'recording' ? 'active' : 'stopping';
+}
+
 function isNonNegativeSafeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
@@ -442,6 +456,37 @@ function isValidStorageLayout(value: Record<string, unknown>): boolean {
   return value.segment_frames >= sampleRate && value.segment_frames <= sampleRate * 60 * 60;
 }
 
+function isValidCaptureProvenance(
+  value: unknown,
+  audioFormat: unknown,
+  committedSamples: unknown,
+): boolean {
+  if (value === undefined) return true;
+  if (!Array.isArray(value) || !isRecord(audioFormat)
+    || !isNonNegativeSafeInteger(audioFormat.sample_rate)
+    || !isNonNegativeSafeInteger(committedSamples)) return false;
+  let cursor = 0;
+  for (const span of value) {
+    if (!isRecord(span)
+      || span.start_sample !== cursor
+      || !isNonNegativeSafeInteger(span.end_sample)
+      || span.end_sample < cursor
+      || span.end_sample > committedSamples
+      || typeof span.device_name !== 'string'
+      || typeof span.device_id !== 'string'
+      || typeof span.input_sample_format !== 'string'
+      || span.input_sample_format.trim() === ''
+      || !isNonNegativeSafeInteger(span.input_channels)
+      || span.input_channels === 0
+      || !isNonNegativeSafeInteger(span.input_channel)
+      || span.input_channel === 0
+      || span.input_channel > span.input_channels
+      || span.sample_rate !== audioFormat.sample_rate) return false;
+    cursor = span.end_sample;
+  }
+  return value.length === 0 || cursor === committedSamples;
+}
+
 function parseValidSnapshot(value: unknown): Record<string, unknown> | null {
   if (!isRecord(value)
     || value.schema_version !== 1
@@ -459,6 +504,11 @@ function parseValidSnapshot(value: unknown): Record<string, unknown> | null {
     || !isNonNegativeSafeInteger(value.captured_samples)
     || !isNonNegativeSafeInteger(value.committed_samples)
     || !isNonNegativeSafeInteger(value.overflow_samples)
+    || !isValidCaptureProvenance(
+      value.capture_provenance,
+      value.audio_format,
+      value.committed_samples,
+    )
     || typeof value.started_at !== 'string'
     || typeof value.updated_at !== 'string'
     || !isValidNoiseCheck(value.noise_check)
@@ -921,7 +971,7 @@ async function hasActiveEngineSession(): Promise<boolean> {
     const state = await engine.request('get_state_optional', {}, 3_000) as EngineOptionalState;
     if (!ownsEngineGeneration(observedIntent) || isQuitting()) return intentTracksLiveSession();
     if (state.active === true && typeof state.session_dir === 'string') {
-      beginEngineIntent('active', state.session_dir);
+      beginEngineIntent(observedLivePhase(state), state.session_dir);
       knownSessionDirs.add(state.session_dir);
       return true;
     }
@@ -1360,6 +1410,13 @@ async function requestSessionWithReconciliation(
   try {
     const result = await engine.request(command, payload, timeoutMs);
     assertCurrentEngineIntent(intent, allowedPhases);
+    if (!isRecord(result)
+      || typeof result.session_dir !== 'string'
+      || !isSameSessionDir(result.session_dir, sessionDir)
+      || !isRecord(result.snapshot)
+      || result.snapshot.status !== 'recording') {
+      throw new Error('录音引擎未返回可确认的 recording 状态');
+    }
     return result;
   } catch (error) {
     assertCurrentEngineIntent(intent, allowedPhases);
@@ -1376,8 +1433,21 @@ async function requestSessionWithReconciliation(
   }
 
   if (state.active === true && typeof state.session_dir === 'string') {
-    if (isSameSessionDir(state.session_dir, sessionDir)) return state;
-    throw new EngineSessionConflictError(state.session_dir);
+    const observedStatus = observedActiveSnapshotStatus(state);
+    if (isSameSessionDir(state.session_dir, sessionDir)) {
+      if (observedStatus === 'recording') return state;
+      const detail = observedStatus === 'stopping'
+        ? '录音引擎仍在安全收尾，未进入可录制状态'
+        : `录音引擎返回了不可确认的活动状态：${observedStatus ?? '缺少状态'}`;
+      throw new EngineStateReconciliationError(requestError, new Error(detail));
+    }
+    throw new EngineSessionConflictError(state.session_dir, observedLivePhase(state));
+  }
+  if (state.active !== false) {
+    throw new EngineStateReconciliationError(
+      requestError,
+      new Error('录音引擎返回了无法确认的可选任务状态'),
+    );
   }
   throw requestError;
 }
@@ -1408,10 +1478,10 @@ async function notifyEngineRecovered(
 }
 
 async function notifyEngineRecoveryFailed(intent: EngineIntent, latestError: string): Promise<void> {
-  if (!isCurrentEngineIntent(intent, ['idle', 'active'])) return;
+  if (!isCurrentEngineIntent(intent, ['idle', 'active', 'stopping'])) return;
   try {
     const window = await showMainWindow();
-    if (!isCurrentEngineIntent(intent, ['idle', 'active'])) return;
+    if (!isCurrentEngineIntent(intent, ['idle', 'active', 'stopping'])) return;
     await dialog.showMessageBox(window, {
       type: 'error',
       title: '录音引擎无法自动恢复',
@@ -1465,9 +1535,16 @@ async function runEngineRecovery(job: EngineRecoveryJob): Promise<void> {
       latestError = error instanceof Error ? error.message : String(error);
       console.error(`录音引擎第 ${attempt} 次自动恢复失败：`, error);
       if (error instanceof EngineSessionConflictError) {
-        transitionEngineIntent(intent, 'active', error.sessionDir);
+        transitionEngineIntent(intent, error.phase, error.sessionDir);
         knownSessionDirs.add(error.sessionDir);
         sendToMain('engine:offline', latestError);
+        if (error.phase === 'stopping') {
+          sendToMain('engine:event', {
+            protocol_version: 1,
+            event: 'engine_recovery_failed',
+            payload: { session_dir: error.sessionDir, error: latestError },
+          });
+        }
         void notifyEngineRecoveryFailed(intent, latestError);
         return;
       }
@@ -1477,6 +1554,21 @@ async function runEngineRecovery(job: EngineRecoveryJob): Promise<void> {
       } catch (stopError) {
         if (!isCurrentEngineIntent(intent, ['recovering'])) return;
         console.error('自动恢复重试前无法完全停止旧引擎：', stopError);
+        if (engine?.running) {
+          latestError = stopError instanceof Error ? stopError.message : String(stopError);
+          retainStoppingIntentAfterEngineStopFailure(
+            intent,
+            '自动恢复重试前旧引擎仍在安全停止',
+            stopError,
+          );
+          sendToMain('engine:event', {
+            protocol_version: 1,
+            event: 'engine_recovery_failed',
+            payload: { session_dir: sessionDir, error: latestError },
+          });
+          void notifyEngineRecoveryFailed(intent, latestError);
+          return;
+        }
       }
     }
   }
@@ -1753,9 +1845,10 @@ function adoptObservedActiveSession(intent: EngineIntent, state: EngineOptionalS
     throw new Error('录音引擎返回了无效的活动任务状态');
   }
   const activeSessionDir = path.resolve(state.session_dir);
-  transitionEngineIntent(intent, 'active', activeSessionDir);
+  const activePhase = observedLivePhase(state);
+  transitionEngineIntent(intent, activePhase, activeSessionDir);
   knownSessionDirs.add(activeSessionDir);
-  throw new EngineSessionConflictError(activeSessionDir);
+  throw new EngineSessionConflictError(activeSessionDir, activePhase);
 }
 
 async function assertEngineIdleForOfflineSeal(intent: EngineIntent): Promise<void> {
@@ -2002,10 +2095,30 @@ async function failSealingSession(intent: EngineIntent, originalError: unknown):
   throw originalError;
 }
 
+function retainStoppingIntentAfterEngineStopFailure(
+  intent: EngineIntent,
+  context: string,
+  error: unknown,
+): void {
+  if (!ownsEngineGeneration(intent)) return;
+  console.error(`${context}：`, error);
+  if (!engine?.running) {
+    transitionEngineIntent(intent, 'idle', null);
+    return;
+  }
+  transitionEngineIntent(intent, 'stopping', intent.sessionDir);
+  idleWhenEngineStopsGeneration = intent.generation;
+  ensureRecordingTray('⚠ 录音任务仍在安全停止…');
+  sendToMain(
+    'engine:offline',
+    '录音任务仍在安全收尾，已阻止新建或恢复其他任务。请稍后继续安全停止。',
+  );
+}
+
 async function failStartingSession(intent: EngineIntent, error: unknown): Promise<never> {
   if (error instanceof EngineIntentSupersededError || !ownsEngineGeneration(intent)) throw error;
   if (error instanceof EngineSessionConflictError) {
-    transitionEngineIntent(intent, 'active', error.sessionDir);
+    transitionEngineIntent(intent, error.phase, error.sessionDir);
     knownSessionDirs.add(error.sessionDir);
     throw error;
   }
@@ -2015,13 +2128,75 @@ async function failStartingSession(intent: EngineIntent, error: unknown): Promis
       await engine?.stop();
       assertCurrentEngineIntent(intent, ['stopping']);
     } catch (stopError) {
-      if (ownsEngineGeneration(intent)) {
-        console.error('录音状态不确定后无法完全停止引擎：', stopError);
-      }
+      retainStoppingIntentAfterEngineStopFailure(
+        intent,
+        '录音状态不确定后无法完全停止引擎',
+        stopError,
+      );
+      throw error;
     }
+    if (ownsEngineGeneration(intent)) transitionEngineIntent(intent, 'idle', null);
+    throw error;
   }
   if (ownsEngineGeneration(intent)) transitionEngineIntent(intent, 'idle', null);
   throw error;
+}
+
+async function finishPendingEngineStop(): Promise<unknown> {
+  if (!engine) throw new Error('录音引擎不可用');
+  const stopIntent = engineIntent;
+  if (stopIntent.phase !== 'stopping') throw new Error('当前没有待继续的安全停止');
+  const stoppedSessionDir = stopIntent.sessionDir;
+  idleWhenEngineStopsGeneration = null;
+  try {
+    await engine.stop();
+    assertCurrentEngineIntent(stopIntent, ['stopping']);
+    await engine.start();
+    assertCurrentEngineIntent(stopIntent, ['stopping']);
+  } catch (error) {
+    retainStoppingIntentAfterEngineStopFailure(
+      stopIntent,
+      '继续安全停止时引擎仍未完成收尾',
+      error,
+    );
+    throw error;
+  }
+  if (!stoppedSessionDir) {
+    transitionEngineIntent(stopIntent, 'idle', null);
+    throw new Error('安全停止已完成，但无法确认对应的录制目录');
+  }
+  let recovered: Awaited<ReturnType<typeof loadHistorySnapshot>>;
+  try {
+    recovered = await loadHistorySnapshot(
+      stoppedSessionDir,
+      path.join(stoppedSessionDir, 'metadata'),
+    );
+    assertCurrentEngineIntent(stopIntent, ['stopping']);
+  } catch (error) {
+    if (ownsEngineGeneration(stopIntent)) {
+      retainCrashSealObligation(
+        stoppedSessionDir,
+        '安全停止后无法读取已封存任务的持久化状态',
+      );
+      transitionEngineIntent(stopIntent, 'idle', null);
+    }
+    throw error;
+  }
+  if (!recovered
+    || (recovered.snapshot.status !== 'stopped'
+      && recovered.snapshot.status !== 'faulted')) {
+    const message = '安全停止已完成，但持久化任务尚未证明已封存；请刷新后使用“修复并封存”';
+    retainCrashSealObligation(stoppedSessionDir, message);
+    transitionEngineIntent(stopIntent, 'idle', null);
+    throw new Error(message);
+  }
+  clearCrashSealObligation(stoppedSessionDir);
+  transitionEngineIntent(stopIntent, 'idle', null);
+  return {
+    session_dir: stoppedSessionDir,
+    snapshot: recovered.snapshot,
+    reconciled_after_pending_stop: true,
+  };
 }
 
 async function rejectStartedSession(intent: EngineIntent, error: unknown): Promise<never> {
@@ -2031,9 +2206,12 @@ async function rejectStartedSession(intent: EngineIntent, error: unknown): Promi
     await engine?.stop();
     assertCurrentEngineIntent(intent, ['stopping']);
   } catch (stopError) {
-    if (ownsEngineGeneration(intent)) {
-      console.error('无法在拒绝异常录音目录后完全停止引擎：', stopError);
-    }
+    retainStoppingIntentAfterEngineStopFailure(
+      intent,
+      '无法在拒绝异常录音目录后完全停止引擎',
+      stopError,
+    );
+    throw error;
   }
   if (ownsEngineGeneration(intent)) transitionEngineIntent(intent, 'idle', null);
   throw error;
@@ -2059,7 +2237,7 @@ async function stopActiveSession(): Promise<unknown> {
     const state = await engine.request('get_state_optional', {}, 5_000) as EngineOptionalState;
     assertCurrentEngineIntent(stopIntent, ['stopping']);
     if (state.active === true && typeof state.session_dir === 'string') {
-      transitionEngineIntent(stopIntent, 'active', state.session_dir);
+      transitionEngineIntent(stopIntent, observedLivePhase(state), state.session_dir);
       knownSessionDirs.add(state.session_dir);
     } else {
       const stoppedSessionDir = stopIntent.sessionDir;
@@ -2073,12 +2251,17 @@ async function stopActiveSession(): Promise<unknown> {
           && (recovered.snapshot.status === 'stopped'
             || recovered.snapshot.status === 'faulted')) {
           transitionEngineIntent(stopIntent, 'idle', null);
+          clearCrashSealObligation(stoppedSessionDir);
           return {
             session_dir: stoppedSessionDir,
             snapshot: recovered.snapshot,
             reconciled_after_error: true,
           };
         }
+        retainCrashSealObligation(
+          stoppedSessionDir,
+          '安全停止后未能确认任务已封存',
+        );
       }
       transitionEngineIntent(stopIntent, 'idle', null);
     }
@@ -2089,7 +2272,12 @@ async function stopActiveSession(): Promise<unknown> {
       await engine.stop();
       assertCurrentEngineIntent(stopIntent, ['stopping']);
     } catch (stopError) {
-      if (ownsEngineGeneration(stopIntent)) console.error('录音引擎安全关闭失败：', stopError);
+      retainStoppingIntentAfterEngineStopFailure(
+        stopIntent,
+        '录音引擎安全关闭失败',
+        stopError,
+      );
+      throw requestError;
     }
     if (ownsEngineGeneration(stopIntent)) transitionEngineIntent(stopIntent, 'idle', null);
   }
@@ -2232,6 +2420,7 @@ function registerIpc(): void {
       }
     }
     if (command === 'stop_session') {
+      if (engineIntent.phase === 'stopping') return await finishPendingEngineStop();
       assertCanMutateActiveSession(command);
       return await stopActiveSession();
     }
@@ -2250,7 +2439,7 @@ function registerIpc(): void {
         if (engineIntent.phase === 'idle'
           && state.active === true
           && typeof state.session_dir === 'string') {
-          beginEngineIntent('active', state.session_dir);
+          beginEngineIntent(observedLivePhase(state), state.session_dir);
           knownSessionDirs.add(state.session_dir);
         } else if (engineIntent.phase === 'active' && state.active !== true) {
           beginEngineIntent('idle', null);
@@ -2363,7 +2552,36 @@ app.whenReady().then(async () => {
   engine.on('offline', (message) => {
     sendToMain('engine:offline', message);
     const interruptedIntent = engineIntent;
-    if (interruptedIntent.phase === 'stopping' || interruptedIntent.phase === 'quitting') return;
+    if (interruptedIntent.phase === 'quitting') return;
+    if (interruptedIntent.phase === 'stopping') {
+      const interruptedSessionDir = interruptedIntent.sessionDir;
+      if (interruptedSessionDir) retainCrashSealObligation(interruptedSessionDir, message);
+      pendingEngineRecovery = null;
+      idleWhenEngineStopsGeneration = null;
+      const recoveryIntent = beginEngineIntent('idle', null);
+      clearBackgroundRecordingStatus();
+      sendToMain('engine:event', {
+        protocol_version: 1,
+        event: 'engine_recovery_failed',
+        payload: {
+          session_dir: interruptedSessionDir ?? '',
+          error: `安全停止期间引擎异常退出：${message}`,
+        },
+      });
+      void engine?.start().then(() => {
+        if (!isCurrentEngineIntent(recoveryIntent, ['idle'])) return;
+        sendToMain('engine:event', {
+          protocol_version: 1,
+          event: 'engine_idle_after_stopping_crash',
+          payload: { session_dir: interruptedSessionDir },
+        });
+      }).catch((error) => {
+        if (!ownsEngineGeneration(recoveryIntent)) return;
+        sendToMain('engine:offline', `安全停止异常后无法重启录音引擎：${error instanceof Error ? error.message : String(error)}`);
+      });
+      void notifyEngineRecoveryFailed(recoveryIntent, message);
+      return;
+    }
     if (interruptedIntent.sessionDir && SESSION_LIVE_PHASES.includes(interruptedIntent.phase)) {
       retainCrashSealObligation(interruptedIntent.sessionDir, message);
       void recoverEngineAfterCrash(interruptedIntent.sessionDir, message);

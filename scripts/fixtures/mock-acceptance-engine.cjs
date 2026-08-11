@@ -55,6 +55,53 @@ function makeWav(sampleRate, bitDepth, frames) {
   return buffer;
 }
 
+function sealInterruptedSession(directory) {
+  const snapshotPath = path.join(directory, 'metadata', 'items.snapshot.json');
+  const recovered = JSON.parse(fs.readFileSync(snapshotPath, 'utf8'));
+  const segmentDirectory = path.join(directory, 'audio', 'segments');
+  const segmentNames = fs.readdirSync(segmentDirectory)
+    .filter((name) => /^master-\d{6}\.wav$/i.test(name))
+    .sort();
+  if (segmentNames.length === 0) throw new Error('mock recovery found no segments');
+  const sampleBytes = recovered.audio_format.bit_depth / 8;
+  const headerLength = recovered.audio_format.bit_depth === 32 ? 56 : 44;
+  let durableFrames = 0;
+  for (const name of segmentNames) {
+    const filePath = path.join(segmentDirectory, name);
+    const bytes = fs.readFileSync(filePath);
+    const frames = Math.floor(Math.max(0, bytes.length - headerLength) / sampleBytes);
+    fs.writeFileSync(
+      filePath,
+      makeWav(recovered.audio_format.sample_rate, recovered.audio_format.bit_depth, frames),
+    );
+    durableFrames += frames;
+  }
+  recovered.status = recovered.overflow_samples > 0 ? 'faulted' : 'stopped';
+  recovered.captured_samples = durableFrames;
+  recovered.committed_samples = durableFrames;
+  recovered.journal_seq = Number(recovered.journal_seq ?? 0) + 1;
+  recovered.updated_at = new Date().toISOString();
+  fs.writeFileSync(snapshotPath, `${JSON.stringify(recovered, null, 2)}\n`);
+  fs.writeFileSync(
+    path.join(directory, 'session.json'),
+    `${JSON.stringify({
+      schema_version: recovered.schema_version,
+      journal_seq: recovered.journal_seq,
+      session_id: recovered.session_id,
+      status: recovered.status,
+    }, null, 2)}\n`,
+  );
+  return {
+    session_dir: directory,
+    snapshot: recovered,
+    durable_frames: durableFrames,
+    recovered_attempts: 0,
+    fault_preserved: recovered.status === 'faulted',
+    no_op: false,
+    warnings: [],
+  };
+}
+
 function updateAudio() {
   if (!snapshot || stopped) return;
   const elapsed = Math.max(0, (Date.now() - startedAt) / 1_000);
@@ -192,6 +239,13 @@ createInterface({ input: process.stdin }).on('line', (line) => {
         `${JSON.stringify({ schema_version: 1, session_id: snapshot.session_id, status: snapshot.status }, null, 2)}\n`,
       );
       response(requestId, { session_dir: sessionDirectory, snapshot, warnings: [] });
+      break;
+    case 'seal_interrupted_session':
+      try {
+        response(requestId, sealInterruptedSession(command.payload.session_dir));
+      } catch (sealError) {
+        error(requestId, sealError.message);
+      }
       break;
     case 'export_session': {
       if (!stopped) {

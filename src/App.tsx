@@ -95,8 +95,13 @@ function latestUsableAttempt(item: ItemState): Attempt | undefined {
 
 function recordingState(recording: RecordingHistoryEntry): { kind: RecordingStateKind; label: string } {
   if (recording.status === 'faulted' || recording.overflow_samples > 0) return { kind: 'attention', label: '需要检查' };
+  if (recording.is_active && recording.status === 'stopping') {
+    return { kind: 'attention', label: '安全停止中' };
+  }
   if (recording.is_active) return { kind: 'unfinished', label: '当前录制' };
-  if (recording.status === 'recording') return { kind: 'attention', label: '异常中断' };
+  if (recording.status === 'recording' || recording.status === 'stopping') {
+    return { kind: 'attention', label: '异常中断' };
+  }
   if (recording.pending_items + recording.review_items > 0) return { kind: 'unfinished', label: '未完成' };
   return { kind: 'completed', label: '已完成' };
 }
@@ -394,6 +399,11 @@ function RecorderApp() {
       setEngineStatus('ready');
       void loadDevices().then((availableDevices) => queryRunningSession().then((current) => {
         if (!active || !current.active) return;
+        if (current.snapshot.status !== 'recording') {
+          setError('上次录音仍在安全收尾，已保留任务列表并阻止进入录制界面。');
+          void refreshRecordings(outputDirRef.current);
+          return;
+        }
         enterRunningSession(current, false, availableDevices);
       })).catch(() => undefined);
     }).catch((caught) => {
@@ -424,9 +434,13 @@ function RecorderApp() {
         const payload = message.payload as { state?: RunningSessionState };
         setEngineStatus('ready');
         setError('');
-        if (payload.state?.snapshot) {
+        if (payload.state?.snapshot.status === 'recording') {
           enterRunningSession(payload.state, true);
           setNotice('录音引擎已自动恢复；异常时的当前句已标记为中断，请重新做噪声检测。');
+        } else if (payload.state?.snapshot) {
+          setPhase('home');
+          setError('录音引擎仍在安全收尾，未进入可录制状态。');
+          void refreshRecordings(outputDirRef.current);
         }
       } else if (terminalRecoveryFailure) {
         resumeOperationRef.current = false;
@@ -465,6 +479,9 @@ function RecorderApp() {
       } else if (message.event === 'offline_seal_cleanup_finished') {
         setEngineStatus('ready');
         setNotice('离线封存的后台清理已完成，可以刷新任务或重试。');
+      } else if (message.event === 'engine_idle_after_stopping_crash') {
+        setEngineStatus('ready');
+        setNotice('录音引擎已重启；中断任务的已落盘母音频仍保留，请使用“修复并封存”。');
       }
     });
     const unsubscribeOffline = window.recorder.onEngineOffline((message) => {
@@ -876,7 +893,22 @@ function RecorderApp() {
   async function returnToActiveRecording() {
     const current = await run('正在返回当前录制…', () => window.recorder.request<RunningSessionState>('get_state'));
     if (!current) return;
+    if (current.snapshot.status !== 'recording') {
+      setError('当前任务仍在安全收尾，不能进入录制界面。');
+      await refreshRecordings();
+      return;
+    }
     enterRunningSession(current, false);
+  }
+
+  async function continuePendingStop(recording: RecordingHistoryEntry) {
+    const stopped = await run('正在继续安全封存…', () => (
+      window.recorder.request<StoppedSessionState>('stop_session')
+    ));
+    await refreshRecordings();
+    if (!stopped) return;
+    setEngineStatus('ready');
+    setNotice(`“${recording.session_id}”已完成安全收尾。`);
   }
 
   async function openRecordingExport(recording: RecordingHistoryEntry) {
@@ -1080,7 +1112,9 @@ function RecorderApp() {
               <div className="home-row-actions">
                 <button title="打开任务目录" aria-label={`打开 ${recording.session_id} 的任务目录`} onClick={() => void run('正在打开录制目录…', () => window.recorder.openPath(recording.session_dir))}><Icon name="folder" size={15} /></button>
                 {recording.is_active
-                  ? <button className="row-primary" onClick={() => void returnToActiveRecording()} disabled={Boolean(busy)}>返回录制</button>
+                  ? recording.status === 'stopping'
+                    ? <button className="row-primary" onClick={() => void continuePendingStop(recording)} disabled={Boolean(busy)}>继续安全停止</button>
+                    : <button className="row-primary" onClick={() => void returnToActiveRecording()} disabled={Boolean(busy)}>返回录制</button>
                   : recoveryPlan.primary === 'resume'
                     ? <>{recording.status === 'stopped' && recording.accepted_items > 0 && (recording.export_exists
                       ? <button title="查看已有交付" aria-label={`查看 ${recording.session_id} 的已有交付`} onClick={() => void openRecordingExport(recording)}><Icon name="export" size={15} /></button>

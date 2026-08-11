@@ -24,6 +24,16 @@ async function main() {
     'an interrupted unfinished task must offer resume and seal simultaneously',
   );
   assert.deepEqual(
+    planHistoryRecovery({ ...base, status: 'stopping', pending_items: 2 }),
+    { canResume: true, canSeal: true, primary: 'resume', secondary: 'seal' },
+    'a process that exited during bounded safe-stop must remain resumable and sealable',
+  );
+  assert.deepEqual(
+    planHistoryRecovery({ ...base, status: 'stopping' }),
+    { canResume: false, canSeal: true, primary: 'seal', secondary: null },
+    'a stopping task with no unfinished rows must still expose offline sealing',
+  );
+  assert.deepEqual(
     planHistoryRecovery({ ...base, status: 'stopped', review_items: 1 }),
     { canResume: true, canSeal: false, primary: 'resume', secondary: null },
     'a normally stopped unfinished task should remain resumable',

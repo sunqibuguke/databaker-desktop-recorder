@@ -262,19 +262,70 @@ export class EngineClient extends EventEmitter {
     );
     const deadline = Date.now() + gracefulTimeoutMs;
     let shutdownError: unknown = null;
-    try {
-      await this.request('shutdown', {}, shutdownTimeoutMs);
-    } catch (error) {
-      shutdownError = error;
-      if (error instanceof EngineRequestTimeoutError) {
-        this.emit('log', `录音引擎未在 ${shutdownTimeoutMs / 1_000} 秒内完成安全收尾，继续等待至总超时。`);
-      } else if (!this.hasExited(child)) {
-        const message = error instanceof Error ? error.message : String(error);
-        this.emit('log', `录音引擎安全收尾请求失败，将通过关闭输入通道继续收尾：${message}`);
+    let confirmedInactive = false;
+    while (!this.hasExited(child) && Date.now() < deadline) {
+      const remainingBeforeShutdown = Math.max(1, deadline - Date.now());
+      const requestTimeoutMs = Math.max(
+        1,
+        Math.min(shutdownTimeoutMs, remainingBeforeShutdown),
+      );
+      try {
+        await this.request('shutdown', {}, requestTimeoutMs);
+        shutdownError = null;
+        break;
+      } catch (error) {
+        shutdownError = error;
+        if (this.hasExited(child)) break;
+        if (error instanceof EngineRequestTimeoutError) {
+          this.emit('log', `录音引擎未在 ${requestTimeoutMs / 1_000} 秒内完成本次安全收尾，正在对账引擎状态。`);
+        } else {
+          const message = error instanceof Error ? error.message : String(error);
+          this.emit('log', `录音引擎安全收尾尚未完成，正在对账引擎状态：${message}`);
+        }
+
+        const remainingBeforeReconciliation = deadline - Date.now();
+        if (remainingBeforeReconciliation <= 0) break;
+        try {
+          const state = await this.request(
+            'get_state_optional',
+            {},
+            Math.max(1, Math.min(5_000, remainingBeforeReconciliation)),
+          );
+          if (state && typeof state === 'object' && (state as { active?: unknown }).active === false) {
+            // Capture resources are no longer live. Preserve the failed
+            // shutdown acknowledgement as a terminal error, but EOF is now
+            // safe to deliver so the sidecar can exit non-zero.
+            confirmedInactive = true;
+            break;
+          }
+          if (state && typeof state === 'object' && (state as { active?: unknown }).active === true) {
+            this.emit('log', '录音引擎仍在安全封存，将在总时限内继续重试。');
+          } else {
+            this.emit('log', '录音引擎返回了无法确认的状态，已保持输入通道并继续重试。');
+          }
+        } catch (reconciliationError) {
+          if (this.hasExited(child)) break;
+          const message = reconciliationError instanceof Error
+            ? reconciliationError.message
+            : String(reconciliationError);
+          this.emit('log', `无法确认录音引擎已停止，已保持输入通道：${message}`);
+        }
+
+        const retryDelayMs = Math.min(50, Math.max(0, deadline - Date.now()));
+        if (retryDelayMs > 0 && await this.waitForExit(child, retryDelayMs)) break;
       }
     }
 
-    if (!this.hasExited(child) && child.stdin.writable) child.stdin.end();
+    const shutdownConfirmed = this.shutdownConfirmedChildren.has(child);
+    // Closing stdin is itself a shutdown command. Do it only after the engine
+    // acknowledged a complete seal, or after state reconciliation proved that
+    // no capture session remains. An active/unknown session keeps the pipe and
+    // process alive beyond the UI deadline so accepted audio can still drain.
+    if ((shutdownConfirmed || confirmedInactive)
+      && !this.hasExited(child)
+      && child.stdin.writable) {
+      child.stdin.end();
+    }
     const remaining = Math.max(0, deadline - Date.now());
     if (!(await this.waitForExit(child, remaining))) {
       this.emit('log', `录音引擎安全收尾超过 ${gracefulTimeoutMs / 1_000} 秒，已保留子进程继续封存，不会自动强制结束。`);
@@ -286,7 +337,6 @@ export class EngineClient extends EventEmitter {
       code: child.exitCode,
       signal: child.signalCode,
     };
-    const shutdownConfirmed = this.shutdownConfirmedChildren.has(child);
     if (!shutdownConfirmed || !outcome.safe) {
       throw new EngineUnsafeStopError(outcome, shutdownConfirmed, shutdownError);
     }

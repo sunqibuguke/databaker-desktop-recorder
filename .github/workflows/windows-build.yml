@@ -53,6 +53,9 @@ jobs:
       - name: Run strict Rust lints
         run: node scripts/run-cargo.cjs clippy --manifest-path engine/Cargo.toml --all-targets -- -D warnings
 
+      - name: Run vendored CPAL WASAPI patch tests
+        run: cargo test --manifest-path engine/vendor/cpal/Cargo.toml --lib
+
       - name: Run type and Rust tests
         run: npm test
 
@@ -67,8 +70,10 @@ jobs:
           $resources = Join-Path "dist/win-unpacked" "resources"
           $acceptance = Join-Path $resources "acceptance/windows-audio-acceptance.cjs"
           $launcher = Join-Path $resources "acceptance/run-windows-audio-acceptance.ps1"
+          $cmdLauncher = Join-Path $resources "acceptance/run-windows-audio-acceptance.cmd"
+          $acceptanceDoc = Join-Path $resources "acceptance/Windows外置声卡生产验收.md"
           $engine = Join-Path $resources "bin/recorder-engine.exe"
-          foreach ($required in @($acceptance, $launcher, $engine)) {
+          foreach ($required in @($acceptance, $launcher, $cmdLauncher, $acceptanceDoc, $engine)) {
             if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
               throw "Packaged acceptance resource is missing: $required"
             }
@@ -79,10 +84,32 @@ jobs:
           if ($null -eq $hostExecutable) {
             throw "Packaged Electron executable was not found"
           }
-          $env:ELECTRON_RUN_AS_NODE = "1"
-          & $hostExecutable.FullName $acceptance --help | Out-Null
-          if ($LASTEXITCODE -ne 0) {
-            throw "Packaged acceptance toolkit failed to start (exit $LASTEXITCODE)"
+          $inventoryRoot = Join-Path $env:RUNNER_TEMP "databaker-packaged-inventory"
+          if (Test-Path -LiteralPath $inventoryRoot) {
+            Remove-Item -LiteralPath $inventoryRoot -Recurse -Force
+          }
+          $PSNativeCommandUseErrorActionPreference = $false
+          & $cmdLauncher --mode inventory --output $inventoryRoot --yes
+          $inventoryExit = $LASTEXITCODE
+          if ($inventoryExit -notin @(0, 1)) {
+            throw "Packaged acceptance inventory was incomplete (exit $inventoryExit)"
+          }
+          $reportFile = Get-ChildItem -LiteralPath $inventoryRoot -Filter "acceptance-report.json" -File -Recurse |
+            Select-Object -First 1
+          if ($null -eq $reportFile) {
+            throw "Packaged acceptance inventory did not write a report"
+          }
+          $report = Get-Content -LiteralPath $reportFile.FullName -Raw | ConvertFrom-Json
+          if ($report.overall -notin @("PASS", "FAIL") -or $null -ne $report.tool_error) {
+            throw "Packaged acceptance inventory did not complete cleanly: $($report.overall) $($report.tool_error)"
+          }
+          $cleanExit = $report.checks | Where-Object { $_.id -eq "engine-clean-exit" } | Select-Object -First 1
+          if ($null -eq $cleanExit -or $cleanExit.status -ne "PASS") {
+            throw "Packaged recorder-engine did not complete a clean JSONL protocol lifecycle"
+          }
+          $protocolLog = Join-Path $reportFile.DirectoryName "protocol.jsonl"
+          if (-not (Test-Path -LiteralPath $protocolLog -PathType Leaf) -or (Get-Item $protocolLog).Length -eq 0) {
+            throw "Packaged acceptance inventory did not record protocol traffic"
           }
 
       - name: Upload Windows installer

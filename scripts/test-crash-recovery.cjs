@@ -297,6 +297,29 @@ function assertRepairedPcm24(wavPath, expectedFrames, expectedAudio) {
   assert.deepEqual(bytes.subarray(wavHeaderBytes), expectedAudio);
 }
 
+function listWavSegments(directory) {
+  return fs.readdirSync(directory).filter((name) => /^master-\d{6}\.wav$/.test(name)).sort();
+}
+
+function assertPcm24SegmentDescriptor(wavPath) {
+  const descriptorPath = `${wavPath}.descriptor.json`;
+  const metadata = fs.lstatSync(descriptorPath);
+  assert.equal(metadata.isFile(), true);
+  assert.equal(metadata.isSymbolicLink(), false);
+  assert.deepEqual(JSON.parse(fs.readFileSync(descriptorPath, 'utf8')), {
+    schema_version: 1,
+    kind: 'databaker.segmented-wav-header',
+    segment_index: 1,
+    segment_file: path.basename(wavPath),
+    sample_rate: sampleRate,
+    channels: 1,
+    bit_depth: bitDepth,
+    encoding: 'pcm',
+    header_len: wavHeaderBytes,
+    max_frames_per_segment: sampleRate,
+  });
+}
+
 async function recover(sessionDir) {
   const engine = new EngineClient();
   try {
@@ -394,7 +417,11 @@ async function main() {
       killedFrames,
       killedBefore.subarray(wavHeaderBytes, wavHeaderBytes + killedFrames * frameBytes),
     );
-    assert.deepEqual(fs.readdirSync(path.dirname(killedWav)).sort(), killedSegmentsBefore);
+    assert.deepEqual(
+      listWavSegments(path.dirname(killedWav)),
+      killedSegmentsBefore.filter((name) => /^master-\d{6}\.wav$/.test(name)),
+    );
+    assertPcm24SegmentDescriptor(killedWav);
     assert.deepEqual(
       JSON.parse(fs.readFileSync(killedSnapshotPaths[0], 'utf8')),
       killedResult.snapshot,
@@ -447,7 +474,11 @@ async function main() {
       aheadFrames,
       aheadBefore.subarray(wavHeaderBytes, wavHeaderBytes + aheadFrames * frameBytes),
     );
-    assert.deepEqual(fs.readdirSync(path.dirname(aheadWav)).sort(), aheadSegmentsBefore);
+    assert.deepEqual(
+      listWavSegments(path.dirname(aheadWav)),
+      aheadSegmentsBefore.filter((name) => /^master-\d{6}\.wav$/.test(name)),
+    );
+    assertPcm24SegmentDescriptor(aheadWav);
     assert.notDeepEqual(fs.readFileSync(aheadSnapshotPath), aheadSnapshotBefore);
     assert.deepEqual(JSON.parse(fs.readFileSync(aheadSnapshotPath, 'utf8')), aheadResult.snapshot);
 

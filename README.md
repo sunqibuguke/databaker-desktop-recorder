@@ -54,7 +54,7 @@ Windows 安装包应在 Windows x64 构建机上执行 `npm run package`。Rust 
 npm run acceptance:audio -- --mode inventory
 ```
 
-Windows 安装包会把验收工具、启动器和文档放在 `resources/acceptance/`。工具覆盖 16/24/32-bit 短录、2–8 小时长稳、USB 拔出和专用测试卷磁盘保护，会保存设备 ID、请求/实际音频参数、WAV 属性、进度和故障证据。完整命令和 PASS/FAIL 标准见 [Windows 外置声卡生产验收](doc/Windows外置声卡生产验收.md)。
+Windows 安装包会把验收工具、启动器和文档放在 `resources/acceptance/`。工具覆盖 16/24/32-bit 短录、2–8 小时长稳、USB 拔出、专用测试卷磁盘保护，以及 `power-cut` → 重启 → `recover` 的真实断电两阶段门禁。生产 `power-cut` 只有在至少 1 小时样本已 committed、文件仍增长且尾差在预算内时才会落盘 nonce 证据并提示断电。`recover` 必须显式传入 `--phase1-report`，并同时匹配会话内证据、同一主机的新 boot、恢复前非终态和 `no_op=false`；正常 stopped 任务、仅杀进程或丢失 armed committed 音频都不能 PASS。它还会严格检查 WAV 头部/EOF、分段编号、完整帧、物理样本水位、overflow/fault marker 和引擎退出。显式的 `--test-only-power-cut` 短时回归只会生成 `TEST_ONLY_PASS` / `production_eligible=false`，不具备生产验收资格。完整命令和 PASS/FAIL 标准见 [Windows 外置声卡生产验收](doc/Windows外置声卡生产验收.md)。
 
 ### 推荐采集参数
 
@@ -62,7 +62,7 @@ Windows 安装包会把验收工具、启动器和文档放在 `resources/accept
 - 后期处理链路需要较大余量时：`48,000 Hz / 32-bit Float / Mono`。
 - 多输入声卡会显示“输入 1、输入 2…”；软件从所选硬件通道采集并交付单声道 WAV。
 
-位深选项控制实际写入 WAV 的编码，不是只写入元数据。硬件输入会优先使用驱动暴露的高精度采样格式，再转换为所选交付格式。如果声卡只提供低精度输入，选择更高交付位深不会凭空增加硬件有效精度。Windows 验收工具因此会分别记录驱动输入格式与交付 WAV 位深，并在 24/32-bit 验收中默认拒绝明显仅有 16-bit 表示的输入；声卡 ADC 有效位数仍需根据硬件规格和专业测量归档。
+位深选项控制实际写入 WAV 的编码，不是只写入元数据。硬件输入会优先使用驱动暴露的高精度采样格式，再转换为所选交付格式。如果声卡只提供低精度输入，选择更高交付位深不会凭空增加硬件有效精度。Windows shared mode 下，候选客户端格式还会受 `GetMixFormat` 有效精度上限约束；不会把 Windows 音频引擎接受格式转换误当成声卡精度升级。Windows 验收工具会分别记录输入样本格式与交付 WAV 位深，并按有效数字精度判定输入门槛（整数 `n` bit 按 `n`，`f32=24`，`f64=53`）。该数字样本精度不等于声卡 ADC ENOB，后者仍需根据硬件规格和专业测量归档。
 
 当前 Windows 基线是 WASAPI，覆盖无需厂商 SDK 的部署场景。仅提供 ASIO、且不提供可用 Windows 输入端点的特殊声卡不在当前基线内，应作为单独的驱动兼容项目验证。
 

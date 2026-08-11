@@ -48,11 +48,7 @@ const WRITER_QUEUE_CLOSED: u64 = 1 << 63;
 const WRITER_QUEUE_IN_FLIGHT_MASK: u64 = WRITER_QUEUE_CLOSED - 1;
 const WRITER_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(25);
 const WRITER_COMMIT_DEADLINE: Duration = Duration::from_secs(30);
-const WRITER_STOP_TIMEOUT: Duration = Duration::from_secs(25);
-#[cfg(not(test))]
-const WRITER_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
-#[cfg(test)]
-const WRITER_JOIN_TIMEOUT: Duration = Duration::from_millis(100);
+const CAPTURE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 // Electron gives normal engine commands 20 seconds. Return control to the
 // protocol loop before that deadline so a slow preview worker can never block
 // a subsequent safe-stop request until the 90-second process kill budget.
@@ -149,6 +145,18 @@ pub struct AudioFormat {
     pub input_channel: u16,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureProvenanceSpan {
+    pub start_sample: u64,
+    pub end_sample: u64,
+    pub device_name: String,
+    pub device_id: String,
+    pub input_sample_format: String,
+    pub input_channels: u16,
+    pub input_channel: u16,
+    pub sample_rate: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub schema_version: u32,
@@ -167,6 +175,11 @@ pub struct SessionSnapshot {
     /// independent from the requested WAV delivery bit depth.
     #[serde(default)]
     pub input_sample_format: String,
+    /// Durable sample ranges attributed to each actual driver configuration.
+    /// Older snapshots have no spans and retain their legacy top-level source
+    /// fields; the first resume upgrades them without inventing sample data.
+    #[serde(default)]
+    pub capture_provenance: Vec<CaptureProvenanceSpan>,
     pub audio_format: AudioFormat,
     pub master_audio: String,
     /// Version of the on-disk master-audio layout. Version 1 is the numbered
@@ -348,11 +361,36 @@ impl WriterQueueBudget {
             })
     }
 
-    fn close_and_wait(&self) {
+    fn close(&self) {
         self.enqueue_state
             .fetch_or(WRITER_QUEUE_CLOSED, Ordering::AcqRel);
+    }
+
+    fn in_flight(&self) -> u64 {
+        self.enqueue_state.load(Ordering::Acquire) & WRITER_QUEUE_IN_FLIGHT_MASK
+    }
+
+    fn close_and_wait_until(&self, deadline: Instant) -> bool {
+        self.close();
         let mut spins = 0u32;
-        while self.enqueue_state.load(Ordering::Acquire) & WRITER_QUEUE_IN_FLIGHT_MASK != 0 {
+        while self.in_flight() != 0 {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            if spins < 100 {
+                std::hint::spin_loop();
+                spins += 1;
+            } else {
+                thread::yield_now();
+            }
+        }
+        true
+    }
+
+    fn close_and_wait(&self) {
+        self.close();
+        let mut spins = 0u32;
+        while self.in_flight() != 0 {
             if spins < 100 {
                 std::hint::spin_loop();
                 spins += 1;
@@ -379,6 +417,17 @@ impl WriterQueueBudget {
                 Some(queued.saturating_sub(frames))
             });
     }
+}
+
+fn wait_for_thread_until(handle: &JoinHandle<()>, deadline: Instant) -> bool {
+    while !handle.is_finished() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+    true
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -594,6 +643,15 @@ pub struct RecordingSession {
     capture_stopped: bool,
 }
 
+#[derive(Debug)]
+struct ActivationCleanupReport {
+    warnings: Vec<String>,
+    capture_resources_joined: bool,
+    audio_safe: bool,
+    captured_samples: u64,
+    committed_samples: u64,
+}
+
 pub struct Engine {
     emitter: Emitter,
     pub session: Option<RecordingSession>,
@@ -716,6 +774,7 @@ impl Engine {
             device_name: payload.device_name.unwrap_or_default(),
             device_id: payload.device_id.unwrap_or_default(),
             input_sample_format: String::new(),
+            capture_provenance: Vec::new(),
             audio_format: AudioFormat {
                 sample_rate: payload.sample_rate,
                 bit_depth: payload.bit_depth,
@@ -847,6 +906,7 @@ impl Engine {
             )?;
         }
         let output_encoding = WavEncoding::for_bit_depth(snapshot.audio_format.bit_depth)?;
+        let previous_capture_source = capture_span_from_snapshot(&snapshot, 0, 0);
         let host = cpal::default_host();
         let requested_device_id =
             (!snapshot.device_id.is_empty()).then_some(snapshot.device_id.as_str());
@@ -863,6 +923,7 @@ impl Engine {
             &device,
             snapshot.audio_format.sample_rate,
             input_channel_index,
+            snapshot.audio_format.bit_depth,
         )?;
         let input_channels = supported.channels();
         let sample_format = supported.sample_format();
@@ -923,6 +984,7 @@ impl Engine {
                             max_frames_per_segment,
                         )?
                     };
+                    recovery_warnings.extend(writer.recovery_warnings().iter().cloned());
                     writer.global_frames()
                 }
             };
@@ -952,11 +1014,16 @@ impl Engine {
         } else {
             0
         };
+        begin_capture_provenance(
+            &mut snapshot,
+            previous_capture_source,
+            expected_existing_frames,
+        )?;
 
-        // A recoverable projection must exist before the audio stream can emit
-        // its first frame. If the process dies between stream startup and the
-        // first journal event, resume can still discover the physical segments
-        // from this sequence-zero bootstrap snapshot.
+        // A recoverable projection must exist before writer/stream resources
+        // are assembled. The authoritative activation event is committed
+        // before `stream.play`; this sequence-zero bootstrap also keeps a new
+        // task discoverable if setup dies before that first journal event.
         if !append {
             atomic_snapshot_json(&session_dir.join("metadata/items.snapshot.json"), &snapshot)?;
             atomic_json(&session_dir.join("script/normalized.json"), &snapshot.items)?;
@@ -971,6 +1038,7 @@ impl Engine {
                     "device_name": snapshot.device_name,
                     "device_id": snapshot.device_id,
                     "input_sample_format": snapshot.input_sample_format,
+                    "capture_provenance": snapshot.capture_provenance,
                     "audio_format": snapshot.audio_format,
                     "storage_layout_version": snapshot.storage_layout_version,
                     "segment_frames": snapshot.segment_frames,
@@ -1048,62 +1116,113 @@ impl Engine {
                     writer_ready_tx,
                 )
             })?;
+
+        // Own the writer and task lock before waiting for its initialization
+        // handshake. A slow or wedged WAV open must never make this command
+        // release the lock while an unjoined writer still holds the audio.
+        let mut session = RecordingSession {
+            _session_lock: session_lock,
+            session_dir,
+            snapshot,
+            stream: None,
+            writer_tx,
+            writer_queue,
+            writer_join: Some(writer_join),
+            telemetry_join: None,
+            telemetry_stop,
+            captured,
+            committed,
+            overflow,
+            faulted,
+            peak: peak_bits,
+            rms: rms_bits,
+            silence_samples,
+            attempt_signal_start_sample,
+            silence_threshold_bits,
+            active_attempt: None,
+            metadata_fault: None,
+            stop_requested: false,
+            capture_stopped: false,
+        };
         match writer_ready_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(frames)) if frames == expected_existing_frames => {}
-            Ok(Ok(_)) => {
-                drop(writer_tx);
-                let _ = writer_join.join();
-                bail!("母音频在恢复录制前发生了变化");
+            Ok(Ok(frames)) => {
+                session.faulted.store(true, Ordering::Release);
+                persist_audio_fault_marker(
+                    &session.session_dir,
+                    "master audio changed during the writer initialization handshake",
+                    session.committed.load(Ordering::Acquire),
+                );
+                return Err(self.finish_activation_failure(
+                    session,
+                    "initialize_audio_writer",
+                    anyhow!(
+                        "母音频在恢复录制前发生了变化：期望 {expected_existing_frames} 帧，实际 {frames} 帧"
+                    ),
+                ));
             }
             Ok(Err(message)) => {
-                drop(writer_tx);
-                let _ = writer_join.join();
-                bail!(message);
+                return Err(self.finish_activation_failure(
+                    session,
+                    "initialize_audio_writer",
+                    anyhow!(message),
+                ));
             }
-            Err(_) => {
-                drop(writer_tx);
-                let _ = writer_join.join();
-                bail!("audio writer initialization timed out");
+            Err(error) => {
+                return Err(self.finish_activation_failure(
+                    session,
+                    "initialize_audio_writer",
+                    anyhow!("audio writer initialization handshake failed: {error}"),
+                ));
             }
         }
 
-        let stream = build_stream(
+        let stream = match build_stream(
             &device,
             &config,
             sample_format,
             input_channel_index,
-            writer_tx.clone(),
-            Arc::clone(&captured),
-            Arc::clone(&overflow),
-            Arc::clone(&faulted),
-            Arc::clone(&peak_bits),
-            Arc::clone(&rms_bits),
-            writer_queue.clone(),
+            session.writer_tx.clone(),
+            Arc::clone(&session.captured),
+            Arc::clone(&session.overflow),
+            Arc::clone(&session.faulted),
+            Arc::clone(&session.peak),
+            Arc::clone(&session.rms),
+            session.writer_queue.clone(),
             SilenceMonitor {
-                silence_samples: Arc::clone(&silence_samples),
+                silence_samples: Arc::clone(&session.silence_samples),
                 last_signal_sample: Arc::clone(&last_signal_sample),
-                attempt_signal_start_sample: Arc::clone(&attempt_signal_start_sample),
-                threshold_bits: Arc::clone(&silence_threshold_bits),
+                attempt_signal_start_sample: Arc::clone(&session.attempt_signal_start_sample),
+                threshold_bits: Arc::clone(&session.silence_threshold_bits),
             },
-        )?;
-        stream.play().context("start input stream")?;
+        ) {
+            Ok(stream) => stream,
+            Err(error) => {
+                return Err(self.finish_activation_failure(
+                    session,
+                    "build_input_stream",
+                    error.context("build input stream"),
+                ));
+            }
+        };
+        session.stream = Some(stream);
 
         let emitter = self.emitter.clone();
-        let telemetry_stop_thread = Arc::clone(&telemetry_stop);
-        let captured_thread = Arc::clone(&captured);
-        let committed_thread = Arc::clone(&committed);
-        let overflow_thread = Arc::clone(&overflow);
-        let faulted_thread = Arc::clone(&faulted);
+        let telemetry_stop_thread = Arc::clone(&session.telemetry_stop);
+        let captured_thread = Arc::clone(&session.captured);
+        let committed_thread = Arc::clone(&session.committed);
+        let overflow_thread = Arc::clone(&session.overflow);
+        let faulted_thread = Arc::clone(&session.faulted);
         let storage_status_thread = Arc::clone(&storage_status);
         let storage_remaining_thread = Arc::clone(&storage_safe_remaining_seconds);
-        let peak_thread = Arc::clone(&peak_bits);
-        let rms_thread = Arc::clone(&rms_bits);
-        let silence_samples_thread = Arc::clone(&silence_samples);
+        let peak_thread = Arc::clone(&session.peak);
+        let rms_thread = Arc::clone(&session.rms);
+        let silence_samples_thread = Arc::clone(&session.silence_samples);
         let last_signal_sample_thread = Arc::clone(&last_signal_sample);
-        let silence_threshold_thread = Arc::clone(&silence_threshold_bits);
-        let silence_duration_ms = snapshot.silence_duration_ms;
-        let telemetry_session_dir = session_dir.clone();
-        let telemetry_join = thread::Builder::new()
+        let silence_threshold_thread = Arc::clone(&session.silence_threshold_bits);
+        let silence_duration_ms = session.snapshot.silence_duration_ms;
+        let telemetry_session_dir = session.session_dir.clone();
+        let telemetry_join = match thread::Builder::new()
             .name("telemetry".to_string())
             .spawn(move || {
                 let mut fault_marker_observed = false;
@@ -1164,32 +1283,18 @@ impl Engine {
                     );
                     thread::sleep(Duration::from_millis(80));
                 }
-            })?;
-
-        let mut session = RecordingSession {
-            _session_lock: session_lock,
-            session_dir,
-            snapshot,
-            stream: Some(stream),
-            writer_tx,
-            writer_queue,
-            writer_join: Some(writer_join),
-            telemetry_join: Some(telemetry_join),
-            telemetry_stop,
-            captured,
-            committed,
-            overflow,
-            faulted,
-            peak: peak_bits,
-            rms: rms_bits,
-            silence_samples,
-            attempt_signal_start_sample,
-            silence_threshold_bits,
-            active_attempt: None,
-            metadata_fault: None,
-            stop_requested: false,
-            capture_stopped: false,
+            })
+        {
+            Ok(join) => join,
+            Err(error) => {
+                return Err(self.finish_activation_failure(
+                    session,
+                    "start_telemetry",
+                    anyhow!(error).context("start telemetry supervisor"),
+                ));
+            }
         };
+        session.telemetry_join = Some(telemetry_join);
         if let Err(error) = session.persist(
             event_name,
             json!({
@@ -1207,17 +1312,23 @@ impl Engine {
                 "existing_samples": expected_existing_frames,
             }),
         ) {
-            let cleanup_warnings = session.cleanup_after_activation_failure();
-            let context = if cleanup_warnings.is_empty() {
-                "persist initial recording metadata; capture resources were stopped and joined"
-                    .to_string()
-            } else {
-                format!(
-                    "persist initial recording metadata; capture cleanup warnings: {}",
-                    cleanup_warnings.join("; ")
-                )
-            };
-            return Err(error.context(context));
+            return Err(self.finish_activation_failure(
+                session,
+                "persist_activation_metadata",
+                error.context("persist initial recording metadata"),
+            ));
+        }
+        // The full-snapshot journal event above is the durable provenance
+        // boundary for this activation. Only now may the driver emit samples;
+        // otherwise a crash during resume could append new-device audio while
+        // the disk still attributes the tail to the previous configuration.
+        if let Err(error) = session
+            .stream
+            .as_ref()
+            .context("input stream is unavailable after activation metadata commit")
+            .and_then(|stream| stream.play().context("start input stream"))
+        {
+            return Err(self.finish_activation_failure(session, "play_input_stream", error));
         }
         let result = json!({
             "snapshot": session.snapshot,
@@ -1650,6 +1761,7 @@ impl Engine {
         // an incomplete final frame and stale RIFF counters; `finalize` makes
         // that physical recovery durable. Neither path writes PCM samples.
         let max_frames_per_segment = storage_layout_segment_frames(&snapshot)?;
+        let mut audio_recovery_warnings = Vec::<String>::new();
         let durable_frames = match storage_kind {
             MasterStorageKind::LegacySingleWav => RecoverableWav::open_append(
                 &master_path,
@@ -1658,15 +1770,20 @@ impl Engine {
                 snapshot.audio_format.bit_depth,
             )?
             .finalize()?,
-            MasterStorageKind::SegmentedWav => SegmentedWav::resume(
-                &master_path,
-                snapshot.audio_format.sample_rate,
-                1,
-                snapshot.audio_format.bit_depth,
-                max_frames_per_segment,
-            )?
-            .finalize()?,
+            MasterStorageKind::SegmentedWav => {
+                let writer = SegmentedWav::resume(
+                    &master_path,
+                    snapshot.audio_format.sample_rate,
+                    1,
+                    snapshot.audio_format.bit_depth,
+                    max_frames_per_segment,
+                )?;
+                audio_recovery_warnings.extend(writer.recovery_warnings().iter().cloned());
+                writer.finalize()?
+            }
         };
+        let provenance_recovered =
+            reconcile_capture_provenance_after_recovery(&mut snapshot, durable_frames)?;
         if let Err(error) = validate_attempt_boundaries(&snapshot, durable_frames) {
             let final_marker_exists =
                 std::fs::symlink_metadata(session_dir.join(AUDIO_FAULT_MARKER)).is_ok();
@@ -1693,6 +1810,10 @@ impl Engine {
             .filter(|attempt| attempt.status == "interrupted")
             .count();
         let mut warnings = journal.warnings.clone();
+        warnings.extend(audio_recovery_warnings);
+        if provenance_recovered {
+            warnings.push("已根据物理母轨长度补全异常中断前的最后一段采集来源区间。".to_string());
+        }
         let interrupted_warnings =
             recover_interrupted_attempts(&journal, &mut snapshot, durable_frames)?;
         let has_interrupted_recovery = !interrupted_warnings.is_empty();
@@ -1722,6 +1843,7 @@ impl Engine {
             && recovered_attempts == 0
             && final_status_consistent
             && !journal_requires_rewrite
+            && !provenance_recovered
         {
             return Ok(json!({
                 "session_dir": session_dir,
@@ -2104,6 +2226,7 @@ impl Engine {
             "device_name": snapshot.device_name,
             "device_id": snapshot.device_id,
             "input_sample_format": snapshot.input_sample_format,
+            "capture_provenance": snapshot.capture_provenance,
             "audio_format": snapshot.audio_format,
             "storage_layout_version": snapshot.storage_layout_version,
             "segment_frames": snapshot.segment_frames,
@@ -2169,6 +2292,70 @@ impl Engine {
             self.session.take();
         }
         result.map(|_| ())
+    }
+
+    fn finish_activation_failure(
+        &mut self,
+        session: RecordingSession,
+        stage: &str,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        self.finish_activation_failure_with_timeout(session, stage, error, CAPTURE_SHUTDOWN_TIMEOUT)
+    }
+
+    fn finish_activation_failure_with_timeout(
+        &mut self,
+        mut session: RecordingSession,
+        stage: &str,
+        error: anyhow::Error,
+        timeout: Duration,
+    ) -> anyhow::Error {
+        let reason = format!("{error:#}");
+        let cleanup = session.cleanup_after_activation_failure_with_timeout(timeout);
+        let persisted = session.persist_activation_failure(stage, &reason, &cleanup);
+        let cleanup_context = if cleanup.capture_resources_joined {
+            if cleanup.warnings.is_empty() {
+                "capture resources were stopped and joined within the safety deadline".to_string()
+            } else {
+                format!(
+                    "capture resources were stopped and joined with warnings: {}",
+                    cleanup.warnings.join("; ")
+                )
+            }
+        } else {
+            format!(
+                "capture cleanup reached its deadline; the live session, task lock, and unfinished handles were retained{}",
+                if cleanup.warnings.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", cleanup.warnings.join("; "))
+                }
+            )
+        };
+        let persistence_context = match persisted {
+            Ok(()) if !cleanup.capture_resources_joined => {
+                "session_activation_failed was durably committed as stopping; call stop_session again to finish cleanup"
+                    .to_string()
+            }
+            Ok(()) if cleanup.audio_safe => {
+                "session_activation_failed was durably committed as stopped and may be resumed"
+                    .to_string()
+            }
+            Ok(()) => {
+                "session_activation_failed was durably committed as faulted for manual recovery"
+                    .to_string()
+            }
+            Err(persist_error) => {
+                format!("could not durably commit session_activation_failed: {persist_error:#}")
+            }
+        };
+        if !cleanup.capture_resources_joined {
+            debug_assert!(self.session.is_none());
+            self.session = Some(session);
+        }
+        error.context(format!(
+            "activation stage {stage} failed; {cleanup_context}; {persistence_context}"
+        ))
     }
 
     fn active_session_mut(&mut self) -> Result<&mut RecordingSession> {
@@ -2258,6 +2445,130 @@ fn validate_attempt_boundaries(snapshot: &SessionSnapshot, durable_frames: u64) 
     Ok(())
 }
 
+fn capture_span_from_snapshot(
+    snapshot: &SessionSnapshot,
+    start_sample: u64,
+    end_sample: u64,
+) -> CaptureProvenanceSpan {
+    CaptureProvenanceSpan {
+        start_sample,
+        end_sample,
+        device_name: snapshot.device_name.clone(),
+        device_id: snapshot.device_id.clone(),
+        input_sample_format: if snapshot.input_sample_format.trim().is_empty() {
+            "unknown".to_string()
+        } else {
+            snapshot.input_sample_format.clone()
+        },
+        input_channels: snapshot.audio_format.input_channels,
+        input_channel: snapshot.audio_format.input_channel,
+        sample_rate: snapshot.audio_format.sample_rate,
+    }
+}
+
+fn same_capture_source(left: &CaptureProvenanceSpan, right: &CaptureProvenanceSpan) -> bool {
+    left.device_id == right.device_id
+        && left.device_name == right.device_name
+        && left.input_sample_format == right.input_sample_format
+        && left.input_channels == right.input_channels
+        && left.input_channel == right.input_channel
+        && left.sample_rate == right.sample_rate
+}
+
+fn validate_capture_provenance(
+    snapshot: &SessionSnapshot,
+    durable_frames: u64,
+    require_complete: bool,
+) -> Result<()> {
+    let mut cursor = 0u64;
+    for (index, span) in snapshot.capture_provenance.iter().enumerate() {
+        if span.start_sample != cursor
+            || span.end_sample < span.start_sample
+            || span.end_sample > durable_frames
+        {
+            bail!("采集来源的第 {} 个样本区间不连续或越界", index + 1);
+        }
+        if span.sample_rate != snapshot.audio_format.sample_rate
+            || span.input_channels == 0
+            || span.input_channel == 0
+            || span.input_channel > span.input_channels
+            || span.input_sample_format.trim().is_empty()
+        {
+            bail!("采集来源的第 {} 个驱动配置无效", index + 1);
+        }
+        cursor = span.end_sample;
+    }
+    if require_complete && !snapshot.capture_provenance.is_empty() && cursor != durable_frames {
+        bail!("采集来源区间未完整覆盖持久母轨");
+    }
+    Ok(())
+}
+
+fn begin_capture_provenance(
+    snapshot: &mut SessionSnapshot,
+    mut previous_source: CaptureProvenanceSpan,
+    existing_frames: u64,
+) -> Result<()> {
+    // Activations that produced no durable audio do not need an empty delivery
+    // span; their journal events still remain available for diagnostics.
+    while snapshot
+        .capture_provenance
+        .last()
+        .is_some_and(|span| span.start_sample == span.end_sample)
+    {
+        snapshot.capture_provenance.pop();
+    }
+    validate_capture_provenance(snapshot, existing_frames, false)?;
+
+    if snapshot.capture_provenance.is_empty() && existing_frames > 0 {
+        previous_source.start_sample = 0;
+        previous_source.end_sample = existing_frames;
+        snapshot.capture_provenance.push(previous_source);
+    } else if let Some(last) = snapshot.capture_provenance.last_mut()
+        && last.end_sample < existing_frames
+    {
+        if !same_capture_source(last, &previous_source) {
+            bail!("快照中未归属的母轨尾部无法安全匹配到上一次采集配置");
+        }
+        last.end_sample = existing_frames;
+    }
+
+    let current_source = capture_span_from_snapshot(snapshot, existing_frames, existing_frames);
+    snapshot.capture_provenance.push(current_source);
+    validate_capture_provenance(snapshot, existing_frames, true)
+}
+
+fn reconcile_capture_provenance_after_recovery(
+    snapshot: &mut SessionSnapshot,
+    durable_frames: u64,
+) -> Result<bool> {
+    if snapshot.capture_provenance.is_empty() {
+        // Backward-compatible legacy task: preserve its existing top-level
+        // source declaration rather than inventing activation boundaries.
+        return Ok(false);
+    }
+    validate_capture_provenance(snapshot, durable_frames, false)?;
+    let last_end = snapshot
+        .capture_provenance
+        .last()
+        .map_or(0, |span| span.end_sample);
+    if last_end == durable_frames {
+        validate_capture_provenance(snapshot, durable_frames, true)?;
+        return Ok(false);
+    }
+    let current_source = capture_span_from_snapshot(snapshot, 0, 0);
+    let last = snapshot
+        .capture_provenance
+        .last_mut()
+        .context("采集来源区间缺失")?;
+    if !same_capture_source(last, &current_source) {
+        bail!("物理母轨尾部超出已记录区间，且无法安全匹配到最后一次采集配置");
+    }
+    last.end_sample = durable_frames;
+    validate_capture_provenance(snapshot, durable_frames, true)?;
+    Ok(true)
+}
+
 fn session_summary_value(snapshot: &SessionSnapshot) -> Value {
     json!({
         "schema_version": snapshot.schema_version,
@@ -2268,6 +2579,7 @@ fn session_summary_value(snapshot: &SessionSnapshot) -> Value {
         "device_name": snapshot.device_name,
         "device_id": snapshot.device_id,
         "input_sample_format": snapshot.input_sample_format,
+        "capture_provenance": snapshot.capture_provenance,
         "audio_format": snapshot.audio_format,
         "storage_layout_version": snapshot.storage_layout_version,
         "segment_frames": snapshot.segment_frames,
@@ -2285,6 +2597,7 @@ fn validate_snapshot_for_export(snapshot: &SessionSnapshot) -> Result<()> {
     if snapshot.status != "stopped" {
         bail!("录制尚未安全结束，禁止生成常规交付；请先封存母轨。")
     }
+    validate_capture_provenance(snapshot, snapshot.committed_samples, true)?;
     for item in &snapshot.items {
         let Some(selected_id) = item.selected_attempt_id.as_deref() else {
             continue;
@@ -2946,7 +3259,13 @@ impl RecordingSession {
     fn live_snapshot(&self) -> SessionSnapshot {
         let mut snapshot = self.snapshot.clone();
         snapshot.captured_samples = self.captured.load(Ordering::Acquire);
-        snapshot.committed_samples = self.committed.load(Ordering::Acquire);
+        let committed_samples = self.committed.load(Ordering::Acquire);
+        snapshot.committed_samples = committed_samples;
+        if let Some(active_span) = snapshot.capture_provenance.last_mut()
+            && committed_samples >= active_span.start_sample
+        {
+            active_span.end_sample = committed_samples;
+        }
         snapshot.overflow_samples = self.overflow.load(Ordering::Acquire);
         snapshot.updated_at = Utc::now().to_rfc3339();
         snapshot
@@ -2959,72 +3278,161 @@ impl RecordingSession {
         Ok(())
     }
 
-    fn settle_captured_samples(&self) -> u64 {
-        let mut captured = self.captured.load(Ordering::Acquire);
-        let mut stable_since = Instant::now();
-        let settle_deadline = Instant::now() + Duration::from_millis(500);
-        while stable_since.elapsed() < Duration::from_millis(50) && Instant::now() < settle_deadline
-        {
-            thread::sleep(Duration::from_millis(10));
-            let current = self.captured.load(Ordering::Acquire);
-            if current != captured {
-                captured = current;
-                stable_since = Instant::now();
-            }
-        }
-        captured
-    }
-
-    /// Tears down every resource that was started before the first journal
-    /// event. This path deliberately joins the writer without detaching it:
-    /// returning the original persistence error must not leave a hidden stream,
-    /// telemetry loop, or unfinalized WAV behind.
-    fn cleanup_after_activation_failure(&mut self) -> Vec<String> {
+    /// Makes bounded progress toward stopping every capture resource. Handles
+    /// are taken only after their threads report completion; a timeout leaves
+    /// the handle and task lock in this session so a later stop can retry.
+    fn progress_capture_shutdown_with_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> ActivationCleanupReport {
+        let deadline = Instant::now() + timeout;
         let mut warnings = Vec::<String>::new();
         if let Some(stream) = self.stream.take() {
             if let Err(error) = stream.pause() {
-                warnings.push(format!("pause input stream: {error}"));
+                warnings.push(format!("pause input stream while stopping: {error}"));
             }
             drop(stream);
         }
         self.telemetry_stop.store(true, Ordering::Release);
-        if let Some(join) = self.telemetry_join.take()
-            && join.join().is_err()
-        {
-            warnings.push("telemetry thread panicked during activation cleanup".to_string());
-        }
+        let telemetry_joined = match self.telemetry_join.as_ref() {
+            None => true,
+            Some(join) if wait_for_thread_until(join, deadline) => {
+                let join = self
+                    .telemetry_join
+                    .take()
+                    .expect("finished telemetry handle disappeared");
+                if join.join().is_err() {
+                    warnings.push("telemetry thread panicked while stopping".to_string());
+                }
+                true
+            }
+            Some(_) => {
+                warnings.push(
+                    "telemetry thread is still stopping; its handle was retained".to_string(),
+                );
+                false
+            }
+        };
 
-        let captured = self.settle_captured_samples();
-        if let Err(error) = self.wait_until_committed(captured) {
-            warnings.push(format!(
-                "checkpoint audio during activation cleanup: {error:#}"
-            ));
+        // Close the callback-entry gate before measuring the accepted timeline.
+        // A callback already inside conversion may still own a lease. Do not
+        // put Stop into the channel until that finite set of callbacks drains.
+        let callback_gate_drained = self.writer_queue.close_and_wait_until(deadline);
+        if !callback_gate_drained {
+            warnings
+                .push("audio callback gate is still draining; the writer was retained".to_string());
         }
+        let captured = self.captured.load(Ordering::Acquire);
 
-        let mut committed = self.committed.load(Ordering::Acquire);
-        let (reply_tx, reply_rx) = bounded(1);
-        match self.writer_tx.send(WriterMessage::Stop(reply_tx)) {
-            Ok(()) => match reply_rx.recv_timeout(WRITER_STOP_TIMEOUT) {
-                Ok(Ok(value)) => committed = value,
-                Ok(Err(message)) => warnings.push(format!(
-                    "finalize audio during activation cleanup: {message}"
-                )),
+        if callback_gate_drained && !self.stop_requested {
+            let (reply_tx, reply_rx) = bounded(1);
+            self.stop_requested = true;
+            match self.writer_tx.send(WriterMessage::Stop(reply_tx)) {
+                Ok(()) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    match reply_rx.recv_timeout(remaining) {
+                        Ok(Ok(value)) => {
+                            // Never let a stale pre-Stop value overwrite a
+                            // later durable watermark published by the writer.
+                            self.committed.fetch_max(value, Ordering::AcqRel);
+                        }
+                        Ok(Err(message)) => {
+                            warnings.push(format!("audio writer could not finalize: {message}"));
+                            self.faulted.store(true, Ordering::Release);
+                        }
+                        Err(error) => warnings.push(format!(
+                            "audio writer is still finalizing; Stop reply was retained by the writer: {error}"
+                        )),
+                    }
+                }
                 Err(error) => warnings.push(format!(
-                    "wait for audio finalization during activation cleanup: {error}"
+                    "audio writer was unavailable when Stop was requested: {error}"
                 )),
-            },
-            Err(error) => warnings.push(format!(
-                "stop audio writer during activation cleanup: {error}"
-            )),
+            }
         }
-        self.committed.store(committed, Ordering::Release);
-        if let Some(join) = self.writer_join.take()
-            && join.join().is_err()
-        {
-            warnings.push("audio writer panicked during activation cleanup".to_string());
+
+        let writer_joined = match self.writer_join.as_ref() {
+            None => true,
+            Some(join) if wait_for_thread_until(join, deadline) => {
+                let join = self
+                    .writer_join
+                    .take()
+                    .expect("finished writer handle disappeared");
+                if join.join().is_err() {
+                    warnings.push("audio writer panicked while stopping".to_string());
+                    self.faulted.store(true, Ordering::Release);
+                }
+                true
+            }
+            Some(_) => {
+                warnings.push("audio writer is still sealing; its handle was retained".to_string());
+                false
+            }
+        };
+        let capture_resources_joined = callback_gate_drained && telemetry_joined && writer_joined;
+        self.capture_stopped = capture_resources_joined;
+        // Reload only after a finished writer has been joined. The writer owns
+        // this atomic and may advance it after the first Stop wait times out.
+        let committed_samples = self.committed.load(Ordering::Acquire);
+        let overflow_samples = self.overflow.load(Ordering::Acquire);
+        let audio_safe = capture_resources_joined
+            && !self.faulted.load(Ordering::Acquire)
+            && overflow_samples == 0
+            && committed_samples == captured;
+        ActivationCleanupReport {
+            warnings,
+            capture_resources_joined,
+            audio_safe,
+            captured_samples: captured,
+            committed_samples,
         }
-        self.capture_stopped = true;
-        warnings
+    }
+
+    #[cfg(test)]
+    fn cleanup_after_activation_failure(&mut self) -> ActivationCleanupReport {
+        self.progress_capture_shutdown_with_timeout(CAPTURE_SHUTDOWN_TIMEOUT)
+    }
+
+    fn cleanup_after_activation_failure_with_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> ActivationCleanupReport {
+        self.progress_capture_shutdown_with_timeout(timeout)
+    }
+
+    fn persist_activation_failure(
+        &mut self,
+        stage: &str,
+        reason: &str,
+        cleanup: &ActivationCleanupReport,
+    ) -> Result<()> {
+        let status = if !cleanup.capture_resources_joined {
+            "stopping"
+        } else if cleanup.audio_safe {
+            "stopped"
+        } else {
+            self.faulted.store(true, Ordering::Release);
+            persist_audio_fault_marker(
+                &self.session_dir,
+                &format!("recording activation failed during {stage}: {reason}"),
+                cleanup.committed_samples,
+            );
+            "faulted"
+        };
+        self.snapshot.status = status.to_string();
+        self.persist(
+            "session_activation_failed",
+            json!({
+                "stage": stage,
+                "reason": reason,
+                "capture_resources_joined": cleanup.capture_resources_joined,
+                "audio_safe": cleanup.audio_safe,
+                "resumable": cleanup.capture_resources_joined && cleanup.audio_safe,
+                "captured_samples": cleanup.captured_samples,
+                "committed_samples": cleanup.committed_samples,
+                "cleanup_warnings": &cleanup.warnings,
+            }),
+        )
     }
 
     fn latch_metadata_fault(&mut self, failure: &JournalAppendFailure) {
@@ -3037,15 +3445,20 @@ impl RecordingSession {
         // messages. This gives metadata durability failures the same finite,
         // drain-and-finalize behavior as an audio-device xrun.
         self.faulted.store(true, Ordering::Release);
-        self.writer_queue.close_and_wait();
+        self.writer_queue.close();
         persist_audio_fault_marker(
             &self.session_dir,
             &format!("metadata journal durability failure: {message}"),
             self.committed.load(Ordering::Acquire),
         );
-        let _ = self.writer_tx.try_send(WriterMessage::FaultAndStop(format!(
-            "metadata journal durability failure: {message}"
-        )));
+        // Keep journal error handling itself bounded. If a callback still owns
+        // the enqueue lease, the next stop attempt will wait for it before
+        // placing Stop behind the final Samples message.
+        if self.writer_queue.in_flight() == 0 {
+            let _ = self.writer_tx.try_send(WriterMessage::FaultAndStop(format!(
+                "metadata journal durability failure: {message}"
+            )));
+        }
     }
 
     fn persist(&mut self, event: &str, payload: Value) -> Result<()> {
@@ -3099,6 +3512,7 @@ impl RecordingSession {
                 "device_name": self.snapshot.device_name,
                 "device_id": self.snapshot.device_id,
                 "input_sample_format": self.snapshot.input_sample_format,
+                "capture_provenance": self.snapshot.capture_provenance,
                 "audio_format": self.snapshot.audio_format,
                 "storage_layout_version": self.snapshot.storage_layout_version,
                 "segment_frames": self.snapshot.segment_frames,
@@ -3178,6 +3592,7 @@ impl RecordingSession {
                 "device_name": self.snapshot.device_name,
                 "device_id": self.snapshot.device_id,
                 "input_sample_format": self.snapshot.input_sample_format,
+                "capture_provenance": self.snapshot.capture_provenance,
                 "audio_format": self.snapshot.audio_format,
                 "storage_layout_version": self.snapshot.storage_layout_version,
                 "segment_frames": self.snapshot.segment_frames,
@@ -3196,81 +3611,48 @@ impl RecordingSession {
         })
     }
 
-    fn stop(&mut self) -> Result<Value> {
+    fn stop_with_timeout(&mut self, timeout: Duration) -> Result<Value> {
         if self.capture_stopped {
             bail!("recording capture resources are already stopped");
         }
-        let mut warnings = Vec::<String>::new();
-        if !self.stop_requested {
-            if let Some(stream) = self.stream.take() {
-                // Pause first, then close the callback-entry gate. A callback
-                // that entered before pause holds a lease from its first line;
-                // close_and_wait therefore waits through conversion and queueing.
-                let _ = stream.pause();
-                drop(stream);
+        let cleanup = self.progress_capture_shutdown_with_timeout(timeout);
+        let mut warnings = cleanup.warnings;
+        if !cleanup.capture_resources_joined {
+            self.snapshot.status = "stopping".to_string();
+            if self.metadata_fault.is_none()
+                && let Err(error) = self.persist(
+                    "session_stopping",
+                    json!({
+                        "capture_resources_joined": false,
+                        "captured_samples": cleanup.captured_samples,
+                        "committed_samples": cleanup.committed_samples,
+                        "cleanup_warnings": &warnings,
+                    }),
+                )
+            {
+                warnings.push(format!("persist stopping state: {error:#}"));
             }
-            self.telemetry_stop.store(true, Ordering::Release);
-            if let Some(join) = self.telemetry_join.take() {
-                let _ = join.join();
-            }
-            self.writer_queue.close_and_wait();
-            let captured = self.settle_captured_samples();
-            if let Err(error) = self.wait_until_committed(captured) {
-                warnings.push(format!("audio checkpoint failed while stopping: {error:#}"));
-                self.faulted.store(true, Ordering::Release);
-            }
-            let (reply_tx, reply_rx) = bounded(1);
-            self.stop_requested = true;
-            match self.writer_tx.send(WriterMessage::Stop(reply_tx)) {
-                Ok(()) => match reply_rx.recv_timeout(WRITER_STOP_TIMEOUT) {
-                    Ok(Ok(value)) => self.committed.store(value, Ordering::Release),
-                    Ok(Err(message)) => {
-                        warnings.push(format!("audio writer could not finalize: {message}"));
-                        self.faulted.store(true, Ordering::Release);
-                    }
-                    Err(error) => {
-                        warnings.push(format!("audio writer stop timed out: {error}"));
-                        self.faulted.store(true, Ordering::Release);
-                    }
-                },
-                Err(error) => {
-                    warnings.push(format!("audio writer was already unavailable: {error}"));
-                    self.faulted.store(true, Ordering::Release);
-                }
-            }
-        }
-
-        let mut writer_exited = self.writer_join.is_none();
-        if let Some(join) = self.writer_join.as_ref() {
-            let join_deadline = Instant::now() + WRITER_JOIN_TIMEOUT;
-            while !join.is_finished() && Instant::now() < join_deadline {
-                thread::sleep(Duration::from_millis(20));
-            }
-            if join.is_finished() {
-                let join = self.writer_join.take().expect("writer handle disappeared");
-                if join.join().is_err() {
-                    warnings.push("audio writer panicked".to_string());
-                    self.faulted.store(true, Ordering::Release);
-                }
-                writer_exited = true;
+            let warning_context = if warnings.is_empty() {
+                String::new()
             } else {
-                let message = "audio writer is still sealing data after the safety timeout";
-                warnings.push(message.to_string());
-                self.faulted.store(true, Ordering::Release);
-                persist_audio_fault_marker(
-                    &self.session_dir,
-                    message,
-                    self.committed.load(Ordering::Acquire),
-                );
-            }
-        }
-        self.capture_stopped = writer_exited;
-        if !writer_exited {
+                format!(" 当前状态：{}", warnings.join("; "))
+            };
             bail!(
-                "音频仍在安全封存，任务锁和写入线程已保留；请稍后重试“结束录制”，不要强制结束进程。"
+                "音频仍在安全封存，状态已记为 stopping，任务锁与未结束的线程句柄保留；请稍后重试“结束录制”。{warning_context}"
             );
         }
         let committed = self.committed.load(Ordering::Acquire);
+        if !cleanup.audio_safe {
+            self.faulted.store(true, Ordering::Release);
+            persist_audio_fault_marker(
+                &self.session_dir,
+                &format!(
+                    "capture resources stopped without a complete durable timeline: captured={}, committed={committed}",
+                    cleanup.captured_samples
+                ),
+                committed,
+            );
+        }
         if self.metadata_fault.is_some() {
             return Err(self.metadata_seal_error(committed, warnings));
         }
@@ -3311,6 +3693,10 @@ impl RecordingSession {
             "snapshot": self.snapshot,
             "warnings": warnings,
         }))
+    }
+
+    fn stop(&mut self) -> Result<Value> {
+        self.stop_with_timeout(CAPTURE_SHUTDOWN_TIMEOUT)
     }
 }
 
@@ -4010,13 +4396,43 @@ fn input_format_score(format: SampleFormat) -> u8 {
     }
 }
 
+fn input_representation_bits(format: SampleFormat) -> Option<u16> {
+    match format {
+        SampleFormat::I8 | SampleFormat::U8 => Some(8),
+        SampleFormat::I16 | SampleFormat::U16 => Some(16),
+        SampleFormat::I24 | SampleFormat::U24 => Some(24),
+        SampleFormat::I32 | SampleFormat::U32 => Some(32),
+        SampleFormat::I64 | SampleFormat::U64 => Some(64),
+        // IEEE-754 precision includes the implicit leading significand bit.
+        // This describes the driver's sample representation, not ADC ENOB.
+        SampleFormat::F32 => Some(24),
+        SampleFormat::F64 => Some(53),
+        _ => None,
+    }
+}
+
+fn minimum_input_representation_bits(output_bit_depth: u16) -> Result<u16> {
+    match output_bit_depth {
+        16 => Ok(16),
+        // A 32-bit float delivery file can preserve headroom and processing
+        // precision, but commodity drivers normally expose f32 (24 bits of
+        // significand precision). Requiring 32 here would wrongly reject the
+        // native high-resolution path on most professional interfaces.
+        24 | 32 => Ok(24),
+        _ => bail!("unsupported output bit depth: {output_bit_depth}"),
+    }
+}
+
 fn select_config(
     device: &Device,
     sample_rate: u32,
     input_channel_index: usize,
+    output_bit_depth: u16,
 ) -> Result<SupportedStreamConfig> {
+    let minimum_representation_bits = minimum_input_representation_bits(output_bit_depth)?;
     let mut selected: Option<(u8, SupportedStreamConfig)> = None;
     let mut compatible_rates = Vec::<(u32, u32)>::new();
+    let mut formats_at_requested_rate = Vec::<(String, u16)>::new();
     let requested_channel = input_channel_index + 1;
     for range in device
         .supported_input_configs()
@@ -4029,6 +4445,12 @@ fn select_config(
         }
         compatible_rates.push((range.min_sample_rate(), range.max_sample_rate()));
         if sample_rate < range.min_sample_rate() || sample_rate > range.max_sample_rate() {
+            continue;
+        }
+        let representation_bits = input_representation_bits(range.sample_format())
+            .context("supported input format has no representation precision")?;
+        formats_at_requested_rate.push((range.sample_format().to_string(), representation_bits));
+        if representation_bits < minimum_representation_bits {
             continue;
         }
         let score = input_format_score(range.sample_format());
@@ -4046,6 +4468,24 @@ fn select_config(
     if compatible_rates.is_empty() {
         bail!(
             "input channel {requested_channel} is unavailable in every compatible format exposed by this device"
+        );
+    }
+    if !formats_at_requested_rate.is_empty() {
+        formats_at_requested_rate.sort_unstable();
+        formats_at_requested_rate.dedup();
+        let offered = formats_at_requested_rate
+            .iter()
+            .map(|(format, bits)| {
+                if format.starts_with('f') {
+                    format!("{format} (约 {bits} 位有效数字精度)")
+                } else {
+                    format!("{format} ({bits} 位整数表示)")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("、");
+        bail!(
+            "所选设备在 {sample_rate} Hz 、输入通道 {requested_channel} 仅提供 {offered}，无法满足 {output_bit_depth}-bit 交付的最低 {minimum_representation_bits} 位输入有效数字精度要求。这是驱动数字样本精度，不等同于声卡 ADC 的有效位数（ENOB）。"
         );
     }
     compatible_rates.sort_unstable();
@@ -4375,7 +4815,10 @@ fn convert_frames<T: Copy>(
                 dropped_frames,
             });
         }
-        mono.push(sample.clamp(-1.0, 1.0));
+        // Preserve finite float headroom for 32-bit float delivery. PCM
+        // saturation belongs in the encoding branch of the WAV writer; the
+        // meter independently clamps its display range and reports overload.
+        mono.push(sample);
     }
     Ok(mono)
 }
@@ -5357,6 +5800,7 @@ mod tests {
             device_name: "test".to_string(),
             device_id: "null:test".to_string(),
             input_sample_format: "f32".to_string(),
+            capture_provenance: Vec::new(),
             audio_format: AudioFormat {
                 sample_rate: 48_000,
                 bit_depth: 24,
@@ -5488,6 +5932,74 @@ mod tests {
         }
     }
 
+    fn activation_test_session(root: &Path, overflow_samples: u64) -> RecordingSession {
+        for name in ["audio", "script"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let master_path = root.join(LEGACY_MASTER_AUDIO);
+        let (writer_tx, writer_rx) = unbounded::<WriterMessage>();
+        let queue = test_writer_queue();
+        let captured = Arc::new(AtomicU64::new(0));
+        let committed = Arc::new(AtomicU64::new(0));
+        let overflow = Arc::new(AtomicU64::new(overflow_samples));
+        let faulted = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = bounded(1);
+        let writer_captured = Arc::clone(&captured);
+        let writer_committed = Arc::clone(&committed);
+        let writer_overflow = Arc::clone(&overflow);
+        let writer_faulted = Arc::clone(&faulted);
+        let writer_queue = queue.clone();
+        let writer_path = master_path.clone();
+        let writer_storage_dir = root.to_path_buf();
+        let writer_join = thread::spawn(move || {
+            writer_loop(
+                writer_rx,
+                &writer_path,
+                48_000,
+                24,
+                false,
+                MasterStorageKind::LegacySingleWav,
+                48_000 * STORAGE_LAYOUT_V1_DEFAULT_SEGMENT_SECONDS,
+                &writer_storage_dir,
+                writer_captured,
+                writer_committed,
+                writer_overflow,
+                writer_faulted,
+                Arc::new(AtomicU32::new(0)),
+                Arc::new(AtomicU64::new(u64::MAX)),
+                writer_queue,
+                disconnected_waveform_sender(),
+                ready_tx,
+            )
+        });
+        assert_eq!(ready_rx.recv().unwrap().unwrap(), 0);
+
+        RecordingSession {
+            _session_lock: SessionLock::acquire(root, "2026-08-11T00:00:00Z").unwrap(),
+            session_dir: root.to_path_buf(),
+            snapshot: test_snapshot(),
+            stream: None,
+            writer_tx,
+            writer_queue: queue,
+            writer_join: Some(writer_join),
+            telemetry_join: None,
+            telemetry_stop: Arc::new(AtomicBool::new(false)),
+            captured,
+            committed,
+            overflow,
+            faulted,
+            peak: Arc::new(AtomicU32::new(0)),
+            rms: Arc::new(AtomicU32::new(0)),
+            silence_samples: Arc::new(AtomicU64::new(0)),
+            attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
+            silence_threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+            active_attempt: None,
+            metadata_fault: None,
+            stop_requested: false,
+            capture_stopped: false,
+        }
+    }
+
     #[test]
     fn file_names_are_safe_and_stable() {
         assert_eq!(safe_file_name("abc-01_x"), "abc-01_x");
@@ -5599,6 +6111,83 @@ mod tests {
             convert_frames(&[1i16, 2, 3, 4], 2, 1, |sample| f32::from(sample) / 4.0).unwrap(),
             vec![0.5, 1.0]
         );
+    }
+
+    #[test]
+    fn frame_conversion_preserves_finite_float_headroom() {
+        assert_eq!(
+            convert_frames(&[1.25f32, -1.5], 1, 0, |sample| sample).unwrap(),
+            vec![1.25, -1.5]
+        );
+    }
+
+    #[test]
+    fn delivery_depth_requires_an_honest_driver_representation() {
+        assert_eq!(minimum_input_representation_bits(16).unwrap(), 16);
+        assert_eq!(minimum_input_representation_bits(24).unwrap(), 24);
+        assert_eq!(minimum_input_representation_bits(32).unwrap(), 24);
+        assert!(minimum_input_representation_bits(20).is_err());
+
+        assert_eq!(input_representation_bits(SampleFormat::I16), Some(16));
+        assert_eq!(input_representation_bits(SampleFormat::I24), Some(24));
+        assert_eq!(input_representation_bits(SampleFormat::I32), Some(32));
+        assert_eq!(input_representation_bits(SampleFormat::F32), Some(24));
+        assert_eq!(input_representation_bits(SampleFormat::F64), Some(53));
+        assert!(
+            input_representation_bits(SampleFormat::I16).unwrap()
+                < minimum_input_representation_bits(24).unwrap()
+        );
+        assert!(
+            input_representation_bits(SampleFormat::F32).unwrap()
+                >= minimum_input_representation_bits(32).unwrap()
+        );
+    }
+
+    #[test]
+    fn capture_provenance_upgrades_legacy_audio_and_tracks_resumes() {
+        let mut snapshot = test_snapshot();
+        snapshot.captured_samples = 100;
+        snapshot.committed_samples = 100;
+        let previous_source = capture_span_from_snapshot(&snapshot, 0, 0);
+
+        snapshot.device_name = "replacement interface".to_string();
+        snapshot.device_id = "null:replacement".to_string();
+        snapshot.input_sample_format = "f64".to_string();
+        snapshot.audio_format.input_channels = 2;
+        snapshot.audio_format.input_channel = 2;
+        begin_capture_provenance(&mut snapshot, previous_source, 100).unwrap();
+
+        assert_eq!(snapshot.capture_provenance.len(), 2);
+        assert_eq!(snapshot.capture_provenance[0].start_sample, 0);
+        assert_eq!(snapshot.capture_provenance[0].end_sample, 100);
+        assert_eq!(snapshot.capture_provenance[0].device_id, "null:test");
+        assert_eq!(snapshot.capture_provenance[1].start_sample, 100);
+        assert_eq!(snapshot.capture_provenance[1].end_sample, 100);
+        assert_eq!(snapshot.capture_provenance[1].device_id, "null:replacement");
+
+        assert!(reconcile_capture_provenance_after_recovery(&mut snapshot, 125).unwrap());
+        assert_eq!(snapshot.capture_provenance[1].end_sample, 125);
+        validate_capture_provenance(&snapshot, 125, true).unwrap();
+    }
+
+    #[test]
+    fn capture_provenance_rejects_gaps_and_unknown_recovery_sources() {
+        let mut snapshot = test_snapshot();
+        snapshot.capture_provenance = vec![CaptureProvenanceSpan {
+            start_sample: 1,
+            end_sample: 10,
+            device_name: "test".to_string(),
+            device_id: "null:test".to_string(),
+            input_sample_format: "f32".to_string(),
+            input_channels: 1,
+            input_channel: 1,
+            sample_rate: 48_000,
+        }];
+        assert!(validate_capture_provenance(&snapshot, 10, true).is_err());
+
+        snapshot.capture_provenance[0].start_sample = 0;
+        snapshot.device_id = "null:changed".to_string();
+        assert!(reconcile_capture_provenance_after_recovery(&mut snapshot, 11).is_err());
     }
 
     #[test]
@@ -7383,19 +7972,21 @@ mod tests {
         // observe/join that same writer; it must never infer that dropping a
         // JoinHandle means the writer stopped.
         session.stop_requested = true;
+        let timeout = Duration::from_millis(100);
 
-        assert!(session.stop().is_err());
+        assert!(session.stop_with_timeout(timeout).is_err());
         assert!(session.writer_join.is_some());
         assert!(!session.capture_stopped);
         assert!(SessionLock::acquire(&root, "2026-08-11T00:00:01Z").is_err());
 
-        assert!(session.stop().is_err());
+        assert!(session.stop_with_timeout(timeout).is_err());
         assert!(session.writer_join.is_some());
         assert!(!session.capture_stopped);
         release_tx.send(()).unwrap();
 
-        let stopped = session.stop().unwrap();
-        assert_eq!(stopped["snapshot"]["status"], "faulted");
+        let stopped = session.stop_with_timeout(timeout).unwrap();
+        assert_eq!(stopped["snapshot"]["status"], "stopped");
+        assert!(!session.faulted.load(Ordering::Acquire));
         assert!(session.writer_join.is_none());
         assert!(session.capture_stopped);
         assert!(SessionLock::acquire(&root, "2026-08-11T00:00:02Z").is_err());
@@ -7403,6 +7994,214 @@ mod tests {
         drop(session);
         let reopened = SessionLock::acquire(&root, "2026-08-11T00:00:03Z").unwrap();
         drop(reopened);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delayed_activation_writer_retains_session_and_late_watermark_wins_on_retry() {
+        let root = test_root("delayed-activation-writer-retry");
+        std::fs::create_dir_all(root.join("script")).unwrap();
+        let mut session = metadata_test_session(&root);
+        session.captured.store(9, Ordering::Release);
+        session.committed.store(3, Ordering::Release);
+        let timeout = Duration::from_millis(100);
+        let committed = Arc::clone(&session.committed);
+        let (writer_tx, writer_rx) = unbounded::<WriterMessage>();
+        let (stop_seen_tx, stop_seen_rx) = bounded::<()>(1);
+        let writer_join = thread::spawn(move || match writer_rx.recv().unwrap() {
+            WriterMessage::Stop(reply) => {
+                stop_seen_tx.send(()).unwrap();
+                thread::sleep(timeout + Duration::from_millis(50));
+                committed.store(9, Ordering::Release);
+                let _ = reply.send(Ok(9));
+            }
+            _ => panic!("expected Stop as the first writer command"),
+        });
+        session.writer_tx = writer_tx;
+        session.writer_join = Some(writer_join);
+
+        let mut engine = Engine::new(Emitter::new());
+        let started = Instant::now();
+        let error = engine.finish_activation_failure_with_timeout(
+            session,
+            "play_input_stream",
+            anyhow!("injected delayed writer finalization"),
+            timeout,
+        );
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(format!("{error:#}").contains("durably committed as stopping"));
+        stop_seen_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let pending = engine
+            .session
+            .as_ref()
+            .expect("pending session was dropped");
+        assert_eq!(pending.snapshot.status, "stopping");
+        assert!(!pending.capture_stopped);
+        assert!(pending.writer_join.is_some());
+        assert!(!pending.faulted.load(Ordering::Acquire));
+        assert!(SessionLock::acquire(&root, "2026-08-11T00:00:01Z").is_err());
+        let journal = read_journal(&root).unwrap();
+        let event = journal.entries.last().unwrap();
+        assert_eq!(event["event"], "session_activation_failed");
+        assert_eq!(event["snapshot"]["status"], "stopping");
+        assert_eq!(
+            event["payload"]["capture_resources_joined"].as_bool(),
+            Some(false)
+        );
+
+        let stopped = engine.stop_session().unwrap();
+        assert_eq!(stopped["snapshot"]["status"], "stopped");
+        assert_eq!(stopped["snapshot"]["committed_samples"], 9);
+        assert!(engine.session.is_none());
+        assert!(ensure_no_audio_fault_marker(&root, "delayed writer retry").is_ok());
+        let reopened = SessionLock::acquire(&root, "2026-08-11T00:00:02Z").unwrap();
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn activation_cleanup_deadline_retains_gate_and_telemetry_for_stop_retry() {
+        let root = test_root("activation-gate-telemetry-retry");
+        let mut session = activation_test_session(&root, 0);
+        let queue = session.writer_queue.clone();
+        let callback_lease = queue.enter().unwrap();
+        let (release_tx, release_rx) = bounded::<()>(0);
+        session.telemetry_join = Some(thread::spawn(move || {
+            release_rx.recv().unwrap();
+        }));
+
+        let mut engine = Engine::new(Emitter::new());
+        let timeout = Duration::from_millis(100);
+        let started = Instant::now();
+        let error = engine.finish_activation_failure_with_timeout(
+            session,
+            "start_telemetry",
+            anyhow!("injected blocked shutdown resources"),
+            timeout,
+        );
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(format!("{error:#}").contains("cleanup reached its deadline"));
+        let pending = engine
+            .session
+            .as_ref()
+            .expect("pending session was dropped");
+        assert!(pending.telemetry_join.is_some());
+        assert!(pending.writer_join.is_some());
+        assert!(!pending.capture_stopped);
+        assert!(!pending.faulted.load(Ordering::Acquire));
+        drop(callback_lease);
+        release_tx.send(()).unwrap();
+
+        let stopped = engine.stop_session().unwrap();
+        assert_eq!(stopped["snapshot"]["status"], "stopped");
+        assert!(engine.session.is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn activation_failure_is_joined_and_durably_stopped_before_and_after_activation_commit() {
+        for activation_committed in [false, true] {
+            let root = test_root(if activation_committed {
+                "activation-failure-after-commit"
+            } else {
+                "activation-failure-before-commit"
+            });
+            let mut session = activation_test_session(&root, 0);
+            if activation_committed {
+                session
+                    .persist("session_resumed", json!({ "existing_samples": 0 }))
+                    .unwrap();
+            }
+
+            let mut engine = Engine::new(Emitter::new());
+            let error = engine.finish_activation_failure(
+                session,
+                if activation_committed {
+                    "play_input_stream"
+                } else {
+                    "build_input_stream"
+                },
+                anyhow!("injected device activation failure"),
+            );
+
+            assert!(format!("{error:#}").contains("may be resumed"));
+            assert!(engine.session.is_none());
+            assert!(ensure_no_audio_fault_marker(&root, "test resume").is_ok());
+
+            let mut journal = read_journal(&root).unwrap();
+            assert_eq!(
+                journal.entries.last().unwrap()["event"].as_str(),
+                Some("session_activation_failed")
+            );
+            assert_eq!(
+                journal.entries.last().unwrap()["payload"]["reason"].as_str(),
+                Some("injected device activation failure")
+            );
+            assert_eq!(
+                journal.entries.last().unwrap()["payload"]["resumable"].as_bool(),
+                Some(true)
+            );
+            let recovered = load_recovery_snapshot(&root, &mut journal).unwrap();
+            assert_eq!(recovered.status, "stopped");
+            assert_eq!(recovered.committed_samples, 0);
+
+            let reopened = SessionLock::acquire(&root, "2026-08-11T00:00:02Z").unwrap();
+            drop(reopened);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn unsafe_activation_cleanup_is_durably_faulted_instead_of_claiming_resumable() {
+        let root = test_root("unsafe-activation-failure");
+        let session = activation_test_session(&root, 1);
+
+        let mut engine = Engine::new(Emitter::new());
+        let error = engine.finish_activation_failure(
+            session,
+            "play_input_stream",
+            anyhow!("injected activation failure after overflow"),
+        );
+
+        assert!(format!("{error:#}").contains("faulted for manual recovery"));
+        assert!(engine.session.is_none());
+        assert!(audio_fault_marker_present(&root).unwrap());
+        let mut journal = read_journal(&root).unwrap();
+        let event = journal.entries.last().unwrap();
+        assert_eq!(event["event"].as_str(), Some("session_activation_failed"));
+        assert_eq!(event["payload"]["audio_safe"].as_bool(), Some(false));
+        assert_eq!(event["payload"]["resumable"].as_bool(), Some(false));
+        let recovered = load_recovery_snapshot(&root, &mut journal).unwrap();
+        assert_eq!(recovered.status, "faulted");
+        assert_eq!(recovered.overflow_samples, 1);
+
+        let reopened = SessionLock::acquire(&root, "2026-08-11T00:00:02Z").unwrap();
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn writer_ready_watermark_mismatch_is_never_marked_resumable() {
+        let root = test_root("writer-ready-watermark-mismatch");
+        let session = activation_test_session(&root, 0);
+        session.faulted.store(true, Ordering::Release);
+
+        let mut engine = Engine::new(Emitter::new());
+        let error = engine.finish_activation_failure(
+            session,
+            "initialize_audio_writer",
+            anyhow!("master audio changed during writer initialization"),
+        );
+
+        assert!(format!("{error:#}").contains("faulted for manual recovery"));
+        assert!(engine.session.is_none());
+        assert!(audio_fault_marker_present(&root).unwrap());
+        let journal = read_journal(&root).unwrap();
+        let event = journal.entries.last().unwrap();
+        assert_eq!(event["snapshot"]["status"], "faulted");
+        assert_eq!(event["payload"]["resumable"].as_bool(), Some(false));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -7479,9 +8278,13 @@ mod tests {
             capture_stopped: false,
         };
 
-        let warnings = session.cleanup_after_activation_failure();
+        let cleanup = session.cleanup_after_activation_failure();
 
-        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(cleanup.warnings.is_empty(), "{cleanup:?}");
+        assert!(cleanup.capture_resources_joined);
+        assert!(cleanup.audio_safe);
+        assert_eq!(cleanup.captured_samples, 1);
+        assert_eq!(cleanup.committed_samples, 1);
         assert!(session.capture_stopped);
         assert!(session.telemetry_stop.load(Ordering::Acquire));
         assert!(session.telemetry_join.is_none());
@@ -7816,8 +8619,9 @@ mod tests {
         assert_eq!(writer.finalize().unwrap(), 3);
         let active = segments.join("master-000001.wav");
         let complete_segment = std::fs::read(&active).unwrap();
-        let mut file = OpenOptions::new().append(true).open(&active).unwrap();
-        file.write_all(&[0x55, 0xaa]).unwrap();
+        let mut file = OpenOptions::new().write(true).open(&active).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(b"FAIL").unwrap();
         file.sync_all().unwrap();
         drop(file);
 
@@ -7835,6 +8639,13 @@ mod tests {
             .unwrap();
         assert_eq!(result["durable_frames"].as_u64(), Some(3));
         assert_eq!(result["recovered_attempts"].as_u64(), Some(1));
+        assert!(
+            result["warnings"]
+                .as_array()
+                .is_some_and(|warnings| warnings.iter().any(|warning| warning
+                    .as_str()
+                    .is_some_and(|warning| warning.contains("WAV 头"))))
+        );
         assert_eq!(std::fs::read(&active).unwrap(), complete_segment);
         assert_eq!(
             std::fs::read_dir(&segments).unwrap().count(),

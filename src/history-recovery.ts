@@ -23,7 +23,7 @@ export function planHistoryRecovery(recording: HistoryRecoveryFields): HistoryRe
   }
 
   const hasUnfinishedItems = recording.pending_items + recording.review_items > 0;
-  if (recording.status === 'recording') {
+  if (recording.status === 'recording' || recording.status === 'stopping') {
     return hasUnfinishedItems
       ? { canResume: true, canSeal: true, primary: 'resume', secondary: 'seal' }
       : { canResume: false, canSeal: true, primary: 'seal', secondary: null };

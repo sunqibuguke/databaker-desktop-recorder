@@ -10,6 +10,7 @@ const {
   defaultOutputRoot,
   engineExitWasClean,
   evaluateInventory,
+  evaluateSealedSession,
   faultMarkerPresent,
   inputSampleFormatBits,
   inspectSession,
@@ -134,6 +135,51 @@ function testArgs() {
   assert.throws(() => parseArgs(['--mode', 'soak', '--hours', '1']), /2–8/);
   assert.throws(() => parseArgs(['--mode', 'short', '--bit-depth', '20']), /16、24/);
   assert.throws(() => parseArgs(['--mode', 'disk-full']), /confirm-dedicated-volume/);
+  assert.throws(() => parseArgs(['--mode', 'power-cut']), /session-dir/);
+  assert.throws(() => parseArgs(['--mode', 'recover']), /session-dir/);
+  assert.throws(() => parseArgs(['--mode', 'inspect']), /session-dir/);
+  const productionPowerCut = parseArgs([
+    '--mode',
+    'power-cut',
+    '--session-dir',
+    path.join(os.tmpdir(), 'power-cut'),
+  ]);
+  assert.equal(productionPowerCut.mode, 'power-cut');
+  assert.equal(productionPowerCut.triggerDelaySeconds, 3_600);
+  assert.equal(productionPowerCut.seconds, 3_900);
+  assert.equal(productionPowerCut.testOnlyPowerCut, false);
+  assert.throws(
+    () => parseArgs([
+      '--mode', 'power-cut',
+      '--session-dir', path.join(os.tmpdir(), 'power-cut'),
+      '--seconds', '5',
+      '--trigger-delay-seconds', '2',
+    ]),
+    /test-only-power-cut/,
+  );
+  const testPowerCut = parseArgs([
+    '--mode', 'power-cut',
+    '--session-dir', path.join(os.tmpdir(), 'power-cut-test'),
+    '--seconds', '5',
+    '--trigger-delay-seconds', '2',
+    '--test-only-power-cut',
+  ]);
+  assert.equal(testPowerCut.testOnlyPowerCut, true);
+  assert.throws(
+    () => parseArgs([
+      '--mode', 'recover',
+      '--session-dir', path.join(os.tmpdir(), 'power-cut'),
+    ]),
+    /phase1-report/,
+  );
+  assert.equal(
+    parseArgs([
+      '--mode', 'recover',
+      '--session-dir', path.join(os.tmpdir(), 'power-cut'),
+      '--phase1-report', path.join(os.tmpdir(), 'phase1.json'),
+    ]).mode,
+    'recover',
+  );
   assert.throws(
     () =>
       parseArgs([
@@ -163,7 +209,9 @@ function testArgs() {
 function testInputSampleFormatBits() {
   assert.equal(inputSampleFormatBits('i16'), 16);
   assert.equal(inputSampleFormatBits('I24'), 24);
-  assert.equal(inputSampleFormatBits('f32'), 32);
+  assert.equal(inputSampleFormatBits('f32'), 24);
+  assert.equal(inputSampleFormatBits('f64'), 53);
+  assert.equal(inputSampleFormatBits('f16'), null);
   assert.equal(inputSampleFormatBits('u8'), 8);
   assert.equal(inputSampleFormatBits('unknown'), null);
   assert.equal(inputSampleFormatBits(null), null);
@@ -299,10 +347,35 @@ function testWavInspection() {
     const session = path.join(root, 'session');
     fs.mkdirSync(path.join(session, 'audio', 'segments'), { recursive: true });
     fs.mkdirSync(path.join(session, 'metadata'), { recursive: true });
+    fs.mkdirSync(path.join(session, 'script'), { recursive: true });
     fs.writeFileSync(path.join(session, 'audio', 'segments', 'master-000001.wav'), makeWav(48_000, 24, 480));
+    const goodSnapshot = {
+      schema_version: 1,
+      journal_seq: 2,
+      session_id: 'qa',
+      status: 'stopped',
+      audio_format: {
+        sample_rate: 48_000,
+        bit_depth: 24,
+        encoding: 'pcm',
+        channels: 1,
+        input_channels: 2,
+        input_channel: 1,
+      },
+      master_audio: 'audio/segments',
+      storage_layout_version: 1,
+      segment_frames: 480,
+      captured_samples: 480,
+      committed_samples: 480,
+      overflow_samples: 0,
+    };
     fs.writeFileSync(
       path.join(session, 'metadata', 'items.snapshot.json'),
-      JSON.stringify({ schema_version: 1, session_id: 'qa', committed_samples: 480 }),
+      JSON.stringify(goodSnapshot),
+    );
+    fs.writeFileSync(
+      path.join(session, 'session.json'),
+      JSON.stringify({ schema_version: 1, journal_seq: 2, session_id: 'qa', status: 'stopped' }),
     );
     const inspected = inspectSession(session);
     assert.equal(inspected.total_physical_frames, 480);
@@ -310,6 +383,107 @@ function testWavInspection() {
     assert.equal(inspected.segment_errors.length, 0);
     assert.equal(inspected.fault_marker_exists, false);
     assert.equal(faultMarkerPresent(inspected), false);
+    assert.equal(overallFromChecks(evaluateSealedSession(inspected)), 'PASS');
+
+    const byteRateBroken = makeWav(48_000, 24, 480);
+    byteRateBroken.writeUInt32LE(0, 28);
+    fs.writeFileSync(path.join(session, 'audio', 'segments', 'master-000001.wav'), byteRateBroken);
+    const byteRateChecks = evaluateSealedSession(inspectSession(session));
+    assert.equal(overallFromChecks(byteRateChecks), 'FAIL');
+    assert.equal(
+      byteRateChecks.find((check) => check.id === 'segment-format-consistent')?.status,
+      'FAIL',
+    );
+
+    fs.writeFileSync(path.join(session, 'audio', 'segments', 'master-000001.wav'), makeWav(48_000, 24, 480));
+    fs.writeFileSync(path.join(session, 'audio', 'segments', 'master-000003.wav'), makeWav(48_000, 24, 480));
+    fs.writeFileSync(
+      path.join(session, 'metadata', 'items.snapshot.json'),
+      JSON.stringify({ ...goodSnapshot, captured_samples: 960, committed_samples: 960 }),
+    );
+    const gapChecks = evaluateSealedSession(inspectSession(session));
+    assert.equal(overallFromChecks(gapChecks), 'FAIL');
+    assert.equal(gapChecks.find((check) => check.id === 'segment-layout-valid')?.status, 'FAIL');
+    fs.unlinkSync(path.join(session, 'audio', 'segments', 'master-000003.wav'));
+    fs.writeFileSync(
+      path.join(session, 'metadata', 'items.snapshot.json'),
+      JSON.stringify(goodSnapshot),
+    );
+
+    if (process.platform !== 'win32') {
+      const linkedSession = path.join(root, 'linked-session');
+      fs.symlinkSync(session, linkedSession, 'dir');
+      const linkedChecks = evaluateSealedSession(inspectSession(linkedSession));
+      assert.equal(overallFromChecks(linkedChecks), 'FAIL');
+      assert.equal(linkedChecks.find((check) => check.id === 'real-recording-tree')?.status, 'FAIL');
+    }
+
+    const redundantDescriptor = path.join(
+      session,
+      'audio',
+      'segments',
+      'master-000001.wav.descriptor.json',
+    );
+    fs.writeFileSync(redundantDescriptor, '{malformed');
+    const redundantDescriptorChecks = evaluateSealedSession(inspectSession(session));
+    assert.equal(overallFromChecks(redundantDescriptorChecks), 'PASS');
+    assert.equal(
+      redundantDescriptorChecks.find((check) => check.id === 'segment-descriptor-redundancy')?.status,
+      'WARN',
+    );
+    fs.unlinkSync(redundantDescriptor);
+
+    const orphanDescriptor = path.join(
+      session,
+      'audio',
+      'segments',
+      'master-000002.wav.descriptor.json',
+    );
+    fs.writeFileSync(orphanDescriptor, '{}');
+    const orphanDescriptorChecks = evaluateSealedSession(inspectSession(session));
+    assert.equal(overallFromChecks(orphanDescriptorChecks), 'FAIL');
+    assert.equal(
+      orphanDescriptorChecks.find((check) => check.id === 'segment-descriptors-valid')?.status,
+      'FAIL',
+    );
+    fs.unlinkSync(orphanDescriptor);
+
+    fs.writeFileSync(
+      path.join(session, 'audio', 'segments', 'master-000001.wav'),
+      makeWav(48_000, 24, 481, 480),
+    );
+    const staleSessionChecks = evaluateSealedSession(inspectSession(session));
+    assert.equal(overallFromChecks(staleSessionChecks), 'FAIL');
+    assert.equal(
+      staleSessionChecks.find((check) => check.id === 'exact-segment-headers')?.status,
+      'FAIL',
+    );
+
+    fs.writeFileSync(
+      path.join(session, 'audio', 'segments', 'master-000001.wav'),
+      Buffer.concat([makeWav(48_000, 24, 480), Buffer.from([0x7f])]),
+    );
+    const tornSessionChecks = evaluateSealedSession(inspectSession(session));
+    assert.equal(overallFromChecks(tornSessionChecks), 'FAIL');
+    assert.equal(
+      tornSessionChecks.find((check) => check.id === 'no-trailing-frame-bytes')?.status,
+      'FAIL',
+    );
+
+    fs.writeFileSync(path.join(session, 'audio', 'segments', 'master-000001.wav'), makeWav(48_000, 24, 480));
+    fs.writeFileSync(
+      path.join(session, 'metadata', 'items.snapshot.json'),
+      JSON.stringify({ ...goodSnapshot, status: 'recording', captured_samples: 481 }),
+    );
+    const inconsistentChecks = evaluateSealedSession(inspectSession(session));
+    assert.equal(overallFromChecks(inconsistentChecks), 'FAIL');
+    assert.equal(inconsistentChecks.find((check) => check.id === 'stopped-status')?.status, 'FAIL');
+    assert.equal(inconsistentChecks.find((check) => check.id === 'exact-sample-watermark')?.status, 'FAIL');
+
+    fs.writeFileSync(
+      path.join(session, 'metadata', 'items.snapshot.json'),
+      JSON.stringify(goodSnapshot),
+    );
 
     fs.writeFileSync(path.join(session, 'metadata', 'audio-fault.json'), '{truncated');
     const malformedFault = inspectSession(session);
@@ -320,6 +494,10 @@ function testWavInspection() {
       faultMarkerPresent(malformedFault),
       true,
       'a malformed final marker must remain fail-closed for QA gating',
+    );
+    assert.equal(
+      evaluateSealedSession(malformedFault).find((check) => check.id === 'no-fault-marker')?.status,
+      'FAIL',
     );
     if (process.platform !== 'win32') {
       fs.unlinkSync(path.join(session, 'metadata', 'audio-fault.json'));
@@ -399,6 +577,295 @@ function testShortProtocolIntegration() {
   }
 }
 
+function writeInterruptedSessionFixture(session, phase1Report) {
+  fs.mkdirSync(path.join(session, 'audio', 'segments'), { recursive: true });
+  fs.mkdirSync(path.join(session, 'metadata'), { recursive: true });
+  fs.mkdirSync(path.join(session, 'script'), { recursive: true });
+  fs.writeFileSync(
+    path.join(session, 'audio', 'segments', 'master-000001.wav'),
+    makeWav(48_000, 24, 96_001, 96_000),
+  );
+  const armedAt = '2026-08-11T00:00:00.000Z';
+  const snapshot = {
+    schema_version: 1,
+    journal_seq: 1,
+    session_id: 'power-cut-fixture',
+    script_name: 'power cut fixture',
+    status: 'recording',
+    device_name: 'Mock USB Audio Interface',
+    device_id: 'mock:usb-interface',
+    input_sample_format: 'f32',
+    audio_format: {
+      sample_rate: 48_000,
+      bit_depth: 24,
+      encoding: 'pcm',
+      channels: 1,
+      input_channels: 2,
+      input_channel: 1,
+    },
+    master_audio: 'audio/segments',
+    storage_layout_version: 1,
+    segment_frames: 48_000 * 300,
+    captured_samples: 96_001,
+    committed_samples: 96_000,
+    overflow_samples: 0,
+    started_at: '2026-08-10T23:59:58.000Z',
+    updated_at: armedAt,
+    noise_check: null,
+    silence_duration_ms: 1_000,
+    silence_threshold_dbfs: -40,
+    items: [{
+      id: 'QA-001',
+      text: 'power cut fixture',
+      label: 'power-cut',
+      status: 'pending',
+      attempts: [],
+      selected_attempt_id: null,
+    }],
+  };
+  fs.writeFileSync(
+    path.join(session, 'metadata', 'items.snapshot.json'),
+    `${JSON.stringify(snapshot, null, 2)}\n`,
+  );
+  fs.writeFileSync(
+    path.join(session, 'session.json'),
+    `${JSON.stringify({
+      schema_version: 1,
+      journal_seq: 1,
+      session_id: snapshot.session_id,
+      status: 'recording',
+    }, null, 2)}\n`,
+  );
+  fs.writeFileSync(
+    path.join(session, 'script', 'normalized.json'),
+    `${JSON.stringify(snapshot.items, null, 2)}\n`,
+  );
+  fs.writeFileSync(
+    path.join(session, 'audio', 'segments', 'master-000001.wav.descriptor.json'),
+    `${JSON.stringify({
+      schema_version: 1,
+      kind: 'databaker.segmented-wav-header',
+      segment_index: 1,
+      segment_file: 'master-000001.wav',
+      sample_rate: 48_000,
+      channels: 1,
+      bit_depth: 24,
+      encoding: 'pcm',
+      header_len: 44,
+      max_frames_per_segment: 48_000 * 300,
+    }, null, 2)}\n`,
+  );
+  const evidence = {
+    schema_version: 1,
+    kind: 'databaker.power-cut-phase-1',
+    phase: 'armed',
+    nonce: 'test-only-power-cut-nonce-0001',
+    test_only: true,
+    production_eligible: false,
+    session_dir: path.resolve(session),
+    session_id: snapshot.session_id,
+    device_id: snapshot.device_id,
+    device_name: snapshot.device_name,
+    input_sample_format: snapshot.input_sample_format,
+    audio_format: snapshot.audio_format,
+    required_duration_seconds: 2,
+    production_minimum_seconds: 3_600,
+    wall_elapsed_seconds: 2.1,
+    armed_at: armedAt,
+    armed_captured_samples: 96_001,
+    armed_committed_samples: 96_000,
+    max_tail_loss_samples: 96_000,
+    segment_total_bytes: 44 + 96_001 * 3,
+    segment_count: 1,
+    tool_version: 1,
+    protocol_version: 1,
+    host: {
+      hostname: os.hostname(),
+      platform: process.platform,
+      architecture: process.arch,
+      boot_id: 'phase1-old-boot',
+      booted_at: '2026-08-10T22:00:00.000Z',
+    },
+  };
+  fs.writeFileSync(
+    path.join(session, 'metadata', 'power-cut.acceptance.json'),
+    `${JSON.stringify(evidence, null, 2)}\n`,
+  );
+  fs.writeFileSync(
+    phase1Report,
+    `${JSON.stringify({
+      schema_version: 1,
+      tool_version: 1,
+      mode: 'power-cut',
+      completed_at: null,
+      overall: 'INCOMPLETE',
+      power_cut: { phase: 'armed', evidence },
+      start: { snapshot: { session_id: snapshot.session_id } },
+    }, null, 2)}\n`,
+  );
+  return { snapshot, evidence };
+}
+
+function latestReport(outputRoot) {
+  const runNames = fs.readdirSync(outputRoot);
+  assert.equal(runNames.length, 1);
+  return JSON.parse(
+    fs.readFileSync(path.join(outputRoot, runNames[0], 'acceptance-report.json'), 'utf8'),
+  );
+}
+
+function testPowerCutArmingIntegration() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'databaker-power-cut-arm-'));
+  try {
+    const tool = path.join(__dirname, 'windows-audio-acceptance.cjs');
+    const mockEngine = path.join(__dirname, 'fixtures', 'mock-acceptance-engine.cjs');
+    const output = path.join(root, 'reports');
+    const session = path.join(root, 'interrupted-recording');
+    const result = spawnSync(
+      process.execPath,
+      [
+        tool,
+        '--mode',
+        'power-cut',
+        '--engine',
+        mockEngine,
+        '--output',
+        output,
+        '--session-dir',
+        session,
+        '--device-index',
+        '1',
+        '--seconds',
+        '5',
+        '--trigger-delay-seconds',
+        '2',
+        '--test-only-power-cut',
+        '--poll-seconds',
+        '0.25',
+        '--skip-noise-check',
+        '--yes',
+      ],
+      { encoding: 'utf8', timeout: 20_000 },
+    );
+    assert.equal(result.error, undefined, result.error?.stack);
+    assert.equal(result.status, 2, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+    const report = latestReport(output);
+    assert.equal(report.overall, 'INCOMPLETE');
+    assert.equal(report.power_cut.phase, 'not-performed');
+    assert.equal(report.power_cut.evidence.test_only, true);
+    assert.equal(report.power_cut.evidence.production_eligible, false);
+    assert.equal(report.production_eligible, false);
+    assert.equal(
+      fs.existsSync(path.join(session, 'metadata', 'power-cut.acceptance.json')),
+      true,
+    );
+    assert.equal(report.stop.result.snapshot.status, 'stopped');
+    assert.equal(report.checks.find((check) => check.id === 'power-cut-observed')?.status, 'FAIL');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function testPowerCutRecoveryIntegration() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'databaker-power-cut-recover-'));
+  try {
+    const tool = path.join(__dirname, 'windows-audio-acceptance.cjs');
+    const mockEngine = path.join(__dirname, 'fixtures', 'mock-acceptance-engine.cjs');
+    const session = path.join(root, 'interrupted-recording');
+    const phase1Report = path.join(root, 'phase1-report.json');
+    writeInterruptedSessionFixture(session, phase1Report);
+    const recoveryEnvironment = {
+      ...process.env,
+      NODE_ENV: 'test',
+      DATABAKER_ACCEPTANCE_TEST_BOOT_ID: 'phase2-new-boot',
+      DATABAKER_ACCEPTANCE_TEST_BOOTED_AT: '2026-08-11T00:01:00.000Z',
+    };
+
+    const beforeOutput = path.join(root, 'before-inspect');
+    const before = spawnSync(
+      process.execPath,
+      [tool, '--mode', 'inspect', '--session-dir', session, '--output', beforeOutput],
+      { encoding: 'utf8', timeout: 10_000 },
+    );
+    assert.equal(before.status, 1, `stdout:\n${before.stdout}\nstderr:\n${before.stderr}`);
+    const beforeReport = latestReport(beforeOutput);
+    assert.equal(beforeReport.overall, 'FAIL');
+    assert.equal(
+      beforeReport.checks.find((check) => check.id === 'exact-segment-headers')?.status,
+      'FAIL',
+    );
+
+    const recoveryOutput = path.join(root, 'recovery');
+    const recovery = spawnSync(
+      process.execPath,
+      [
+        tool,
+        '--mode',
+        'recover',
+        '--engine',
+        mockEngine,
+        '--session-dir',
+        session,
+        '--phase1-report',
+        phase1Report,
+        '--test-only-power-cut',
+        '--output',
+        recoveryOutput,
+        '--yes',
+      ],
+      { encoding: 'utf8', timeout: 20_000, env: recoveryEnvironment },
+    );
+    assert.equal(recovery.error, undefined, recovery.error?.stack);
+    assert.equal(recovery.status, 0, `stdout:\n${recovery.stdout}\nstderr:\n${recovery.stderr}`);
+    const recoveryReport = latestReport(recoveryOutput);
+    assert.equal(recoveryReport.overall, 'TEST_ONLY_PASS');
+    assert.equal(recoveryReport.production_eligible, false);
+    assert.equal(recoveryReport.recovery.result.snapshot.status, 'stopped');
+    assert.equal(recoveryReport.inspection.total_physical_frames, 96_001);
+    assert.equal(recoveryReport.inspection.snapshot.committed_samples, 96_001);
+    assert.equal(recoveryReport.inspection.segments[0].exact_header, true);
+    assert.equal(
+      recoveryReport.checks.find((check) => check.id === 'engine-clean-exit')?.status,
+      'PASS',
+    );
+
+    const afterOutput = path.join(root, 'after-inspect');
+    const after = spawnSync(
+      process.execPath,
+      [tool, '--mode', 'inspect', '--session-dir', session, '--output', afterOutput],
+      { encoding: 'utf8', timeout: 10_000 },
+    );
+    assert.equal(after.status, 0, `stdout:\n${after.stdout}\nstderr:\n${after.stderr}`);
+    assert.equal(latestReport(afterOutput).overall, 'PASS');
+
+    const replayOutput = path.join(root, 'recovery-replay');
+    const replay = spawnSync(
+      process.execPath,
+      [
+        tool,
+        '--mode', 'recover',
+        '--engine', mockEngine,
+        '--session-dir', session,
+        '--phase1-report', phase1Report,
+        '--test-only-power-cut',
+        '--output', replayOutput,
+        '--yes',
+      ],
+      { encoding: 'utf8', timeout: 20_000, env: recoveryEnvironment },
+    );
+    assert.equal(replay.status, 1, `stdout:\n${replay.stdout}\nstderr:\n${replay.stderr}`);
+    const replayReport = latestReport(replayOutput);
+    assert.equal(replayReport.overall, 'FAIL');
+    assert.equal(
+      replayReport.checks.find((check) => check.id === 'interrupted-preseal-status')?.status,
+      'FAIL',
+    );
+    assert.equal(replayReport.recovery, undefined, 'normal stopped sessions must be rejected before seal');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
 function testAbnormalEngineShutdownIntegration(mode, expectedStatus, expectedOverall) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), `databaker-acceptance-${mode}-`));
   try {
@@ -461,6 +928,8 @@ testEngineExitChecks();
 testWavInspection();
 testTimestamp();
 testShortProtocolIntegration();
+testPowerCutArmingIntegration();
+testPowerCutRecoveryIntegration();
 testAbnormalEngineShutdownIntegration('nonzero', 1, 'FAIL');
 testAbnormalEngineShutdownIntegration('hang', 2, 'INCOMPLETE');
 process.stdout.write('windows audio acceptance tool tests passed\n');

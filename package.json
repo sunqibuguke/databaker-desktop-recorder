@@ -17,7 +17,7 @@
     "typecheck": "tsc --noEmit && tsc -p electron/tsconfig.json --noEmit",
     "acceptance:audio": "node scripts/windows-audio-acceptance.cjs",
     "test:acceptance-tool": "node scripts/test-windows-audio-acceptance.cjs",
-    "test:electron": "npm run build:electron && node scripts/test-history-snapshot.cjs && node scripts/test-engine-client.cjs && node scripts/test-offline-seal-ipc.cjs && node scripts/test-safe-stop-main.cjs && node scripts/test-crash-before-quit-main.cjs && node scripts/test-export-lifecycle-ipc.cjs && node scripts/test-engine-recovery-failure-main.cjs && node --no-warnings scripts/test-history-recovery-ui.cjs",
+    "test:electron": "npm run build:electron && node scripts/test-history-snapshot.cjs && node scripts/test-engine-client.cjs && node scripts/test-offline-seal-ipc.cjs && node scripts/test-safe-stop-main.cjs && node scripts/test-crash-before-quit-main.cjs && node scripts/test-export-lifecycle-ipc.cjs && node scripts/test-engine-recovery-failure-main.cjs && node scripts/test-start-reconciliation-main.cjs && node --no-warnings scripts/test-history-recovery-ui.cjs",
     "test:engine": "node scripts/run-cargo.cjs test --manifest-path engine/Cargo.toml",
     "test:engine-protocol": "node scripts/run-cargo.cjs build --manifest-path engine/Cargo.toml && node scripts/smoke-engine.cjs",
     "test:crash-recovery": "node scripts/run-cargo.cjs build --manifest-path engine/Cargo.toml && node scripts/test-crash-recovery.cjs",

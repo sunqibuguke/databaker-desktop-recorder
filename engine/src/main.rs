@@ -46,6 +46,7 @@ fn main() -> Result<()> {
     );
     let stdin = io::stdin();
     let mut engine = Engine::new(emitter.clone());
+    let mut terminal_shutdown_error = None::<String>;
     for line in stdin.lock().lines() {
         let line = match line {
             Ok(line) if !line.trim().is_empty() => line,
@@ -78,6 +79,13 @@ fn main() -> Result<()> {
         match dispatch(&mut engine, command) {
             Ok(result) => emitter.response_ok(&request_id, result),
             Err(error) => {
+                if command_name == "shutdown" && !engine_has_active_session(&engine) {
+                    // Capture resources have already been removed, so another
+                    // shutdown command would return success and could mask a
+                    // terminal metadata/fault sealing error. Preserve it until
+                    // process exit so Electron cannot classify that exit safe.
+                    terminal_shutdown_error = Some(format!("{error:#}"));
+                }
                 let code = if is_no_active_session_error(&error) {
                     "NO_ACTIVE_SESSION"
                 } else {
@@ -88,9 +96,42 @@ fn main() -> Result<()> {
             }
         }
     }
-    if let Err(error) = engine.shutdown() {
-        eprintln!("engine shutdown after stdin EOF failed: {error:#}");
-        return Err(error.context("safely stop recording after stdin EOF"));
+    finish_engine_after_input_closed(&mut engine, terminal_shutdown_error)?;
+    Ok(())
+}
+
+fn engine_has_active_session(engine: &Engine) -> bool {
+    engine
+        .get_state_optional()
+        .get("active")
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+fn finish_engine_after_input_closed(
+    engine: &mut Engine,
+    terminal_shutdown_error: Option<String>,
+) -> Result<()> {
+    loop {
+        match engine.shutdown() {
+            Ok(()) => break,
+            Err(error) if engine_has_active_session(engine) => {
+                // Each Engine::shutdown attempt is bounded. EOF means no more
+                // protocol commands can arrive, so keep making bounded
+                // progress while this process still owns the session lock and
+                // writer JoinHandle; returning here would terminate a writer
+                // that may still be draining accepted audio.
+                eprintln!(
+                    "engine shutdown after stdin EOF is still in progress; retrying: {error:#}"
+                );
+            }
+            Err(error) => {
+                return Err(error.context("safely stop recording after stdin EOF"));
+            }
+        }
+    }
+    if let Some(error) = terminal_shutdown_error {
+        return Err(anyhow!(error).context("shutdown reached a terminal unconfirmed seal state"));
     }
     Ok(())
 }
@@ -175,6 +216,17 @@ mod tests {
     }
 
     #[test]
+    fn eof_cleanup_preserves_a_terminal_shutdown_error() {
+        let mut engine = Engine::new(Emitter::new());
+        let error = finish_engine_after_input_closed(
+            &mut engine,
+            Some("metadata journal could not be sealed".to_string()),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("metadata journal could not be sealed"));
+    }
+
+    #[test]
     fn production_seal_command_succeeds_without_opening_an_audio_device() {
         let root = std::env::temp_dir().join(format!(
             "recorder-engine-protocol-seal-{}",
@@ -199,6 +251,7 @@ mod tests {
             device_name: "disconnected interface".to_string(),
             device_id: "missing:device".to_string(),
             input_sample_format: "f32".to_string(),
+            capture_provenance: Vec::new(),
             audio_format: AudioFormat {
                 sample_rate: 48_000,
                 bit_depth: 24,

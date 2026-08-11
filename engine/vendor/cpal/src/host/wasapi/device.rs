@@ -193,8 +193,8 @@ unsafe fn data_flow_from_immendpoint(endpoint: &Audio::IMMEndpoint) -> Audio::ED
         .expect("could not get endpoint data_flow")
 }
 
-// Given the audio client and format, returns whether the audio engine supports it natively in
-// shared mode without format conversion.
+// Given the audio client and format, returns whether the shared audio engine accepts that exact
+// client representation. Acceptance does not imply native hardware precision or no conversion.
 pub unsafe fn is_format_supported(
     client: &Audio::IAudioClient,
     waveformatex_ptr: *const Audio::WAVEFORMATEX,
@@ -209,9 +209,126 @@ pub unsafe fn is_format_supported(
         let _free = WaveFormatExPtr(closest_match);
     }
 
-    // S_OK (hr.0 == 0): format is natively supported, Initialize will accept it without conversion.
-    // S_FALSE (hr.0 == 1): only usable when AUTOCONVERTPCM is set (output).
+    // S_OK (hr.0 == 0): the shared audio engine accepts this exact client
+    // representation. It may still convert sample representations internally,
+    // so this is not proof of native device precision. S_FALSE reports only a
+    // closest match, which this path deliberately rejects.
     Ok(hr.0 == 0)
+}
+
+fn cmp_guid(left: &GUID, right: &GUID) -> bool {
+    (left.data1, left.data2, left.data3, left.data4)
+        == (right.data1, right.data2, right.data3, right.data4)
+}
+
+fn pcm_effective_precision_bits(container_bits: u16, valid_bits: u16) -> Option<u16> {
+    (container_bits > 0
+        && container_bits % 8 == 0
+        && valid_bits > 0
+        && valid_bits <= container_bits)
+        .then_some(valid_bits)
+}
+
+fn float_effective_precision_bits(container_bits: u16, valid_bits: u16) -> Option<u16> {
+    if valid_bits != container_bits {
+        return None;
+    }
+    match container_bits {
+        // IEEE-754 precision includes the implicit leading significand bit.
+        32 => Some(24),
+        64 => Some(53),
+        _ => None,
+    }
+}
+
+fn sample_format_effective_precision_bits(sample_format: SampleFormat) -> Option<u16> {
+    match sample_format {
+        SampleFormat::U8 => Some(8),
+        SampleFormat::I16 => Some(16),
+        SampleFormat::I24 => Some(24),
+        SampleFormat::I32 => Some(32),
+        SampleFormat::I64 => Some(64),
+        SampleFormat::F32 => Some(24),
+        SampleFormat::F64 => Some(53),
+        _ => None,
+    }
+}
+
+fn capture_candidate_within_mix_precision(
+    sample_format: SampleFormat,
+    mix_precision_bits: Option<u16>,
+) -> bool {
+    sample_format_effective_precision_bits(sample_format)
+        .zip(mix_precision_bits)
+        .is_some_and(|(candidate_bits, mix_bits)| candidate_bits <= mix_bits)
+}
+
+unsafe fn effective_precision_from_waveformatex_ptr(
+    waveformatex_ptr: *const Audio::WAVEFORMATEX,
+) -> Option<u16> {
+    let format = unsafe { &*waveformatex_ptr };
+    match (format.wBitsPerSample, format.wFormatTag as u32) {
+        (container_bits, Audio::WAVE_FORMAT_PCM) => {
+            pcm_effective_precision_bits(container_bits, container_bits)
+        }
+        (container_bits, Multimedia::WAVE_FORMAT_IEEE_FLOAT) => {
+            float_effective_precision_bits(container_bits, container_bits)
+        }
+        (container_bits, KernelStreaming::WAVE_FORMAT_EXTENSIBLE) => {
+            if usize::from(format.cbSize)
+                < mem::size_of::<Audio::WAVEFORMATEXTENSIBLE>()
+                    - mem::size_of::<Audio::WAVEFORMATEX>()
+            {
+                return None;
+            }
+            let extensible = unsafe { &*(waveformatex_ptr as *const Audio::WAVEFORMATEXTENSIBLE) };
+            let valid_bits = unsafe { extensible.Samples.wValidBitsPerSample };
+            let sub_format = extensible.SubFormat;
+            if cmp_guid(&sub_format, &KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM) {
+                pcm_effective_precision_bits(container_bits, valid_bits)
+            } else if cmp_guid(&sub_format, &Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) {
+                float_effective_precision_bits(container_bits, valid_bits)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn extensible_pcm_sample_format(container_bits: u16, valid_bits: u16) -> Option<SampleFormat> {
+    match (container_bits, valid_bits) {
+        (8, 8) => Some(SampleFormat::U8),
+        (16, 16) => Some(SampleFormat::I16),
+        // CPAL's I24 is stored in a four-byte i32 container. A packed 24-bit
+        // WASAPI buffer therefore cannot be exposed as I24 without an explicit
+        // unpacking adapter in the stream backend.
+        (32, 24) => Some(SampleFormat::I24),
+        (32, 32) => Some(SampleFormat::I32),
+        (64, 64) => Some(SampleFormat::I64),
+        // CPAL has no representation for e.g. 20 valid bits in a 24/32-bit
+        // container. Calling it I24/I32 would overstate input precision, while
+        // calling it I16 would use the wrong alignment and stream format.
+        _ => None,
+    }
+}
+
+fn extensible_float_sample_format(container_bits: u16, valid_bits: u16) -> Option<SampleFormat> {
+    match (container_bits, valid_bits) {
+        (32, 32) => Some(SampleFormat::F32),
+        (64, 64) => Some(SampleFormat::F64),
+        _ => None,
+    }
+}
+
+fn default_probe_geometry(
+    mapped_default: Option<SupportedStreamConfig>,
+    raw_channels: u16,
+    raw_sample_rate: SampleRate,
+) -> (u16, SampleRate, SupportedBufferSize) {
+    mapped_default
+        .map(|format| (format.channels, format.sample_rate, format.buffer_size))
+        .unwrap_or((raw_channels, raw_sample_rate, SupportedBufferSize::Unknown))
 }
 
 // Get a cpal Format from a WAVEFORMATEX.
@@ -219,9 +336,6 @@ unsafe fn format_from_waveformatex_ptr(
     waveformatex_ptr: *const Audio::WAVEFORMATEX,
     audio_client: &Audio::IAudioClient,
 ) -> Option<SupportedStreamConfig> {
-    fn cmp_guid(a: &GUID, b: &GUID) -> bool {
-        (a.data1, a.data2, a.data3, a.data4) == (b.data1, b.data2, b.data3, b.data4)
-    }
     let sample_format = match (
         (*waveformatex_ptr).wBitsPerSample,
         (*waveformatex_ptr).wFormatTag as u32,
@@ -236,21 +350,9 @@ unsafe fn format_from_waveformatex_ptr(
             let valid_bits = unsafe { (*waveformatextensible_ptr).Samples.wValidBitsPerSample };
 
             if cmp_guid(&sub, &KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM) {
-                match n_bits {
-                    8 => SampleFormat::U8,
-                    16 => SampleFormat::I16,
-                    24 => SampleFormat::I24,
-                    32 if valid_bits == 24 => SampleFormat::I24,
-                    32 => SampleFormat::I32,
-                    64 => SampleFormat::I64,
-                    _ => return None,
-                }
+                extensible_pcm_sample_format(n_bits, valid_bits)?
             } else if cmp_guid(&sub, &Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) {
-                match n_bits {
-                    32 => SampleFormat::F32,
-                    64 => SampleFormat::F64,
-                    _ => return None,
-                }
+                extensible_float_sample_format(n_bits, valid_bits)?
             } else {
                 return None;
             }
@@ -651,20 +753,45 @@ impl Device {
                 ));
             }
 
-            let format = match format_from_waveformatex_ptr(default_waveformatex_ptr.0, client) {
-                Some(fmt) => fmt,
-                None => {
-                    return Err(Error::with_message(
-                        ErrorKind::UnsupportedConfig,
-                        "Default audio format could not be mapped to a supported configuration",
-                    ));
-                }
+            let is_output = self.data_flow() == Audio::eRender;
+            // Shared-mode IsFormatSupported only proves that the Windows audio
+            // engine accepts a client representation; it may convert integer
+            // samples to its internal float representation. For capture, cap
+            // every probed client format at the effective precision explicitly
+            // described by GetMixFormat so that such conversion cannot be
+            // reported as additional source precision. Unknown or invalid input
+            // precision is rejected rather than promoted by probing.
+            let capture_mix_precision_bits = if is_output {
+                None
+            } else {
+                Some(
+                    effective_precision_from_waveformatex_ptr(default_waveformatex_ptr.0)
+                        .ok_or_else(|| {
+                            Error::with_message(
+                                ErrorKind::UnsupportedConfig,
+                                "Default input mix format has unknown or invalid effective precision",
+                            )
+                        })?,
+                )
             };
 
+            // Some input mix formats have a valid precision CPAL cannot expose
+            // directly (for example 20 valid bits in a 32-bit container). Keep
+            // their channels/rate as probe geometry, but never enumerate a
+            // candidate above the precision cap computed above. Output probing
+            // deliberately retains its previous conversion behavior.
+            let mapped_default = format_from_waveformatex_ptr(default_waveformatex_ptr.0, client);
+            let (default_channels, default_sample_rate, default_buffer_size) =
+                default_probe_geometry(
+                    mapped_default,
+                    (*default_waveformatex_ptr.0).nChannels,
+                    (*default_waveformatex_ptr.0).nSamplesPerSec,
+                );
+
             // Output streams use AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM so Initialize accepts any
-            // format regardless of what IsFormatSupported returns. Capture streams do not;
-            // only native formats will work.
-            let is_output = self.data_flow() == Audio::eRender;
+            // format regardless of what IsFormatSupported returns. Capture
+            // still queries IsFormatSupported, subject to the independent mix
+            // precision cap above.
 
             // For output, restrict to rates the MF Resampler can handle; for capture, probe all.
             let mut sample_rates: Vec<SampleRate> = COMMON_SAMPLE_RATES
@@ -674,8 +801,8 @@ impl Device {
                     !is_output || (OUTPUT_MIN_SAMPLE_RATE..=OUTPUT_MAX_SAMPLE_RATE).contains(&r)
                 })
                 .collect();
-            if !sample_rates.contains(&format.sample_rate) {
-                sample_rates.push(format.sample_rate);
+            if !sample_rates.contains(&default_sample_rate) {
+                sample_rates.push(default_sample_rate);
             }
 
             let mut default_period_hns: i64 = 0;
@@ -691,7 +818,7 @@ impl Device {
 
             let mut supported_formats = Vec::new();
             for sample_rate in sample_rates {
-                let buffer_size = match format.buffer_size {
+                let buffer_size = match default_buffer_size {
                     // Software stacks: substitute the device period expressed in frames
                     // at this sample rate.
                     SupportedBufferSize::Unknown => device_period_hns
@@ -708,9 +835,17 @@ impl Device {
                 };
 
                 for sample_format in WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS {
+                    if !is_output
+                        && !capture_candidate_within_mix_precision(
+                            sample_format,
+                            capture_mix_precision_bits,
+                        )
+                    {
+                        continue;
+                    }
                     if let Some(waveformat) = config_to_waveformatextensible(
                         StreamConfig {
-                            channels: format.channels,
+                            channels: default_channels,
                             sample_rate,
                             buffer_size: BufferSize::Default,
                         },
@@ -723,7 +858,7 @@ impl Device {
                             )?;
                         if usable {
                             supported_formats.push(SupportedStreamConfigRange {
-                                channels: format.channels,
+                                channels: default_channels,
                                 min_sample_rate: sample_rate,
                                 max_sample_rate: sample_rate,
                                 buffer_size,
@@ -1461,4 +1596,85 @@ fn buffer_size_to_duration(buffer_size: &BufferSize, sample_rate: SampleRate) ->
 
 fn buffer_duration_to_frames(buffer_duration: i64, sample_rate: SampleRate) -> FrameCount {
     (buffer_duration * sample_rate as i64 * 100 / 1_000_000_000) as FrameCount
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extensible_formats_never_overstate_valid_sample_bits() {
+        assert_eq!(
+            extensible_pcm_sample_format(32, 24),
+            Some(SampleFormat::I24)
+        );
+        assert_eq!(
+            extensible_pcm_sample_format(32, 32),
+            Some(SampleFormat::I32)
+        );
+        assert_eq!(extensible_pcm_sample_format(32, 16), None);
+        assert_eq!(extensible_pcm_sample_format(32, 20), None);
+        assert_eq!(extensible_pcm_sample_format(24, 24), None);
+        assert_eq!(extensible_pcm_sample_format(24, 20), None);
+        assert_eq!(extensible_pcm_sample_format(16, 0), None);
+        assert_eq!(
+            extensible_float_sample_format(32, 32),
+            Some(SampleFormat::F32)
+        );
+        assert_eq!(extensible_float_sample_format(32, 24), None);
+    }
+
+    #[test]
+    fn an_unmappable_mix_format_still_supplies_probe_geometry() {
+        assert_eq!(
+            default_probe_geometry(None, 2, 48_000),
+            (2, 48_000, SupportedBufferSize::Unknown)
+        );
+    }
+
+    #[test]
+    fn capture_candidates_never_exceed_mix_effective_precision() {
+        for mix_bits in [Some(16), Some(20)] {
+            assert!(capture_candidate_within_mix_precision(
+                SampleFormat::I16,
+                mix_bits
+            ));
+            assert!(!capture_candidate_within_mix_precision(
+                SampleFormat::I24,
+                mix_bits
+            ));
+            assert!(!capture_candidate_within_mix_precision(
+                SampleFormat::F32,
+                mix_bits
+            ));
+        }
+        assert!(capture_candidate_within_mix_precision(
+            SampleFormat::I24,
+            Some(24)
+        ));
+        assert!(capture_candidate_within_mix_precision(
+            SampleFormat::F32,
+            Some(24)
+        ));
+        assert!(!capture_candidate_within_mix_precision(
+            SampleFormat::I32,
+            Some(24)
+        ));
+        assert!(!capture_candidate_within_mix_precision(
+            SampleFormat::I16,
+            None
+        ));
+    }
+
+    #[test]
+    fn mix_precision_uses_valid_pcm_bits_and_float_significand_bits() {
+        assert_eq!(pcm_effective_precision_bits(32, 16), Some(16));
+        assert_eq!(pcm_effective_precision_bits(32, 20), Some(20));
+        assert_eq!(pcm_effective_precision_bits(32, 24), Some(24));
+        assert_eq!(pcm_effective_precision_bits(24, 0), None);
+        assert_eq!(pcm_effective_precision_bits(24, 25), None);
+        assert_eq!(float_effective_precision_bits(32, 32), Some(24));
+        assert_eq!(float_effective_precision_bits(64, 64), Some(53));
+        assert_eq!(float_effective_precision_bits(32, 24), None);
+    }
 }

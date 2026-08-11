@@ -16,6 +16,17 @@ export type ItemState = ScriptItem & {
   selected_attempt_id: string | null;
 };
 
+export type CaptureProvenanceSpan = {
+  start_sample: number;
+  end_sample: number;
+  device_name: string;
+  device_id: string;
+  input_sample_format: string;
+  input_channels: number;
+  input_channel: number;
+  sample_rate: number;
+};
+
 export type SessionSnapshot = {
   schema_version: number;
   session_id: string;
@@ -24,6 +35,7 @@ export type SessionSnapshot = {
   device_name: string;
   device_id?: string;
   input_sample_format?: string;
+  capture_provenance?: CaptureProvenanceSpan[];
   audio_format: {
     sample_rate: number;
     bit_depth: number;

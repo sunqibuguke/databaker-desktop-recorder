@@ -10,6 +10,7 @@ const mockEngineSource = String.raw`
 const readline = require('node:readline');
 const mode = process.argv[1];
 const lines = readline.createInterface({ input: process.stdin });
+let shutdownAttempts = 0;
 function send(value) {
   process.stdout.write(JSON.stringify(value) + '\n');
 }
@@ -20,9 +21,30 @@ lines.on('line', (line) => {
     send({ protocol_version: 1, request_id: request.request_id, ok: true, result: {} });
     return;
   }
+  if (request.command === 'get_state_optional') {
+    send({
+      protocol_version: 1,
+      request_id: request.request_id,
+      ok: true,
+      result: mode === 'stopping-then-success'
+        ? { active: true, session_dir: '/mock/session', snapshot: { status: 'stopping' } }
+        : { active: false },
+    });
+    return;
+  }
   if (request.command !== 'shutdown') return;
+  shutdownAttempts += 1;
   if (mode === 'hang') {
     setInterval(() => {}, 1_000);
+    return;
+  }
+  if (mode === 'stopping-then-success' && shutdownAttempts < 3) {
+    send({
+      protocol_version: 1,
+      request_id: request.request_id,
+      ok: false,
+      error: { code: 'COMMAND_FAILED', message: 'mock audio writer is still stopping' },
+    });
     return;
   }
   if (mode === 'response-error') {
@@ -93,6 +115,17 @@ async function main() {
   const [gracefulOutcome] = await gracefulExit;
   assert.deepEqual(gracefulOutcome, { safe: true, code: 0, signal: null });
   assert.equal(graceful.running, false, 'normal safe stop exits the engine');
+
+  const retrying = client('stopping-then-success', 1_000);
+  await retrying.start();
+  const retryingExit = waitForEvent(retrying, 'stopped');
+  await retrying.stop();
+  assert.deepEqual(
+    (await retryingExit)[0],
+    { safe: true, code: 0, signal: null },
+    'multiple bounded stopping responses must be retried without closing stdin',
+  );
+  assert.equal(retrying.running, false, 'the engine exits after a later confirmed shutdown');
 
   const responseError = client('response-error', 500);
   await responseError.start();

@@ -17,7 +17,7 @@
 - 活动分段的文件增长；停止后的 RIFF/RF64 WAVE 属性、物理完整帧和头部/EOF 一致性。
 - `audio-fault.json`、故障检测时间、时间轴是否停止、故障数据是否被禁止常规导出。
 
-> `input_sample_format` 是驱动实际交给引擎的样本表示，例如 `i16` / `i24` / `i32` / `f32`。`--bit-depth` 是交付 WAV 编码。把低精度硬件输入写成 24-bit 或 32-bit 不会凭空增加有效精度，因此报告会同时保留两者。验收工具默认要求 16-bit 交付至少为 16-bit driver representation，24/32-bit 交付至少为 24-bit representation；可用 `--minimum-input-format-bits` 按项目提高。这仍不能证明 ADC 的 ENOB，声卡型号、驱动版本与厂商规格必须人工归档。
+> `input_sample_format` 是最终交给引擎的数字样本表示，例如 `i16` / `i24` / `i32` / `f32`。`--bit-depth` 是交付 WAV 编码。验收门槛按有效数字精度计算：整数 `n` bit 按 `n`，IEEE-754 `f32` 按 24 bit 有效数字，`f64` 按 53 bit，不会把 `f32` 容器误认为 32 bit 有效精度。Windows shared mode 下，可枚举的客户端格式不得超过 `GetMixFormat` 声明的有效精度；`IsFormatSupported` 只能证明 Windows 音频引擎接受该客户端格式，不能用来把已知的低位深源判成高精度。把低精度硬件输入写成 24-bit 或 32-bit 不会凭空增加有效精度，因此报告会同时保留输入格式与交付编码。验收工具默认要求 16-bit 交付至少 16 bit 有效数字精度，24/32-bit 交付至少 24 bit；可用 `--minimum-input-format-bits` 按项目提高。这仍不能证明声卡 ADC 的 ENOB，声卡型号、驱动版本与厂商规格必须人工归档。
 
 ## 2. 安全规则
 
@@ -110,7 +110,7 @@ $device = "<inventory 返回的完整设备 ID>"
 强制通过标准：
 
 - 请求设备 ID、采样率、输入通道和交付位深与会话快照一致。
-- 引擎记录非空 `input_sample_format`，且通过 `minimum_input_format_bits` 门槛（默认 24/32-bit 交付不接受 `i16/u16`）。
+- 引擎记录非空 `input_sample_format`，且通过 `minimum_input_format_bits` 有效数字精度门槛（整数按位宽，`f32=24`、`f64=53`；默认 24/32-bit 交付不接受 `i16/u16`）。
 - `captured` / `committed` 单调，最大提交延迟 ≤ 10 秒，无 overflow/fault marker。
 - 所有分段 WAV 为请求采样率、请求位深、Mono；物理帧数等于最终 `committed_samples`。
 - 安全停止后 WAV 头与物理 EOF 一致，整轨导出可解析；文件较大时能正确识别 RF64 的 `ds64` 计数和哨兵字段。
@@ -228,25 +228,94 @@ try {
 
 验收完成后，先保存整个验收结果目录，再在“磁盘管理”中分离并删除该专用 VHDX。
 
-## 9. 发布判定与工单清单
+## 9. 真实断电与重启恢复（两阶段）
+
+这项门禁必须使用可丢弃的 Windows 测试机，不能在客户正在录音的机器上执行。“断电”指录制进行中切断整台计算机电源，不能用 Ctrl+C、任务管理器、关闭窗口或正常关机代替。
+
+### 9.1 阶段 1：建立指定会话并在录制中断电
+
+先创建一个未被客户任务使用的测试根目录，但不要预先创建 `$session` 目录；工具会拒绝复用已存在的会话目录。
+
+```powershell
+$device = "<inventory 返回的完整设备 ID>"
+$qaRoot = "D:\DataBaker-PowerCut-QA"
+$session = Join-Path $qaRoot "recording-01"
+$reports = Join-Path $qaRoot "reports-phase-1"
+.\run-windows-audio-acceptance.cmd --mode power-cut --session-dir $session --output $reports --device-id $device --sample-rate 48000 --bit-depth 24 --channel 1 --seconds 3900 --trigger-delay-seconds 3600 --poll-seconds 5
+```
+
+生产 `power-cut` 模式会强制 `--trigger-delay-seconds >= 3600`；未显式给出时，默认是录制 3600 秒后进入达标检查、最长等待 3900 秒。到达墙钟时间并不会立即提示断电；工具还会确认：
+
+- `committed_samples >= sample_rate * 3600`，即至少 1 小时的样本已进入持久化水位。
+- 样本水位和分段文件仍在增长，会话无 fault/overflow，磁盘读取正常。
+- `captured - committed` 不超过 `--max-tail-loss-seconds`（默认 2 秒，用于覆盖约 1 秒 checkpoint 和一个回调缓冲）。
+
+全部达标后，工具才会生成随机 nonce，将同一份 `armed` 证据同步写入 phase-1 报告目录和 `<session>\metadata\power-cut.acceptance.json`，并强制落盘 telemetry，然后鸣笛并打印断电提示。提示出现后：
+
+1. 确认终端中的 `captured` / `committed` 和文件字节仍在增长。
+2. 直接切断整台测试机电源，不点击应用的停止或退出。
+3. 如果工具在断电前自行结束，它会安全停止并返回 `INCOMPLETE`；这种情况不得计为断电通过。
+
+阶段 1 不会产生 `PASS`。真实断电时进程来不及完成报告，这正是本测试的预期结果。工具会在 armed 时打印 `phase-1 报告` 和 `phase-1 证据` 的精确路径；阶段 2 必须显式传入其中一个，不会仅凭一个已封存目录判定断电通过。
+
+### 9.2 阶段 2：重启后离线封存并严格检查
+
+重新上电进入 Windows 后，不要先打开桌面录音任务，也不要人工修改 WAV 或 JSON。在同一版本的 `resources\acceptance` 中执行：
+
+```powershell
+$qaRoot = "D:\DataBaker-PowerCut-QA"
+$session = Join-Path $qaRoot "recording-01"
+$reports = Join-Path $qaRoot "reports-phase-2"
+$phase1Report = Get-ChildItem (Join-Path $qaRoot "reports-phase-1") -Filter "acceptance-report.json" -File -Recurse |
+  Sort-Object LastWriteTime -Descending |
+  Select-Object -First 1 -ExpandProperty FullName
+.\run-windows-audio-acceptance.cmd --mode recover --session-dir $session --phase1-report $phase1Report --output $reports --yes
+```
+
+`--phase1-report` 也可以指向 phase-1 目录中的独立 `power-cut-evidence.json`。`recover` 在启动引擎、更改 WAV 或写入恢复元数据之前，会先只读校验 nonce、会话内证据、session/device/format 身份、恢复前 `recording/stopping` 状态、1 小时 committed 水位，以及同一 hostname/platform/architecture 上的系统启动时间已晚于 armed 时间。因此仅强杀录音进程、没有重启 Windows，不能通过该门禁。
+
+预检通过后，`recover` 才会启动包内同一个 `recorder-engine.exe`，调用 `seal_interrupted_session`，修复最后一段的不完整帧和落后头部，再从磁盘重新读取全部证据。只有以下项目全部成立才返回 `PASS` / 退出码 `0`：
+
+- `seal_interrupted_session` 成功，返回目录与指定会话完全一致，且 `no_op=false`；正常 stopped 或已恢复会话不能重复借用旧证据 PASS。
+- 所有五分钟分段从 `000001` 连续编号，已闭合段长度正确，RIFF/RF64 头部与物理 EOF 精确一致，`block_align` / `byte_rate` 合法，没有半个音频帧的尾字节。
+- 磁盘上的 `captured_samples == committed_samples == 物理完整帧总数`。不接受“物理帧不少于快照”这种宽松判定。
+- 恢复后物理帧数不少于 phase-1 `armed_committed_samples`；相对 `armed_captured_samples` 的尾差不超过 phase-1 确定的上限（默认 2 秒）。
+- 会话状态为 `stopped`，`overflow_samples=0`，不存在 `audio-fault.json` 或 `audio-fault.tmp`。
+- `session.json` 与 `items.snapshot.json` 的 `session_id` / `journal_seq` / `status` 一致。
+- 原生引擎完成正常 `shutdown`，退出码为 0，无信号退出或超时脱离。
+
+任何 stale WAV header、不完整帧、故障标记、溢出、非 `stopped` 状态或水位不相等都是 `FAIL`。命令错误、无法读取证据或引擎无法安全退出是 `INCOMPLETE`，两者均不得发布。
+
+必要时可再做一次不修改文件的复核：
+
+```powershell
+.\run-windows-audio-acceptance.cmd --mode inspect --session-dir $session --output (Join-Path $qaRoot "reports-inspect")
+```
+
+`inspect` 使用与 `recover` 相同的严格磁盘判定，但不修复任何文件。它会拒绝可识别的会话/分段 symlink 或 junction、分段编号缺口、孤立 descriptor 和语义无效的 WAV 头。与健康 WAV 对应的损坏冗余 descriptor 只会是 `WARN`：已闭合段不依赖 sidecar，健康末段的 sidecar 可由引擎原子补建；但末段 WAV 头已损坏时，必须有匹配的有效 descriptor 才允许恢复。阶段 1 的残留报告、阶段 2 的完整报告、协议日志、stderr 和整个会话目录必须一起归档。
+
+> 开发回归可显式使用 `--test-only-power-cut` 缩短时间，但 phase-1 证据会固定写入 `test_only=true` / `production_eligible=false`，recover 只会返回 `TEST_ONLY_PASS`。该结果退出码为 0，仅用于自动回归，不得填入生产验收工单或代替 1 小时真实断电。
+
+## 10. 发布判定与工单清单
 
 同一个声卡/驱动/Windows 组合的发布门禁为：
 
 | 项目 | 最低要求 |
 | --- | --- |
 | 设备枚举 | `inventory` PASS，稳定 ID 唯一 |
-| 位深 | 48 kHz / 16、24、32-bit 短录各 PASS；24/32-bit 项目默认不接受 16-bit driver representation |
+| 位深 | 48 kHz / 16、24、32-bit 短录各 PASS；24/32-bit 项目默认要求至少 24 bit 输入有效数字精度（`f32=24`） |
 | 通道 | 生产会使用的每个输入通道 PASS |
 | 长稳 | 候选版 2h PASS；客户正式版主力组合 8h PASS |
 | USB 拔出 | `unplug` PASS |
 | 磁盘保护 | 专用测试卷 `disk-full` PASS |
+| 整机断电 | 阶段 1 录制至少 1h 后真实断电；重启后 `recover` PASS，严格 `inspect` 复核 PASS |
 | 原始证据 | report + telemetry + protocol + stderr + recording 全部归档 |
 
 任意一项 `FAIL` 或 `INCOMPLETE` 都不允许以“验收通过”结单。`WARN` 必须有书面处理记录；例如削波 WARN 需调整硬件增益后重测。
 
-## 10. 已知边界
+## 11. 已知边界
 
 - 当前 Windows 基线是 WASAPI shared mode，不是 ASIO 或独占 bit-perfect 链路。需要 ASIO-only 的声卡不属于本门禁覆盖范围。
 - 工具可证明驱动交给应用的样本格式和最终 WAV 编码，不能仅凭 WASAPI 元数据证明声卡 ADC 的真实 ENOB。模拟前端、噪声底和失真仍需专业测量。
 - 标准 RIFF/WAV 容器有约 4 GiB 上限；整轨超过该边界时会自动切换为 RF64，五分钟分段、单句和预览仍保持普通 RIFF。RF64 的目标文件系统及播放器、标注、上传等下游兼容性必须按实际交付链路验收，FAT32 不能保存大于 4 GiB 的单文件。
-- 本工具的人工模式覆盖真实 USB 拔出和存储保护。进程强杀/恢复的无硬件回归由 `npm run test:crash-recovery` 执行；真实断电仍应在可丢弃的 Windows 测试机上单独归档。
+- 进程强杀/恢复的无硬件回归由 `npm run test:crash-recovery` 执行；真实断电必须按第 9 节在可丢弃的 Windows 测试机上执行并归档，不能用无硬件回归代替。

@@ -87,7 +87,11 @@ class FakeEngineClient extends EventEmitter {
     if (command === 'get_state_optional') {
       this.getStateCalls += 1;
       if (this.mode === 'active') {
-        return { active: true, session_dir: globalThis.offlineSealSessionDir };
+        return {
+          active: true,
+          session_dir: globalThis.offlineSealSessionDir,
+          snapshot: validSnapshot(path.basename(globalThis.offlineSealSessionDir)),
+        };
       }
       if (this.mode === 'timeout' && this.getStateCalls > 1) {
         throw new FakeTimeoutError(command);

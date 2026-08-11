@@ -3,15 +3,31 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { randomUUID } = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { createInterface } = require('node:readline');
 const { createInterface: createPrompt } = require('node:readline/promises');
 
 const PROTOCOL_VERSION = 1;
 const TOOL_VERSION = 1;
-const MODES = new Set(['inventory', 'short', 'soak', 'unplug', 'disk-full', 'inspect']);
+const MODES = new Set([
+  'inventory',
+  'short',
+  'soak',
+  'unplug',
+  'disk-full',
+  'power-cut',
+  'recover',
+  'inspect',
+]);
 const FAULT_MODES = new Set(['unplug', 'disk-full']);
 const BIT_DEPTHS = new Set([16, 24, 32]);
+const PRODUCTION_POWER_CUT_SECONDS = 3_600;
+const DEFAULT_POWER_CUT_MAXIMUM_SECONDS = 3_900;
+const DEFAULT_MAX_TAIL_LOSS_SECONDS = 2;
+const POWER_CUT_EVIDENCE_KIND = 'databaker.power-cut-phase-1';
+const POWER_CUT_SESSION_EVIDENCE = path.join('metadata', 'power-cut.acceptance.json');
+const SEGMENT_DESCRIPTOR_KIND = 'databaker.segmented-wav-header';
 
 function testTimeout(name, fallback) {
   if (process.env.NODE_ENV !== 'test') return fallback;
@@ -50,7 +66,9 @@ function usage() {
   soak        2–8 小时连续录音和文件增长监测（默认不拷贝整轨）
   unplug      进行中人工拔出 USB 声卡，验证 fail-closed 和故障标记
   disk-full   在专用测试卷上人工降低剩余空间，验证磁盘保护
-  inspect     只读检查已有录制目录，需 --session-dir
+  power-cut   阶段1：开始录音并等待人工断电，需 --session-dir
+  recover     阶段2：重启后离线封存并严格验证断电会话，需 --session-dir
+  inspect     只读严格检查已封存录制目录，需 --session-dir
 
 常用参数:
   --engine <path>                recorder-engine.exe 路径（可自动定位）
@@ -59,13 +77,14 @@ function usage() {
   --device-index <n>             界面打印的 1-based 设备序号
   --sample-rate <hz>             默认 48000
   --bit-depth <16|24|32>         交付 WAV 位深，默认 24
-  --minimum-input-format-bits <n> 驱动输入表示最低位数；默认 16-bit 交付要求 16，24/32-bit 要求 24
+  --minimum-input-format-bits <n> 驱动输入有效数字精度门槛；f32 按 24、f64 按 53；默认 16-bit 交付要求 16，24/32-bit 要求 24
   --channel <n>                  声卡输入通道（1-based），默认 1
-  --seconds <n>                  short 录制秒数，默认 20
+  --seconds <n>                  short 录制秒数（默认 20）/ power-cut 最长等待（生产默认 3900）
   --hours <2..8>                 soak 时长，默认 2
   --poll-seconds <n>             进度落盘间隔，默认 1（soak 默认 5）
-  --trigger-delay-seconds <n>    故障操作倒计时，默认 10
+  --trigger-delay-seconds <n>    故障操作倒计时，power-cut 生产默认/最小 3600
   --fault-timeout-seconds <n>    等待故障被检测的时间，默认 60
+  --max-tail-loss-seconds <n>    断电证据允许的最大 captured/committed 尾差，默认 2
   --confirm-dedicated-volume     disk-full 确认 1：输出位于可丢弃测试卷
   --confirm-not-system-drive     disk-full 确认 2：该卷不是 Windows 系统盘
   --noise-threshold-dbfs <n>     环境噪声阈值，默认 -40
@@ -73,7 +92,10 @@ function usage() {
   --export                       soak 也生成 full-track.wav（可能很大）
   --no-export                    short 不生成 full-track.wav
   --yes                          非交互执行；无设备参数时选系统默认设备
-  --session-dir <path>           inspect 的录制目录
+  --session-dir <path>           power-cut / recover / inspect 共用的录制目录
+  --phase1-report <path>         recover 必需：phase-1 acceptance-report.json 或独立证据 JSON
+  --phase1-evidence <path>       --phase1-report 的等价别名
+  --test-only-power-cut          显式启用短时无害回归；结果永不具备生产验收资格
   --help                         显示帮助
 
 结果:
@@ -135,6 +157,7 @@ function parseArgs(argv) {
     pollSeconds: null,
     triggerDelaySeconds: 10,
     faultTimeoutSeconds: 60,
+    maxTailLossSeconds: DEFAULT_MAX_TAIL_LOSS_SECONDS,
     confirmDedicatedVolume: false,
     confirmNotSystemDrive: false,
     noiseThresholdDbfs: -40,
@@ -142,6 +165,10 @@ function parseArgs(argv) {
     export: null,
     yes: false,
     sessionDir: null,
+    phase1Report: null,
+    testOnlyPowerCut: false,
+    secondsExplicit: false,
+    triggerDelayExplicit: false,
     help: false,
   };
 
@@ -197,6 +224,7 @@ function parseArgs(argv) {
         break;
       case '--seconds':
         options.seconds = parseNumber(valueFor(index, flag), flag);
+        options.secondsExplicit = true;
         index += 1;
         break;
       case '--hours':
@@ -209,10 +237,15 @@ function parseArgs(argv) {
         break;
       case '--trigger-delay-seconds':
         options.triggerDelaySeconds = parseNumber(valueFor(index, flag), flag);
+        options.triggerDelayExplicit = true;
         index += 1;
         break;
       case '--fault-timeout-seconds':
         options.faultTimeoutSeconds = parseNumber(valueFor(index, flag), flag);
+        index += 1;
+        break;
+      case '--max-tail-loss-seconds':
+        options.maxTailLossSeconds = parseNumber(valueFor(index, flag), flag);
         index += 1;
         break;
       case '--confirm-dedicated-volume':
@@ -241,6 +274,15 @@ function parseArgs(argv) {
         options.sessionDir = path.resolve(valueFor(index, flag));
         index += 1;
         break;
+      case '--phase1-report':
+      case '--phase1-evidence':
+        if (options.phase1Report !== null) throw new Error('--phase1-report / --phase1-evidence 只能指定一次');
+        options.phase1Report = path.resolve(valueFor(index, flag));
+        index += 1;
+        break;
+      case '--test-only-power-cut':
+        options.testOnlyPowerCut = true;
+        break;
       default:
         throw new Error(`未知参数: ${flag}`);
     }
@@ -248,7 +290,18 @@ function parseArgs(argv) {
 
   if (options.help) return options;
   if (!MODES.has(options.mode)) throw new Error(`--mode 必须是 ${[...MODES].join(', ')}`);
-  if (options.mode === 'inspect' && !options.sessionDir) throw new Error('inspect 需要 --session-dir');
+  if (['inspect', 'power-cut', 'recover'].includes(options.mode) && !options.sessionDir) {
+    throw new Error(`${options.mode} 需要 --session-dir`);
+  }
+  if (options.mode === 'recover' && !options.phase1Report) {
+    throw new Error('recover 需要 --phase1-report <phase-1 report/evidence JSON>');
+  }
+  if (options.phase1Report && options.mode !== 'recover') {
+    throw new Error('--phase1-report / --phase1-evidence 只能用于 recover');
+  }
+  if (options.testOnlyPowerCut && !['power-cut', 'recover'].includes(options.mode)) {
+    throw new Error('--test-only-power-cut 只能用于 power-cut / recover');
+  }
   if (
     options.mode === 'disk-full' &&
     (!options.outputExplicit || !options.confirmDedicatedVolume || !options.confirmNotSystemDrive)
@@ -260,26 +313,47 @@ function parseArgs(argv) {
   if (options.mode === 'disk-full') validateDiskFullTarget(options.output);
   if (!BIT_DEPTHS.has(options.bitDepth)) throw new Error('--bit-depth 必须是 16、24 或 32');
   if (options.minimumInputFormatBits === null) {
-    // 32-bit Float 交付通常来自 24-bit ADC。这里只拒绝明显的
-    // 16-bit driver container 降级，不把样本表示宽度误当成 ADC ENOB 证明。
+    // 32-bit Float 交付通常来自 24-bit ADC。这里只拒绝明显低于
+    // 24-bit 有效数字精度的输入，不把数字表示精度误当成 ADC ENOB 证明。
     options.minimumInputFormatBits = options.bitDepth === 16 ? 16 : 24;
   }
-  if (![8, 16, 24, 32, 64].includes(options.minimumInputFormatBits)) {
-    throw new Error('--minimum-input-format-bits 必须是 8、16、24、32 或 64');
+  if (![8, 16, 24, 32, 53, 64].includes(options.minimumInputFormatBits)) {
+    throw new Error('--minimum-input-format-bits 必须是 8、16、24、32、53 或 64');
   }
   if (options.sampleRate < 8_000 || options.sampleRate > 384_000) {
     throw new Error('--sample-rate 必须在 8000–384000 之间');
   }
   if (options.channel < 1 || options.channel > 256) throw new Error('--channel 必须在 1–256 之间');
-  if (options.seconds < 5 || options.seconds > 3_600) throw new Error('--seconds 必须在 5–3600 之间');
+  if (options.mode === 'power-cut' && !options.testOnlyPowerCut) {
+    if (!options.secondsExplicit) options.seconds = DEFAULT_POWER_CUT_MAXIMUM_SECONDS;
+    if (!options.triggerDelayExplicit) options.triggerDelaySeconds = PRODUCTION_POWER_CUT_SECONDS;
+  }
+  const maximumSeconds = options.mode === 'power-cut' ? 8 * 3_600 : 3_600;
+  if (options.seconds < 5 || options.seconds > maximumSeconds) {
+    throw new Error(`--seconds 必须在 5–${maximumSeconds} 之间`);
+  }
   if (options.mode === 'soak' && (options.hours < 2 || options.hours > 8)) {
     throw new Error('soak --hours 必须在 2–8 之间');
   }
   if (options.pollSeconds !== null && (options.pollSeconds < 0.25 || options.pollSeconds > 60)) {
     throw new Error('--poll-seconds 必须在 0.25–60 之间');
   }
-  if (options.triggerDelaySeconds < 2 || options.triggerDelaySeconds > 600) {
-    throw new Error('--trigger-delay-seconds 必须在 2–600 之间');
+  const maximumTriggerDelay = options.mode === 'power-cut' ? 8 * 3_600 - 1 : 600;
+  if (options.triggerDelaySeconds < 2 || options.triggerDelaySeconds > maximumTriggerDelay) {
+    throw new Error(`--trigger-delay-seconds 必须在 2–${maximumTriggerDelay} 之间`);
+  }
+  if (options.mode === 'power-cut' && options.triggerDelaySeconds >= options.seconds) {
+    throw new Error('power-cut --trigger-delay-seconds 必须小于 --seconds，以留出断电操作窗口');
+  }
+  if (
+    options.mode === 'power-cut' &&
+    !options.testOnlyPowerCut &&
+    options.triggerDelaySeconds < PRODUCTION_POWER_CUT_SECONDS
+  ) {
+    throw new Error(`生产 power-cut --trigger-delay-seconds 不能少于 ${PRODUCTION_POWER_CUT_SECONDS}；短时回归必须显式使用 --test-only-power-cut`);
+  }
+  if (options.maxTailLossSeconds < 0.1 || options.maxTailLossSeconds > 10) {
+    throw new Error('--max-tail-loss-seconds 必须在 0.1–10 之间');
   }
   if (options.faultTimeoutSeconds < 10 || options.faultTimeoutSeconds > 3_600) {
     throw new Error('--fault-timeout-seconds 必须在 10–3600 之间');
@@ -292,6 +366,8 @@ function parseArgs(argv) {
   }
   if (options.pollSeconds === null) options.pollSeconds = options.mode === 'soak' ? 5 : 1;
   if (options.export === null) options.export = options.mode === 'short';
+  delete options.secondsExplicit;
+  delete options.triggerDelayExplicit;
   return options;
 }
 
@@ -309,9 +385,16 @@ function linearToDbfs(value) {
 }
 
 function inputSampleFormatBits(format) {
-  const match = /^\s*[iuf](\d+)\s*$/i.exec(String(format ?? ''));
+  const match = /^\s*([iuf])(\d+)\s*$/i.exec(String(format ?? ''));
   if (!match) return null;
-  const bits = Number(match[1]);
+  const kind = match[1].toLowerCase();
+  const bits = Number(match[2]);
+  if (kind === 'f') {
+    // IEEE-754 precision includes the implicit leading significand bit.
+    if (bits === 32) return 24;
+    if (bits === 64) return 53;
+    return null;
+  }
   return Number.isSafeInteger(bits) && bits > 0 ? bits : null;
 }
 
@@ -331,6 +414,120 @@ function pathEntryExists(filePath) {
     if (error?.code === 'ENOENT') return false;
     throw error;
   }
+}
+
+function comparablePath(filePath, platform = process.platform) {
+  const resolved = path.resolve(filePath);
+  return platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function pathsEqual(left, right, platform = process.platform) {
+  return comparablePath(left, platform) === comparablePath(right, platform);
+}
+
+function hostBootIdentity(
+  environment = process.env,
+  nowMs = Date.now(),
+  uptimeSeconds = os.uptime(),
+  hostname = os.hostname(),
+) {
+  if (
+    environment.NODE_ENV === 'test' &&
+    environment.DATABAKER_ACCEPTANCE_TEST_BOOT_ID &&
+    environment.DATABAKER_ACCEPTANCE_TEST_BOOTED_AT
+  ) {
+    const overridden = Date.parse(environment.DATABAKER_ACCEPTANCE_TEST_BOOTED_AT);
+    if (!Number.isFinite(overridden)) {
+      throw new Error('DATABAKER_ACCEPTANCE_TEST_BOOTED_AT 必须是有效 ISO 时间');
+    }
+    return {
+      id: environment.DATABAKER_ACCEPTANCE_TEST_BOOT_ID,
+      booted_at: new Date(overridden).toISOString(),
+      observed_uptime_seconds: Math.max(0, (nowMs - overridden) / 1_000),
+      source: 'test-override',
+    };
+  }
+  const bootedAtMs = Math.max(0, nowMs - Math.max(0, Number(uptimeSeconds)) * 1_000);
+  const roundedBootMinute = Math.floor(bootedAtMs / 60_000) * 60_000;
+  return {
+    id: `${hostname}:${roundedBootMinute}`,
+    booted_at: new Date(bootedAtMs).toISOString(),
+    observed_uptime_seconds: Math.max(0, Number(uptimeSeconds)),
+    source: 'os-uptime',
+  };
+}
+
+function readJsonRegularFile(filePath, label = 'JSON', maximumBytes = 2 * 1024 * 1024) {
+  const metadata = fs.lstatSync(filePath);
+  if (metadata.isSymbolicLink() || !metadata.isFile()) {
+    throw new Error(`${label} 必须是普通文件，不能是链接: ${filePath}`);
+  }
+  if (metadata.size <= 0 || metadata.size > maximumBytes) {
+    throw new Error(`${label} 大小无效: ${filePath} (${metadata.size} bytes)`);
+  }
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (error) {
+    throw new Error(`${label} 无法解析: ${filePath}: ${error.message}`);
+  }
+}
+
+function loadPhase1Evidence(sourcePath) {
+  const source = readJsonRegularFile(sourcePath, 'phase-1 报告/证据');
+  if (source?.kind === POWER_CUT_EVIDENCE_KIND) {
+    return { evidence: source, source_kind: 'evidence', report: null };
+  }
+  const evidence = source?.power_cut?.evidence;
+  if (source?.mode !== 'power-cut' || !evidence) {
+    throw new Error('--phase1-report 不是 power-cut 报告，也不是独立 phase-1 证据');
+  }
+  if (source.power_cut.phase !== 'armed' || source.completed_at !== null || source.overall !== 'INCOMPLETE') {
+    throw new Error('phase-1 报告未停留在已达标 armed 的异常中断状态');
+  }
+  return { evidence, source_kind: 'report', report: source };
+}
+
+function powerCutRequiredDurationSeconds(options) {
+  return options.testOnlyPowerCut
+    ? Math.max(2, Math.min(options.triggerDelaySeconds, PRODUCTION_POWER_CUT_SECONDS - 1))
+    : PRODUCTION_POWER_CUT_SECONDS;
+}
+
+function buildPowerCutEvidence(report, options, sessionDirectory, row) {
+  const snapshot = report.start?.snapshot;
+  const requiredDurationSeconds = powerCutRequiredDurationSeconds(options);
+  return {
+    schema_version: 1,
+    kind: POWER_CUT_EVIDENCE_KIND,
+    phase: 'armed',
+    nonce: report.power_cut.nonce,
+    test_only: options.testOnlyPowerCut,
+    production_eligible: !options.testOnlyPowerCut,
+    session_dir: path.resolve(sessionDirectory),
+    session_id: snapshot?.session_id,
+    device_id: snapshot?.device_id,
+    device_name: snapshot?.device_name,
+    input_sample_format: snapshot?.input_sample_format,
+    audio_format: snapshot?.audio_format,
+    required_duration_seconds: requiredDurationSeconds,
+    production_minimum_seconds: PRODUCTION_POWER_CUT_SECONDS,
+    wall_elapsed_seconds: Number(row.elapsed_seconds),
+    armed_at: row.at,
+    armed_captured_samples: Number(row.captured_samples),
+    armed_committed_samples: Number(row.committed_samples),
+    max_tail_loss_samples: Math.ceil(options.maxTailLossSeconds * options.sampleRate),
+    segment_total_bytes: Number(row.segment_total_bytes),
+    segment_count: Number(row.segment_count),
+    tool_version: TOOL_VERSION,
+    protocol_version: PROTOCOL_VERSION,
+    host: {
+      hostname: report.host.hostname,
+      platform: report.host.platform,
+      architecture: report.host.architecture,
+      boot_id: report.host.boot.id,
+      booted_at: report.host.boot.booted_at,
+    },
+  };
 }
 
 function writeJsonDurable(filePath, value) {
@@ -668,8 +865,8 @@ function segmentStatSnapshot(sessionDirectory) {
   let names = [];
   try {
     names = fs.readdirSync(directory).filter((name) => /^master-\d{6}\.wav$/i.test(name)).sort();
-  } catch {
-    return { files: [], total_bytes: 0, error: null };
+  } catch (error) {
+    return { files: [], total_bytes: 0, error: error.message };
   }
   const files = [];
   let totalBytes = 0;
@@ -687,8 +884,8 @@ function segmentStatSnapshot(sessionDirectory) {
 }
 
 function inspectWav(filePath) {
-  const stat = fs.statSync(filePath);
-  if (!stat.isFile()) throw new Error(`不是普通文件: ${filePath}`);
+  const stat = fs.lstatSync(filePath);
+  if (stat.isSymbolicLink() || !stat.isFile()) throw new Error(`不是普通 WAV 文件或文件是链接: ${filePath}`);
   if (stat.size < 12) throw new Error(`WAV 文件过短: ${filePath}`);
   const fd = fs.openSync(filePath, 'r');
   let buffer;
@@ -762,6 +959,29 @@ function inspectWav(filePath) {
   const physicalDataBytes = payloadMatchesDeclared ? declaredDataBytes : physicalPayloadBytes;
   const wordPaddingBytes = payloadMatchesDeclared ? physicalPayloadBytes - declaredDataBytes : 0;
   const blockAlign = format.block_align;
+  const formatErrors = [];
+  const expectedSampleBytes = format.bits_per_sample / 8;
+  const expectedBlockAlign = format.channels * expectedSampleBytes;
+  if (!Number.isInteger(expectedSampleBytes) || expectedSampleBytes <= 0) {
+    formatErrors.push(`bits_per_sample ${format.bits_per_sample} 不是整字节样本`);
+  }
+  if (format.channels <= 0 || format.sample_rate <= 0) {
+    formatErrors.push('channels / sample_rate 必须大于 0');
+  }
+  if (!Number.isInteger(expectedBlockAlign) || blockAlign !== expectedBlockAlign) {
+    formatErrors.push(`block_align=${blockAlign}，期望 ${expectedBlockAlign}`);
+  }
+  const expectedByteRate = format.sample_rate * expectedBlockAlign;
+  if (!Number.isSafeInteger(expectedByteRate) || format.byte_rate !== expectedByteRate) {
+    formatErrors.push(`byte_rate=${format.byte_rate}，期望 ${expectedByteRate}`);
+  }
+  const supportedEncoding =
+    (format.format_code === 1 && (format.bits_per_sample === 16 || format.bits_per_sample === 24)) ||
+    (format.format_code === 3 && format.bits_per_sample === 32);
+  if (!supportedEncoding) {
+    formatErrors.push(`不支持的 format_code/bit_depth: ${format.format_code}/${format.bits_per_sample}`);
+  }
+  const formatValid = formatErrors.length === 0;
   const completeFrames = blockAlign > 0 ? Math.floor(physicalDataBytes / blockAlign) : 0;
   const trailingBytes = blockAlign > 0 ? physicalDataBytes % blockAlign : physicalDataBytes;
   const declaredFrames = blockAlign > 0 ? Math.floor(declaredDataBytes / blockAlign) : 0;
@@ -770,6 +990,7 @@ function inspectWav(filePath) {
     riffSize32 !== 0xffffffff &&
     riffSize32 + 8 === stat.size &&
     payloadMatchesDeclared &&
+    formatValid &&
     trailingBytes === 0 &&
     (format.format_code !== 3 || factFrames === completeFrames);
   const exactRf64Header =
@@ -779,6 +1000,8 @@ function inspectWav(filePath) {
     ds64.riff_size + 8 === stat.size &&
     ds64.sample_count === completeFrames &&
     payloadMatchesDeclared &&
+    formatValid &&
+    ds64.table_length === 0 &&
     wordPaddingBytes === expectedPaddingBytes &&
     trailingBytes === 0 &&
     (format.format_code !== 3 || factFrames === 0xffffffff);
@@ -792,6 +1015,8 @@ function inspectWav(filePath) {
     riff_size_32: riffSize32,
     ds64,
     ...format,
+    format_valid: formatValid,
+    format_errors: formatErrors,
     encoding: format.format_code === 1 ? 'pcm' : format.format_code === 3 ? 'float' : `format-${format.format_code}`,
     data_offset: data.offset,
     data_size_32: data.size_32,
@@ -808,6 +1033,88 @@ function inspectWav(filePath) {
   };
 }
 
+function inspectDirectory(result, directory, label) {
+  try {
+    const metadata = fs.lstatSync(directory);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      result.tree_errors.push(`${label} 必须是真实目录，不能是链接: ${directory}`);
+      return false;
+    }
+    return true;
+  } catch (error) {
+    result.tree_errors.push(`${label} 无法读取: ${directory}: ${error.message}`);
+    return false;
+  }
+}
+
+function inspectionJson(result, filePath, label) {
+  try {
+    return readJsonRegularFile(filePath, label);
+  } catch (error) {
+    result.metadata_errors.push(error.message);
+    return null;
+  }
+}
+
+function expectedSegmentFrames(snapshot) {
+  const explicit = Number(snapshot?.segment_frames);
+  if (Number.isSafeInteger(explicit) && explicit > 0) return explicit;
+  const sampleRate = Number(snapshot?.audio_format?.sample_rate);
+  return Number.isSafeInteger(sampleRate) && sampleRate > 0 ? sampleRate * 300 : null;
+}
+
+function validateSegmentDescriptor(result, descriptorPath, descriptorIndex, segmentName) {
+  let descriptor;
+  try {
+    descriptor = readJsonRegularFile(descriptorPath, 'WAV segment descriptor', 4 * 1024);
+  } catch (error) {
+    try {
+      const metadata = fs.lstatSync(descriptorPath);
+      if (metadata.isDirectory()) result.descriptor_errors.push(error.message);
+      else result.descriptor_issues.push(error.message);
+    } catch {
+      result.descriptor_issues.push(error.message);
+    }
+    result.segment_descriptors.push({
+      path: descriptorPath,
+      segment_index: descriptorIndex,
+      valid: false,
+      descriptor: null,
+    });
+    return false;
+  }
+  const snapshot = result.snapshot;
+  const bitDepth = Number(snapshot?.audio_format?.bit_depth);
+  const expected = {
+    schema_version: 1,
+    kind: SEGMENT_DESCRIPTOR_KIND,
+    segment_index: descriptorIndex,
+    segment_file: segmentName,
+    sample_rate: Number(snapshot?.audio_format?.sample_rate),
+    channels: 1,
+    bit_depth: bitDepth,
+    encoding: bitDepth === 32 ? 'float' : 'pcm',
+    header_len: bitDepth === 32 ? 56 : 44,
+    max_frames_per_segment: expectedSegmentFrames(snapshot),
+  };
+  const expectedKeys = Object.keys(expected).sort();
+  const actualKeys = descriptor && typeof descriptor === 'object' ? Object.keys(descriptor).sort() : [];
+  const exactKeys = JSON.stringify(actualKeys) === JSON.stringify(expectedKeys);
+  const exactValues = exactKeys && expectedKeys.every((key) => descriptor[key] === expected[key]);
+  if (!exactValues) {
+    result.descriptor_issues.push(
+      `WAV segment descriptor 与会话格式、编号或文件名不匹配: ${descriptorPath}`,
+    );
+  }
+  result.segment_descriptors.push({
+    path: descriptorPath,
+    segment_index: descriptorIndex,
+    valid: exactValues,
+    descriptor,
+  });
+  return exactValues;
+}
+
 function inspectSession(sessionDirectory) {
   const result = {
     session_dir: sessionDirectory,
@@ -818,42 +1125,160 @@ function inspectSession(sessionDirectory) {
     fault_marker_exists: false,
     fault_marker_parse_error: false,
     fault_marker_temporary_exists: false,
+    tree_errors: [],
+    metadata_errors: [],
     segments: [],
     segment_errors: [],
+    segment_error_details: [],
+    segment_layout_errors: [],
+    descriptor_errors: [],
+    descriptor_issues: [],
+    segment_descriptors: [],
+    preseal_recovery_errors: [],
     total_physical_frames: 0,
     total_file_bytes: 0,
     full_track: null,
     full_track_error: null,
   };
-  const stat = fs.statSync(sessionDirectory);
-  if (!stat.isDirectory()) throw new Error(`不是录制目录: ${sessionDirectory}`);
+  if (!inspectDirectory(result, sessionDirectory, '录制根目录')) return result;
   result.exists = true;
-  result.snapshot = safeReadJson(path.join(sessionDirectory, 'metadata', 'items.snapshot.json'));
-  result.session_summary = safeReadJson(path.join(sessionDirectory, 'session.json'));
-  const faultMarkerPath = path.join(sessionDirectory, 'metadata', 'audio-fault.json');
-  result.fault_marker_exists = pathEntryExists(faultMarkerPath);
-  result.fault_marker = safeReadJson(faultMarkerPath);
-  result.fault_marker_parse_error = result.fault_marker_exists && result.fault_marker === null;
-  result.fault_marker_temporary_exists = pathEntryExists(path.join(sessionDirectory, 'metadata', 'audio-fault.tmp'));
-  const segmentDirectory = path.join(sessionDirectory, 'audio', 'segments');
-  let names = [];
-  try {
-    names = fs.readdirSync(segmentDirectory).filter((name) => /^master-\d{6}\.wav$/i.test(name)).sort();
-  } catch (error) {
-    result.segment_errors.push(error.message);
+  const audioDirectory = path.join(sessionDirectory, 'audio');
+  const metadataDirectory = path.join(sessionDirectory, 'metadata');
+  const scriptDirectory = path.join(sessionDirectory, 'script');
+  const segmentDirectory = path.join(audioDirectory, 'segments');
+  const audioSafe = inspectDirectory(result, audioDirectory, 'audio');
+  const metadataSafe = inspectDirectory(result, metadataDirectory, 'metadata');
+  inspectDirectory(result, scriptDirectory, 'script');
+  const segmentsSafe = audioSafe && inspectDirectory(result, segmentDirectory, 'audio/segments');
+  if (metadataSafe) {
+    result.snapshot = inspectionJson(
+      result,
+      path.join(metadataDirectory, 'items.snapshot.json'),
+      '会话快照',
+    );
+    result.session_summary = inspectionJson(result, path.join(sessionDirectory, 'session.json'), '会话摘要');
   }
-  for (const name of names) {
+  const faultMarkerPath = path.join(sessionDirectory, 'metadata', 'audio-fault.json');
+  if (metadataSafe) {
+    result.fault_marker_exists = pathEntryExists(faultMarkerPath);
+    if (result.fault_marker_exists) {
+      try {
+        result.fault_marker = readJsonRegularFile(faultMarkerPath, '音频故障标记');
+      } catch (error) {
+        result.fault_marker_parse_error = true;
+        result.metadata_errors.push(error.message);
+      }
+    }
+    result.fault_marker_temporary_exists = pathEntryExists(path.join(sessionDirectory, 'metadata', 'audio-fault.tmp'));
+  }
+  let segmentEntries = [];
+  const descriptors = new Map();
+  if (segmentsSafe) {
     try {
-      const wav = inspectWav(path.join(segmentDirectory, name));
+      for (const entry of fs.readdirSync(segmentDirectory, { withFileTypes: true })) {
+        const name = entry.name;
+        const segmentMatch = /^master-(\d{6})\.wav$/.exec(name);
+        const descriptorMatch = /^master-(\d{6})\.wav\.descriptor\.json$/.exec(name);
+        if (segmentMatch) {
+          const index = Number(segmentMatch[1]);
+          segmentEntries.push({ index, name, path: path.join(segmentDirectory, name) });
+        } else if (descriptorMatch) {
+          descriptors.set(Number(descriptorMatch[1]), {
+            name,
+            path: path.join(segmentDirectory, name),
+          });
+        } else if (/^\.?master-/i.test(name)) {
+          result.segment_layout_errors.push(`无效或未清理的分段文件名: ${name}`);
+        }
+      }
+    } catch (error) {
+      result.segment_layout_errors.push(error.message);
+    }
+  }
+  segmentEntries.sort((left, right) => left.index - right.index);
+  for (const [offset, segment] of segmentEntries.entries()) {
+    const expectedIndex = offset + 1;
+    if (segment.index !== expectedIndex) {
+      result.segment_layout_errors.push(
+        `分段编号必须从 master-000001.wav 连续递增；位置 ${expectedIndex} 实际为 ${segment.name}`,
+      );
+    }
+    try {
+      const wav = inspectWav(segment.path);
+      wav.segment_index = segment.index;
       result.segments.push(wav);
       result.total_physical_frames += wav.physical_complete_frames;
       result.total_file_bytes += wav.file_bytes;
     } catch (error) {
-      result.segment_errors.push(`${name}: ${error.message}`);
+      result.segment_errors.push(`${segment.name}: ${error.message}`);
+      result.segment_error_details.push({
+        segment_index: segment.index,
+        file_name: segment.name,
+        error: error.message,
+      });
+    }
+    const descriptor = descriptors.get(segment.index);
+    if (descriptor) validateSegmentDescriptor(result, descriptor.path, segment.index, segment.name);
+  }
+  for (const [index, descriptor] of descriptors) {
+    if (!segmentEntries.some((segment) => segment.index === index)) {
+      try {
+        const metadata = fs.lstatSync(descriptor.path);
+        const kind = metadata.isDirectory()
+          ? 'directory'
+          : metadata.isSymbolicLink()
+            ? 'link'
+            : metadata.isFile()
+              ? 'file'
+              : 'other';
+        result.descriptor_errors.push(
+          `WAV descriptor 没有对应分段，拒绝作为封存会话通过: ${descriptor.name} (${kind})`,
+        );
+      } catch (error) {
+        result.descriptor_errors.push(`无法检查孤立 WAV descriptor ${descriptor.name}: ${error.message}`);
+      }
     }
   }
-  const fullTrack = path.join(sessionDirectory, 'export', 'full-track.wav');
-  if (fs.existsSync(fullTrack)) {
+  const lastSegment = segmentEntries.at(-1) ?? null;
+  for (const detail of result.segment_error_details) {
+    if (!lastSegment || detail.segment_index !== lastSegment.index) {
+      result.preseal_recovery_errors.push(
+        `已闭合分段无法严格解析，离线恢复不得重建: ${detail.file_name}`,
+      );
+      continue;
+    }
+    const descriptorValid = result.segment_descriptors.some(
+      (descriptor) => descriptor.segment_index === detail.segment_index && descriptor.valid === true,
+    );
+    if (!descriptorValid) {
+      result.preseal_recovery_errors.push(
+        `末段 WAV 头无法解析且缺少有效恢复 descriptor: ${detail.file_name}`,
+      );
+    }
+  }
+  const maxFrames = expectedSegmentFrames(result.snapshot);
+  if (Number.isSafeInteger(maxFrames) && maxFrames > 0 && result.segments.length > 0) {
+    for (const [index, wav] of result.segments.entries()) {
+      const isLast = index === result.segments.length - 1;
+      if (!isLast && wav.physical_complete_frames !== maxFrames) {
+        result.segment_layout_errors.push(
+          `已闭合分段 ${wav.file_name} 应为 ${maxFrames} 帧，实际 ${wav.physical_complete_frames}`,
+        );
+      }
+      if (isLast && wav.physical_complete_frames > maxFrames) {
+        result.segment_layout_errors.push(
+          `末分段 ${wav.file_name} 超过固定上限 ${maxFrames} 帧`,
+        );
+      }
+    }
+  }
+  const exportDirectory = path.join(sessionDirectory, 'export');
+  const previewDirectory = path.join(sessionDirectory, 'preview');
+  if (pathEntryExists(previewDirectory)) inspectDirectory(result, previewDirectory, 'preview');
+  const exportExists = pathEntryExists(exportDirectory);
+  const exportSafe = !exportExists || inspectDirectory(result, exportDirectory, 'export');
+  const fullTrack = path.join(exportDirectory, 'full-track.wav');
+  if (exportExists && exportSafe && pathEntryExists(fullTrack)) {
     try {
       result.full_track = inspectWav(fullTrack);
     } catch (error) {
@@ -970,6 +1395,316 @@ function evaluateInventory(inventory) {
   return checks;
 }
 
+function evaluateSealedSession(inspection) {
+  const checks = [];
+  const snapshot = inspection?.snapshot ?? null;
+  const summary = inspection?.session_summary ?? null;
+  const segments = Array.isArray(inspection?.segments) ? inspection.segments : [];
+  const captured = Number(snapshot?.captured_samples);
+  const committed = Number(snapshot?.committed_samples);
+  const physical = Number(inspection?.total_physical_frames);
+  const format = snapshot?.audio_format ?? null;
+
+  addCheck(
+    checks,
+    'real-recording-tree',
+    '会话根目录和固定子目录为真实目录而非链接',
+    Array.isArray(inspection?.tree_errors) && inspection.tree_errors.length === 0,
+    inspection?.tree_errors,
+  );
+  addCheck(
+    checks,
+    'metadata-readable',
+    '会话元数据是可解析的普通文件',
+    Array.isArray(inspection?.metadata_errors) && inspection.metadata_errors.length === 0,
+    inspection?.metadata_errors,
+  );
+  addCheck(checks, 'snapshot-present', '存在可解析的会话快照', Boolean(snapshot), snapshot);
+  addCheck(checks, 'segments-present', '存在可解析的分段 WAV', segments.length > 0, inspection);
+  addCheck(
+    checks,
+    'no-segment-errors',
+    '分段 WAV 无解析错误',
+    Array.isArray(inspection?.segment_errors) && inspection.segment_errors.length === 0,
+    inspection?.segment_errors,
+  );
+  addCheck(
+    checks,
+    'segment-layout-valid',
+    '分段从 000001 连续编号且已闭合分段长度正确',
+    Array.isArray(inspection?.segment_layout_errors) && inspection.segment_layout_errors.length === 0,
+    inspection?.segment_layout_errors,
+  );
+  addCheck(
+    checks,
+    'segment-descriptors-valid',
+    'descriptor 路径没有恢复器无法处理的类型',
+    Array.isArray(inspection?.descriptor_errors) && inspection.descriptor_errors.length === 0,
+    inspection?.descriptor_errors,
+  );
+  addCheck(
+    checks,
+    'segment-descriptor-redundancy',
+    '冗余 WAV descriptor 均完整（健康 WAV 不依赖该 sidecar）',
+    Array.isArray(inspection?.descriptor_issues) && inspection.descriptor_issues.length === 0,
+    inspection?.descriptor_issues,
+    'WARN',
+  );
+  addCheck(
+    checks,
+    'exact-segment-headers',
+    '所有分段 WAV 头部与物理 EOF 精确一致',
+    segments.length > 0 && segments.every((wav) => wav.exact_header === true),
+    segments.map((wav) => ({
+      file: wav.file_name,
+      exact_header: wav.exact_header,
+      declared_frames: wav.declared_frames,
+      physical_frames: wav.physical_complete_frames,
+      trailing_bytes: wav.trailing_bytes,
+    })),
+  );
+  addCheck(
+    checks,
+    'no-trailing-frame-bytes',
+    '所有分段都以完整音频帧结束',
+    segments.length > 0 && segments.every((wav) => wav.trailing_bytes === 0),
+    segments.map((wav) => ({ file: wav.file_name, trailing_bytes: wav.trailing_bytes })),
+  );
+  addCheck(
+    checks,
+    'segment-format-consistent',
+    '所有分段格式与会话快照一致',
+    Boolean(format) && segments.length > 0 && segments.every((wav) =>
+      wav.sample_rate === Number(format.sample_rate) &&
+      wav.bits_per_sample === Number(format.bit_depth) &&
+      wav.channels === 1 &&
+      wav.encoding === format.encoding &&
+      wav.format_valid === true),
+    { audio_format: format, segments: segments.map((wav) => ({
+      file: wav.file_name,
+      sample_rate: wav.sample_rate,
+      bits_per_sample: wav.bits_per_sample,
+      channels: wav.channels,
+      encoding: wav.encoding,
+      format_valid: wav.format_valid,
+      format_errors: wav.format_errors,
+    })) },
+  );
+  addCheck(checks, 'stopped-status', '会话已离线封存为 stopped', snapshot?.status === 'stopped', {
+    status: snapshot?.status,
+  });
+  addCheck(checks, 'no-overflow', '会话无音频队列溢出', Number(snapshot?.overflow_samples) === 0, {
+    overflow_samples: snapshot?.overflow_samples,
+  });
+  addCheck(checks, 'no-fault-marker', '会话无故障标记或未完成的故障标记', !faultMarkerPresent(inspection), {
+    marker: inspection?.fault_marker,
+    final_exists: inspection?.fault_marker_exists,
+    parse_error: inspection?.fault_marker_parse_error,
+    temporary: inspection?.fault_marker_temporary_exists,
+  });
+  addCheck(
+    checks,
+    'exact-sample-watermark',
+    '采集、持久化与物理 WAV 样本水位完全一致',
+    Number.isSafeInteger(captured) &&
+      Number.isSafeInteger(committed) &&
+      captured >= 0 &&
+      captured === committed &&
+      committed === physical,
+    { captured_samples: captured, committed_samples: committed, physical_frames: physical },
+  );
+  addCheck(
+    checks,
+    'session-summary-consistent',
+    '会话摘要与快照的身份、序号和状态一致',
+    Boolean(snapshot) &&
+      Boolean(summary) &&
+      summary.session_id === snapshot.session_id &&
+      Number(summary.journal_seq) === Number(snapshot.journal_seq) &&
+      summary.status === snapshot.status,
+    { snapshot: snapshot ? {
+      session_id: snapshot.session_id,
+      journal_seq: snapshot.journal_seq,
+      status: snapshot.status,
+    } : null, session_summary: summary },
+  );
+  addCheck(
+    checks,
+    'full-track-readable-if-present',
+    '若已生成整轨导出，其 WAV 也必须可严格解析',
+    !inspection?.full_track_error,
+    { error: inspection?.full_track_error, full_track: inspection?.full_track },
+  );
+  return checks;
+}
+
+function evaluatePhase1Evidence(phase1, options, inspection, currentHost) {
+  const checks = [];
+  const evidence = phase1?.evidence ?? null;
+  const snapshot = inspection?.snapshot ?? null;
+  const localEvidence = phase1?.session_evidence ?? null;
+  const evidenceFormat = evidence?.audio_format ?? null;
+  const snapshotFormat = snapshot?.audio_format ?? null;
+  const requiredDuration = Number(evidence?.required_duration_seconds);
+  const sampleRate = Number(evidenceFormat?.sample_rate);
+  const requiredFrames = Number.isFinite(requiredDuration) && Number.isSafeInteger(sampleRate)
+    ? Math.ceil(requiredDuration * sampleRate)
+    : Number.NaN;
+  const armedCaptured = Number(evidence?.armed_captured_samples);
+  const armedCommitted = Number(evidence?.armed_committed_samples);
+  const evidenceTailLimit = Number(evidence?.max_tail_loss_samples);
+  const requestedTailLimit = Number.isSafeInteger(sampleRate)
+    ? Math.ceil(options.maxTailLossSeconds * sampleRate)
+    : Number.NaN;
+  const effectiveTailLimit = Math.min(evidenceTailLimit, requestedTailLimit);
+  const armedAtMs = Date.parse(String(evidence?.armed_at ?? ''));
+  const phase2BootedAtMs = Date.parse(String(currentHost?.boot?.booted_at ?? ''));
+
+  addCheck(
+    checks,
+    'phase1-evidence-schema',
+    'phase-1 证据类型、版本、nonce 和 armed 状态有效',
+    evidence?.schema_version === 1 &&
+      evidence?.kind === POWER_CUT_EVIDENCE_KIND &&
+      evidence?.phase === 'armed' &&
+      typeof evidence?.nonce === 'string' &&
+      evidence.nonce.length >= 16,
+    evidence,
+  );
+  addCheck(
+    checks,
+    'phase1-source-bound',
+    'phase-1 报告/独立证据与证据内的会话身份一致',
+    phase1?.source_kind === 'evidence' ||
+      (phase1?.source_kind === 'report' &&
+        phase1.report?.mode === 'power-cut' &&
+        phase1.report?.power_cut?.phase === 'armed' &&
+        phase1.report?.start?.snapshot?.session_id === evidence?.session_id),
+    { source_kind: phase1?.source_kind, report_mode: phase1?.report?.mode },
+  );
+  addCheck(
+    checks,
+    'session-evidence-bound',
+    '会话内的持久证据与显式 phase-1 输入具有同一 nonce 和身份',
+    localEvidence?.kind === POWER_CUT_EVIDENCE_KIND &&
+      localEvidence?.nonce === evidence?.nonce &&
+      localEvidence?.session_id === evidence?.session_id &&
+      pathsEqual(String(localEvidence?.session_dir ?? ''), String(evidence?.session_dir ?? '')),
+    { source: evidence, session_evidence: localEvidence },
+  );
+  addCheck(
+    checks,
+    'recording-tree-safe-before-seal',
+    '离线封存前会话目录、元数据、分段编号和 descriptor 均未越界',
+    Array.isArray(inspection?.tree_errors) && inspection.tree_errors.length === 0 &&
+      Array.isArray(inspection?.metadata_errors) && inspection.metadata_errors.length === 0 &&
+      Array.isArray(inspection?.segment_layout_errors) && inspection.segment_layout_errors.length === 0 &&
+      Array.isArray(inspection?.descriptor_errors) && inspection.descriptor_errors.length === 0 &&
+      Array.isArray(inspection?.preseal_recovery_errors) && inspection.preseal_recovery_errors.length === 0,
+    {
+      tree_errors: inspection?.tree_errors,
+      metadata_errors: inspection?.metadata_errors,
+      segment_layout_errors: inspection?.segment_layout_errors,
+      descriptor_errors: inspection?.descriptor_errors,
+      descriptor_issues: inspection?.descriptor_issues,
+      preseal_recovery_errors: inspection?.preseal_recovery_errors,
+    },
+  );
+  addCheck(
+    checks,
+    'interrupted-preseal-status',
+    '恢复前状态必须是 recording/stopping，不接受正常 stopped 或已恢复会话',
+    snapshot?.status === 'recording' || snapshot?.status === 'stopping',
+    { status: snapshot?.status },
+  );
+  addCheck(
+    checks,
+    'phase1-session-identity',
+    'phase-1 证据与磁盘会话的目录、ID、设备和音频格式完全一致',
+    Boolean(snapshot) &&
+      pathsEqual(String(evidence?.session_dir ?? ''), options.sessionDir) &&
+      snapshot.session_id === evidence?.session_id &&
+      snapshot.device_id === evidence?.device_id &&
+      snapshot.input_sample_format === evidence?.input_sample_format &&
+      snapshotFormat?.sample_rate === evidenceFormat?.sample_rate &&
+      snapshotFormat?.bit_depth === evidenceFormat?.bit_depth &&
+      snapshotFormat?.encoding === evidenceFormat?.encoding &&
+      snapshotFormat?.channels === evidenceFormat?.channels &&
+      snapshotFormat?.input_channel === evidenceFormat?.input_channel &&
+      snapshotFormat?.input_channels === evidenceFormat?.input_channels,
+    { session_dir: options.sessionDir, snapshot, evidence },
+  );
+  const testEvidence = evidence?.test_only === true;
+  const productionEvidence = evidence?.test_only === false && evidence?.production_eligible === true;
+  addCheck(
+    checks,
+    'power-cut-qualification-class',
+    '生产恢复只接受生产证据，测试证据必须显式声明且不具备生产资格',
+    options.testOnlyPowerCut
+      ? testEvidence && evidence?.production_eligible === false
+      : productionEvidence,
+    {
+      requested_test_only: options.testOnlyPowerCut,
+      evidence_test_only: evidence?.test_only,
+      production_eligible: evidence?.production_eligible,
+    },
+  );
+  const minimumDuration = options.testOnlyPowerCut ? 2 : PRODUCTION_POWER_CUT_SECONDS;
+  addCheck(
+    checks,
+    'phase1-minimum-duration',
+    options.testOnlyPowerCut
+      ? '短时回归证据已达到明确的 test-only 时长'
+      : 'phase-1 持久样本水位和墙钟时长均至少 1 小时',
+    Number.isFinite(requiredDuration) &&
+      requiredDuration >= minimumDuration &&
+      Number(evidence?.wall_elapsed_seconds) >= requiredDuration &&
+      Number.isSafeInteger(requiredFrames) &&
+      Number.isSafeInteger(armedCommitted) &&
+      armedCommitted >= requiredFrames,
+    {
+      required_duration_seconds: requiredDuration,
+      wall_elapsed_seconds: evidence?.wall_elapsed_seconds,
+      required_frames: requiredFrames,
+      armed_committed_samples: armedCommitted,
+    },
+  );
+  addCheck(
+    checks,
+    'phase1-tail-budget',
+    'armed 时 captured/committed 尾差在已持久的 checkpoint+callback 预算内',
+    Number.isSafeInteger(armedCaptured) &&
+      Number.isSafeInteger(armedCommitted) &&
+      Number.isSafeInteger(evidenceTailLimit) &&
+      Number.isSafeInteger(requestedTailLimit) &&
+      armedCaptured >= armedCommitted &&
+      armedCaptured - armedCommitted <= effectiveTailLimit,
+    {
+      armed_captured_samples: armedCaptured,
+      armed_committed_samples: armedCommitted,
+      armed_lag_samples: armedCaptured - armedCommitted,
+      evidence_tail_limit_samples: evidenceTailLimit,
+      requested_tail_limit_samples: requestedTailLimit,
+      effective_tail_limit_samples: effectiveTailLimit,
+    },
+  );
+  const sameHost = evidence?.host?.hostname === currentHost?.hostname &&
+    evidence?.host?.platform === currentHost?.platform &&
+    evidence?.host?.architecture === currentHost?.architecture;
+  const bootChangedAfterArm = Number.isFinite(armedAtMs) &&
+    Number.isFinite(phase2BootedAtMs) &&
+    currentHost?.boot?.id !== evidence?.host?.boot_id &&
+    phase2BootedAtMs > armedAtMs + 1_000;
+  addCheck(
+    checks,
+    'host-rebooted-after-arm',
+    'phase-2 在同一主机上且系统启动时间晚于 armed，不接受只杀进程',
+    sameHost && bootChangedAfterArm && (options.testOnlyPowerCut || currentHost?.platform === 'win32'),
+    { phase1_host: evidence?.host, phase2_host: currentHost, armed_at: evidence?.armed_at },
+  );
+  return checks;
+}
+
 function evaluateCommon(report, options, inspection) {
   const checks = [];
   const snapshot = report.start?.snapshot ?? null;
@@ -1006,9 +1741,10 @@ function evaluateCommon(report, options, inspection) {
     actualInputFormatBits !== null && actualInputFormatBits >= options.minimumInputFormatBits,
     {
       input_sample_format: snapshot?.input_sample_format,
-      actual_format_bits: actualInputFormatBits,
-      minimum_format_bits: options.minimumInputFormatBits,
-      limitation: '此项只验证驱动样本表示宽度，不证明声卡 ADC 有效位数',
+      actual_effective_precision_bits: actualInputFormatBits,
+      minimum_effective_precision_bits: options.minimumInputFormatBits,
+      effective_precision_rule: 'integer n-bit = n; f32 = 24; f64 = 53',
+      limitation: '此项只验证驱动交给应用的数字样本有效精度，不证明声卡 ADC ENOB',
     },
   );
   addCheck(checks, 'captured-monotonic', '采集样本水位单调', progress.captured_monotonic, progress);
@@ -1205,13 +1941,16 @@ async function safeStopSession(client) {
   return { result: null, error: lastError?.message ?? '未知停止错误', attempts: 4 };
 }
 
-async function monitorCapture(client, sessionDirectory, options, telemetryLog) {
+async function monitorCapture(client, sessionDirectory, options, telemetryLog, onPowerCutArm = null) {
   const rows = [];
   const started = Date.now();
   const normalDurationMs = options.mode === 'soak' ? options.hours * 3_600_000 : options.seconds * 1_000;
   const expectedFault = FAULT_MODES.has(options.mode);
-  const triggerAtMs = expectedFault ? started + options.triggerDelaySeconds * 1_000 : null;
-  const deadlineMs = expectedFault ? triggerAtMs + options.faultTimeoutSeconds * 1_000 : started + normalDurationMs;
+  const powerCut = options.mode === 'power-cut';
+  const triggerAtMs = expectedFault || powerCut ? started + options.triggerDelaySeconds * 1_000 : null;
+  const deadlineMs = expectedFault
+    ? triggerAtMs + options.faultTimeoutSeconds * 1_000
+    : started + normalDurationMs;
   let announcedTrigger = false;
   let detectedAtMs = null;
   let detectedElapsedSeconds = null;
@@ -1249,7 +1988,11 @@ async function monitorCapture(client, sessionDirectory, options, telemetryLog) {
     const row = {
       at: new Date().toISOString(),
       elapsed_seconds: Number(elapsedSeconds.toFixed(3)),
-      phase: expectedFault && announcedTrigger ? 'fault-observation' : 'recording',
+      phase: expectedFault && announcedTrigger
+        ? 'fault-observation'
+        : powerCut && announcedTrigger
+          ? 'power-cut-armed'
+          : 'recording',
       captured_samples: Number(state?.snapshot?.captured_samples ?? meter.captured_samples ?? 0),
       committed_samples: Number(state?.snapshot?.committed_samples ?? meter.committed_samples ?? 0),
       overflow_samples: Number(state?.snapshot?.overflow_samples ?? meter.overflow_samples ?? 0),
@@ -1266,10 +2009,49 @@ async function monitorCapture(client, sessionDirectory, options, telemetryLog) {
       segment_stat_error: segmentStats.error,
       state_error: stateError,
     };
+    const isFault =
+      row.faulted ||
+      row.overflow_samples > 0 ||
+      markerExists ||
+      state?.snapshot?.status === 'faulted';
+    let armedThisRow = false;
+    if (powerCut && !announcedTrigger && now >= triggerAtMs && !isFault) {
+      const previous = rows.at(-1) ?? null;
+      const requiredFrames = Math.ceil(powerCutRequiredDurationSeconds(options) * options.sampleRate);
+      const maximumLagFrames = Math.ceil(options.maxTailLossSeconds * options.sampleRate);
+      const progressing = Boolean(previous) &&
+        row.committed_samples > Number(previous.committed_samples ?? 0) &&
+        row.segment_total_bytes >= Number(previous.segment_total_bytes ?? 0);
+      const eligible =
+        stateError === null &&
+        state?.snapshot?.status === 'recording' &&
+        segmentStats.error === null &&
+        row.segment_count > 0 &&
+        row.committed_samples >= requiredFrames &&
+        row.captured_samples >= row.committed_samples &&
+        row.captured_samples - row.committed_samples <= maximumLagFrames &&
+        progressing;
+      if (eligible) {
+        if (typeof onPowerCutArm !== 'function') throw new Error('power-cut 缺少持久证据回调');
+        row.phase = 'power-cut-armed';
+        await onPowerCutArm(row);
+        announcedTrigger = true;
+        capturedBeforeTrigger = row.captured_samples;
+        armedThisRow = true;
+      }
+    }
     rows.push(row);
-    telemetryLog.write(row, row.faulted || row.fault_marker_exists || row.storage_status === 'critical');
+    telemetryLog.write(
+      row,
+      armedThisRow || row.faulted || row.fault_marker_exists || row.storage_status === 'critical',
+    );
+    if (armedThisRow) {
+      process.stdout.write('\x07\n============================================================\n');
+      process.stdout.write('已持久化达标证据。现在切断整台 Windows 测试机的电源！\n');
+      process.stdout.write('不要点停止，不要关闭窗口。\n');
+      process.stdout.write('============================================================\n');
+    }
     if (row.storage_status === 'critical' && firstCriticalElapsed === null) firstCriticalElapsed = elapsedSeconds;
-    const isFault = row.faulted || row.overflow_samples > 0 || markerExists;
     if (isFault && detectedAtMs === null) {
       detectedAtMs = Date.now();
       detectedElapsedSeconds = elapsedSeconds;
@@ -1320,6 +2102,9 @@ async function maybePromptBeforeCapture(options) {
     if (options.mode === 'soak') message = '确认信号源、供电、USB 和专用存储均已准备，按 Enter 启动长稳。';
     if (options.mode === 'unplug') message = '保持声卡连接，按 Enter 启动；倒计时结束后按提示拔出。';
     if (options.mode === 'disk-full') message = '确认输出在可丢弃的专用测试卷，按 Enter 启动；勿对系统盘做填满测试。';
+    if (options.mode === 'power-cut') {
+      message = '确认已使用可丢弃的 Windows 测试机和指定录制目录，按 Enter 开始；只在倒计时结束后切断整机电源。';
+    }
     await prompt.question(`${message}\n`);
   } finally {
     prompt.close();
@@ -1365,6 +2150,151 @@ async function runInventory(options, runDirectory, report) {
   }
 }
 
+async function runRecover(options, runDirectory, report) {
+  let enginePath = null;
+  let client = null;
+  try {
+    report.session_dir = options.sessionDir;
+    const phase1 = loadPhase1Evidence(options.phase1Report);
+    phase1.source_path = options.phase1Report;
+    try {
+      phase1.session_evidence = readJsonRegularFile(
+        path.join(options.sessionDir, POWER_CUT_SESSION_EVIDENCE),
+        '会话内 phase-1 证据',
+      );
+    } catch (error) {
+      phase1.session_evidence = null;
+      phase1.session_evidence_error = error.message;
+    }
+    const preInspection = inspectSession(options.sessionDir);
+    report.phase1 = phase1;
+    report.pre_recovery_inspection = preInspection;
+    const currentHost = {
+      hostname: report.host.hostname,
+      platform: report.host.platform,
+      architecture: report.host.architecture,
+      boot: report.host.boot,
+    };
+    const preflightChecks = evaluatePhase1Evidence(phase1, options, preInspection, currentHost);
+    if (phase1.session_evidence_error) {
+      preflightChecks.find((check) => check.id === 'session-evidence-bound').details = {
+        error: phase1.session_evidence_error,
+      };
+    }
+    if (overallFromChecks(preflightChecks) !== 'PASS') {
+      report.checks = preflightChecks;
+      report.production_eligible = false;
+      report.overall = 'FAIL';
+      return;
+    }
+    writeJsonDurable(path.join(runDirectory, 'acceptance-report.json'), report);
+
+    enginePath = findEngine(options.engine);
+    client = new EngineClient(
+      enginePath,
+      runDirectory,
+      path.join(runDirectory, 'protocol.jsonl'),
+      path.join(runDirectory, 'engine-stderr.log'),
+    );
+    const ready = await client.start();
+    report.engine = { path: enginePath, ready };
+    report.recovery = {
+      result: await client.request(
+        'seal_interrupted_session',
+        { session_dir: options.sessionDir },
+        10 * 60_000,
+      ),
+    };
+    writeJsonDurable(path.join(runDirectory, 'acceptance-report.json'), report);
+    try {
+      report.engine.exit = await client.shutdown();
+    } catch (shutdownError) {
+      report.engine.shutdown_error = shutdownError.message;
+      report.engine.exit = client.shutdownResult ?? client.exitResult;
+    }
+    report.inspection = inspectSession(options.sessionDir);
+    const checks = [];
+    checks.push(...preflightChecks);
+    addCheck(checks, 'engine-ready', '原生录音引擎启动', Boolean(report.engine.ready), report.engine);
+    addCheck(
+      checks,
+      'offline-seal-complete',
+      '断电会话已执行 seal_interrupted_session',
+      Boolean(report.recovery.result?.snapshot) &&
+        report.recovery.result?.no_op === false &&
+        pathsEqual(String(report.recovery.result?.session_dir ?? ''), options.sessionDir),
+      report.recovery,
+    );
+    checks.push(...evaluateSealedSession(report.inspection));
+    addCheck(
+      checks,
+      'seal-watermark-consistent',
+      '离线封存返回的持久水位与磁盘复查一致',
+      Number(report.recovery.result?.durable_frames) === report.inspection.total_physical_frames &&
+        Number(report.recovery.result?.snapshot?.committed_samples) === report.inspection.total_physical_frames,
+      {
+        seal_durable_frames: report.recovery.result?.durable_frames,
+        seal_committed_samples: report.recovery.result?.snapshot?.committed_samples,
+        inspected_physical_frames: report.inspection.total_physical_frames,
+      },
+    );
+    const evidence = phase1.evidence;
+    const physicalFrames = Number(report.inspection.total_physical_frames);
+    const armedCommitted = Number(evidence.armed_committed_samples);
+    const armedCaptured = Number(evidence.armed_captured_samples);
+    const evidenceTailLimit = Number(evidence.max_tail_loss_samples);
+    const requestedTailLimit = Math.ceil(options.maxTailLossSeconds * Number(evidence.audio_format.sample_rate));
+    const effectiveTailLimit = Math.min(evidenceTailLimit, requestedTailLimit);
+    const tailLoss = Math.max(0, armedCaptured - physicalFrames);
+    addCheck(
+      checks,
+      'armed-committed-preserved',
+      'recovered 物理帧不少于 phase-1 armed 时已持久化水位',
+      Number.isSafeInteger(physicalFrames) &&
+        Number.isSafeInteger(armedCommitted) &&
+        physicalFrames >= armedCommitted,
+      { physical_frames: physicalFrames, armed_committed_samples: armedCommitted },
+    );
+    addCheck(
+      checks,
+      'power-cut-tail-loss-budget',
+      '断电尾部损失不超过 phase-1 确定的 checkpoint+callback 预算',
+      Number.isSafeInteger(armedCaptured) &&
+        Number.isSafeInteger(effectiveTailLimit) &&
+        tailLoss <= effectiveTailLimit,
+      {
+        armed_captured_samples: armedCaptured,
+        recovered_physical_frames: physicalFrames,
+        tail_loss_samples: tailLoss,
+        maximum_tail_loss_samples: effectiveTailLimit,
+      },
+    );
+    addEngineExitCheck(checks, report.engine);
+    report.checks = checks;
+    const checkedOverall = overallFromChecks(checks, Boolean(report.engine.shutdown_error));
+    report.production_eligible = phase1.evidence.test_only === false && checkedOverall === 'PASS';
+    report.overall = checkedOverall === 'PASS' && phase1.evidence.test_only === true
+      ? 'TEST_ONLY_PASS'
+      : checkedOverall;
+  } catch (error) {
+    report.tool_error = error.stack ?? error.message;
+    report.overall = 'INCOMPLETE';
+    try {
+      if (!client) throw error;
+      report.engine = report.engine ?? { path: enginePath, ready: client.readyPayload };
+      report.engine.exit = await client.shutdown();
+    } catch (shutdownError) {
+      if (client) {
+        report.engine = report.engine ?? { path: enginePath, ready: client.readyPayload };
+        report.engine.shutdown_error = shutdownError.message;
+        report.engine.exit = client.shutdownResult ?? client.exitResult;
+      }
+    }
+  } finally {
+    client?.closeLogs();
+  }
+}
+
 async function runCapture(options, runDirectory, report) {
   const enginePath = findEngine(options.engine);
   const client = new EngineClient(
@@ -1375,8 +2305,11 @@ async function runCapture(options, runDirectory, report) {
   );
   const telemetry = new NdjsonLog(path.join(runDirectory, 'telemetry.jsonl'));
   let sessionStarted = false;
-  let sessionDirectory = path.join(runDirectory, 'recording');
+  let sessionDirectory = options.mode === 'power-cut' ? options.sessionDir : path.join(runDirectory, 'recording');
   try {
+    if (options.mode === 'power-cut' && pathEntryExists(sessionDirectory)) {
+      throw new Error(`power-cut --session-dir 必须是不存在的新目录: ${sessionDirectory}`);
+    }
     const ready = await client.start();
     report.engine = { path: enginePath, ready };
     const inventory = await client.request('list_devices', {}, 30_000);
@@ -1418,6 +2351,26 @@ async function runCapture(options, runDirectory, report) {
     sessionStarted = true;
     report.session_dir = sessionDirectory;
     report.start = start;
+    if (options.mode === 'power-cut') {
+      const phase1ReportPath = path.join(runDirectory, 'acceptance-report.json');
+      const phase1EvidencePath = path.join(runDirectory, 'power-cut-evidence.json');
+      report.power_cut = {
+        phase: 'recording-not-armed',
+        nonce: randomUUID(),
+        test_only: options.testOnlyPowerCut,
+        production_eligible: !options.testOnlyPowerCut,
+        required_duration_seconds: powerCutRequiredDurationSeconds(options),
+        cut_after_seconds: options.triggerDelaySeconds,
+        maximum_wait_seconds: options.seconds,
+        phase1_report_path: phase1ReportPath,
+        phase1_evidence_path: phase1EvidencePath,
+        session_evidence_path: path.join(sessionDirectory, POWER_CUT_SESSION_EVIDENCE),
+        recovery_command: `--mode recover --session-dir "${sessionDirectory}" --phase1-report "${phase1ReportPath}"${options.testOnlyPowerCut ? ' --test-only-power-cut' : ''}`,
+        instruction: '只有当证据持久化并显示断电提示后，才能切断整机电源。',
+        evidence: null,
+      };
+      report.production_eligible = !options.testOnlyPowerCut;
+    }
     writeJsonDurable(path.join(runDirectory, 'acceptance-report.json'), report);
     process.stdout.write(
       `\n已启动: ${start.snapshot.device_name}\nID: ${start.snapshot.device_id}\n输入: ${start.snapshot.input_sample_format}, ${start.snapshot.audio_format.input_channels} ch\n交付: ${start.snapshot.audio_format.sample_rate} Hz / ${start.snapshot.audio_format.bit_depth}-bit ${start.snapshot.audio_format.encoding} / mono\n\n`,
@@ -1437,7 +2390,31 @@ async function runCapture(options, runDirectory, report) {
       if (options.mode === 'short') process.stdout.write('现在请持续朗读或播放测试音。\n');
     }
 
-    const monitor = await monitorCapture(client, sessionDirectory, options, telemetry);
+    const onPowerCutArm = options.mode === 'power-cut'
+      ? async (row) => {
+          const evidence = buildPowerCutEvidence(report, options, sessionDirectory, row);
+          const sessionEvidencePath = path.join(sessionDirectory, POWER_CUT_SESSION_EVIDENCE);
+          const phase1EvidencePath = path.join(runDirectory, 'power-cut-evidence.json');
+          if (pathEntryExists(sessionEvidencePath) || pathEntryExists(phase1EvidencePath)) {
+            throw new Error('power-cut 证据文件已存在，拒绝覆盖或重复 armed');
+          }
+          writeJsonDurable(sessionEvidencePath, evidence);
+          writeJsonDurable(phase1EvidencePath, evidence);
+          report.power_cut.phase = 'armed';
+          report.power_cut.armed_at = evidence.armed_at;
+          report.power_cut.evidence = evidence;
+          writeJsonDurable(path.join(runDirectory, 'acceptance-report.json'), report);
+          process.stdout.write(`phase-1 报告: ${path.join(runDirectory, 'acceptance-report.json')}\n`);
+          process.stdout.write(`phase-1 证据: ${phase1EvidencePath}\n`);
+        }
+      : null;
+    const monitor = await monitorCapture(
+      client,
+      sessionDirectory,
+      options,
+      telemetry,
+      onPowerCutArm,
+    );
     report.progress_rows = monitor.rows;
     report.progress_summary = summarizeProgress(monitor.rows, options.sampleRate, options.pollSeconds);
     if (FAULT_MODES.has(options.mode)) {
@@ -1453,6 +2430,31 @@ async function runCapture(options, runDirectory, report) {
       };
     }
     report.aborted = monitor.aborted;
+    if (options.mode === 'power-cut') {
+      // Reaching this branch proves that no real power loss happened. Seal the
+      // fixture safely so an unattended or mistimed run cannot be mistaken for
+      // a successful destructive test.
+      report.stop = await safeStopSession(client);
+      sessionStarted = false;
+      try {
+        report.engine.exit = await client.shutdown();
+      } catch (error) {
+        report.engine.shutdown_error = error.message;
+        report.engine.exit = client.shutdownResult ?? client.exitResult;
+      }
+      report.inspection = inspectSession(sessionDirectory);
+      report.power_cut.phase = 'not-performed';
+      report.power_cut.message = '工具在测试机断电前恢复运行，本轮已安全停止，不计入断电验收。';
+      report.checks = [{
+        id: 'power-cut-observed',
+        label: '录制进程由整机断电中断',
+        status: 'FAIL',
+        details: report.power_cut,
+      }];
+      addEngineExitCheck(report.checks, report.engine);
+      report.overall = 'INCOMPLETE';
+      return;
+    }
     report.stop = await safeStopSession(client);
     sessionStarted = false;
 
@@ -1553,6 +2555,7 @@ async function main() {
       release: os.release(),
       architecture: process.arch,
       hostname: os.hostname(),
+      boot: hostBootIdentity(),
       node: process.version,
       electron: process.versions.electron ?? null,
       cpus: os.cpus().map((cpu) => cpu.model),
@@ -1572,20 +2575,12 @@ async function main() {
     if (options.mode === 'inspect') {
       report.session_dir = options.sessionDir;
       report.inspection = inspectSession(options.sessionDir);
-      const snapshot = report.inspection.snapshot;
-      report.checks = [];
-      addCheck(report.checks, 'segments-present', '存在可解析的分段 WAV', report.inspection.segments.length > 0, report.inspection);
-      addCheck(report.checks, 'no-segment-errors', '分段无解析错误', report.inspection.segment_errors.length === 0, report.inspection.segment_errors);
-      addCheck(
-        report.checks,
-        'physical-frame-watermark',
-        '物理完整帧不少于快照持久化水位',
-        Boolean(snapshot) && report.inspection.total_physical_frames >= Number(snapshot?.committed_samples),
-        { physical: report.inspection.total_physical_frames, committed: snapshot?.committed_samples },
-      );
+      report.checks = evaluateSealedSession(report.inspection);
       report.overall = overallFromChecks(report.checks);
     } else if (options.mode === 'inventory') {
       await runInventory(options, runDirectory, report);
+    } else if (options.mode === 'recover') {
+      await runRecover(options, runDirectory, report);
     } else {
       await runCapture(options, runDirectory, report);
     }
@@ -1596,7 +2591,11 @@ async function main() {
   report.completed_at = new Date().toISOString();
   writeJsonDurable(reportPath, report);
   printSummary(report, reportPath);
-  process.exitCode = report.overall === 'PASS' ? 0 : report.overall === 'FAIL' ? 1 : 2;
+  process.exitCode = report.overall === 'PASS' || report.overall === 'TEST_ONLY_PASS'
+    ? 0
+    : report.overall === 'FAIL'
+      ? 1
+      : 2;
 }
 
 if (require.main === module) {
@@ -1611,6 +2610,7 @@ module.exports = {
   defaultOutputRoot,
   evaluateInventory,
   engineExitWasClean,
+  evaluateSealedSession,
   faultMarkerPresent,
   inputSampleFormatBits,
   inspectSession,

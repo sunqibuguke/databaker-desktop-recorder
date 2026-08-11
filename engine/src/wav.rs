@@ -486,6 +486,114 @@ impl RecoverableWav {
         Ok(wav)
     }
 
+    /// Rebuilds the mutable RIFF header of the final active recording segment
+    /// from independently persisted format evidence.
+    ///
+    /// This deliberately does not try to recognize an arbitrary file by its
+    /// length. The segmented storage layer is the only caller and must first
+    /// validate the immutable per-segment descriptor against the trusted
+    /// session snapshot, segment index, and file name. Older segments and
+    /// descriptor-less recordings must continue through `open_append`, whose
+    /// normal header validation remains fail-closed.
+    pub(crate) fn open_append_rebuilding_active_header(
+        path: &Path,
+        sample_rate: u32,
+        channels: u16,
+        bit_depth: u16,
+        maximum_frames: u64,
+    ) -> Result<Self> {
+        if sample_rate == 0 {
+            bail!("sample rate must be greater than zero");
+        }
+        if channels == 0 {
+            bail!("channels must be greater than zero");
+        }
+        if maximum_frames == 0 {
+            bail!("active WAV recovery frame limit must be greater than zero");
+        }
+        let encoding = WavEncoding::for_bit_depth(bit_depth)?;
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("inspect torn active WAV {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("torn active WAV must be a regular file");
+        }
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("open torn active WAV {}", path.display()))?;
+        file.try_lock()
+            .with_context(|| format!("lock torn active WAV {} for recovery", path.display()))?;
+
+        let header_len = encoding.header_len();
+        let file_len = file.metadata()?.len();
+        if file_len < header_len {
+            bail!("torn active WAV is shorter than its descriptor header length");
+        }
+        let sample_bytes = u64::from(bytes_per_sample(bit_depth)?);
+        let frame_bytes = u64::from(channels)
+            .checked_mul(sample_bytes)
+            .context("active WAV recovery frame size overflow")?;
+        let actual_data_bytes = file_len - header_len;
+        let complete_data_bytes = actual_data_bytes - actual_data_bytes % frame_bytes;
+        let complete_frames = complete_data_bytes / frame_bytes;
+        if complete_frames > maximum_frames {
+            bail!(
+                "torn active WAV has {complete_frames} complete frames; descriptor limit is {maximum_frames}"
+            );
+        }
+        let maximum_data_bytes = u64::from(u32::MAX)
+            .checked_sub(header_len - 8)
+            .context("WAV RIFF size underflow")?;
+        if complete_data_bytes > maximum_data_bytes {
+            bail!("torn active WAV exceeds the 4 GiB RIFF limit");
+        }
+
+        // Recorder-generated 32-bit Float samples are always finite. Validate
+        // the complete payload before replacing a destroyed header so a
+        // descriptor next to unrelated non-audio float data does not get
+        // silently promoted into a recording segment. Values outside [-1, 1]
+        // remain valid because Float delivery may intentionally preserve
+        // interface headroom.
+        if encoding == WavEncoding::Float {
+            file.seek(SeekFrom::Start(header_len))?;
+            let mut remaining = complete_data_bytes;
+            let mut buffer = vec![0u8; 64 * 1024];
+            while remaining > 0 {
+                let count = usize::try_from(remaining.min(buffer.len() as u64))?;
+                file.read_exact(&mut buffer[..count])?;
+                for sample in buffer[..count].chunks_exact(4) {
+                    let value = f32::from_le_bytes(sample.try_into().expect("four-byte float"));
+                    if !value.is_finite() {
+                        bail!("torn active Float WAV contains invalid recorder sample data");
+                    }
+                }
+                remaining -= count as u64;
+            }
+        }
+
+        let repaired_file_len = header_len
+            .checked_add(complete_data_bytes)
+            .context("active WAV recovery length overflow")?;
+        if repaired_file_len != file_len {
+            file.set_len(repaired_file_len)
+                .context("truncate incomplete torn active WAV tail")?;
+        }
+        file.seek(SeekFrom::Start(repaired_file_len))?;
+        let samples_written = complete_data_bytes / sample_bytes;
+        let mut wav = Self {
+            file,
+            sample_rate,
+            channels,
+            bit_depth,
+            encoding,
+            samples_written,
+        };
+        wav.checkpoint()
+            .context("rebuild torn active WAV header from durable descriptor")?;
+        Ok(wav)
+    }
+
     pub fn write_samples(&mut self, samples: &[f32]) -> Result<()> {
         if samples.iter().any(|sample| !sample.is_finite()) {
             bail!("WAV sample block contains a non-finite value");
@@ -493,9 +601,9 @@ impl RecoverableWav {
         let bytes_per_sample = usize::from(bytes_per_sample(self.bit_depth)?);
         let mut encoded = Vec::with_capacity(samples.len() * bytes_per_sample);
         for sample in samples {
-            let sample = sample.clamp(-1.0, 1.0);
             match (self.encoding, self.bit_depth) {
                 (WavEncoding::Pcm, 16) => {
+                    let sample = sample.clamp(-1.0, 1.0);
                     let value = (sample * 32_768.0)
                         .round()
                         .clamp(f32::from(i16::MIN), f32::from(i16::MAX))
@@ -503,6 +611,7 @@ impl RecoverableWav {
                     encoded.extend_from_slice(&value.to_le_bytes());
                 }
                 (WavEncoding::Pcm, 24) => {
+                    let sample = sample.clamp(-1.0, 1.0);
                     let value = (sample * 8_388_608.0)
                         .round()
                         .clamp(-8_388_608.0, 8_388_607.0) as i32;
@@ -1092,6 +1201,53 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(decoded_24, values_24);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn float_wav_preserves_finite_headroom_while_pcm_outputs_saturate() {
+        let root = test_root("float-headroom");
+        let input = [1.25f32, -1.5f32];
+
+        let float_path = root.join("headroom-32.wav");
+        let mut float_writer = RecoverableWav::create(&float_path, 48_000, 1, 32).unwrap();
+        float_writer.write_samples(&input).unwrap();
+        float_writer.finalize().unwrap();
+        let float_bytes = std::fs::read(&float_path).unwrap();
+        let decoded_float = float_bytes[FLOAT_HEADER_LEN as usize..]
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(decoded_float, input);
+
+        let pcm16_path = root.join("saturated-16.wav");
+        let mut pcm16_writer = RecoverableWav::create(&pcm16_path, 48_000, 1, 16).unwrap();
+        pcm16_writer.write_samples(&input).unwrap();
+        pcm16_writer.finalize().unwrap();
+        let pcm16_bytes = std::fs::read(&pcm16_path).unwrap();
+        let decoded_16 = pcm16_bytes[PCM_HEADER_LEN as usize..]
+            .chunks_exact(2)
+            .map(|bytes| i16::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(decoded_16, vec![i16::MAX, i16::MIN]);
+
+        let pcm24_path = root.join("saturated-24.wav");
+        let mut pcm24_writer = RecoverableWav::create(&pcm24_path, 48_000, 1, 24).unwrap();
+        pcm24_writer.write_samples(&input).unwrap();
+        pcm24_writer.finalize().unwrap();
+        let pcm24_bytes = std::fs::read(&pcm24_path).unwrap();
+        let decoded_24 = pcm24_bytes[PCM_HEADER_LEN as usize..]
+            .chunks_exact(3)
+            .map(|bytes| {
+                let raw = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]);
+                if raw & 0x0080_0000 != 0 {
+                    raw | !0x00ff_ffff
+                } else {
+                    raw
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decoded_24, vec![8_388_607, -8_388_608]);
         let _ = std::fs::remove_dir_all(root);
     }
 
