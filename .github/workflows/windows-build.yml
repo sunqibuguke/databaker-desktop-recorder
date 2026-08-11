@@ -71,9 +71,14 @@ jobs:
           $acceptance = Join-Path $resources "acceptance/windows-audio-acceptance.cjs"
           $launcher = Join-Path $resources "acceptance/run-windows-audio-acceptance.ps1"
           $cmdLauncher = Join-Path $resources "acceptance/run-windows-audio-acceptance.cmd"
+          $qualification = Join-Path $resources "acceptance/windows-audio-qualification.cjs"
+          $qualificationLauncher = Join-Path $resources "acceptance/run-windows-audio-qualification.cmd"
+          $qualificationPowerShell = Join-Path $resources "acceptance/run-windows-audio-qualification.ps1"
+          $qualificationSchema = Join-Path $resources "acceptance/windows-audio-qualification-plan.schema.json"
+          $qualificationExample = Join-Path $resources "acceptance/Windows外置声卡资格计划.example.json"
           $acceptanceDoc = Join-Path $resources "acceptance/Windows外置声卡生产验收.md"
           $engine = Join-Path $resources "bin/recorder-engine.exe"
-          foreach ($required in @($acceptance, $launcher, $cmdLauncher, $acceptanceDoc, $engine)) {
+          foreach ($required in @($acceptance, $launcher, $cmdLauncher, $qualification, $qualificationLauncher, $qualificationPowerShell, $qualificationSchema, $qualificationExample, $acceptanceDoc, $engine)) {
             if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
               throw "Packaged acceptance resource is missing: $required"
             }
@@ -116,6 +121,10 @@ jobs:
           if (-not (Test-Path -LiteralPath $protocolLog -PathType Leaf) -or (Get-Item $protocolLog).Length -eq 0) {
             throw "Packaged acceptance inventory did not record protocol traffic"
           }
+          & $qualificationLauncher --help | Out-Host
+          if ($LASTEXITCODE -ne 0) {
+            throw "Packaged qualification launcher could not start"
+          }
 
       - name: Verify generated installer payload
         shell: pwsh
@@ -139,8 +148,10 @@ jobs:
           }
 
           $installedLauncher = Join-Path $installRoot "resources/acceptance/run-windows-audio-acceptance.cmd"
+          $installedQualification = Join-Path $installRoot "resources/acceptance/run-windows-audio-qualification.cmd"
+          $installedQualificationExample = Join-Path $installRoot "resources/acceptance/Windows外置声卡资格计划.example.json"
           $installedEngine = Join-Path $installRoot "resources/bin/recorder-engine.exe"
-          foreach ($required in @($installedLauncher, $installedEngine)) {
+          foreach ($required in @($installedLauncher, $installedQualification, $installedQualificationExample, $installedEngine)) {
             if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
               throw "Installed production payload is missing: $required"
             }
@@ -165,6 +176,32 @@ jobs:
           $cleanExit = $report.checks | Where-Object { $_.id -eq "engine-clean-exit" } | Select-Object -First 1
           if ($report.overall -notin @("PASS", "FAIL") -or $null -ne $report.tool_error -or $cleanExit.status -ne "PASS") {
             throw "Installed recorder-engine did not complete a clean JSONL lifecycle"
+          }
+          & $installedQualification --help | Out-Host
+          if ($LASTEXITCODE -ne 0) {
+            throw "Installed qualification launcher could not start"
+          }
+
+          # Prove the installed Electron-as-Node launcher can load Ajv from
+          # app.asar and rejects a schema-invalid plan before writing output.
+          $invalidQualificationRoot = Join-Path $env:RUNNER_TEMP "databaker-installed-invalid-qualification"
+          if (Test-Path -LiteralPath $invalidQualificationRoot) {
+            Remove-Item -LiteralPath $invalidQualificationRoot -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $invalidQualificationRoot | Out-Null
+          $invalidPlan = Get-Content -LiteralPath $installedQualificationExample -Raw | ConvertFrom-Json
+          $invalidPlan | Add-Member -NotePropertyName schema_bypass_probe -NotePropertyValue $true
+          $invalidPlanPath = Join-Path $invalidQualificationRoot "qualification-plan.json"
+          $invalidPlan | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $invalidPlanPath -Encoding utf8NoBOM
+          $invalidOutput = & $installedQualification --plan $invalidPlanPath --reports $invalidQualificationRoot 2>&1
+          $schemaExit = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+          $invalidOutput | Out-Host
+          if ($schemaExit -ne 2 -or ($invalidOutput -join "`n") -notmatch "strict JSON Schema") {
+            throw "Installed qualification launcher did not enforce the strict runtime schema (exit $schemaExit)"
+          }
+          if (Test-Path -LiteralPath (Join-Path $invalidQualificationRoot "qualification-report.json")) {
+            throw "Schema-invalid installed qualification plan wrote an output report"
           }
 
           $sha256 = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()

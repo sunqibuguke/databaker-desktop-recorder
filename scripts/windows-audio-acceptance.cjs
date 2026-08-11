@@ -99,6 +99,9 @@ function usage() {
   --session-dir <path>           power-cut / recover / inspect 共用的录制目录
   --phase1-report <path>         recover 必需：phase-1 acceptance-report.json 或独立证据 JSON
   --phase1-evidence <path>       --phase1-report 的等价别名
+  --qualification-id <id>       生产资格计划 ID；与下两项必须同时提供
+  --qualification-run-id <id>   资格计划定义的本次 run / phase-1 证据 ID
+  --installer-sha256 <sha256>   本次安装包的 SHA-256
   --test-only-power-cut          显式启用短时无害回归；结果永不具备生产验收资格
   --help                         显示帮助
 
@@ -170,6 +173,9 @@ function parseArgs(argv) {
     yes: false,
     sessionDir: null,
     phase1Report: null,
+    qualificationId: null,
+    qualificationRunId: null,
+    installerSha256: null,
     testOnlyPowerCut: false,
     secondsExplicit: false,
     triggerDelayExplicit: false,
@@ -284,6 +290,18 @@ function parseArgs(argv) {
         options.phase1Report = path.resolve(valueFor(index, flag));
         index += 1;
         break;
+      case '--qualification-id':
+        options.qualificationId = valueFor(index, flag);
+        index += 1;
+        break;
+      case '--qualification-run-id':
+        options.qualificationRunId = valueFor(index, flag);
+        index += 1;
+        break;
+      case '--installer-sha256':
+        options.installerSha256 = valueFor(index, flag).toLowerCase();
+        index += 1;
+        break;
       case '--test-only-power-cut':
         options.testOnlyPowerCut = true;
         break;
@@ -305,6 +323,20 @@ function parseArgs(argv) {
   }
   if (options.testOnlyPowerCut && !['power-cut', 'recover'].includes(options.mode)) {
     throw new Error('--test-only-power-cut 只能用于 power-cut / recover');
+  }
+  const qualificationValues = [
+    options.qualificationId,
+    options.qualificationRunId,
+    options.installerSha256,
+  ];
+  if (qualificationValues.some((value) => value !== null) && qualificationValues.some((value) => value === null)) {
+    throw new Error('--qualification-id、--qualification-run-id 和 --installer-sha256 必须同时提供');
+  }
+  if (options.qualificationId !== null) {
+    const safeId = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+    if (!safeId.test(options.qualificationId)) throw new Error('--qualification-id 格式无效');
+    if (!safeId.test(options.qualificationRunId)) throw new Error('--qualification-run-id 格式无效');
+    if (!/^[0-9a-f]{64}$/.test(options.installerSha256)) throw new Error('--installer-sha256 必须是 64 位十六进制 SHA-256');
   }
   if (
     options.mode === 'disk-full' &&
@@ -606,6 +638,7 @@ function buildPowerCutEvidence(report, options, sessionDirectory, row) {
       engine_sha256: report.engine.binary_sha256,
       engine_ready: report.engine.ready,
     },
+    qualification: report.qualification,
     host: {
       hostname: report.host.hostname,
       platform: report.host.platform,
@@ -2850,6 +2883,7 @@ async function main() {
   const report = {
     schema_version: 1,
     tool_version: TOOL_VERSION,
+    acceptance_tool_sha256: ACCEPTANCE_TOOL_SHA256,
     mode: options.mode,
     started_at: new Date().toISOString(),
     completed_at: null,
@@ -2879,6 +2913,13 @@ async function main() {
       output: options.output,
       sessionDir: options.sessionDir,
     },
+    qualification: options.qualificationId === null
+      ? null
+      : {
+          qualification_id: options.qualificationId,
+          run_id: options.qualificationRunId,
+          installer_sha256: options.installerSha256,
+        },
     checks: [],
   };
   writeJsonDurable(reportPath, report);

@@ -1,0 +1,295 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://databaker.example/schemas/windows-audio-qualification-plan.schema.json",
+  "title": "DataBaker Windows Audio Qualification Plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "profile",
+    "qualification_id",
+    "release",
+    "target",
+    "required_runs"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "profile": {
+      "const": "databaker-windows-v1"
+    },
+    "qualification_id": {
+      "$ref": "#/$defs/id"
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "app_version",
+        "installer_path",
+        "installer_sha256",
+        "engine_sha256",
+        "acceptance_tool_sha256"
+      ],
+      "properties": {
+        "app_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "installer_path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "installer_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "engine_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "acceptance_tool_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "hostname",
+        "platform",
+        "architecture",
+        "windows_release",
+        "device_id",
+        "device_name",
+        "driver_version",
+        "usb_port",
+        "serial",
+        "channels",
+        "primary_format"
+      ],
+      "properties": {
+        "hostname": {
+          "type": "string",
+          "minLength": 1
+        },
+        "platform": {
+          "const": "win32"
+        },
+        "architecture": {
+          "const": "x64"
+        },
+        "windows_release": {
+          "type": "string",
+          "minLength": 1
+        },
+        "device_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "device_name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "driver_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "usb_port": {
+          "type": "string",
+          "minLength": 1
+        },
+        "serial": {
+          "type": "string",
+          "minLength": 1
+        },
+        "channels": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 256
+          }
+        },
+        "primary_format": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "sample_rate",
+            "bit_depth",
+            "channel"
+          ],
+          "properties": {
+            "sample_rate": {
+              "enum": [
+                44100,
+                48000,
+                96000
+              ]
+            },
+            "bit_depth": {
+              "enum": [
+                16,
+                24,
+                32
+              ]
+            },
+            "channel": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 256
+            }
+          }
+        }
+      }
+    },
+    "required_runs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/run"
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{64}$"
+    },
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "mode"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "mode": {
+          "enum": [
+            "inventory",
+            "short",
+            "soak",
+            "unplug",
+            "disk-full",
+            "power-cut",
+            "recover",
+            "inspect",
+            "default-switch",
+            "replug",
+            "abrupt-enospc"
+          ]
+        },
+        "report": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sample_rate": {
+          "enum": [
+            44100,
+            48000,
+            96000
+          ]
+        },
+        "bit_depth": {
+          "enum": [
+            16,
+            24,
+            32
+          ]
+        },
+        "channel": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256
+        },
+        "min_seconds": {
+          "type": "number",
+          "minimum": 30
+        },
+        "min_hours": {
+          "type": "number",
+          "minimum": 2,
+          "maximum": 8
+        },
+        "export": {
+          "type": "boolean"
+        },
+        "expected_full_track_container": {
+          "enum": [
+            "riff",
+            "rf64"
+          ]
+        },
+        "production_eligible": {
+          "type": "boolean"
+        },
+        "phase1_evidence_run_id": {
+          "$ref": "#/$defs/id"
+        },
+        "phase1_report": {
+          "type": "string",
+          "minLength": 1
+        },
+        "bound_to": {
+          "$ref": "#/$defs/id"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "recover"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "phase1_evidence_run_id": true,
+              "phase1_report": true,
+              "production_eligible": true
+            },
+            "required": [
+              "phase1_evidence_run_id",
+              "phase1_report",
+              "production_eligible"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "abrupt-enospc"
+              }
+            },
+            "required": [
+              "mode"
+            ]
+          },
+          "then": {
+            "properties": {
+              "production_eligible": true
+            },
+            "required": [
+              "production_eligible"
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

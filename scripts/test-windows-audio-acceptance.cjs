@@ -118,6 +118,29 @@ function testArgs() {
   assert.equal(short.pollSeconds, 1);
   assert.equal(short.export, true);
 
+  const qualification = parseArgs([
+    '--mode', 'inventory',
+    '--qualification-id', 'DB-WIN-001',
+    '--qualification-run-id', 'inventory',
+    '--installer-sha256', 'A'.repeat(64),
+  ]);
+  assert.equal(qualification.qualificationId, 'DB-WIN-001');
+  assert.equal(qualification.qualificationRunId, 'inventory');
+  assert.equal(qualification.installerSha256, 'a'.repeat(64));
+  assert.throws(
+    () => parseArgs(['--mode', 'inventory', '--qualification-id', 'DB-WIN-001']),
+    /must be provided together|\u5fc5须同时提供/,
+  );
+  assert.throws(
+    () => parseArgs([
+      '--mode', 'inventory',
+      '--qualification-id', 'DB-WIN-001',
+      '--qualification-run-id', 'inventory',
+      '--installer-sha256', 'not-a-hash',
+    ]),
+    /SHA-256/,
+  );
+
   const sixteenBit = parseArgs(['--mode', 'short', '--bit-depth', '16']);
   assert.equal(sixteenBit.minimumInputFormatBits, 16);
   const explicitMinimum = parseArgs([
@@ -640,6 +663,12 @@ function testShortProtocolIntegration() {
         '--poll-seconds',
         '0.25',
         '--skip-noise-check',
+        '--qualification-id',
+        'DB-WIN-FIXTURE-001',
+        '--qualification-run-id',
+        'short-48000-24-ch1',
+        '--installer-sha256',
+        'a'.repeat(64),
         '--yes',
       ],
       {
@@ -655,6 +684,12 @@ function testShortProtocolIntegration() {
     const reportPath = path.join(root, runNames[0], 'acceptance-report.json');
     const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
     assert.equal(report.overall, 'PASS');
+    assert.match(report.acceptance_tool_sha256, /^[0-9a-f]{64}$/);
+    assert.deepEqual(report.qualification, {
+      qualification_id: 'DB-WIN-FIXTURE-001',
+      run_id: 'short-48000-24-ch1',
+      installer_sha256: 'a'.repeat(64),
+    });
     assert.equal(report.start.snapshot.device_id, 'mock:usb-interface');
     assert.equal(report.start.snapshot.input_sample_format, 'f32');
     assert.equal(report.inspection.segments[0].bits_per_sample, 24);

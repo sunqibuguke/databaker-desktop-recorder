@@ -17,13 +17,15 @@
     "dev": "npm run build:engine && concurrently -k -n renderer,electron -c cyan,magenta \"npm:dev:renderer\" \"npm:dev:electron\"",
     "typecheck": "tsc --noEmit && tsc -p electron/tsconfig.json --noEmit",
     "acceptance:audio": "node scripts/windows-audio-acceptance.cjs",
+    "qualification:audio": "node scripts/windows-audio-qualification.cjs",
     "test:acceptance-tool": "node scripts/test-windows-audio-acceptance.cjs",
+    "test:qualification-tool": "node scripts/test-windows-audio-qualification.cjs",
     "test:electron": "npm run build:electron && node scripts/test-history-snapshot.cjs && node scripts/test-engine-client.cjs && node scripts/test-offline-seal-ipc.cjs && node scripts/test-safe-stop-main.cjs && node scripts/test-crash-before-quit-main.cjs && node scripts/test-export-lifecycle-ipc.cjs && node scripts/test-engine-recovery-failure-main.cjs && node scripts/test-start-reconciliation-main.cjs && node scripts/test-capture-fault-tray-main.cjs && node --no-warnings scripts/test-history-recovery-ui.cjs && node --no-warnings scripts/test-recording-workflow.cjs && node --no-warnings scripts/test-waveform-buffer.cjs && node --no-warnings scripts/test-capture-fault-event.cjs && node scripts/test-capture-presets.cjs",
     "test:engine": "node scripts/run-cargo.cjs test --manifest-path engine/Cargo.toml",
     "test:engine-protocol": "node scripts/run-cargo.cjs build --manifest-path engine/Cargo.toml && node scripts/smoke-engine.cjs",
     "test:crash-recovery": "node scripts/run-cargo.cjs build --manifest-path engine/Cargo.toml && node scripts/test-crash-recovery.cjs",
     "test:engine-system": "npm run build:engine:release && npm run build:engine:system-test && node scripts/test-engine-system-faults.cjs --profile quick",
-    "test": "npm run typecheck && npm run test:acceptance-tool && npm run test:electron && npm run test:engine && npm run test:engine-protocol && npm run test:crash-recovery && npm run test:engine-system",
+    "test": "npm run typecheck && npm run test:acceptance-tool && npm run test:qualification-tool && npm run test:electron && npm run test:engine && npm run test:engine-protocol && npm run test:crash-recovery && npm run test:engine-system",
     "package:dir": "npm run build && electron-builder --dir",
     "package": "npm run build && electron-builder",
     "package:win": "npm run build && electron-builder --win nsis --x64 --publish never"
@@ -47,6 +49,10 @@
         "to": "acceptance/windows-audio-acceptance.cjs"
       },
       {
+        "from": "scripts/windows-audio-qualification.cjs",
+        "to": "acceptance/windows-audio-qualification.cjs"
+      },
+      {
         "from": "scripts/run-windows-audio-acceptance.ps1",
         "to": "acceptance/run-windows-audio-acceptance.ps1"
       },
@@ -55,8 +61,24 @@
         "to": "acceptance/run-windows-audio-acceptance.cmd"
       },
       {
+        "from": "scripts/run-windows-audio-qualification.ps1",
+        "to": "acceptance/run-windows-audio-qualification.ps1"
+      },
+      {
+        "from": "scripts/run-windows-audio-qualification.cmd",
+        "to": "acceptance/run-windows-audio-qualification.cmd"
+      },
+      {
         "from": "doc/Windows外置声卡生产验收.md",
         "to": "acceptance/Windows外置声卡生产验收.md"
+      },
+      {
+        "from": "doc/windows-audio-qualification-plan.schema.json",
+        "to": "acceptance/windows-audio-qualification-plan.schema.json"
+      },
+      {
+        "from": "doc/Windows外置声卡资格计划.example.json",
+        "to": "acceptance/Windows外置声卡资格计划.example.json"
       }
     ],
     "mac": {
@@ -92,6 +114,7 @@
     "node": ">=22.12"
   },
   "dependencies": {
+    "ajv": "^8.20.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },

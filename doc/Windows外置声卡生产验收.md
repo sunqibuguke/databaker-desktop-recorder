@@ -42,6 +42,11 @@ resources/
     ├── run-windows-audio-acceptance.cmd
     ├── run-windows-audio-acceptance.ps1
     ├── windows-audio-acceptance.cjs
+    ├── run-windows-audio-qualification.cmd
+    ├── run-windows-audio-qualification.ps1
+    ├── windows-audio-qualification.cjs
+    ├── windows-audio-qualification-plan.schema.json
+    ├── Windows外置声卡资格计划.example.json
     └── Windows外置声卡生产验收.md
 ```
 
@@ -109,7 +114,7 @@ $device = "<inventory 返回的完整设备 ID>"
 .\run-windows-audio-acceptance.cmd --mode short --device-id $device --sample-rate 48000 --bit-depth 32 --channel 1 --seconds 30
 ```
 
-执行噪声检测的前 3 秒保持安静，之后持续朗读或播放稳定测试音。如果是多输入声卡，对生产会使用的每一个 `--channel` 分别执行。如果项目要求 96 kHz，再以 `--sample-rate 96000` 重复完整矩阵。
+执行噪声检测的前 3 秒保持安静，之后持续朗读或播放稳定测试音。如果是多输入声卡，对生产会使用的每一个 `--channel` 分别执行。完整生产资格必须在 44.1/48/96 kHz 下各重复 16/24/32-bit 矩阵；单次项目验证不能代替该资格矩阵。
 
 强制通过标准：
 
@@ -234,6 +239,14 @@ try {
 
 验收完成后，先保存整个验收结果目录，再在“磁盘管理”中分离并删除该专用 VHDX。
 
+### 8.4 瞬时真实 ENOSPC 与恢复门禁
+
+`disk-full` 模式只证明引擎在 critical 保留线上能提前 fail-closed。同目录的原子 rename 不等于“磁盘真的 0 byte 时仍能写入元数据”的保证，因此 `disk-full PASS` 不能代替瞬时 ENOSPC 验收。
+
+完整资格还必须有独立的 `abrupt-enospc` 证据：只在可丢弃 VHDX/专用测试卷中，录制进行时将卷瞬间压到真实 ENOSPC，随后 kill 录音进程或重启测试机；重启后先释放足够空间，不修改录音会话，再执行离线 seal 和严格 inspect。验收必须证明无 panic/死锁、已持久化完整帧可保留、WAV 头与 EOF 可修复且时间轴不被伪装为正常交付。
+
+**当前验收工具尚未实现 `abrupt-enospc` 模式。** 不得在系统盘、用户数据盘或客户交付盘上人工填到 0 byte。
+
 ## 9. 真实断电与重启恢复（两阶段）
 
 这项门禁必须使用可丢弃的 Windows 测试机，不能在客户正在录音的机器上执行。“断电”指录制进行中切断整台计算机电源，不能用 Ctrl+C、任务管理器、关闭窗口或正常关机代替。
@@ -304,6 +317,39 @@ $phase1Report = Get-ChildItem (Join-Path $qaRoot "reports-phase-1") -Filter "acc
 
 > 本地双份证据可以防止单文件损坏、误用旧报告或只杀进程被误判为断电，但它不是对本机管理员的密码学反篡改证明。需要对抗恶意管理员时，必须在断电前将 phase-1 证据的哈希/签名发往独立的可信存档或时间戳服务；这是实机验收流程门槛，不能靠会话目录内的自签 JSON 代替。
 
+### 9.3 聚合整套生产资格
+
+单次 `PASS` 只能证明一个参数组合，不等于该声卡已通过全部生产资格。复制 `Windows外置声卡资格计划.example.json`，按 `windows-audio-qualification-plan.schema.json` 填入安装包、引擎、验收工具哈希，以及主机、稳定设备 ID、驱动版本、USB 端口和序列号。每次验收都增加下列参数，将报告绑定到计划中唯一的 `required_runs[].id`：
+
+```powershell
+$qualification = "DB-WIN-RELEASE-DEVICE-001"
+$installerSha256 = "<SHA256SUMS.txt 中的 64 位哈希>"
+.\run-windows-audio-acceptance.cmd --mode short --device-id $device --sample-rate 48000 --bit-depth 24 --channel 1 --seconds 30 --qualification-id $qualification --qualification-run-id short-48000-24-ch1 --installer-sha256 $installerSha256
+```
+
+所有 run 完成后，将计划、安装包、各 run 目录和 power-cut 会话放在同一归档根下，执行：
+
+```powershell
+.\run-windows-audio-qualification.cmd --plan D:\QA\qualification-plan.json --reports D:\QA
+```
+
+整机断电需要两个唯一绑定：phase 1 `power-cut` 使用 recover 计划项的 `phase1_evidence_run_id`，phase 2 `recover` 使用该项自身的 `id`。recover 计划项还必须用 `phase1_report` 指向归档根下唯一的 phase-1 `acceptance-report.json`（相对路径）。两次的 qualification ID 和 installer hash 必须一致。例如：
+
+```powershell
+.\run-windows-audio-acceptance.cmd --mode power-cut <阶段 1 其他参数> --qualification-id $qualification --qualification-run-id power-cut-phase1-48000-24-ch1 --installer-sha256 $installerSha256
+.\run-windows-audio-acceptance.cmd --mode recover <阶段 2 其他参数> --qualification-id $qualification --qualification-run-id power-cut-recover-48000-24-ch1 --installer-sha256 $installerSha256
+```
+
+真正断电后，phase-1 原始报告保持 `overall=INCOMPLETE`、`completed_at=null`、`power_cut.phase=armed`，这是预期状态，不要人工改成 `PASS`。该 run 目录必须整体归档，至少包含 `acceptance-report.json`、`power-cut-evidence.json`、`telemetry.jsonl`、`protocol.jsonl`和 `engine-stderr.log`，并保留会话内的 `metadata/power-cut.acceptance.json`。
+
+聚合器会 fail-closed 核对上述原始报告、独立证据、会话证据和 phase-2 内嵌证据；还会从 telemetry/protocol 复核 armed 水位、引擎启动与成功 `start_session`，严格比对 qualification/run、安装包、验收工具、引擎、主机、设备和音频格式。原始报告缺失、出现重复或任一字段不一致，均为 `NOT_QUALIFIED`。通过后，phase-1 的报告、日志和证据也必须进入 `qualification-evidence.sha256`。
+
+资格计划在运行时使用 Ajv 2020 严格验证：多余字段、用字符串写数字等情况会在生成报告前被拒绝，不会被自动删除或转型。安装包内的 launcher 直接使用 `app.asar` 中的 Ajv，客户机无需另装 Node.js。
+
+聚合器只在以下条件全部满足时返回 `QUALIFIED`：44.1/48/96 kHz × 16/24/32-bit × 每个生产通道的 30 秒完整导出矩阵；三个采样率各至少 2 小时长稳；主力组合 8 小时；一次超过 RIFF 容量的 RF64 整轨导出；枚举、拔出、默认设备切换、重连后新录制、critical 磁盘保护、瞬时真实 ENOSPC 后恢复、真实断电恢复和严格复核。它还要求全部报告属于同一资格 ID、安装包、引擎、验收工具、Windows 主机和稳定设备 ID，且所有 check 都是 `PASS`、没有未处理 `WARN`。通过后会生成 `qualification-report.json` 和覆盖计划、报告、日志、原始录音及安装包的 `qualification-evidence.sha256`。
+
+**当前 `default-switch`、`replug` 和 `abrupt-enospc` 验收模式尚未实现。** 聚合器会将这三项标为 `NOT_IMPLEMENTED` 并返回 `NOT_QUALIFIED`；不允许删掉它们、修改示例或用人工声明获得整套资格。
+
 ## 10. 发布判定与工单清单
 
 同一个声卡/驱动/Windows 组合的发布门禁为：
@@ -311,16 +357,20 @@ $phase1Report = Get-ChildItem (Join-Path $qaRoot "reports-phase-1") -Filter "acc
 | 项目 | 最低要求 |
 | --- | --- |
 | 设备枚举 | `inventory` PASS，稳定 ID 唯一 |
-| 位深 | 48 kHz / 16、24、32-bit 短录各 PASS；24/32-bit 项目默认要求至少 24 bit 输入有效数字精度（`f32=24`） |
+| 参数矩阵 | 44.1/48/96 kHz × 16/24/32-bit × 每个生产通道，每项至少 30s 且整轨导出 PASS；24/32-bit 项默认要求至少 24 bit 输入有效数字精度（`f32=24`） |
 | 通道 | 生产会使用的每个输入通道 PASS |
-| 长稳 | 候选版 2h PASS；客户正式版主力组合 8h PASS |
+| 长稳 | 44.1/48/96 kHz 各至少 2h PASS；主力组合 8h PASS |
+| 超大整轨 | 超过 RIFF 容量的实际 RF64 导出及下游交付链解析 PASS |
 | USB 拔出 | `unplug` PASS |
-| 磁盘保护 | 专用测试卷 `disk-full` PASS |
+| 默认设备切换 | 指定声卡录制期间切换系统默认输入，`default-switch` PASS（当前模式待实现） |
+| 拔出后重连 | 声卡拔出、插回后开启新会话，`replug` PASS（当前模式待实现） |
+| 磁盘临界保护 | 专用测试卷 `disk-full` PASS，证明 critical 保留线上提前 fail-closed |
+| 瞬时真实 ENOSPC | 可丢弃 VHDX 上制造真实 ENOSPC，kill/reboot 后释放空间并 seal/inspect，`abrupt-enospc` PASS（当前模式待实现） |
 | 整机断电 | 阶段 1 录制至少 1h 后真实断电；重启后 `recover` PASS，严格 `inspect` 复核 PASS |
-| 原始证据 | report + telemetry + protocol + stderr + recording 全部归档 |
+| 原始证据 | plan + report + telemetry + protocol + stderr + recording + 安装包全部归档，生成并校验 `qualification-evidence.sha256` |
 | 安装包 | CI 从真实 NSIS 安装目录运行验收启动器；下载后核对 `SHA256SUMS.txt` |
 
-任意一项 `FAIL` 或 `INCOMPLETE` 都不允许以“验收通过”结单。`WARN` 必须有书面处理记录；例如削波 WARN 需调整硬件增益后重测。
+任意一项 `FAIL`、`INCOMPLETE`、`WARN` 或 `NOT_IMPLEMENTED` 都不允许以“验收通过”结单。例如削波 WARN 需调整硬件增益后重测。
 
 ## 11. 已知边界
 

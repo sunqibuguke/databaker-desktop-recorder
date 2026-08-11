@@ -1,0 +1,206 @@
+{
+  "schema_version": 1,
+  "profile": "databaker-windows-v1",
+  "qualification_id": "REPLACE-ME-WIN-AUDIO-001",
+  "release": {
+    "app_version": "0.1.0",
+    "installer_path": "./DataBaker-Recorder-0.1.0-Windows-x64.exe",
+    "installer_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "engine_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "acceptance_tool_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "target": {
+    "hostname": "REPLACE-WINDOWS-HOST",
+    "platform": "win32",
+    "architecture": "x64",
+    "windows_release": "REPLACE-WINDOWS-RELEASE",
+    "device_id": "REPLACE-WASAPI-STABLE-ENDPOINT-ID",
+    "device_name": "REPLACE-USB-AUDIO-INTERFACE",
+    "driver_version": "REPLACE-DRIVER-VERSION",
+    "usb_port": "REPLACE-PHYSICAL-USB-PORT",
+    "serial": "REPLACE-DEVICE-SERIAL-OR-N-A",
+    "channels": [
+      1
+    ],
+    "primary_format": {
+      "sample_rate": 48000,
+      "bit_depth": 24,
+      "channel": 1
+    }
+  },
+  "required_runs": [
+    {
+      "id": "inventory",
+      "mode": "inventory"
+    },
+    {
+      "id": "short-44100-16-ch1",
+      "mode": "short",
+      "sample_rate": 44100,
+      "bit_depth": 16,
+      "channel": 1,
+      "min_seconds": 30,
+      "export": true
+    },
+    {
+      "id": "short-44100-24-ch1",
+      "mode": "short",
+      "sample_rate": 44100,
+      "bit_depth": 24,
+      "channel": 1,
+      "min_seconds": 30,
+      "export": true
+    },
+    {
+      "id": "short-44100-32-ch1",
+      "mode": "short",
+      "sample_rate": 44100,
+      "bit_depth": 32,
+      "channel": 1,
+      "min_seconds": 30,
+      "export": true
+    },
+    {
+      "id": "short-48000-16-ch1",
+      "mode": "short",
+      "sample_rate": 48000,
+      "bit_depth": 16,
+      "channel": 1,
+      "min_seconds": 30,
+      "export": true
+    },
+    {
+      "id": "short-48000-24-ch1",
+      "mode": "short",
+      "sample_rate": 48000,
+      "bit_depth": 24,
+      "channel": 1,
+      "min_seconds": 30,
+      "export": true
+    },
+    {
+      "id": "short-48000-32-ch1",
+      "mode": "short",
+      "sample_rate": 48000,
+      "bit_depth": 32,
+      "channel": 1,
+      "min_seconds": 30,
+      "export": true
+    },
+    {
+      "id": "short-96000-16-ch1",
+      "mode": "short",
+      "sample_rate": 96000,
+      "bit_depth": 16,
+      "channel": 1,
+      "min_seconds": 30,
+      "export": true
+    },
+    {
+      "id": "short-96000-24-ch1",
+      "mode": "short",
+      "sample_rate": 96000,
+      "bit_depth": 24,
+      "channel": 1,
+      "min_seconds": 30,
+      "export": true
+    },
+    {
+      "id": "short-96000-32-ch1",
+      "mode": "short",
+      "sample_rate": 96000,
+      "bit_depth": 32,
+      "channel": 1,
+      "min_seconds": 30,
+      "export": true
+    },
+    {
+      "id": "soak-44100-24-ch1-2h",
+      "mode": "soak",
+      "sample_rate": 44100,
+      "bit_depth": 24,
+      "channel": 1,
+      "min_hours": 2,
+      "export": false
+    },
+    {
+      "id": "soak-primary-48000-24-ch1-8h",
+      "mode": "soak",
+      "sample_rate": 48000,
+      "bit_depth": 24,
+      "channel": 1,
+      "min_hours": 8,
+      "export": false
+    },
+    {
+      "id": "soak-96000-24-ch1-2h",
+      "mode": "soak",
+      "sample_rate": 96000,
+      "bit_depth": 24,
+      "channel": 1,
+      "min_hours": 2,
+      "export": false
+    },
+    {
+      "id": "soak-rf64-96000-32-ch1-4h",
+      "mode": "soak",
+      "sample_rate": 96000,
+      "bit_depth": 32,
+      "channel": 1,
+      "min_hours": 4,
+      "export": true,
+      "expected_full_track_container": "rf64"
+    },
+    {
+      "id": "unplug-48000-24-ch1",
+      "mode": "unplug",
+      "sample_rate": 48000,
+      "bit_depth": 24,
+      "channel": 1
+    },
+    {
+      "id": "default-switch-48000-24-ch1",
+      "mode": "default-switch",
+      "sample_rate": 48000,
+      "bit_depth": 24,
+      "channel": 1
+    },
+    {
+      "id": "replug-48000-24-ch1",
+      "mode": "replug",
+      "sample_rate": 48000,
+      "bit_depth": 24,
+      "channel": 1
+    },
+    {
+      "id": "disk-full-48000-24-ch1",
+      "mode": "disk-full",
+      "sample_rate": 48000,
+      "bit_depth": 24,
+      "channel": 1
+    },
+    {
+      "id": "abrupt-enospc-48000-24-ch1",
+      "mode": "abrupt-enospc",
+      "sample_rate": 48000,
+      "bit_depth": 24,
+      "channel": 1,
+      "production_eligible": true
+    },
+    {
+      "id": "power-cut-recover-48000-24-ch1",
+      "mode": "recover",
+      "sample_rate": 48000,
+      "bit_depth": 24,
+      "channel": 1,
+      "production_eligible": true,
+      "phase1_evidence_run_id": "power-cut-phase1-48000-24-ch1",
+      "phase1_report": "reports-phase-1/REPLACE-POWER-CUT-RUN/acceptance-report.json"
+    },
+    {
+      "id": "power-cut-inspect",
+      "mode": "inspect",
+      "bound_to": "power-cut-recover-48000-24-ch1"
+    }
+  ]
+}
