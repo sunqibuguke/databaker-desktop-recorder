@@ -4,6 +4,9 @@ export type Attempt = {
   attempt_id: string;
   start_sample: number;
   recording_started_sample: number;
+  head_silence_armed_sample?: number;
+  head_silence_passed_sample?: number;
+  required_head_silence_samples?: number;
   content_started_sample: number;
   end_sample: number;
   /** 该版本由操作员在句尾静音未达标时强制封闭，交付前需要重点试听。 */
@@ -13,6 +16,8 @@ export type Attempt = {
   status: string;
   created_at: string;
 };
+
+export type HeadSilencePhase = 'idle' | 'waiting_for_head_silence' | 'ready_for_speech' | 'speech_started';
 
 export type ItemState = ScriptItem & {
   status: 'pending' | 'review' | 'accepted' | 'skipped' | string;
@@ -105,9 +110,16 @@ export type Meter = {
   rms: number;
   silence_samples: number;
   last_signal_sample: number;
+  head_silence_phase?: HeadSilencePhase;
+  head_silence_armed_sample?: number;
+  head_silence_progress_samples?: number;
+  required_head_silence_samples?: number;
+  head_silence_passed_sample?: number;
+  content_started_sample?: number;
   silence_threshold_dbfs: number;
   silence_duration_ms: number;
   waveform: Array<[number, number]>;
+  waveform_end_sample?: number;
 };
 
 export type EngineEvent = { event: string; payload: unknown; protocol_version: number };
@@ -137,7 +149,7 @@ export type SealInterruptedSessionResult = {
   warnings?: string[];
 };
 
-export type PrompterCue = 'idle' | 'checking' | 'ready' | 'recording' | 'post-ready' | 'review';
+export type PrompterCue = 'idle' | 'checking' | 'ready' | 'recording' | 'post-ready' | 'review' | 'complete';
 
 export type PrompterState = {
   sessionName: string;

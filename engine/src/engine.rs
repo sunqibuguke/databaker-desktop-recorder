@@ -58,6 +58,7 @@ const WRITER_AUTOMATIC_CHECKPOINT_SECONDS: u64 = 10;
 // cannot postpone the critical-reserve guard by checkpointing every sentence.
 const WRITER_STORAGE_CHECK_INTERVAL_SECONDS: u64 = 1;
 const WRITER_POWER_LOSS_TAIL_BUDGET_SECONDS: u64 = 30;
+const WAVEFORM_BIN_SAMPLES: usize = 64;
 const _: () = {
     assert!(
         WRITER_AUTOMATIC_CHECKPOINT_SECONDS + WRITER_QUEUE_AUDIO_BUDGET_SECONDS
@@ -147,6 +148,21 @@ pub struct Attempt {
     pub start_sample: u64,
     #[serde(default)]
     pub recording_started_sample: u64,
+    /// Authoritative capture boundary at which the operator clicked start and
+    /// this take's head-silence detector was armed. Kept separate from
+    /// `start_sample`, which may exclude noise before the validated silence
+    /// run, and from the legacy `recording_started_sample` field so downstream
+    /// consumers can migrate without guessing timestamp semantics.
+    #[serde(default)]
+    pub head_silence_armed_sample: u64,
+    /// First sample boundary at which the configured continuous head silence
+    /// had been observed. Zero means unavailable on legacy or interrupted
+    /// metadata; completed takes produced by the current engine always set it.
+    #[serde(default)]
+    pub head_silence_passed_sample: u64,
+    /// Head-silence requirement in force for this take.
+    #[serde(default)]
+    pub required_head_silence_samples: u64,
     #[serde(default)]
     pub content_started_sample: u64,
     pub end_sample: u64,
@@ -377,6 +393,164 @@ struct ActiveAttempt {
     recording_started_sample: u64,
 }
 
+const HEAD_SILENCE_IDLE: u32 = 0;
+const HEAD_SILENCE_WAITING: u32 = 1;
+const HEAD_SILENCE_PASSED: u32 = 2;
+const HEAD_SILENCE_SPEECH_STARTED: u32 = 3;
+
+#[derive(Clone)]
+struct HeadSilenceMonitor {
+    phase: Arc<AtomicU32>,
+    armed_sample: Arc<AtomicU64>,
+    progress_samples: Arc<AtomicU64>,
+    passed_sample: Arc<AtomicU64>,
+    required_samples: u64,
+}
+
+impl HeadSilenceMonitor {
+    fn new(required_samples: u64) -> Self {
+        Self {
+            phase: Arc::new(AtomicU32::new(HEAD_SILENCE_IDLE)),
+            armed_sample: Arc::new(AtomicU64::new(0)),
+            progress_samples: Arc::new(AtomicU64::new(0)),
+            passed_sample: Arc::new(AtomicU64::new(0)),
+            required_samples,
+        }
+    }
+
+    /// Must be called while holding the capture-analysis seqlock.
+    fn arm(&self, armed_sample: u64) {
+        // Publish WAITING last so a callback that observes the armed phase also
+        // observes the fresh boundary and zeroed progress from this take.
+        self.phase.store(HEAD_SILENCE_IDLE, Ordering::Release);
+        self.armed_sample.store(armed_sample, Ordering::Release);
+        self.progress_samples.store(0, Ordering::Release);
+        self.passed_sample.store(0, Ordering::Release);
+        self.phase.store(HEAD_SILENCE_WAITING, Ordering::Release);
+    }
+
+    /// Must be called while holding the capture-analysis seqlock.
+    fn disarm(&self) {
+        self.phase.store(HEAD_SILENCE_IDLE, Ordering::Release);
+        self.armed_sample.store(0, Ordering::Release);
+        self.progress_samples.store(0, Ordering::Release);
+        self.passed_sample.store(0, Ordering::Release);
+    }
+}
+
+fn head_silence_phase_name(phase: u32) -> &'static str {
+    match phase {
+        HEAD_SILENCE_WAITING => "waiting_for_head_silence",
+        HEAD_SILENCE_PASSED => "ready_for_speech",
+        HEAD_SILENCE_SPEECH_STARTED => "speech_started",
+        _ => "idle",
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct WaveformPacket {
+    bins: Vec<[f32; 2]>,
+    end_sample: u64,
+}
+
+#[derive(Debug)]
+struct WaveformBinner {
+    next_sample: u64,
+    pending_samples: usize,
+    minimum: f32,
+    maximum: f32,
+}
+
+impl WaveformBinner {
+    fn new(start_sample: u64) -> Self {
+        Self {
+            next_sample: start_sample,
+            pending_samples: 0,
+            minimum: 0.0,
+            maximum: 0.0,
+        }
+    }
+
+    fn reset(&mut self, start_sample: u64) {
+        self.next_sample = start_sample;
+        self.pending_samples = 0;
+        self.minimum = 0.0;
+        self.maximum = 0.0;
+    }
+
+    fn push_block(&mut self, block_start: u64, samples: &[f32]) -> Option<WaveformPacket> {
+        // The preview is disposable and must never fault capture. If a caller
+        // presents a discontinuous accepted range, restart only its visual
+        // accumulator and expose the gap through the packet sample endpoint.
+        if self.next_sample != block_start {
+            self.reset(block_start);
+        }
+        let mut bins =
+            Vec::with_capacity((self.pending_samples + samples.len()) / WAVEFORM_BIN_SAMPLES);
+        let mut end_sample = 0;
+        for sample in samples {
+            let normalized = sample.clamp(-1.0, 1.0);
+            self.minimum = self.minimum.min(normalized);
+            self.maximum = self.maximum.max(normalized);
+            self.pending_samples += 1;
+            self.next_sample = self.next_sample.saturating_add(1);
+            if self.pending_samples == WAVEFORM_BIN_SAMPLES {
+                bins.push([self.minimum, self.maximum]);
+                end_sample = self.next_sample;
+                self.pending_samples = 0;
+                self.minimum = 0.0;
+                self.maximum = 0.0;
+            }
+        }
+        (!bins.is_empty()).then_some(WaveformPacket { bins, end_sample })
+    }
+}
+
+struct CaptureWaveformPreview {
+    sender: Sender<WaveformPacket>,
+    binner: WaveformBinner,
+}
+
+impl CaptureWaveformPreview {
+    fn new(sender: Sender<WaveformPacket>, start_sample: u64) -> Self {
+        Self {
+            sender,
+            binner: WaveformBinner::new(start_sample),
+        }
+    }
+
+    fn prepare(&mut self, block_start: u64, samples: &[f32]) -> Option<WaveformPacket> {
+        self.binner.push_block(block_start, samples)
+    }
+
+    fn publish(&self, packet: WaveformPacket) {
+        // Preview congestion may drop visuals, but can never wait in the audio
+        // callback or apply backpressure to the authoritative writer queue.
+        let _ = self.sender.try_send(packet);
+    }
+}
+
+fn append_waveform_packet(
+    waveform: &mut Vec<[f32; 2]>,
+    waveform_end_sample: &mut u64,
+    packet: WaveformPacket,
+    maximum_bins: usize,
+) {
+    let packet_samples = (packet.bins.len() as u64).saturating_mul(WAVEFORM_BIN_SAMPLES as u64);
+    let packet_start_sample = packet.end_sample.saturating_sub(packet_samples);
+    if *waveform_end_sample != 0 && packet_start_sample != *waveform_end_sample {
+        // A full preview channel is allowed to drop packets. Never compress
+        // that missing time into a continuous-looking waveform batch.
+        waveform.clear();
+    }
+    waveform.extend(packet.bins);
+    *waveform_end_sample = packet.end_sample;
+    if waveform.len() > maximum_bins {
+        let discard = waveform.len() - maximum_bins;
+        waveform.drain(..discard);
+    }
+}
+
 #[derive(Clone)]
 struct SilenceMonitor {
     silence_samples: Arc<AtomicU64>,
@@ -386,6 +560,7 @@ struct SilenceMonitor {
     analysis_epoch: Arc<AtomicU64>,
     threshold_bits: Arc<AtomicU32>,
     capture_heartbeat: Arc<AtomicU64>,
+    head_silence: HeadSilenceMonitor,
 }
 
 #[derive(Clone)]
@@ -406,6 +581,10 @@ struct AnalysisWriteGuard<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CaptureAnalysisSnapshot {
     boundary: u64,
+    head_silence_phase: u32,
+    head_silence_armed_sample: u64,
+    head_silence_progress_samples: u64,
+    head_silence_passed_sample: u64,
     content_started_sample: u64,
     last_signal_sample: u64,
 }
@@ -636,6 +815,8 @@ struct InterruptedAttemptStart {
     attempt_id: String,
     start_sample: u64,
     recording_started_sample: u64,
+    head_silence_armed_sample: u64,
+    required_head_silence_samples: u64,
     created_at: String,
     event_index: usize,
 }
@@ -821,6 +1002,7 @@ pub struct RecordingSession {
     analyzed_samples: Arc<AtomicU64>,
     analysis_epoch: Arc<AtomicU64>,
     silence_threshold_bits: Arc<AtomicU32>,
+    head_silence: HeadSilenceMonitor,
     active_attempt: Option<ActiveAttempt>,
     metadata_fault: Option<String>,
     /// A stop command has already been placed behind every callback that
@@ -1359,7 +1541,14 @@ impl Engine {
         let analysis_epoch = Arc::new(AtomicU64::new(0));
         let silence_threshold_bits =
             Arc::new(AtomicU32::new(snapshot.silence_threshold_dbfs.to_bits()));
-        let (waveform_tx, waveform_rx) = bounded::<Vec<[f32; 2]>>(128);
+        let required_head_silence_samples = u64::from(snapshot.audio_format.sample_rate)
+            .saturating_mul(u64::from(snapshot.silence_duration_ms))
+            / 1_000;
+        let head_silence = HeadSilenceMonitor::new(required_head_silence_samples);
+        let (waveform_tx, waveform_rx) = bounded::<WaveformPacket>(128);
+        // Production preview leaves the callback only through this bounded,
+        // non-blocking channel. The writer receives no visualization sink, so
+        // WAV writes and checkpoints do not spend time recomputing preview bins.
         let telemetry_stop = Arc::new(AtomicBool::new(false));
         let capture_watchdog_armed = Arc::new(AtomicBool::new(false));
         let capture_heartbeat = Arc::new(AtomicU64::new(0));
@@ -1395,7 +1584,7 @@ impl Engine {
                     writer_storage_status,
                     writer_storage_remaining,
                     writer_queue_thread,
-                    waveform_tx,
+                    None,
                     writer_ready_tx,
                 )
             })?;
@@ -1428,6 +1617,7 @@ impl Engine {
             analyzed_samples,
             analysis_epoch,
             silence_threshold_bits,
+            head_silence,
             active_attempt: None,
             metadata_fault: None,
             stop_requested: false,
@@ -1479,6 +1669,7 @@ impl Engine {
                 Arc::clone(&session.peak),
                 Arc::clone(&session.rms),
                 session.writer_queue.clone(),
+                waveform_tx,
                 SilenceMonitor {
                     silence_samples: Arc::clone(&session.silence_samples),
                     last_signal_sample: Arc::clone(&session.last_signal_sample),
@@ -1487,6 +1678,7 @@ impl Engine {
                     analysis_epoch: Arc::clone(&session.analysis_epoch),
                     threshold_bits: Arc::clone(&session.silence_threshold_bits),
                     capture_heartbeat: Arc::clone(&session.capture_heartbeat),
+                    head_silence: session.head_silence.clone(),
                 },
             ) {
                 Ok(stream) => stream,
@@ -1570,7 +1762,9 @@ impl Engine {
         let rms_thread = Arc::clone(&session.rms);
         let silence_samples_thread = Arc::clone(&session.silence_samples);
         let last_signal_sample_thread = Arc::clone(&session.last_signal_sample);
+        let content_started_sample_thread = Arc::clone(&session.attempt_signal_start_sample);
         let silence_threshold_thread = Arc::clone(&session.silence_threshold_bits);
+        let head_silence_thread = session.head_silence.clone();
         let silence_duration_ms = session.snapshot.silence_duration_ms;
         let telemetry_session_dir = session.session_dir.clone();
         let telemetry_join = match thread::Builder::new()
@@ -1586,12 +1780,14 @@ impl Engine {
                         _ => "critical",
                     };
                     let mut waveform = Vec::<[f32; 2]>::new();
-                    while let Ok(block) = waveform_rx.try_recv() {
-                        waveform.extend(block);
-                        if waveform.len() > 2_048 {
-                            let discard = waveform.len() - 2_048;
-                            waveform.drain(..discard);
-                        }
+                    let mut waveform_end_sample = 0u64;
+                    while let Ok(packet) = waveform_rx.try_recv() {
+                        append_waveform_packet(
+                            &mut waveform,
+                            &mut waveform_end_sample,
+                            packet,
+                            2_048,
+                        );
                     }
                     let capture_faulted = faulted_thread.load(Ordering::Acquire);
                     let overflow_samples = overflow_thread.load(Ordering::Acquire);
@@ -1629,7 +1825,21 @@ impl Engine {
                             "last_signal_sample": last_signal_sample_thread.load(Ordering::Acquire),
                             "silence_threshold_dbfs": f32::from_bits(silence_threshold_thread.load(Ordering::Relaxed)),
                             "silence_duration_ms": silence_duration_ms,
+                            "head_silence_phase": head_silence_phase_name(
+                                head_silence_thread.phase.load(Ordering::Acquire)
+                            ),
+                            "head_silence_armed_sample": head_silence_thread
+                                .armed_sample.load(Ordering::Acquire),
+                            "head_silence_progress_samples": head_silence_thread
+                                .progress_samples.load(Ordering::Acquire)
+                                .min(head_silence_thread.required_samples),
+                            "required_head_silence_samples": head_silence_thread.required_samples,
+                            "head_silence_passed_sample": head_silence_thread
+                                .passed_sample.load(Ordering::Acquire),
+                            "content_started_sample": content_started_sample_thread
+                                .load(Ordering::Acquire),
                             "waveform": waveform,
+                            "waveform_end_sample": waveform_end_sample,
                         }),
                     );
                     thread::sleep(Duration::from_millis(80));
@@ -1743,6 +1953,7 @@ impl Engine {
             analysis_epoch: Arc::clone(&session.analysis_epoch),
             threshold_bits: Arc::clone(&session.silence_threshold_bits),
             capture_heartbeat: Arc::clone(&session.capture_heartbeat),
+            head_silence: session.head_silence.clone(),
         };
         let mut emitted = 0u64;
         while emitted < frames {
@@ -1897,21 +2108,12 @@ impl Engine {
             }
             sequence += 1;
         };
-        let required_silence_samples = session.required_silence_samples();
-        let current_silence_samples = session.silence_samples.load(Ordering::Acquire);
-        if current_silence_samples < required_silence_samples {
-            bail!(
-                "开始录制前需要连续静音 {:.1} 秒；当前 {:.1} 秒",
-                session.snapshot.silence_duration_ms as f64 / 1_000.0,
-                current_silence_samples as f64
-                    / f64::from(session.snapshot.audio_format.sample_rate)
-            );
-        }
-        let recording_started_sample = session.captured.load(Ordering::Acquire);
-        session
-            .attempt_signal_start_sample
-            .store(0, Ordering::Release);
-        let start_sample = recording_started_sample.saturating_sub(required_silence_samples);
+        // Clicking start arms a fresh per-take detector. Ambient silence from
+        // before the click intentionally does not count: the operator must be
+        // given an observable, deterministic head-silence interval after the
+        // action, but the action itself must never be rejected.
+        let recording_started_sample = session.arm_attempt_analysis();
+        let start_sample = recording_started_sample;
         session.active_attempt = Some(ActiveAttempt {
             item_id: item_id.to_string(),
             attempt_id: attempt_id.clone(),
@@ -1925,13 +2127,27 @@ impl Engine {
                 "attempt_id": attempt_id,
                 "start_sample": start_sample,
                 "recording_started_sample": recording_started_sample,
-                "pre_silence_samples": recording_started_sample - start_sample,
+                "head_silence_armed_sample": recording_started_sample,
+                "required_head_silence_samples": session.head_silence.required_samples,
+                // Legacy field retained for journal readers. At arm time no
+                // post-click silence has been accepted yet.
+                "pre_silence_samples": 0,
             }),
         )?;
+        let phase = session.head_silence.phase.load(Ordering::Acquire);
         Ok(json!({
             "attempt_id": attempt_id,
             "start_sample": start_sample,
             "recording_started_sample": recording_started_sample,
+            "head_silence_armed_sample": recording_started_sample,
+            "head_silence_phase": head_silence_phase_name(phase),
+            "head_silence_progress_samples": session.head_silence
+                .progress_samples.load(Ordering::Acquire)
+                .min(session.head_silence.required_samples),
+            "required_head_silence_samples": session.head_silence.required_samples,
+            "head_silence_passed_sample": session.head_silence
+                .passed_sample.load(Ordering::Acquire),
+            "content_started_sample": session.attempt_signal_start_sample.load(Ordering::Acquire),
         }))
     }
 
@@ -1947,20 +2163,13 @@ impl Engine {
             let durable_end = session
                 .checkpoint()
                 .unwrap_or_else(|_| session.committed.load(Ordering::Acquire));
-            let attempt = mark_active_attempt_interrupted(
-                &mut session.snapshot,
+            let attempt = session.interrupt_attempt(
                 &active,
                 durable_end,
+                session.head_silence.passed_sample.load(Ordering::Acquire),
+                session.head_silence.required_samples,
                 session.attempt_signal_start_sample.load(Ordering::Acquire),
-            )?;
-            session.active_attempt = None;
-            session.persist(
-                "attempt_interrupted",
-                json!({
-                    "item_id": &active.item_id,
-                    "attempt": &attempt,
-                    "reason": "audio_writer_fault"
-                }),
+                "audio_writer_fault",
             )?;
             return Ok(json!({
                 "item_id": &active.item_id,
@@ -1994,18 +2203,37 @@ impl Engine {
                 json!({
                     "item_id": &active.item_id,
                     "attempt_id": &active.attempt_id,
-                    "reason": "manual_stop_without_signal"
+                    "reason": if analysis.head_silence_passed_sample == 0 {
+                        "manual_stop_before_head_silence"
+                    } else {
+                        "manual_stop_without_signal"
+                    },
+                    "head_silence_armed_sample": analysis.head_silence_armed_sample,
+                    "head_silence_passed_sample": analysis.head_silence_passed_sample,
+                    "head_silence_progress_samples": analysis.head_silence_progress_samples,
+                    "required_head_silence_samples": session.head_silence.required_samples,
                 }),
             )?;
             // Retain the active attempt if the authoritative journal append
             // fails so fault sealing can still preserve its sample range.
             session.active_attempt = None;
+            session.disarm_attempt_analysis();
             return Ok(json!({
                 "item_id": active.item_id,
                 "attempt": null,
                 "discarded": true,
                 "forced": true,
             }));
+        }
+        let head_silence_passed_sample = analysis.head_silence_passed_sample;
+        if head_silence_passed_sample == 0
+            || head_silence_passed_sample > content_started_sample
+            || !matches!(
+                analysis.head_silence_phase,
+                HEAD_SILENCE_PASSED | HEAD_SILENCE_SPEECH_STARTED
+            )
+        {
+            bail!("本句头静音与正文起点的分析边界不一致，请稍后重试完成本句");
         }
         let required_silence_samples = session.required_silence_samples();
         let last_signal_sample = analysis.last_signal_sample;
@@ -2024,10 +2252,30 @@ impl Engine {
         let forced_without_tail_silence = force && tail_silence_samples < required_silence_samples;
         let end_sample = match session.wait_until_committed(captured_boundary) {
             Ok(_) => captured_boundary,
-            Err(_) if session.faulted.load(Ordering::Acquire) => session
-                .committed
-                .load(Ordering::Acquire)
-                .min(captured_boundary),
+            Err(error) if session.faulted.load(Ordering::Acquire) => {
+                // The writer can fail after the analysis snapshot but before
+                // its final checkpoint. Never turn the durable prefix into a
+                // successful take: it may end before the calculated bundle or
+                // even before speech. Preserve only an interrupted version at
+                // the proven committed boundary.
+                let durable_end = session
+                    .committed
+                    .load(Ordering::Acquire)
+                    .min(captured_boundary);
+                let attempt = session.interrupt_attempt(
+                    &active,
+                    durable_end,
+                    analysis.head_silence_passed_sample,
+                    session.head_silence.required_samples,
+                    analysis.content_started_sample,
+                    &format!("audio_writer_fault_while_finishing: {error:#}"),
+                )?;
+                return Ok(json!({
+                    "item_id": &active.item_id,
+                    "attempt": attempt,
+                    "interrupted": true,
+                }));
+            }
             Err(error) => return Err(error),
         };
         if end_sample <= active.start_sample {
@@ -2051,8 +2299,15 @@ impl Engine {
         }
         let attempt = Attempt {
             attempt_id: active.attempt_id.clone(),
+            // Deliver exactly the configured silence immediately preceding
+            // the first content sample. If the speaker waits after the head
+            // gate passes, that extra pause remains in the continuous master
+            // track but does not bloat the sentence bundle.
             start_sample: content_started_sample.saturating_sub(required_silence_samples),
             recording_started_sample: active.recording_started_sample,
+            head_silence_armed_sample: analysis.head_silence_armed_sample,
+            head_silence_passed_sample,
+            required_head_silence_samples: required_silence_samples,
             content_started_sample,
             end_sample,
             forced_without_tail_silence,
@@ -2080,6 +2335,7 @@ impl Engine {
                 "required_tail_silence_samples": required_silence_samples,
             }),
         )?;
+        session.disarm_attempt_analysis();
         Ok(json!({
             "item_id": active.item_id,
             "attempt": attempt,
@@ -2167,11 +2423,22 @@ impl Engine {
         Ok(json!({
             "snapshot": session.live_snapshot(),
             "session_dir": session.session_dir,
+            "attempt_analysis": session.active_attempt.as_ref()
+                .map(|_| session.active_attempt_analysis_value()),
             "active_attempt": session.active_attempt.as_ref().map(|attempt| json!({
                 "item_id": attempt.item_id,
                 "attempt_id": attempt.attempt_id,
                 "start_sample": attempt.start_sample,
                 "recording_started_sample": attempt.recording_started_sample,
+                "head_silence_armed_sample": session.head_silence.armed_sample.load(Ordering::Acquire),
+                "head_silence_passed_sample": session.head_silence.passed_sample.load(Ordering::Acquire),
+                "head_silence_progress_samples": session.head_silence.progress_samples
+                    .load(Ordering::Acquire).min(session.head_silence.required_samples),
+                "required_head_silence_samples": session.head_silence.required_samples,
+                "head_silence_phase": head_silence_phase_name(
+                    session.head_silence.phase.load(Ordering::Acquire)
+                ),
+                "content_started_sample": session.attempt_signal_start_sample.load(Ordering::Acquire),
             })),
         }))
     }
@@ -2184,11 +2451,22 @@ impl Engine {
             "active": true,
             "snapshot": session.live_snapshot(),
             "session_dir": session.session_dir,
+            "attempt_analysis": session.active_attempt.as_ref()
+                .map(|_| session.active_attempt_analysis_value()),
             "active_attempt": session.active_attempt.as_ref().map(|attempt| json!({
                 "item_id": attempt.item_id,
                 "attempt_id": attempt.attempt_id,
                 "start_sample": attempt.start_sample,
                 "recording_started_sample": attempt.recording_started_sample,
+                "head_silence_armed_sample": session.head_silence.armed_sample.load(Ordering::Acquire),
+                "head_silence_passed_sample": session.head_silence.passed_sample.load(Ordering::Acquire),
+                "head_silence_progress_samples": session.head_silence.progress_samples
+                    .load(Ordering::Acquire).min(session.head_silence.required_samples),
+                "required_head_silence_samples": session.head_silence.required_samples,
+                "head_silence_phase": head_silence_phase_name(
+                    session.head_silence.phase.load(Ordering::Acquire)
+                ),
+                "content_started_sample": session.attempt_signal_start_sample.load(Ordering::Acquire),
             })),
         })
     }
@@ -2719,6 +2997,9 @@ impl Engine {
                 "attempt_id": attempt.attempt_id,
                 "start_sample": attempt.start_sample,
                 "recording_started_sample": attempt.recording_started_sample,
+                "head_silence_armed_sample": attempt.head_silence_armed_sample,
+                "head_silence_passed_sample": attempt.head_silence_passed_sample,
+                "required_head_silence_samples": attempt.required_head_silence_samples,
                 "content_started_sample": attempt.content_started_sample,
                 "content_started_seconds": attempt.content_started_sample as f64
                     / f64::from(snapshot.audio_format.sample_rate),
@@ -2963,10 +3244,37 @@ fn validate_attempt_boundaries(snapshot: &SessionSnapshot, durable_frames: u64) 
         .iter()
         .flat_map(|item| item.attempts.iter())
         .any(|attempt| {
+            let head_silence_invalid = if attempt.head_silence_passed_sample == 0 {
+                // Legacy attempts omit all three fields. Interrupted attempts
+                // may durably preserve only the click boundary. A deliverable
+                // take that advertises any new head-silence metadata must also
+                // contain the latched pass boundary.
+                attempt.status != "interrupted"
+                    && (attempt.head_silence_armed_sample != 0
+                        || attempt.required_head_silence_samples != 0)
+            } else {
+                attempt.head_silence_armed_sample > attempt.head_silence_passed_sample
+                    || attempt.required_head_silence_samples == 0
+                    || attempt
+                        .head_silence_passed_sample
+                        .saturating_sub(attempt.head_silence_armed_sample)
+                        < attempt.required_head_silence_samples
+                    || (attempt.status != "interrupted"
+                        && (attempt.recording_started_sample != attempt.head_silence_armed_sample
+                            || attempt.start_sample
+                                != attempt
+                                    .content_started_sample
+                                    .saturating_sub(attempt.required_head_silence_samples)
+                            || attempt.head_silence_passed_sample > attempt.content_started_sample))
+            };
             attempt.start_sample > durable_frames
                 || attempt.recording_started_sample > durable_frames
+                || attempt.head_silence_armed_sample > durable_frames
+                || attempt.head_silence_passed_sample > durable_frames
                 || attempt.content_started_sample > durable_frames
                 || attempt.end_sample > durable_frames
+                || attempt.content_started_sample > attempt.end_sample
+                || head_silence_invalid
                 || (attempt.status == "interrupted" && attempt.end_sample < attempt.start_sample)
                 || (attempt.status != "interrupted" && attempt.end_sample <= attempt.start_sample)
         });
@@ -3128,6 +3436,7 @@ fn validate_snapshot_for_export(snapshot: &SessionSnapshot) -> Result<()> {
     if snapshot.status != "stopped" {
         bail!("录制尚未安全结束，禁止生成常规交付；请先封存母轨。")
     }
+    validate_attempt_boundaries(snapshot, snapshot.committed_samples)?;
     validate_capture_provenance(snapshot, snapshot.committed_samples, true)?;
     for item in &snapshot.items {
         let Some(selected_id) = item.selected_attempt_id.as_deref() else {
@@ -3146,6 +3455,8 @@ fn validate_snapshot_for_export(snapshot: &SessionSnapshot) -> Result<()> {
         let outside_durable_audio = attempt.end_sample <= attempt.start_sample
             || attempt.start_sample > snapshot.committed_samples
             || attempt.recording_started_sample > snapshot.committed_samples
+            || attempt.head_silence_armed_sample > snapshot.committed_samples
+            || attempt.head_silence_passed_sample > snapshot.committed_samples
             || attempt.content_started_sample > snapshot.committed_samples
             || attempt.end_sample > snapshot.committed_samples;
         if attempt.status == "interrupted" || outside_durable_audio {
@@ -3623,6 +3934,20 @@ fn recover_interrupted_attempts(
                             .get("recording_started_sample")
                             .and_then(Value::as_u64)
                             .unwrap_or(durable_frames),
+                        head_silence_armed_sample: payload
+                            .get("head_silence_armed_sample")
+                            .and_then(Value::as_u64)
+                            .or_else(|| {
+                                payload
+                                    .get("recording_started_sample")
+                                    .and_then(Value::as_u64)
+                            })
+                            .unwrap_or(durable_frames),
+                        required_head_silence_samples: payload
+                            .get("required_head_silence_samples")
+                            .or_else(|| payload.get("head_silence_required_samples"))
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default(),
                         created_at: event
                             .get("at")
                             .and_then(Value::as_str)
@@ -3680,6 +4005,9 @@ fn recover_interrupted_attempts(
             attempt_id: active.attempt_id.clone(),
             start_sample,
             recording_started_sample: active.recording_started_sample.min(durable_frames),
+            head_silence_armed_sample: active.head_silence_armed_sample.min(durable_frames),
+            head_silence_passed_sample: 0,
+            required_head_silence_samples: active.required_head_silence_samples,
             content_started_sample: 0,
             end_sample: durable_frames,
             forced_without_tail_silence: false,
@@ -3700,6 +4028,8 @@ fn mark_active_attempt_interrupted(
     snapshot: &mut SessionSnapshot,
     active: &ActiveAttempt,
     durable_end: u64,
+    head_silence_passed_sample: u64,
+    required_head_silence_samples: u64,
     content_started_sample: u64,
 ) -> Result<Attempt> {
     let item = snapshot
@@ -3714,15 +4044,27 @@ fn mark_active_attempt_interrupted(
     {
         return Ok(existing.clone());
     }
-    let content_started_sample = if content_started_sample == 0 {
-        0
+    let head_silence_passed_sample =
+        if head_silence_passed_sample > 0 && head_silence_passed_sample <= durable_end {
+            head_silence_passed_sample
+        } else {
+            0
+        };
+    let content_started_sample = if content_started_sample > 0
+        && content_started_sample <= durable_end
+        && (head_silence_passed_sample == 0 || content_started_sample >= head_silence_passed_sample)
+    {
+        content_started_sample
     } else {
-        content_started_sample.min(durable_end)
+        0
     };
     let attempt = Attempt {
         attempt_id: active.attempt_id.clone(),
         start_sample: active.start_sample.min(durable_end),
         recording_started_sample: active.recording_started_sample.min(durable_end),
+        head_silence_armed_sample: active.recording_started_sample.min(durable_end),
+        head_silence_passed_sample,
+        required_head_silence_samples,
         content_started_sample,
         end_sample: durable_end,
         forced_without_tail_silence: false,
@@ -3742,6 +4084,75 @@ impl RecordingSession {
             / 1_000
     }
 
+    fn arm_attempt_analysis(&self) -> u64 {
+        // Serialize the click boundary with callback analysis. A callback may
+        // already have reserved and queued a block; loading `captured` while
+        // holding this guard puts that complete block before the click, so its
+        // silence can never satisfy the newly armed take.
+        let analysis_write = begin_analysis_write(&self.analysis_epoch);
+        let armed_sample = self.captured.load(Ordering::Acquire);
+        self.attempt_signal_start_sample.store(0, Ordering::Release);
+        self.last_signal_sample.store(0, Ordering::Release);
+        self.head_silence.arm(armed_sample);
+        drop(analysis_write);
+        armed_sample
+    }
+
+    fn disarm_attempt_analysis(&self) {
+        let analysis_write = begin_analysis_write(&self.analysis_epoch);
+        self.head_silence.disarm();
+        self.attempt_signal_start_sample.store(0, Ordering::Release);
+        self.last_signal_sample.store(0, Ordering::Release);
+        drop(analysis_write);
+    }
+
+    fn interrupt_attempt(
+        &mut self,
+        active: &ActiveAttempt,
+        durable_end: u64,
+        head_silence_passed_sample: u64,
+        required_head_silence_samples: u64,
+        content_started_sample: u64,
+        reason: &str,
+    ) -> Result<Attempt> {
+        let attempt = mark_active_attempt_interrupted(
+            &mut self.snapshot,
+            active,
+            durable_end,
+            head_silence_passed_sample,
+            required_head_silence_samples,
+            content_started_sample,
+        )?;
+        self.persist(
+            "attempt_interrupted",
+            json!({
+                "item_id": &active.item_id,
+                "attempt": &attempt,
+                "reason": reason,
+            }),
+        )?;
+        // Clear the in-memory mutation only after the journal projection is
+        // durable. If metadata persistence fails, fault sealing can retry the
+        // same active range without losing its identity.
+        self.active_attempt = None;
+        self.disarm_attempt_analysis();
+        Ok(attempt)
+    }
+
+    fn active_attempt_analysis_value(&self) -> Value {
+        let phase = self.head_silence.phase.load(Ordering::Acquire);
+        json!({
+            "head_silence_phase": head_silence_phase_name(phase),
+            "head_silence_armed_sample": self.head_silence.armed_sample.load(Ordering::Acquire),
+            "head_silence_progress_samples": self.head_silence
+                .progress_samples.load(Ordering::Acquire)
+                .min(self.head_silence.required_samples),
+            "required_head_silence_samples": self.head_silence.required_samples,
+            "head_silence_passed_sample": self.head_silence.passed_sample.load(Ordering::Acquire),
+            "content_started_sample": self.attempt_signal_start_sample.load(Ordering::Acquire),
+        })
+    }
+
     fn wait_for_analysis_snapshot(&self, requested: u64) -> Result<CaptureAnalysisSnapshot> {
         let deadline = Instant::now() + CAPTURE_ANALYSIS_TIMEOUT;
         loop {
@@ -3754,12 +4165,22 @@ impl RecordingSession {
                 continue;
             }
             let analyzed = self.analyzed_samples.load(Ordering::Acquire);
+            let head_silence_phase = self.head_silence.phase.load(Ordering::Acquire);
+            let head_silence_armed_sample = self.head_silence.armed_sample.load(Ordering::Acquire);
+            let head_silence_progress_samples =
+                self.head_silence.progress_samples.load(Ordering::Acquire);
+            let head_silence_passed_sample =
+                self.head_silence.passed_sample.load(Ordering::Acquire);
             let content_started_sample = self.attempt_signal_start_sample.load(Ordering::Acquire);
             let last_signal_sample = self.last_signal_sample.load(Ordering::Acquire);
             let second_epoch = self.analysis_epoch.load(Ordering::Acquire);
             if first_epoch == second_epoch && second_epoch & 1 == 0 && analyzed >= requested {
                 return Ok(CaptureAnalysisSnapshot {
                     boundary: analyzed,
+                    head_silence_phase,
+                    head_silence_armed_sample,
+                    head_silence_progress_samples,
+                    head_silence_passed_sample,
                     content_started_sample,
                     last_signal_sample,
                 });
@@ -4152,6 +4573,8 @@ impl RecordingSession {
                 &mut self.snapshot,
                 &active,
                 committed,
+                self.head_silence.passed_sample.load(Ordering::Acquire),
+                self.head_silence.required_samples,
                 self.attempt_signal_start_sample.load(Ordering::Acquire),
             )
         {
@@ -4260,6 +4683,8 @@ impl RecordingSession {
                 &mut self.snapshot,
                 &active,
                 committed,
+                self.head_silence.passed_sample.load(Ordering::Acquire),
+                self.head_silence.required_samples,
                 self.attempt_signal_start_sample.load(Ordering::Acquire),
             )?;
             if let Err(error) = self.persist(
@@ -4617,7 +5042,7 @@ fn writer_loop(
     storage_status: Arc<AtomicU32>,
     storage_safe_remaining_seconds: Arc<AtomicU64>,
     queue: WriterQueueBudget,
-    waveform: Sender<Vec<[f32; 2]>>,
+    waveform: Option<Sender<Vec<[f32; 2]>>>,
     ready: Sender<Result<u64, String>>,
 ) {
     let initialized = match (storage_kind, append) {
@@ -4713,7 +5138,9 @@ fn writer_loop(
                 // budget include the in-progress write instead of allowing a
                 // second full queue to accumulate behind it.
                 queue.release(samples.len() as u64);
-                let _ = waveform.try_send(waveform_bins(&samples));
+                if let Some(waveform) = &waveform {
+                    let _ = waveform.try_send(waveform_bins(&samples));
+                }
                 let mut fault_stop_reason = None::<String>;
                 if !shutdown_after_drain
                     && automatic_writer_checkpoint_due(
@@ -5153,6 +5580,7 @@ fn build_stream(
     peak_bits: Arc<AtomicU32>,
     rms_bits: Arc<AtomicU32>,
     queue: WriterQueueBudget,
+    waveform: Sender<WaveformPacket>,
     silence: SilenceMonitor,
 ) -> Result<Stream> {
     match format {
@@ -5167,6 +5595,7 @@ fn build_stream(
             peak_bits,
             rms_bits,
             queue.clone(),
+            waveform.clone(),
             silence.clone(),
             |sample| sample,
         ),
@@ -5181,6 +5610,7 @@ fn build_stream(
             peak_bits,
             rms_bits,
             queue.clone(),
+            waveform.clone(),
             silence.clone(),
             |sample| sample as f32,
         ),
@@ -5195,6 +5625,7 @@ fn build_stream(
             peak_bits,
             rms_bits,
             queue.clone(),
+            waveform.clone(),
             silence.clone(),
             |sample| f32::from(sample) / 128.0,
         ),
@@ -5209,6 +5640,7 @@ fn build_stream(
             peak_bits,
             rms_bits,
             queue.clone(),
+            waveform.clone(),
             silence.clone(),
             |sample| f32::from(sample) / 32_768.0,
         ),
@@ -5223,6 +5655,7 @@ fn build_stream(
             peak_bits,
             rms_bits,
             queue.clone(),
+            waveform.clone(),
             silence.clone(),
             i24_to_f32,
         ),
@@ -5237,6 +5670,7 @@ fn build_stream(
             peak_bits,
             rms_bits,
             queue.clone(),
+            waveform.clone(),
             silence.clone(),
             |sample| (f64::from(sample) / 2_147_483_648.0) as f32,
         ),
@@ -5251,6 +5685,7 @@ fn build_stream(
             peak_bits,
             rms_bits,
             queue.clone(),
+            waveform.clone(),
             silence.clone(),
             |sample| (sample as f64 / 9_223_372_036_854_775_808.0) as f32,
         ),
@@ -5265,6 +5700,7 @@ fn build_stream(
             peak_bits,
             rms_bits,
             queue.clone(),
+            waveform.clone(),
             silence.clone(),
             |sample| (f32::from(sample) - 128.0) / 128.0,
         ),
@@ -5279,6 +5715,7 @@ fn build_stream(
             peak_bits,
             rms_bits,
             queue.clone(),
+            waveform.clone(),
             silence.clone(),
             |sample| (f32::from(sample) - 32_768.0) / 32_768.0,
         ),
@@ -5293,6 +5730,7 @@ fn build_stream(
             peak_bits,
             rms_bits,
             queue.clone(),
+            waveform.clone(),
             silence.clone(),
             u24_to_f32,
         ),
@@ -5307,6 +5745,7 @@ fn build_stream(
             peak_bits,
             rms_bits,
             queue.clone(),
+            waveform.clone(),
             silence.clone(),
             |sample| (f64::from(sample) - 2_147_483_648.0) as f32 / 2_147_483_648.0,
         ),
@@ -5321,6 +5760,7 @@ fn build_stream(
             peak_bits,
             rms_bits,
             queue,
+            waveform,
             silence,
             |sample| {
                 ((sample as f64 - 9_223_372_036_854_775_808.0) / 9_223_372_036_854_775_808.0) as f32
@@ -5342,6 +5782,7 @@ fn build_typed_stream<T>(
     peak_bits: Arc<AtomicU32>,
     rms_bits: Arc<AtomicU32>,
     queue: WriterQueueBudget,
+    waveform: Sender<WaveformPacket>,
     silence: SilenceMonitor,
     convert: fn(T) -> f32,
 ) -> Result<Stream>
@@ -5358,6 +5799,8 @@ where
     let error_emitter = Arc::clone(&faulted);
     let error_writer = writer.clone();
     let error_queue = queue.clone();
+    let mut waveform_preview =
+        CaptureWaveformPreview::new(waveform, captured.load(Ordering::Acquire));
     Ok(device.build_input_stream(
         *config,
         move |data: &[T], _| {
@@ -5382,7 +5825,7 @@ where
                 return;
             };
             match convert_frames(data, channels, input_channel_index, convert) {
-                Ok(mono) => publish_leased_block(
+                Ok(mono) => publish_leased_block_with_preview(
                     mono,
                     &writer,
                     &captured,
@@ -5393,6 +5836,7 @@ where
                     &queue,
                     enqueue_lease,
                     &silence,
+                    Some(&mut waveform_preview),
                 ),
                 Err(error) => fail_capture_block(
                     error.reason,
@@ -5543,6 +5987,7 @@ fn publish_block(
     );
 }
 
+#[cfg(any(test, feature = "system-test"))]
 #[allow(clippy::too_many_arguments)]
 fn publish_leased_block(
     mono: Vec<f32>,
@@ -5555,6 +6000,35 @@ fn publish_leased_block(
     queue: &WriterQueueBudget,
     enqueue_lease: WriterQueueLease<'_>,
     silence: &SilenceMonitor,
+) {
+    publish_leased_block_with_preview(
+        mono,
+        writer,
+        captured,
+        overflow,
+        faulted,
+        peak_bits,
+        rms_bits,
+        queue,
+        enqueue_lease,
+        silence,
+        None,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_leased_block_with_preview(
+    mono: Vec<f32>,
+    writer: &Sender<WriterMessage>,
+    captured: &AtomicU64,
+    overflow: &AtomicU64,
+    faulted: &AtomicBool,
+    peak_bits: &AtomicU32,
+    rms_bits: &AtomicU32,
+    queue: &WriterQueueBudget,
+    enqueue_lease: WriterQueueLease<'_>,
+    silence: &SilenceMonitor,
+    mut waveform_preview: Option<&mut CaptureWaveformPreview>,
 ) {
     let frames = mono.len() as u64;
     if frames == 0 {
@@ -5610,6 +6084,9 @@ fn publish_leased_block(
         );
         return;
     };
+    let waveform_packet = waveform_preview
+        .as_deref_mut()
+        .and_then(|preview| preview.prepare(block_start, &mono));
     if writer.try_send(WriterMessage::Samples(mono)).is_err() {
         queue.release(frames);
         let rollback_succeeded = captured
@@ -5632,6 +6109,9 @@ fn publish_leased_block(
         );
         return;
     }
+    if let (Some(preview), Some(packet)) = (waveform_preview, waveform_packet) {
+        preview.publish(packet);
+    }
     // The checked timeline reservation is retained only after the complete
     // finite block has entered the writer queue. Once enqueueing fails, later
     // callbacks are rejected so WAV frames and sample annotations cannot drift.
@@ -5640,17 +6120,78 @@ fn publish_leased_block(
     let threshold_linear = 10f32.powf(threshold_dbfs / 20.0);
     if rms <= threshold_linear {
         saturating_atomic_add(&silence.silence_samples, frames);
+        if silence.head_silence.phase.load(Ordering::Acquire) == HEAD_SILENCE_WAITING {
+            let armed_sample = silence.head_silence.armed_sample.load(Ordering::Acquire);
+            if block_end > armed_sample {
+                let eligible_start = block_start.max(armed_sample);
+                let eligible_frames = block_end.saturating_sub(eligible_start);
+                let previous = silence
+                    .head_silence
+                    .progress_samples
+                    .load(Ordering::Acquire)
+                    .min(silence.head_silence.required_samples);
+                let updated = previous
+                    .saturating_add(eligible_frames)
+                    .min(silence.head_silence.required_samples);
+                silence
+                    .head_silence
+                    .progress_samples
+                    .store(updated, Ordering::Release);
+                if previous < silence.head_silence.required_samples
+                    && updated >= silence.head_silence.required_samples
+                {
+                    let samples_needed = silence
+                        .head_silence
+                        .required_samples
+                        .saturating_sub(previous);
+                    let passed_sample = eligible_start.saturating_add(samples_needed);
+                    // Publish the exact threshold boundary before the latched
+                    // phase. Later signal blocks can advance to SPEECH_STARTED
+                    // but can never reset this value within the take.
+                    silence
+                        .head_silence
+                        .passed_sample
+                        .store(passed_sample, Ordering::Release);
+                    silence
+                        .head_silence
+                        .phase
+                        .store(HEAD_SILENCE_PASSED, Ordering::Release);
+                }
+            }
+        }
     } else {
         silence.silence_samples.store(0, Ordering::Release);
-        let _ = silence.attempt_signal_start_sample.compare_exchange(
-            0,
-            block_start.max(1),
-            Ordering::Release,
-            Ordering::Relaxed,
-        );
-        silence
-            .last_signal_sample
-            .store(block_end, Ordering::Release);
+        match silence.head_silence.phase.load(Ordering::Acquire) {
+            HEAD_SILENCE_WAITING => {
+                // Only post-click samples participate. Any above-threshold
+                // block after arming restarts the continuous head-silence run,
+                // but it is not sentence content yet.
+                if block_end > silence.head_silence.armed_sample.load(Ordering::Acquire) {
+                    silence
+                        .head_silence
+                        .progress_samples
+                        .store(0, Ordering::Release);
+                }
+            }
+            HEAD_SILENCE_PASSED | HEAD_SILENCE_SPEECH_STARTED => {
+                let passed_sample = silence.head_silence.passed_sample.load(Ordering::Acquire);
+                let candidate = block_start.max(passed_sample).max(1);
+                let _ = silence.attempt_signal_start_sample.compare_exchange(
+                    0,
+                    candidate,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                );
+                silence
+                    .head_silence
+                    .phase
+                    .store(HEAD_SILENCE_SPEECH_STARTED, Ordering::Release);
+                silence
+                    .last_signal_sample
+                    .store(block_end, Ordering::Release);
+            }
+            _ => {}
+        }
     }
     // Publish this only after every signal/silence annotation for the accepted
     // range is visible. `stop_attempt` uses the watermark as the acquire side
@@ -5672,9 +6213,8 @@ fn publish_leased_block(
 }
 
 fn waveform_bins(samples: &[f32]) -> Vec<[f32; 2]> {
-    const BIN_SAMPLES: usize = 64;
     samples
-        .chunks(BIN_SAMPLES)
+        .chunks(WAVEFORM_BIN_SAMPLES)
         .map(|chunk| {
             let mut minimum = 0f32;
             let mut maximum = 0f32;
@@ -6298,19 +6838,28 @@ fn write_csv(path: &Path, exported: &Value) -> Result<()> {
     let result = (|| -> Result<()> {
         writeln!(
             file,
-            "id,text,label,attempt_id,start_sample,recording_started_sample,content_started_sample,content_started_seconds,end_sample,duration_samples,file,forced_without_tail_silence,tail_silence_samples,required_tail_silence_samples"
+            "id,text,label,attempt_id,start_sample,recording_started_sample,head_silence_armed_sample,head_silence_passed_sample,required_head_silence_samples,content_started_sample,content_started_seconds,end_sample,duration_samples,file,forced_without_tail_silence,tail_silence_samples,required_tail_silence_samples"
         )?;
         if let Some(rows) = exported.as_array() {
             for row in rows {
                 writeln!(
                     file,
-                    "{},{},{},{},{},{},{},{:.6},{},{},{},{},{},{}",
+                    "{},{},{},{},{},{},{},{},{},{},{:.6},{},{},{},{},{},{}",
                     csv_cell(row["id"].as_str().unwrap_or_default()),
                     csv_cell(row["text"].as_str().unwrap_or_default()),
                     csv_cell(row["label"].as_str().unwrap_or_default()),
                     csv_cell(row["attempt_id"].as_str().unwrap_or_default()),
                     row["start_sample"].as_u64().unwrap_or_default(),
                     row["recording_started_sample"].as_u64().unwrap_or_default(),
+                    row["head_silence_armed_sample"]
+                        .as_u64()
+                        .unwrap_or_default(),
+                    row["head_silence_passed_sample"]
+                        .as_u64()
+                        .unwrap_or_default(),
+                    row["required_head_silence_samples"]
+                        .as_u64()
+                        .unwrap_or_default(),
                     row["content_started_sample"].as_u64().unwrap_or_default(),
                     row["content_started_seconds"].as_f64().unwrap_or_default(),
                     row["end_sample"].as_u64().unwrap_or_default(),
@@ -6365,8 +6914,67 @@ mod tests {
         }
     }
 
-    fn disconnected_waveform_sender() -> Sender<Vec<[f32; 2]>> {
-        bounded::<Vec<[f32; 2]>>(1).0
+    fn test_head_silence_monitor() -> HeadSilenceMonitor {
+        HeadSilenceMonitor::new(48_000)
+    }
+
+    struct AttemptAnalysisHarness {
+        writer: Sender<WriterMessage>,
+        _receiver: Receiver<WriterMessage>,
+        captured: AtomicU64,
+        overflow: AtomicU64,
+        faulted: AtomicBool,
+        peak: AtomicU32,
+        rms: AtomicU32,
+        queue: WriterQueueBudget,
+        silence: SilenceMonitor,
+    }
+
+    impl AttemptAnalysisHarness {
+        fn armed_at(armed_sample: u64, required_samples: u64) -> Self {
+            let (writer, receiver) = unbounded();
+            let head_silence = HeadSilenceMonitor::new(required_samples);
+            head_silence.arm(armed_sample);
+            Self {
+                writer,
+                _receiver: receiver,
+                captured: AtomicU64::new(armed_sample),
+                overflow: AtomicU64::new(0),
+                faulted: AtomicBool::new(false),
+                peak: AtomicU32::new(0f32.to_bits()),
+                rms: AtomicU32::new(0f32.to_bits()),
+                queue: test_writer_queue(),
+                silence: SilenceMonitor {
+                    silence_samples: Arc::new(AtomicU64::new(0)),
+                    last_signal_sample: Arc::new(AtomicU64::new(0)),
+                    attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
+                    analyzed_samples: Arc::new(AtomicU64::new(armed_sample)),
+                    analysis_epoch: Arc::new(AtomicU64::new(0)),
+                    threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+                    capture_heartbeat: Arc::new(AtomicU64::new(0)),
+                    head_silence,
+                },
+            }
+        }
+
+        fn publish(&self, samples: Vec<f32>) {
+            publish_block(
+                samples,
+                &self.writer,
+                &self.captured,
+                &self.overflow,
+                &self.faulted,
+                &self.peak,
+                &self.rms,
+                &self.queue,
+                &self.silence,
+            );
+            assert!(!self.faulted.load(Ordering::Acquire));
+        }
+    }
+
+    fn disconnected_waveform_sender() -> Option<Sender<Vec<[f32; 2]>>> {
+        None
     }
 
     fn assert_storage_fault_drains_backlog(
@@ -6392,6 +7000,7 @@ mod tests {
             analysis_epoch: Arc::new(AtomicU64::new(0)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
+            head_silence: test_head_silence_monitor(),
         };
         const BLOCKS: usize = 4;
         const FRAMES_PER_BLOCK: usize = 4;
@@ -6544,6 +7153,8 @@ mod tests {
                     "attempt_id": "001-a1",
                     "start_sample": 1,
                     "recording_started_sample": 2,
+                    "head_silence_armed_sample": 2,
+                    "required_head_silence_samples": 48_000,
                 },
                 "captured_samples": snapshot.captured_samples,
                 "committed_samples": snapshot.committed_samples,
@@ -6604,6 +7215,7 @@ mod tests {
             analyzed_samples: Arc::new(AtomicU64::new(0)),
             analysis_epoch: Arc::new(AtomicU64::new(0)),
             silence_threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+            head_silence: test_head_silence_monitor(),
             active_attempt: None,
             metadata_fault: None,
             stop_requested: false,
@@ -6632,7 +7244,202 @@ mod tests {
         let started = engine.start_attempt("001").unwrap();
 
         assert_eq!(started["attempt_id"], "001-a1");
+        assert_eq!(started["head_silence_phase"], "waiting_for_head_silence");
+        assert_eq!(started["head_silence_progress_samples"], 0);
+        assert_eq!(started["head_silence_passed_sample"], 0);
         assert!(engine.session.as_ref().unwrap().active_attempt.is_some());
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn head_silence_before_the_click_never_satisfies_a_new_take() {
+        let root = test_root("head-silence-starts-at-click");
+        let session = prepare_metadata_test_session(&root);
+        session.silence_samples.store(u64::MAX, Ordering::Release);
+        session.captured.store(12_345, Ordering::Release);
+        session.analyzed_samples.store(12_345, Ordering::Release);
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+
+        let started = engine.start_attempt("001").unwrap();
+
+        assert_eq!(started["recording_started_sample"], 12_345);
+        assert_eq!(started["head_silence_armed_sample"], 12_345);
+        assert_eq!(started["head_silence_progress_samples"], 0);
+        assert_eq!(started["head_silence_passed_sample"], 0);
+        assert_eq!(started["content_started_sample"], 0);
+        let state = engine.get_state().unwrap();
+        assert_eq!(
+            state["active_attempt"]["head_silence_phase"],
+            "waiting_for_head_silence"
+        );
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn noise_before_head_silence_pass_resets_only_the_new_take_progress() {
+        let harness = AttemptAnalysisHarness::armed_at(100, 4);
+        harness.publish(vec![0.0; 3]);
+        assert_eq!(
+            harness
+                .silence
+                .head_silence
+                .progress_samples
+                .load(Ordering::Acquire),
+            3
+        );
+
+        harness.publish(vec![0.1]);
+
+        assert_eq!(
+            harness
+                .silence
+                .head_silence
+                .progress_samples
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            harness.silence.head_silence.phase.load(Ordering::Acquire),
+            HEAD_SILENCE_WAITING
+        );
+        assert_eq!(
+            harness
+                .silence
+                .attempt_signal_start_sample
+                .load(Ordering::Acquire),
+            0
+        );
+    }
+
+    #[test]
+    fn first_head_silence_pass_is_latched_for_the_whole_take() {
+        let harness = AttemptAnalysisHarness::armed_at(20, 4);
+        harness.publish(vec![0.0; 4]);
+        assert_eq!(
+            harness
+                .silence
+                .head_silence
+                .passed_sample
+                .load(Ordering::Acquire),
+            24
+        );
+
+        harness.publish(vec![0.1; 2]);
+        harness.publish(vec![0.0; 2]);
+        harness.publish(vec![0.2; 2]);
+
+        assert_eq!(
+            harness
+                .silence
+                .head_silence
+                .passed_sample
+                .load(Ordering::Acquire),
+            24
+        );
+        assert_eq!(
+            harness
+                .silence
+                .head_silence
+                .progress_samples
+                .load(Ordering::Acquire),
+            4
+        );
+        assert_eq!(
+            harness.silence.head_silence.phase.load(Ordering::Acquire),
+            HEAD_SILENCE_SPEECH_STARTED
+        );
+    }
+
+    #[test]
+    fn sound_before_head_silence_pass_is_not_sentence_content() {
+        let harness = AttemptAnalysisHarness::armed_at(40, 4);
+
+        harness.publish(vec![0.2; 3]);
+
+        assert_eq!(
+            harness
+                .silence
+                .attempt_signal_start_sample
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            harness.silence.last_signal_sample.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            harness.silence.head_silence.phase.load(Ordering::Acquire),
+            HEAD_SILENCE_WAITING
+        );
+    }
+
+    #[test]
+    fn first_sound_after_head_silence_pass_is_sentence_content() {
+        let harness = AttemptAnalysisHarness::armed_at(60, 4);
+        harness.publish(vec![0.0; 4]);
+
+        harness.publish(vec![0.2; 3]);
+
+        assert_eq!(
+            harness
+                .silence
+                .head_silence
+                .passed_sample
+                .load(Ordering::Acquire),
+            64
+        );
+        assert_eq!(
+            harness
+                .silence
+                .attempt_signal_start_sample
+                .load(Ordering::Acquire),
+            64
+        );
+        assert_eq!(
+            harness.silence.last_signal_sample.load(Ordering::Acquire),
+            67
+        );
+    }
+
+    #[test]
+    fn forced_stop_before_pass_or_before_speech_creates_no_attempt() {
+        let root = test_root("forced-stop-before-head-or-speech");
+        let session = prepare_metadata_test_session(&root);
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+
+        engine.start_attempt("001").unwrap();
+        let before_pass = engine.stop_attempt(true).unwrap();
+        assert_eq!(before_pass["discarded"], true);
+        assert!(before_pass["attempt"].is_null());
+
+        engine.start_attempt("001").unwrap();
+        {
+            let session = engine.session.as_ref().unwrap();
+            session
+                .head_silence
+                .progress_samples
+                .store(48_000, Ordering::Release);
+            session
+                .head_silence
+                .passed_sample
+                .store(48_000, Ordering::Release);
+            session
+                .head_silence
+                .phase
+                .store(HEAD_SILENCE_PASSED, Ordering::Release);
+        }
+        let before_speech = engine.stop_attempt(true).unwrap();
+        assert_eq!(before_speech["discarded"], true);
+        assert!(before_speech["attempt"].is_null());
+        assert!(
+            engine.session.as_ref().unwrap().snapshot.items[0]
+                .attempts
+                .is_empty()
+        );
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -6645,7 +7452,7 @@ mod tests {
             item_id: "001".to_string(),
             attempt_id: "001-a1".to_string(),
             start_sample: 0,
-            recording_started_sample: 10,
+            recording_started_sample: 20,
         });
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
@@ -6719,6 +7526,10 @@ mod tests {
             snapshot,
             CaptureAnalysisSnapshot {
                 boundary: 130,
+                head_silence_phase: HEAD_SILENCE_IDLE,
+                head_silence_armed_sample: 0,
+                head_silence_progress_samples: 0,
+                head_silence_passed_sample: 0,
                 content_started_sample: 20,
                 last_signal_sample: 120,
             }
@@ -6737,6 +7548,9 @@ mod tests {
     fn forced_stop_keeps_detected_speech_when_tail_silence_is_short() {
         let root = test_root("forced-stop-short-tail");
         let mut session = prepare_metadata_test_session(&root);
+        session.snapshot.audio_format.sample_rate = 100;
+        session.snapshot.silence_duration_ms = 200;
+        session.head_silence = HeadSilenceMonitor::new(20);
         session.captured.store(100, Ordering::Release);
         session.committed.store(100, Ordering::Release);
         session.analyzed_samples.store(100, Ordering::Release);
@@ -6751,11 +7565,27 @@ mod tests {
         session
             .attempt_signal_start_sample
             .store(50, Ordering::Release);
+        session
+            .head_silence
+            .armed_sample
+            .store(20, Ordering::Release);
+        session
+            .head_silence
+            .progress_samples
+            .store(20, Ordering::Release);
+        session
+            .head_silence
+            .passed_sample
+            .store(40, Ordering::Release);
+        session
+            .head_silence
+            .phase
+            .store(HEAD_SILENCE_SPEECH_STARTED, Ordering::Release);
         session.active_attempt = Some(ActiveAttempt {
             item_id: "001".to_string(),
             attempt_id: "001-a1".to_string(),
             start_sample: 0,
-            recording_started_sample: 10,
+            recording_started_sample: 20,
         });
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
@@ -6764,10 +7594,13 @@ mod tests {
 
         assert_eq!(stopped["forced"], true);
         assert_eq!(stopped["attempt"]["content_started_sample"], 50);
+        assert_eq!(stopped["attempt"]["head_silence_armed_sample"], 20);
+        assert_eq!(stopped["attempt"]["head_silence_passed_sample"], 40);
+        assert_eq!(stopped["attempt"]["start_sample"], 30);
         assert_eq!(stopped["attempt"]["end_sample"], 100);
         assert_eq!(stopped["attempt"]["forced_without_tail_silence"], true);
         assert_eq!(stopped["attempt"]["tail_silence_samples"], 5);
-        assert_eq!(stopped["attempt"]["required_tail_silence_samples"], 48_000);
+        assert_eq!(stopped["attempt"]["required_tail_silence_samples"], 20);
         let session = engine.session.as_ref().unwrap();
         assert!(session.active_attempt.is_none());
         assert_eq!(session.snapshot.items[0].status, "review");
@@ -6780,6 +7613,84 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn writer_fault_while_finishing_never_records_a_truncated_take() {
+        let root = test_root("writer-fault-while-finishing-attempt");
+        let mut session = prepare_metadata_test_session(&root);
+        session.snapshot.audio_format.sample_rate = 100;
+        session.snapshot.silence_duration_ms = 200;
+        session.head_silence = HeadSilenceMonitor::new(20);
+        session.captured.store(100, Ordering::Release);
+        session.committed.store(35, Ordering::Release);
+        session.analyzed_samples.store(100, Ordering::Release);
+        session.last_signal_sample.store(95, Ordering::Release);
+        session
+            .attempt_signal_start_sample
+            .store(50, Ordering::Release);
+        session
+            .head_silence
+            .armed_sample
+            .store(20, Ordering::Release);
+        session
+            .head_silence
+            .progress_samples
+            .store(20, Ordering::Release);
+        session
+            .head_silence
+            .passed_sample
+            .store(40, Ordering::Release);
+        session
+            .head_silence
+            .phase
+            .store(HEAD_SILENCE_SPEECH_STARTED, Ordering::Release);
+        session.active_attempt = Some(ActiveAttempt {
+            item_id: "001".to_string(),
+            attempt_id: "001-a1".to_string(),
+            start_sample: 20,
+            recording_started_sample: 20,
+        });
+
+        let (writer_tx, writer_rx) = bounded::<WriterMessage>(1);
+        let writer_faulted = Arc::clone(&session.faulted);
+        let writer_committed = Arc::clone(&session.committed);
+        session.writer_tx = writer_tx;
+        session.writer_join = Some(thread::spawn(move || {
+            if let Ok(WriterMessage::Checkpoint(reply)) = writer_rx.recv() {
+                writer_committed.store(35, Ordering::Release);
+                writer_faulted.store(true, Ordering::Release);
+                let _ = reply.send(Err(
+                    "injected writer failure after analysis snapshot".to_string()
+                ));
+            }
+        }));
+
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+        let stopped = engine.stop_attempt(true).unwrap();
+
+        assert_eq!(stopped["interrupted"], true);
+        assert_eq!(stopped["attempt"]["status"], "interrupted");
+        assert_eq!(stopped["attempt"]["start_sample"], 20);
+        assert_eq!(stopped["attempt"]["content_started_sample"], 0);
+        assert_eq!(stopped["attempt"]["end_sample"], 35);
+        let session = engine.session.as_mut().unwrap();
+        assert!(session.active_attempt.is_none());
+        assert_eq!(session.snapshot.items[0].status, "pending");
+        validate_attempt_boundaries(&session.snapshot, 35).unwrap();
+        let journal = read_journal(&root).unwrap();
+        let event = journal.entries.last().unwrap();
+        assert_eq!(event["event"], "attempt_interrupted");
+        assert!(
+            event["payload"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("audio_writer_fault_while_finishing")
+        );
+        session.writer_join.take().unwrap().join().unwrap();
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -6851,6 +7762,7 @@ mod tests {
             analyzed_samples: Arc::new(AtomicU64::new(0)),
             analysis_epoch: Arc::new(AtomicU64::new(0)),
             silence_threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+            head_silence: test_head_silence_monitor(),
             active_attempt: None,
             metadata_fault: None,
             stop_requested: false,
@@ -7224,6 +8136,7 @@ mod tests {
             analysis_epoch: Arc::new(AtomicU64::new(0)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(1)),
+            head_silence: test_head_silence_monitor(),
         };
         publish_block(
             vec![0.25, -0.25, 0.5, -0.5],
@@ -7277,6 +8190,119 @@ mod tests {
         assert_eq!(bins.len(), 1);
         assert!((bins[0][0] + 0.5).abs() < 0.001);
         assert!((bins[0][1] - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn waveform_binner_carries_partial_bins_across_callback_sizes() {
+        for callback_frames in [240usize, 441, 480, 512] {
+            let start_sample = 1_003u64;
+            let callback_count = 100usize;
+            let mut binner = WaveformBinner::new(start_sample);
+            let mut cursor = start_sample;
+            let mut emitted_bins = 0usize;
+            let mut last_end_sample = start_sample;
+            for callback in 0..callback_count {
+                let mut samples = vec![0.25; callback_frames];
+                if callback == 0 {
+                    samples[0] = -0.75;
+                }
+                if let Some(packet) = binner.push_block(cursor, &samples) {
+                    emitted_bins += packet.bins.len();
+                    last_end_sample = packet.end_sample;
+                }
+                cursor += callback_frames as u64;
+            }
+            let total_frames = callback_frames * callback_count;
+            assert_eq!(
+                emitted_bins,
+                total_frames / WAVEFORM_BIN_SAMPLES,
+                "callback size {callback_frames} must not round each callback tail up to a bin"
+            );
+            assert_eq!(
+                binner.pending_samples,
+                total_frames % WAVEFORM_BIN_SAMPLES,
+                "callback size {callback_frames} must retain the exact cross-callback remainder"
+            );
+            assert_eq!(
+                last_end_sample,
+                start_sample + (emitted_bins * WAVEFORM_BIN_SAMPLES) as u64
+            );
+        }
+    }
+
+    #[test]
+    fn waveform_binner_reports_authoritative_sample_endpoint() {
+        let mut binner = WaveformBinner::new(10_000);
+        assert!(binner.push_block(10_000, &[0.25; 63]).is_none());
+        let packet = binner.push_block(10_063, &[-0.5, 0.75]).unwrap();
+        assert_eq!(packet.end_sample, 10_064);
+        assert_eq!(packet.bins, vec![[-0.5, 0.25]]);
+        assert_eq!(binner.pending_samples, 1);
+    }
+
+    #[test]
+    fn telemetry_waveform_batch_does_not_hide_dropped_sample_ranges() {
+        let mut waveform = Vec::new();
+        let mut end_sample = 0;
+        append_waveform_packet(
+            &mut waveform,
+            &mut end_sample,
+            WaveformPacket {
+                bins: vec![[0.0, 0.1], [0.0, 0.2]],
+                end_sample: 128,
+            },
+            2_048,
+        );
+        append_waveform_packet(
+            &mut waveform,
+            &mut end_sample,
+            WaveformPacket {
+                bins: vec![[-0.3, 0.3]],
+                end_sample: 320,
+            },
+            2_048,
+        );
+        assert_eq!(waveform, vec![[-0.3, 0.3]]);
+        assert_eq!(end_sample, 320);
+    }
+
+    #[test]
+    fn full_waveform_channel_never_blocks_or_rejects_authoritative_audio() {
+        let harness = AttemptAnalysisHarness::armed_at(0, 64);
+        let (waveform_tx, waveform_rx) = bounded(1);
+        waveform_tx
+            .try_send(WaveformPacket {
+                bins: vec![[0.0, 0.0]],
+                end_sample: 64,
+            })
+            .unwrap();
+        let mut preview = CaptureWaveformPreview::new(waveform_tx, 0);
+        let enqueue_lease = harness.queue.enter().unwrap();
+        publish_leased_block_with_preview(
+            vec![0.25; 64],
+            &harness.writer,
+            &harness.captured,
+            &harness.overflow,
+            &harness.faulted,
+            &harness.peak,
+            &harness.rms,
+            &harness.queue,
+            enqueue_lease,
+            &harness.silence,
+            Some(&mut preview),
+        );
+
+        assert_eq!(harness.captured.load(Ordering::Acquire), 64);
+        assert!(!harness.faulted.load(Ordering::Acquire));
+        match harness._receiver.try_recv().unwrap() {
+            WriterMessage::Samples(samples) => assert_eq!(samples, vec![0.25; 64]),
+            _ => panic!("accepted audio must enter the authoritative writer queue"),
+        }
+        assert_eq!(waveform_rx.try_recv().unwrap().end_sample, 64);
+        assert!(
+            waveform_rx.try_recv().is_err(),
+            "new preview may be dropped under pressure"
+        );
     }
 
     #[test]
@@ -7533,7 +8559,7 @@ mod tests {
                 Arc::new(AtomicU32::new(0)),
                 Arc::new(AtomicU64::new(u64::MAX)),
                 test_writer_queue(),
-                waveform_tx,
+                Some(waveform_tx),
                 ready_tx,
             )
         });
@@ -7604,7 +8630,7 @@ mod tests {
                 Arc::new(AtomicU32::new(0)),
                 Arc::new(AtomicU64::new(u64::MAX)),
                 writer_queue,
-                waveform_tx,
+                Some(waveform_tx),
                 ready_tx,
             )
         });
@@ -7825,6 +8851,7 @@ mod tests {
             analysis_epoch: Arc::new(AtomicU64::new(0)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
+            head_silence: test_head_silence_monitor(),
         };
         let (write_entered_tx, write_entered_rx) = bounded(1);
         let (release_write_tx, release_write_rx) = bounded(1);
@@ -8065,7 +9092,7 @@ mod tests {
                 Arc::new(AtomicU32::new(0)),
                 Arc::new(AtomicU64::new(u64::MAX)),
                 writer_queue,
-                waveform_tx,
+                Some(waveform_tx),
                 ready_tx,
             )
         });
@@ -8111,6 +9138,7 @@ mod tests {
             analysis_epoch: Arc::new(AtomicU64::new(0)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
+            head_silence: test_head_silence_monitor(),
         };
         const BLOCK_FRAMES: usize = 480;
         const BLOCK_COUNT: usize = 600;
@@ -8188,6 +9216,7 @@ mod tests {
             analysis_epoch: Arc::new(AtomicU64::new(0)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
+            head_silence: test_head_silence_monitor(),
         };
 
         publish_block(
@@ -8269,6 +9298,7 @@ mod tests {
             analysis_epoch: Arc::new(AtomicU64::new(0)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
+            head_silence: test_head_silence_monitor(),
         };
 
         publish_block(
@@ -8319,6 +9349,7 @@ mod tests {
             analysis_epoch: Arc::new(AtomicU64::new(0)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
+            head_silence: test_head_silence_monitor(),
         };
         publish_block(
             vec![0.1, 0.2, 0.3],
@@ -8380,6 +9411,7 @@ mod tests {
             analysis_epoch: Arc::new(AtomicU64::new(0)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
+            head_silence: test_head_silence_monitor(),
         };
         const BLOCK_FRAMES: usize = 4_800;
         let block_count = usize::try_from(queue.max_frames).unwrap() / BLOCK_FRAMES;
@@ -8459,6 +9491,7 @@ mod tests {
             analyzed_samples: Arc::new(AtomicU64::new(0)),
             analysis_epoch: Arc::new(AtomicU64::new(0)),
             silence_threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+            head_silence: test_head_silence_monitor(),
             active_attempt: None,
             metadata_fault: None,
             stop_requested: false,
@@ -8547,6 +9580,7 @@ mod tests {
             analyzed_samples: Arc::new(AtomicU64::new(0)),
             analysis_epoch: Arc::new(AtomicU64::new(0)),
             silence_threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+            head_silence: test_head_silence_monitor(),
             active_attempt: Some(ActiveAttempt {
                 item_id: "001".to_string(),
                 attempt_id: "001-a1".to_string(),
@@ -8589,6 +9623,9 @@ mod tests {
             attempt_id: "001-a1".to_string(),
             start_sample: 10,
             recording_started_sample: 20,
+            head_silence_armed_sample: 0,
+            head_silence_passed_sample: 0,
+            required_head_silence_samples: 0,
             content_started_sample: 25,
             end_sample: 90,
             forced_without_tail_silence: false,
@@ -8757,6 +9794,9 @@ mod tests {
             "attempt_id": "001-a1",
             "start_sample": 10,
             "recording_started_sample": 11,
+            "head_silence_armed_sample": 11,
+            "head_silence_passed_sample": 12,
+            "required_head_silence_samples": 1,
             "content_started_sample": 12,
             "content_started_seconds": 0.00025,
             "end_sample": 20,
@@ -8772,6 +9812,10 @@ mod tests {
         let csv = std::fs::read_to_string(&destination).unwrap();
         assert!(!csv.contains("old generation"));
         assert!(csv.contains("\"hello, \"\"world\"\"\""));
+        assert!(csv.lines().next().unwrap().contains(
+            "head_silence_armed_sample,head_silence_passed_sample,required_head_silence_samples"
+        ));
+        assert!(csv.contains(",10,11,11,12,1,12,0.000250,"));
         assert!(csv.lines().next().unwrap().ends_with(
             "file,forced_without_tail_silence,tail_silence_samples,required_tail_silence_samples"
         ));
@@ -8813,8 +9857,11 @@ mod tests {
         stopped.items[0].selected_attempt_id = Some("001-a1".to_string());
         stopped.items[0].attempts.push(Attempt {
             attempt_id: "001-a1".to_string(),
-            start_sample: 0,
+            start_sample: 3,
             recording_started_sample: 2,
+            head_silence_armed_sample: 2,
+            head_silence_passed_sample: 4,
+            required_head_silence_samples: 2,
             content_started_sample: 5,
             end_sample: 25,
             forced_without_tail_silence: true,
@@ -8833,6 +9880,9 @@ mod tests {
             serde_json::from_slice(&std::fs::read(root.join("export/metadata.json")).unwrap())
                 .unwrap();
         assert_eq!(metadata["exported"][0]["forced_without_tail_silence"], true);
+        assert_eq!(metadata["exported"][0]["head_silence_armed_sample"], 2);
+        assert_eq!(metadata["exported"][0]["head_silence_passed_sample"], 4);
+        assert_eq!(metadata["exported"][0]["required_head_silence_samples"], 2);
         assert_eq!(metadata["exported"][0]["tail_silence_samples"], 2);
         assert_eq!(metadata["exported"][0]["required_tail_silence_samples"], 10);
         let csv = std::fs::read_to_string(root.join("export/metadata.csv")).unwrap();
@@ -8849,7 +9899,7 @@ mod tests {
     }
 
     #[test]
-    fn attempt_without_tail_quality_fields_is_backward_compatible() {
+    fn attempt_without_head_or_tail_quality_fields_is_backward_compatible() {
         let attempt: Attempt = serde_json::from_value(json!({
             "attempt_id": "001-a1",
             "start_sample": 10,
@@ -8861,6 +9911,9 @@ mod tests {
         }))
         .unwrap();
 
+        assert_eq!(attempt.head_silence_armed_sample, 0);
+        assert_eq!(attempt.head_silence_passed_sample, 0);
+        assert_eq!(attempt.required_head_silence_samples, 0);
         assert!(!attempt.forced_without_tail_silence);
         assert_eq!(attempt.tail_silence_samples, 0);
         assert_eq!(attempt.required_tail_silence_samples, 0);
@@ -9596,6 +10649,7 @@ mod tests {
             analyzed_samples: Arc::new(AtomicU64::new(0)),
             analysis_epoch: Arc::new(AtomicU64::new(0)),
             silence_threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+            head_silence: test_head_silence_monitor(),
             active_attempt: None,
             metadata_fault: Some("injected initial persist failure".to_string()),
             stop_requested: false,
@@ -9849,6 +10903,10 @@ mod tests {
                 "attempt_id": "001-a1",
                 "start_sample": 100,
                 "recording_started_sample": 110,
+                "head_silence_armed_sample": 110,
+                // Compatibility with the short-lived pre-release telemetry
+                // spelling used before the Attempt/export schema was unified.
+                "head_silence_required_samples": 10,
             }
         });
         std::fs::write(
@@ -9864,6 +10922,12 @@ mod tests {
         assert_eq!(snapshot.items[0].attempts.len(), 1);
         assert_eq!(snapshot.items[0].attempts[0].status, "interrupted");
         assert_eq!(snapshot.items[0].attempts[0].start_sample, 100);
+        assert_eq!(snapshot.items[0].attempts[0].head_silence_armed_sample, 110);
+        assert_eq!(
+            snapshot.items[0].attempts[0].required_head_silence_samples,
+            10
+        );
+        assert_eq!(snapshot.items[0].attempts[0].head_silence_passed_sample, 0);
         assert_eq!(snapshot.items[0].attempts[0].end_sample, 120);
 
         let warnings = recover_interrupted_attempts(&journal, &mut snapshot, 120).unwrap();
@@ -9896,6 +10960,9 @@ mod tests {
         assert_eq!(attempt.status, "interrupted");
         assert_eq!(attempt.start_sample, 1);
         assert_eq!(attempt.recording_started_sample, 2);
+        assert_eq!(attempt.head_silence_armed_sample, 2);
+        assert_eq!(attempt.head_silence_passed_sample, 0);
+        assert_eq!(attempt.required_head_silence_samples, 48_000);
         assert_eq!(attempt.end_sample, 3);
 
         let repaired = std::fs::read(&master).unwrap();

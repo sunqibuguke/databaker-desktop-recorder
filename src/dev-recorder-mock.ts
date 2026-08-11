@@ -1,16 +1,29 @@
-import type { Attempt, AudioDevice, Meter, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SessionSnapshot } from './types';
+import type { Attempt, AudioDevice, HeadSilencePhase, Meter, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SessionSnapshot } from './types';
+
+type MockActiveAttempt = {
+  item_id: string;
+  attempt_id: string;
+  start_sample: number;
+  recording_started_sample: number;
+  head_silence_armed_sample: number;
+  head_silence_passed_sample: number;
+  head_silence_progress_samples: number;
+  required_head_silence_samples: number;
+  head_silence_phase: HeadSilencePhase;
+  content_started_sample: number;
+};
 
 export function installDevRecorderMock() {
   if ('recorder' in window) return;
 
   let snapshot: SessionSnapshot | null = null;
-  let activeAttempt: { item_id: string; attempt_id: string; start_sample: number; recording_started_sample: number } | null = null;
+  let activeAttempt: MockActiveAttempt | null = null;
   let capturedSamples = 0;
   let previousCapturedSamples = 0;
+  let waveformSampleCursor = 0;
   let silenceSamples = 0;
   let lastSignalSample = 0;
   let firstAttemptSignalSample = 0;
-  let attemptStartedAt = 0;
   let currentSessionDir = '';
   let mockSampleRate = 48_000;
   let recordingStartedAt = 0;
@@ -114,17 +127,39 @@ export function installDevRecorderMock() {
     capturedSamples = Math.max(capturedSamples, Math.floor((performance.now() - recordingStartedAt) / 1_000 * mockSampleRate));
     const newSamples = Math.max(0, capturedSamples - previousCapturedSamples);
     previousCapturedSamples = capturedSamples;
-    const speaking = Boolean(activeAttempt) && performance.now() - attemptStartedAt < 1_800;
+    const requiredHeadSilence = activeAttempt?.required_head_silence_samples ?? 0;
+    if (activeAttempt?.head_silence_phase === 'waiting_for_head_silence') {
+      activeAttempt.head_silence_progress_samples = Math.min(
+        requiredHeadSilence,
+        Math.max(0, capturedSamples - activeAttempt.head_silence_armed_sample),
+      );
+      if (activeAttempt.head_silence_progress_samples >= requiredHeadSilence) {
+        activeAttempt.head_silence_passed_sample = activeAttempt.head_silence_armed_sample + requiredHeadSilence;
+        activeAttempt.head_silence_phase = 'ready_for_speech';
+      }
+    }
+    const mockReadyPauseSamples = Math.round(mockSampleRate * 0.5);
+    const mockSpeechSamples = Math.round(mockSampleRate * 1.5);
+    if (activeAttempt?.head_silence_phase === 'ready_for_speech'
+      && capturedSamples >= activeAttempt.head_silence_passed_sample + mockReadyPauseSamples) {
+      activeAttempt.content_started_sample = activeAttempt.head_silence_passed_sample + mockReadyPauseSamples;
+      firstAttemptSignalSample = activeAttempt.content_started_sample;
+      activeAttempt.head_silence_phase = 'speech_started';
+    }
+    const speaking = Boolean(activeAttempt?.content_started_sample)
+      && capturedSamples < (activeAttempt?.content_started_sample ?? 0) + mockSpeechSamples;
     const pulse = speaking ? .1 + Math.abs(Math.sin(capturedSamples / 35_000)) * .22 : .0025;
     if (speaking) {
       silenceSamples = 0;
       lastSignalSample = capturedSamples;
-      if (!firstAttemptSignalSample) firstAttemptSignalSample = Math.max(1, previousCapturedSamples);
     } else {
       silenceSamples += newSamples;
     }
-    const waveform = Array.from({ length: 75 }, (_, index): [number, number] => {
-      const position = (capturedSamples + index * 64) / 690;
+    const waveformBinCount = Math.floor((capturedSamples - waveformSampleCursor) / 64);
+    const waveformStartSample = waveformSampleCursor;
+    waveformSampleCursor += waveformBinCount * 64;
+    const waveform = Array.from({ length: waveformBinCount }, (_, index): [number, number] => {
+      const position = (waveformStartSample + index * 64) / 690;
       const envelope = pulse * (.42 + .58 * Math.abs(Math.sin(position * .19)));
       const sample = Math.sin(position) * envelope;
       return [Math.min(0, sample - envelope * .18), Math.max(0, sample + envelope * .18)];
@@ -140,9 +175,16 @@ export function installDevRecorderMock() {
       rms: pulse * .42,
       silence_samples: silenceSamples,
       last_signal_sample: lastSignalSample,
+      head_silence_phase: activeAttempt?.head_silence_phase ?? 'idle',
+      head_silence_armed_sample: activeAttempt?.head_silence_armed_sample ?? 0,
+      head_silence_progress_samples: activeAttempt?.head_silence_progress_samples ?? 0,
+      required_head_silence_samples: activeAttempt?.required_head_silence_samples ?? 0,
+      head_silence_passed_sample: activeAttempt?.head_silence_passed_sample ?? 0,
+      content_started_sample: activeAttempt?.content_started_sample ?? 0,
       silence_threshold_dbfs: snapshot?.silence_threshold_dbfs ?? -42,
       silence_duration_ms: snapshot?.silence_duration_ms ?? 1_000,
       waveform,
+      waveform_end_sample: waveformSampleCursor,
     };
     emitEvent('meter', meter);
   }
@@ -166,6 +208,7 @@ export function installDevRecorderMock() {
     if (command === 'start_session') {
       capturedSamples = 0;
       previousCapturedSamples = 0;
+      waveformSampleCursor = 0;
       silenceSamples = 0;
       lastSignalSample = 0;
       firstAttemptSignalSample = 0;
@@ -243,10 +286,31 @@ export function installDevRecorderMock() {
     }
     if (command === 'resume_session') {
       const target = String(data.session_dir ?? '');
+      if (snapshot && target === currentSessionDir) {
+        capturedSamples = snapshot.captured_samples;
+        previousCapturedSamples = capturedSamples;
+        waveformSampleCursor = capturedSamples;
+        silenceSamples = 0;
+        lastSignalSample = 0;
+        firstAttemptSignalSample = 0;
+        mockSampleRate = snapshot.audio_format.sample_rate;
+        recordingStartedAt = performance.now() - capturedSamples / mockSampleRate * 1_000;
+        snapshot.status = 'recording';
+        snapshot.updated_at = new Date().toISOString();
+        window.clearInterval(meterTimer);
+        meterTimer = window.setInterval(emitMeter, 100);
+        return {
+          snapshot: snapshotCopy(),
+          session_dir: target,
+          active_attempt: null,
+          recovery_warnings: [],
+        } as T;
+      }
       const recording = previewHistory.find((candidate) => candidate.session_dir === target);
       if (!recording) throw new Error('Mock 中没有该录制任务');
       capturedSamples = recording.captured_samples;
       previousCapturedSamples = capturedSamples;
+      waveformSampleCursor = capturedSamples;
       silenceSamples = 0;
       lastSignalSample = 0;
       firstAttemptSignalSample = 0;
@@ -332,17 +396,23 @@ export function installDevRecorderMock() {
     }
     if (command === 'start_attempt') {
       const required = mockSampleRate * snapshot.silence_duration_ms / 1_000;
-      if (silenceSamples < required) throw new Error('开始录制前静音时长不足');
       const item = snapshot.items.find((candidate) => candidate.id === data.item_id)!;
       activeAttempt = {
         item_id: item.id,
         attempt_id: `${item.id}-a${item.attempts.length + 1}`,
-        start_sample: Math.max(0, capturedSamples - required),
+        start_sample: capturedSamples,
         recording_started_sample: capturedSamples,
+        head_silence_armed_sample: capturedSamples,
+        head_silence_passed_sample: 0,
+        head_silence_progress_samples: 0,
+        required_head_silence_samples: required,
+        head_silence_phase: 'waiting_for_head_silence',
+        content_started_sample: 0,
       };
       firstAttemptSignalSample = 0;
-      attemptStartedAt = performance.now();
-      return activeAttempt as T;
+      lastSignalSample = 0;
+      silenceSamples = 0;
+      return { ...activeAttempt } as T;
     }
     if (command === 'stop_attempt') {
       if (!activeAttempt) throw new Error('没有正在录制的版本');
@@ -357,8 +427,12 @@ export function installDevRecorderMock() {
       const forcedWithoutTailSilence = force && silenceSamples < requiredSilence;
       if (!force && silenceSamples < requiredSilence) throw new Error('完成前静音时长不足');
       const attempt: Attempt = {
-        ...activeAttempt,
-        start_sample: Math.max(0, firstAttemptSignalSample - mockSampleRate * snapshot.silence_duration_ms / 1_000),
+        attempt_id: activeAttempt.attempt_id,
+        start_sample: Math.max(0, firstAttemptSignalSample - requiredSilence),
+        recording_started_sample: activeAttempt.recording_started_sample,
+        head_silence_armed_sample: activeAttempt.head_silence_armed_sample,
+        head_silence_passed_sample: activeAttempt.head_silence_passed_sample,
+        required_head_silence_samples: activeAttempt.required_head_silence_samples,
         content_started_sample: firstAttemptSignalSample,
         end_sample: capturedSamples,
         forced_without_tail_silence: forcedWithoutTailSilence,
@@ -440,7 +514,7 @@ export function installDevRecorderMock() {
       readAudio: async () => new ArrayBuffer(44),
       openPath: async () => undefined,
       openPrompter: async () => {
-        window.open(`${window.location.pathname}?view=prompter`, 'databaker-prompter', 'popup=yes,width=1100,height=700');
+        window.open(`${window.location.pathname}?view=prompter`, 'databaker-prompter', 'popup=yes,width=720,height=500');
         return true;
       },
       closePrompter: async () => window.close(),

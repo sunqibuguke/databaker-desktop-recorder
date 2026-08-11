@@ -61,7 +61,7 @@ function csvCell(value) {
 
 function exportCsv(exported) {
   const lines = [
-    'id,text,label,attempt_id,start_sample,recording_started_sample,content_started_sample,content_started_seconds,end_sample,duration_samples,file,forced_without_tail_silence,tail_silence_samples,required_tail_silence_samples',
+    'id,text,label,attempt_id,start_sample,recording_started_sample,head_silence_armed_sample,head_silence_passed_sample,required_head_silence_samples,content_started_sample,content_started_seconds,end_sample,duration_samples,file,forced_without_tail_silence,tail_silence_samples,required_tail_silence_samples',
   ];
   for (const row of exported) {
     lines.push([
@@ -71,6 +71,9 @@ function exportCsv(exported) {
       csvCell(row.attempt_id),
       row.start_sample,
       row.recording_started_sample,
+      row.head_silence_armed_sample,
+      row.head_silence_passed_sample,
+      row.required_head_silence_samples,
       row.content_started_sample,
       Number(row.content_started_seconds).toFixed(6),
       row.end_sample,
@@ -265,6 +268,9 @@ createInterface({ input: process.stdin }).on('line', (line) => {
           attempt_id: `${item.id}-a1`,
           start_sample: 0,
           recording_started_sample: 0,
+          head_silence_armed_sample: 0,
+          head_silence_passed_sample: 1,
+          required_head_silence_samples: 1,
           content_started_sample: 1,
           end_sample: endSample,
           forced_without_tail_silence: false,
@@ -333,6 +339,9 @@ createInterface({ input: process.stdin }).on('line', (line) => {
           attempt_id: attempt.attempt_id,
           start_sample: attempt.start_sample,
           recording_started_sample: attempt.recording_started_sample,
+          head_silence_armed_sample: attempt.head_silence_armed_sample,
+          head_silence_passed_sample: attempt.head_silence_passed_sample,
+          required_head_silence_samples: attempt.required_head_silence_samples,
           content_started_sample: attempt.content_started_sample,
           content_started_seconds: attempt.content_started_sample / snapshot.audio_format.sample_rate,
           end_sample: attempt.end_sample,

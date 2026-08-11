@@ -620,6 +620,9 @@ function testShortProtocolIntegration() {
     assert.equal(report.inspection.full_track.exact_header, true);
     assert.equal(report.inspection.export_metadata.exported.length, 1);
     assert.equal(report.inspection.export_metadata.skipped.length, 0);
+    assert.equal(report.inspection.export_metadata.exported[0].head_silence_armed_sample, 0);
+    assert.equal(report.inspection.export_metadata.exported[0].head_silence_passed_sample, 1);
+    assert.equal(report.inspection.export_metadata.exported[0].required_head_silence_samples, 1);
     assert.equal(
       report.inspection.export_metadata.exported[0].forced_without_tail_silence,
       false,

@@ -1,9 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
+import {
+  reconcileWaveformBatch,
+  waveformCatchUpCount,
+  waveformWindowBinCount,
+} from './waveform-buffer';
 
 export type WaveformBin = [minimum: number, maximum: number];
 
 type Props = {
   bins: WaveformBin[];
+  waveformEndSample?: number;
   recording: boolean;
   sampleRate: number;
 };
@@ -53,27 +59,56 @@ function createProgram(gl: WebGLRenderingContext | WebGL2RenderingContext) {
   return program;
 }
 
-export function WebGLWaveform({ bins, recording, sampleRate }: Props) {
+export function WebGLWaveform({ bins, waveformEndSample, recording, sampleRate }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const historyRef = useRef<WaveformBin[]>([]);
   const pendingRef = useRef<WaveformBin[]>([]);
+  const latestEndSampleRef = useRef<number | null>(null);
+  const consumeBudgetRef = useRef(0);
   const recordingRef = useRef(recording);
   const sampleRateRef = useRef(sampleRate);
   const [available, setAvailable] = useState(true);
 
   useEffect(() => {
     if (!bins.length) return;
-    pendingRef.current.push(...bins);
-    const maximumPending = 8_192;
-    if (pendingRef.current.length > maximumPending) {
-      pendingRef.current.splice(0, pendingRef.current.length - maximumPending);
+    const reconciled = reconcileWaveformBatch(
+      bins,
+      waveformEndSample,
+      latestEndSampleRef.current,
+    );
+    if (!reconciled.bins.length) return;
+    if (reconciled.reset) {
+      historyRef.current.length = 0;
+      pendingRef.current.length = 0;
+      consumeBudgetRef.current = 0;
     }
-  }, [bins]);
+    latestEndSampleRef.current = reconciled.endSample;
+    pendingRef.current.push(...reconciled.bins);
+
+    // Incoming telemetry is already a real-time stream, not playback media.
+    // Fast-forward any backlog beyond the small smoothing budget immediately;
+    // otherwise a renderer pause would turn into permanent multi-second lag.
+    const catchUp = waveformCatchUpCount(pendingRef.current.length, sampleRateRef.current);
+    if (catchUp > 0) {
+      historyRef.current.push(...pendingRef.current.splice(0, catchUp));
+    }
+    const maximumBins = waveformWindowBinCount(sampleRateRef.current);
+    if (historyRef.current.length > maximumBins) {
+      historyRef.current.splice(0, historyRef.current.length - maximumBins);
+    }
+  }, [bins, waveformEndSample]);
 
   useEffect(() => {
     recordingRef.current = recording;
   }, [recording]);
 
   useEffect(() => {
+    if (sampleRateRef.current !== sampleRate) {
+      historyRef.current.length = 0;
+      pendingRef.current.length = 0;
+      latestEndSampleRef.current = null;
+      consumeBudgetRef.current = 0;
+    }
     sampleRateRef.current = sampleRate;
   }, [sampleRate]);
 
@@ -110,25 +145,20 @@ export function WebGLWaveform({ bins, recording, sampleRate }: Props) {
       return;
     }
 
-    const history: WaveformBin[] = [];
     let width = 0;
     let height = 0;
-    let maximumBins = 2_048;
     let frame = 0;
     let lastFrameAt = performance.now();
-    let consumeBudget = 0;
 
     const resize = () => {
       const bounds = canvas.getBoundingClientRect();
       const ratio = Math.min(2, window.devicePixelRatio || 1);
       width = Math.max(1, Math.round(bounds.width * ratio));
       height = Math.max(1, Math.round(bounds.height * ratio));
-      maximumBins = Math.max(1_024, Math.round(bounds.width * 3.2));
       if (canvas.width !== width || canvas.height !== height) {
         canvas.width = width;
         canvas.height = height;
       }
-      if (history.length > maximumBins) history.splice(0, history.length - maximumBins);
       gl.viewport(0, 0, width, height);
     };
 
@@ -155,7 +185,9 @@ export function WebGLWaveform({ bins, recording, sampleRate }: Props) {
     };
 
     const drawWaveform = () => {
+      const history = historyRef.current;
       if (!history.length) return;
+      const maximumBins = waveformWindowBinCount(sampleRateRef.current);
       const vertices = new Float32Array(history.length * 4);
       const offset = maximumBins - history.length;
       for (let index = 0; index < history.length; index += 1) {
@@ -174,22 +206,27 @@ export function WebGLWaveform({ bins, recording, sampleRate }: Props) {
     };
 
     const render = (now: number) => {
-      const elapsed = Math.min(34, Math.max(0, now - lastFrameAt));
+      // Account for the complete wall-clock interval. Capping this delta made
+      // every long frame permanently delay the waveform by the discarded time.
+      const elapsed = Math.max(0, now - lastFrameAt);
       lastFrameAt = now;
       const pending = pendingRef.current;
       if (pending.length) {
         // Rust emits one min/max bin per 64 PCM samples. Consuming at that
         // fixed media rate keeps the time axis stable even when IPC batches
         // arrive unevenly.
-        consumeBudget += elapsed / 1_000 * Math.max(1, sampleRateRef.current / 64);
-        const consume = Math.min(pending.length, Math.floor(consumeBudget));
+        consumeBudgetRef.current += elapsed / 1_000 * Math.max(1, sampleRateRef.current / 64);
+        const consume = Math.min(pending.length, Math.floor(consumeBudgetRef.current));
         if (consume > 0) {
-          history.push(...pending.splice(0, consume));
-          consumeBudget -= consume;
-          if (history.length > maximumBins) history.splice(0, history.length - maximumBins);
+          historyRef.current.push(...pending.splice(0, consume));
+          consumeBudgetRef.current -= consume;
+          const maximumBins = waveformWindowBinCount(sampleRateRef.current);
+          if (historyRef.current.length > maximumBins) {
+            historyRef.current.splice(0, historyRef.current.length - maximumBins);
+          }
         }
       } else {
-        consumeBudget = 0;
+        consumeBudgetRef.current = 0;
       }
 
       gl.clearColor(0, 0, 0, 0);

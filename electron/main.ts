@@ -398,6 +398,12 @@ function isValidAttempt(value: unknown): boolean {
     && isNonNegativeSafeInteger(value.start_sample)
     && (value.recording_started_sample === undefined
       || isNonNegativeSafeInteger(value.recording_started_sample))
+    && (value.head_silence_armed_sample === undefined
+      || isNonNegativeSafeInteger(value.head_silence_armed_sample))
+    && (value.head_silence_passed_sample === undefined
+      || isNonNegativeSafeInteger(value.head_silence_passed_sample))
+    && (value.required_head_silence_samples === undefined
+      || isNonNegativeSafeInteger(value.required_head_silence_samples))
     && (value.content_started_sample === undefined
       || isNonNegativeSafeInteger(value.content_started_sample))
     && isNonNegativeSafeInteger(value.end_sample)
@@ -1804,10 +1810,17 @@ async function createPrompterWindow(): Promise<BrowserWindow> {
   const primaryDisplay = screen.getPrimaryDisplay();
   const targetDisplay = screen.getAllDisplays().find((display) => display.id !== primaryDisplay.id)
     ?? primaryDisplay;
+  const width = Math.min(720, targetDisplay.workArea.width);
+  const height = Math.min(500, targetDisplay.workArea.height);
+  const x = Math.round(targetDisplay.workArea.x + (targetDisplay.workArea.width - width) / 2);
+  const y = Math.round(targetDisplay.workArea.y + (targetDisplay.workArea.height - height) / 2);
   prompterWindow = new BrowserWindow({
-    ...targetDisplay.workArea,
-    minWidth: 760,
-    minHeight: 480,
+    width,
+    height,
+    x,
+    y,
+    minWidth: Math.min(520, width),
+    minHeight: Math.min(360, height),
     backgroundColor: '#111315',
     title: '领读面板',
     autoHideMenuBar: true,
@@ -2262,6 +2275,9 @@ async function stopActiveSession(): Promise<unknown> {
             session_dir: stoppedSessionDir,
             snapshot: recovered.snapshot,
             reconciled_after_error: true,
+            warnings: recovered.snapshot.status === 'faulted'
+              ? ['录音引擎已停止，但任务处于故障封存状态；继续前请在任务列表执行“修复并封存”。']
+              : [],
           };
         }
         retainCrashSealObligation(
