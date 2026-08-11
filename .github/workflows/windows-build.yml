@@ -91,6 +91,11 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $false
           & $cmdLauncher --mode inventory --output $inventoryRoot --yes
           $inventoryExit = $LASTEXITCODE
+          # A hosted runner normally has no input device, so inventory returns
+          # the accepted product-level FAIL code 1. GitHub's pwsh wrapper would
+          # otherwise propagate that stale native exit code after our report
+          # checks succeed.
+          $global:LASTEXITCODE = 0
           if ($inventoryExit -notin @(0, 1)) {
             throw "Packaged acceptance inventory was incomplete (exit $inventoryExit)"
           }
@@ -147,6 +152,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $false
           & $installedLauncher --mode inventory --output $installedInventoryRoot --yes
           $inventoryExit = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
           if ($inventoryExit -notin @(0, 1)) {
             throw "Installed acceptance toolkit was incomplete (exit $inventoryExit)"
           }
