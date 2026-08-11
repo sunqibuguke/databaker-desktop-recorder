@@ -19,6 +19,8 @@
 
 > `input_sample_format` 是最终交给引擎的数字样本表示，例如 `i16` / `i24` / `i32` / `f32`。`--bit-depth` 是交付 WAV 编码。验收门槛按有效数字精度计算：整数 `n` bit 按 `n`，IEEE-754 `f32` 按 24 bit 有效数字，`f64` 按 53 bit，不会把 `f32` 容器误认为 32 bit 有效精度。Windows shared mode 下，可枚举的客户端格式不得超过 `GetMixFormat` 声明的有效精度；`IsFormatSupported` 只能证明 Windows 音频引擎接受该客户端格式，不能用来把已知的低位深源判成高精度。把低精度硬件输入写成 24-bit 或 32-bit 不会凭空增加有效精度，因此报告会同时保留输入格式与交付编码。验收工具默认要求 16-bit 交付至少 16 bit 有效数字精度，24/32-bit 交付至少 24 bit；可用 `--minimum-input-format-bits` 按项目提高。这仍不能证明声卡 ADC 的 ENOB，声卡型号、驱动版本与厂商规格必须人工归档。
 
+> 音频 PCM 仍持续写入活动分段；为避免每秒 `FlushFileBuffers` 对长录音造成抖动，引擎默认约每 10 秒执行一次昂贵的“音频落盘 → WAV 头落盘” checkpoint。磁盘余量查询与 checkpoint 独立，仍每秒执行，频繁完成短句不会推迟安全余量保护。`committed_samples` 表示这个可恢复水位，因此正常验收允许最多 15 秒 committed 延迟；真实断电的默认尾差也是 15 秒，项目可用 `--max-tail-loss-seconds` 放宽，但生产工具不允许超过 30 秒。
+
 ## 2. 安全规则
 
 1. `inventory`、`inspect` 是只读模式。`short`默认只录 20 秒。
@@ -50,6 +52,8 @@ resources/
 ```
 
 启动器会把已打包的 Electron exe 当作 Node host，客户机不需另外安装 Node.js。如果使用了自定义安装位置，从该位置的 `resources\acceptance` 运行即可。
+
+Windows CI 不只检查 `win-unpacked`：它还会静默安装最终 NSIS `.exe`，从实际安装目录运行 `inventory`，确认启动器、Electron-as-Node 和 `recorder-engine.exe` 完成一次干净 JSONL 生命周期。GitHub artifact 同时包含 `SHA256SUMS.txt`，下载后应在安装前核对。
 
 Windows 默认把报告写到 `%LOCALAPPDATA%\DataBaker\acceptance-results`，不会尝试写入通常受保护的应用安装目录。需要把证据直接放到指定验收盘时，显式传入 `--output D:\DataBaker-Acceptance`；`disk-full` 必须按第 8 节使用专用测试卷。
 
@@ -111,9 +115,10 @@ $device = "<inventory 返回的完整设备 ID>"
 
 - 请求设备 ID、采样率、输入通道和交付位深与会话快照一致。
 - 引擎记录非空 `input_sample_format`，且通过 `minimum_input_format_bits` 有效数字精度门槛（整数按位宽，`f32=24`、`f64=53`；默认 24/32-bit 交付不接受 `i16/u16`）。
-- `captured` / `committed` 单调，最大提交延迟 ≤ 10 秒，无 overflow/fault marker。
+- `captured` / `committed` 单调，最大提交延迟 ≤ 15 秒，无 overflow/fault marker。
 - 所有分段 WAV 为请求采样率、请求位深、Mono；物理帧数等于最终 `committed_samples`。
 - 安全停止后 WAV 头与物理 EOF 一致，整轨导出可解析；文件较大时能正确识别 RF64 的 `ds64` 计数和哨兵字段。
+- 导出 `status.json` 已提交，其与 `metadata.json`、`metadata.csv`、整轨/单句 WAV 的 session、source 水位、条目数和格式一致；不允许只有 `full-track.wav` 就 PASS。
 - 验收结束后原生引擎以退出码 0 正常收尾；超时、信号退出、非 0 退出或 `shutdown_error` 均不能判定 PASS。
 - 检测到 Peak > -50 dBFS。Peak 达到 -0.1 dBFS 会给出 `WARN`，应降低声卡增益后重测。
 - `engine-stderr.log` 无 panic/fatal runtime error。
@@ -138,7 +143,7 @@ $device = "<inventory 返回的完整设备 ID>"
 - 实际运行时长达到请求时长，无人工中止。
 - 无 fault、overflow、`audio-fault.json`、panic。
 - `captured` / `committed` / 文件总字节数始终单调。
-- 采集与持久化最大差值 ≤ 10 秒。
+- 采集与持久化最大差值 ≤ 15 秒。
 - 文件增长停滞不超过 `max(10 秒, 3 × poll interval)`。
 - 平均样本速率在请求采样率的 ±5% 内。
 - 全程 `storage_status=healthy`。
@@ -248,9 +253,9 @@ $reports = Join-Path $qaRoot "reports-phase-1"
 
 - `committed_samples >= sample_rate * 3600`，即至少 1 小时的样本已进入持久化水位。
 - 样本水位和分段文件仍在增长，会话无 fault/overflow，磁盘读取正常。
-- `captured - committed` 不超过 `--max-tail-loss-seconds`（默认 2 秒，用于覆盖约 1 秒 checkpoint 和一个回调缓冲）。
+- `captured - committed` 不超过 `--max-tail-loss-seconds`（默认 15 秒，覆盖约 10 秒 checkpoint、回调缓冲和少量调度抖动；允许配置到 30 秒，不能更高）。
 
-全部达标后，工具才会生成随机 nonce，将同一份 `armed` 证据同步写入 phase-1 报告目录和 `<session>\metadata\power-cut.acceptance.json`，并强制落盘 telemetry，然后鸣笛并打印断电提示。提示出现后：
+全部达标后，工具才会生成随机 nonce，将同一份 `armed` 证据同步写入 phase-1 报告目录和 `<session>\metadata\power-cut.acceptance.json`，对重命名后的最终证据文件再次执行 flush，并强制落盘 telemetry，然后鸣笛并打印断电提示。提示出现后：
 
 1. 确认终端中的 `captured` / `committed` 和文件字节仍在增长。
 2. 直接切断整台测试机电源，不点击应用的停止或退出。
@@ -272,14 +277,14 @@ $phase1Report = Get-ChildItem (Join-Path $qaRoot "reports-phase-1") -Filter "acc
 .\run-windows-audio-acceptance.cmd --mode recover --session-dir $session --phase1-report $phase1Report --output $reports --yes
 ```
 
-`--phase1-report` 也可以指向 phase-1 目录中的独立 `power-cut-evidence.json`。`recover` 在启动引擎、更改 WAV 或写入恢复元数据之前，会先只读校验 nonce、会话内证据、session/device/format 身份、恢复前 `recording/stopping` 状态、1 小时 committed 水位，以及同一 hostname/platform/architecture 上的系统启动时间已晚于 armed 时间。因此仅强杀录音进程、没有重启 Windows，不能通过该门禁。
+`--phase1-report` 也可以指向 phase-1 目录中的独立 `power-cut-evidence.json`，不能直接指向会话内那一份证据。`recover` 在启动引擎、更改 WAV 或写入恢复元数据之前，会先只读校验两份证据逐字段一致、session/device/format 身份、恢复前 `recording/stopping` 状态、1 小时 committed 水位、phase-1/phase-2 验收脚本与 `recorder-engine.exe` 的 SHA-256 完全一致，以及同一 hostname/platform/architecture 上的系统启动时间已晚于 armed 时间。因此仅强杀录音进程、没有重启 Windows，或换用另一个构建来恢复，都不能通过该门禁。用于无硬件测试的 boot 注入只在显式 `--test-only-power-cut` 分类下生效，设置 `NODE_ENV=test` 不能伪造生产恢复的新 boot。
 
 预检通过后，`recover` 才会启动包内同一个 `recorder-engine.exe`，调用 `seal_interrupted_session`，修复最后一段的不完整帧和落后头部，再从磁盘重新读取全部证据。只有以下项目全部成立才返回 `PASS` / 退出码 `0`：
 
 - `seal_interrupted_session` 成功，返回目录与指定会话完全一致，且 `no_op=false`；正常 stopped 或已恢复会话不能重复借用旧证据 PASS。
 - 所有五分钟分段从 `000001` 连续编号，已闭合段长度正确，RIFF/RF64 头部与物理 EOF 精确一致，`block_align` / `byte_rate` 合法，没有半个音频帧的尾字节。
 - 磁盘上的 `captured_samples == committed_samples == 物理完整帧总数`。不接受“物理帧不少于快照”这种宽松判定。
-- 恢复后物理帧数不少于 phase-1 `armed_committed_samples`；相对 `armed_captured_samples` 的尾差不超过 phase-1 确定的上限（默认 2 秒）。
+- 恢复后物理帧数不少于 phase-1 `armed_committed_samples`；相对 `armed_captured_samples` 的尾差不超过 phase-1 确定的上限（默认 15 秒，生产最大 30 秒）。
 - 会话状态为 `stopped`，`overflow_samples=0`，不存在 `audio-fault.json` 或 `audio-fault.tmp`。
 - `session.json` 与 `items.snapshot.json` 的 `session_id` / `journal_seq` / `status` 一致。
 - 原生引擎完成正常 `shutdown`，退出码为 0，无信号退出或超时脱离。
@@ -296,6 +301,8 @@ $phase1Report = Get-ChildItem (Join-Path $qaRoot "reports-phase-1") -Filter "acc
 
 > 开发回归可显式使用 `--test-only-power-cut` 缩短时间，但 phase-1 证据会固定写入 `test_only=true` / `production_eligible=false`，recover 只会返回 `TEST_ONLY_PASS`。该结果退出码为 0，仅用于自动回归，不得填入生产验收工单或代替 1 小时真实断电。
 
+> 本地双份证据可以防止单文件损坏、误用旧报告或只杀进程被误判为断电，但它不是对本机管理员的密码学反篡改证明。需要对抗恶意管理员时，必须在断电前将 phase-1 证据的哈希/签名发往独立的可信存档或时间戳服务；这是实机验收流程门槛，不能靠会话目录内的自签 JSON 代替。
+
 ## 10. 发布判定与工单清单
 
 同一个声卡/驱动/Windows 组合的发布门禁为：
@@ -310,6 +317,7 @@ $phase1Report = Get-ChildItem (Join-Path $qaRoot "reports-phase-1") -Filter "acc
 | 磁盘保护 | 专用测试卷 `disk-full` PASS |
 | 整机断电 | 阶段 1 录制至少 1h 后真实断电；重启后 `recover` PASS，严格 `inspect` 复核 PASS |
 | 原始证据 | report + telemetry + protocol + stderr + recording 全部归档 |
+| 安装包 | CI 从真实 NSIS 安装目录运行验收启动器；下载后核对 `SHA256SUMS.txt` |
 
 任意一项 `FAIL` 或 `INCOMPLETE` 都不允许以“验收通过”结单。`WARN` 必须有书面处理记录；例如削波 WARN 需调整硬件增益后重测。
 

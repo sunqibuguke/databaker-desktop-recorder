@@ -1,4 +1,6 @@
-use crate::durable_fs::{durable_rename, durable_replace, sync_directory};
+use crate::durable_fs::{
+    durable_create_directory_all, durable_rename, durable_replace, sync_directory,
+};
 use crate::wav::{RecoverableWav, WavExportMode, WavExportWriter};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -782,12 +784,8 @@ fn validate_settings(
 
 fn ensure_directory(directory: &Path, create: bool) -> Result<()> {
     if create {
-        let existed = std::fs::symlink_metadata(directory).is_ok();
-        std::fs::create_dir_all(directory)
+        durable_create_directory_all(directory)
             .with_context(|| format!("create segment directory {}", directory.display()))?;
-        if !existed && let Some(parent) = directory.parent() {
-            sync_directory(parent)?;
-        }
     }
     let metadata = std::fs::symlink_metadata(directory)
         .with_context(|| format!("inspect segment directory {}", directory.display()))?;

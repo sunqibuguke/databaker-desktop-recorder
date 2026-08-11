@@ -15,7 +15,7 @@ Electron + React + TypeScript 桌面操作台，配套 Rust 原生录音引擎�
 - Rust 端提取 PCM min/max 包络，WebGL 以固定媒体时间轴渲染实时波形，并显示 Peak / RMS 和写盘状态。
 - 每句支持开始、结束、试听、手动确认、重录、跳过；历史 attempt 不覆盖。
 - 业务事件先同步写入带序号的 JSONL journal，再原子替换快照；启动时可从最新持久化事件重建状态。
-- 母轨默认每 5 分钟封存为一个不再修改的 WAV 段；只有最后活动段会继续写入，且每秒按“先同步音频、再同步 WAV 头”做 checkpoint。
+- 母轨默认每 5 分钟封存为一个不再修改的 WAV 段；最后活动段始终连续写入，约每 10 秒按“先同步音频、再同步 WAV 头”做一次昂贵 checkpoint，避免每秒 `FlushFileBuffers`；廉价的磁盘余量检查仍每秒执行，不会被频繁完成短句推迟。异常断电默认按 15 秒尾差验收，可配置上限为 30 秒。
 - 异常启动可自动修复落后/超前的 WAV 头和不完整尾帧；队列溢出、写盘故障或磁盘余量进入安全线后 fail-closed，不再伪造连续时间轴。
 - 一键导出整轨 `full-track.wav`、选中 attempt 的单句 WAV bundle、`metadata.json` 和 `metadata.csv`。
 - 同时保存操作打点 `recording_started_sample`、首次有效语音 `content_started_sample` 和实际切片起点 `start_sample`，便于后续根据一线规则选择业务时间戳。
@@ -54,7 +54,7 @@ Windows 安装包应在 Windows x64 构建机上执行 `npm run package`。Rust 
 npm run acceptance:audio -- --mode inventory
 ```
 
-Windows 安装包会把验收工具、启动器和文档放在 `resources/acceptance/`。工具覆盖 16/24/32-bit 短录、2–8 小时长稳、USB 拔出、专用测试卷磁盘保护，以及 `power-cut` → 重启 → `recover` 的真实断电两阶段门禁。生产 `power-cut` 只有在至少 1 小时样本已 committed、文件仍增长且尾差在预算内时才会落盘 nonce 证据并提示断电。`recover` 必须显式传入 `--phase1-report`，并同时匹配会话内证据、同一主机的新 boot、恢复前非终态和 `no_op=false`；正常 stopped 任务、仅杀进程或丢失 armed committed 音频都不能 PASS。它还会严格检查 WAV 头部/EOF、分段编号、完整帧、物理样本水位、overflow/fault marker 和引擎退出。显式的 `--test-only-power-cut` 短时回归只会生成 `TEST_ONLY_PASS` / `production_eligible=false`，不具备生产验收资格。完整命令和 PASS/FAIL 标准见 [Windows 外置声卡生产验收](doc/Windows外置声卡生产验收.md)。
+Windows 安装包会把验收工具、启动器和文档放在 `resources/acceptance/`。工具覆盖 16/24/32-bit 短录、2–8 小时长稳、USB 拔出、专用测试卷磁盘保护，以及 `power-cut` → 重启 → `recover` 的真实断电两阶段门禁。生产 `power-cut` 只有在至少 1 小时样本已 committed、文件仍增长且尾差在预算内时才会落盘 nonce 证据并提示断电。`recover` 必须显式传入独立的 `--phase1-report`，并与会话内证据逐字段一致，同时匹配同一主机的新 boot、恢复前非终态和 `no_op=false`；正常 stopped 任务、仅杀进程、修改单份证据或丢失 armed committed 音频都不能 PASS。它还会严格检查 WAV 头部/EOF、分段编号、完整帧、物理样本水位、导出 status/metadata/CSV 一致性、overflow/fault marker 和引擎退出。显式的 `--test-only-power-cut` 短时回归只会生成 `TEST_ONLY_PASS` / `production_eligible=false`，不具备生产验收资格。Windows CI 还会静默安装实际 NSIS 产物、从安装目录运行验收启动器，并与安装包一起发布 `SHA256SUMS.txt`。完整命令和 PASS/FAIL 标准见 [Windows 外置声卡生产验收](doc/Windows外置声卡生产验收.md)。
 
 ### 推荐采集参数
 

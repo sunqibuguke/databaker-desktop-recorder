@@ -12,12 +12,16 @@ const {
   evaluateInventory,
   evaluateSealedSession,
   faultMarkerPresent,
+  hostBootIdentity,
   inputSampleFormatBits,
   inspectSession,
   inspectWav,
   matchingConfigurations,
+  MAX_NORMAL_COMMIT_LAG_SECONDS,
+  MAX_POWER_CUT_TAIL_LOSS_SECONDS,
   overallFromChecks,
   parseArgs,
+  sha256RegularFile,
   summarizeProgress,
   timestampForPath,
   validateDiskFullTarget,
@@ -147,7 +151,26 @@ function testArgs() {
   assert.equal(productionPowerCut.mode, 'power-cut');
   assert.equal(productionPowerCut.triggerDelaySeconds, 3_600);
   assert.equal(productionPowerCut.seconds, 3_900);
+  assert.equal(productionPowerCut.maxTailLossSeconds, 15);
   assert.equal(productionPowerCut.testOnlyPowerCut, false);
+  assert.equal(MAX_NORMAL_COMMIT_LAG_SECONDS, 15);
+  assert.equal(MAX_POWER_CUT_TAIL_LOSS_SECONDS, 30);
+  assert.equal(
+    parseArgs([
+      '--mode', 'power-cut',
+      '--session-dir', path.join(os.tmpdir(), 'power-cut-tail-30'),
+      '--max-tail-loss-seconds', '30',
+    ]).maxTailLossSeconds,
+    30,
+  );
+  assert.throws(
+    () => parseArgs([
+      '--mode', 'power-cut',
+      '--session-dir', path.join(os.tmpdir(), 'power-cut-tail-too-large'),
+      '--max-tail-loss-seconds', '30.1',
+    ]),
+    /0.1–30/,
+  );
   assert.throws(
     () => parseArgs([
       '--mode', 'power-cut',
@@ -215,6 +238,32 @@ function testInputSampleFormatBits() {
   assert.equal(inputSampleFormatBits('u8'), 8);
   assert.equal(inputSampleFormatBits('unknown'), null);
   assert.equal(inputSampleFormatBits(null), null);
+}
+
+function testBootOverrideIsolation() {
+  const environment = {
+    NODE_ENV: 'test',
+    DATABAKER_ACCEPTANCE_TEST_BOOT_ID: 'forged-new-boot',
+    DATABAKER_ACCEPTANCE_TEST_BOOTED_AT: '2026-08-11T00:01:00.000Z',
+  };
+  const production = hostBootIdentity(
+    environment,
+    Date.parse('2026-08-11T01:00:00.000Z'),
+    3_600,
+    'qa-host',
+    false,
+  );
+  assert.equal(production.source, 'os-uptime');
+  assert.notEqual(production.id, 'forged-new-boot');
+  const explicitTestOnly = hostBootIdentity(
+    environment,
+    Date.parse('2026-08-11T01:00:00.000Z'),
+    3_600,
+    'qa-host',
+    true,
+  );
+  assert.equal(explicitTestOnly.source, 'test-override');
+  assert.equal(explicitTestOnly.id, 'forged-new-boot');
 }
 
 function testConfigurations() {
@@ -552,7 +601,11 @@ function testShortProtocolIntegration() {
         '--skip-noise-check',
         '--yes',
       ],
-      { encoding: 'utf8', timeout: 30_000 },
+      {
+        encoding: 'utf8',
+        timeout: 30_000,
+        env: { ...process.env, DATABAKER_ACCEPTANCE_MOCK_EXPORT_ACCEPTED_ITEM: '1' },
+      },
     );
     assert.equal(result.error, undefined, result.error?.stack);
     assert.equal(result.status, 0, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
@@ -565,6 +618,18 @@ function testShortProtocolIntegration() {
     assert.equal(report.start.snapshot.input_sample_format, 'f32');
     assert.equal(report.inspection.segments[0].bits_per_sample, 24);
     assert.equal(report.inspection.full_track.exact_header, true);
+    assert.equal(report.inspection.export_metadata.exported.length, 1);
+    assert.equal(report.inspection.export_metadata.skipped.length, 0);
+    assert.equal(report.inspection.export_csv.matches_metadata, true);
+    assert.equal(report.inspection.export_sentence_wavs.length, 1);
+    assert.equal(
+      report.inspection.export_sentence_wavs[0].physical_complete_frames,
+      report.inspection.export_metadata.exported[0].duration_samples,
+    );
+    assert.equal(
+      report.checks.find((check) => check.id === 'delivery-manifest-coherent')?.status,
+      'PASS',
+    );
     assert.equal(
       report.checks.find((check) => check.id === 'engine-clean-exit')?.status,
       'PASS',
@@ -572,6 +637,47 @@ function testShortProtocolIntegration() {
     assert.equal(report.progress_rows, undefined);
     assert(report.progress_samples_recorded >= 10);
     assert(fs.statSync(path.join(root, runNames[0], 'telemetry.jsonl')).size > 0);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function testBadExportManifestRejected() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'databaker-acceptance-bad-manifest-'));
+  try {
+    const tool = path.join(__dirname, 'windows-audio-acceptance.cjs');
+    const mockEngine = path.join(__dirname, 'fixtures', 'mock-acceptance-engine.cjs');
+    const result = spawnSync(
+      process.execPath,
+      [
+        tool,
+        '--mode', 'short',
+        '--engine', mockEngine,
+        '--output', root,
+        '--device-index', '1',
+        '--seconds', '5',
+        '--poll-seconds', '0.25',
+        '--skip-noise-check',
+        '--yes',
+      ],
+      {
+        encoding: 'utf8',
+        timeout: 30_000,
+        env: {
+          ...process.env,
+          DATABAKER_ACCEPTANCE_MOCK_EXPORT_ACCEPTED_ITEM: '1',
+          DATABAKER_ACCEPTANCE_MOCK_BAD_EXPORT_MANIFEST: '1',
+        },
+      },
+    );
+    assert.equal(result.error, undefined, result.error?.stack);
+    assert.equal(result.status, 1, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+    const report = latestReport(root);
+    assert.equal(report.overall, 'FAIL');
+    assert.equal(
+      report.checks.find((check) => check.id === 'delivery-manifest-coherent')?.status,
+      'FAIL',
+    );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -679,6 +785,20 @@ function writeInterruptedSessionFixture(session, phase1Report) {
     segment_count: 1,
     tool_version: 1,
     protocol_version: 1,
+    binary_identity: {
+      acceptance_tool_sha256: sha256RegularFile(
+        path.join(__dirname, 'windows-audio-acceptance.cjs'),
+      ),
+      engine_sha256: sha256RegularFile(
+        path.join(__dirname, 'fixtures', 'mock-acceptance-engine.cjs'),
+      ),
+      engine_ready: {
+        engine_version: 'mock-1',
+        protocol_version: 1,
+        platform: process.platform,
+        arch: process.arch,
+      },
+    },
     host: {
       hostname: os.hostname(),
       platform: process.platform,
@@ -780,6 +900,98 @@ function testPowerCutRecoveryIntegration() {
       DATABAKER_ACCEPTANCE_TEST_BOOT_ID: 'phase2-new-boot',
       DATABAKER_ACCEPTANCE_TEST_BOOTED_AT: '2026-08-11T00:01:00.000Z',
     };
+
+    const sessionEvidencePath = path.join(session, 'metadata', 'power-cut.acceptance.json');
+    const originalSessionEvidence = JSON.parse(fs.readFileSync(sessionEvidencePath, 'utf8'));
+    fs.writeFileSync(
+      sessionEvidencePath,
+      `${JSON.stringify({ ...originalSessionEvidence, armed_committed_samples: 95_999 }, null, 2)}\n`,
+    );
+    const tamperedOutput = path.join(root, 'tampered-evidence');
+    const tampered = spawnSync(
+      process.execPath,
+      [
+        tool,
+        '--mode', 'recover',
+        '--engine', mockEngine,
+        '--session-dir', session,
+        '--phase1-report', phase1Report,
+        '--test-only-power-cut',
+        '--output', tamperedOutput,
+        '--yes',
+      ],
+      { encoding: 'utf8', timeout: 20_000, env: recoveryEnvironment },
+    );
+    assert.equal(tampered.status, 1, `stdout:\n${tampered.stdout}\nstderr:\n${tampered.stderr}`);
+    const tamperedReport = latestReport(tamperedOutput);
+    assert.equal(
+      tamperedReport.checks.find((check) => check.id === 'session-evidence-bound')?.status,
+      'FAIL',
+    );
+    assert.equal(tamperedReport.recovery, undefined, 'tampered evidence must fail before engine start');
+    fs.writeFileSync(sessionEvidencePath, `${JSON.stringify(originalSessionEvidence, null, 2)}\n`);
+
+    const sameSourceOutput = path.join(root, 'same-source-evidence');
+    const sameSource = spawnSync(
+      process.execPath,
+      [
+        tool,
+        '--mode', 'recover',
+        '--engine', mockEngine,
+        '--session-dir', session,
+        '--phase1-report', sessionEvidencePath,
+        '--test-only-power-cut',
+        '--output', sameSourceOutput,
+        '--yes',
+      ],
+      { encoding: 'utf8', timeout: 20_000, env: recoveryEnvironment },
+    );
+    assert.equal(sameSource.status, 1, `stdout:\n${sameSource.stdout}\nstderr:\n${sameSource.stderr}`);
+    assert.equal(
+      latestReport(sameSourceOutput).checks.find((check) => check.id === 'session-evidence-bound')?.status,
+      'FAIL',
+    );
+
+    const originalPhase1Report = JSON.parse(fs.readFileSync(phase1Report, 'utf8'));
+    const wrongBinaryEvidence = {
+      ...originalSessionEvidence,
+      binary_identity: {
+        ...originalSessionEvidence.binary_identity,
+        engine_sha256: '0'.repeat(64),
+      },
+    };
+    fs.writeFileSync(sessionEvidencePath, `${JSON.stringify(wrongBinaryEvidence, null, 2)}\n`);
+    fs.writeFileSync(
+      phase1Report,
+      `${JSON.stringify({
+        ...originalPhase1Report,
+        power_cut: { ...originalPhase1Report.power_cut, evidence: wrongBinaryEvidence },
+      }, null, 2)}\n`,
+    );
+    const wrongBinaryOutput = path.join(root, 'wrong-binary');
+    const wrongBinary = spawnSync(
+      process.execPath,
+      [
+        tool,
+        '--mode', 'recover',
+        '--engine', mockEngine,
+        '--session-dir', session,
+        '--phase1-report', phase1Report,
+        '--test-only-power-cut',
+        '--output', wrongBinaryOutput,
+        '--yes',
+      ],
+      { encoding: 'utf8', timeout: 20_000, env: recoveryEnvironment },
+    );
+    assert.equal(wrongBinary.status, 1, `stdout:\n${wrongBinary.stdout}\nstderr:\n${wrongBinary.stderr}`);
+    const wrongBinaryReport = latestReport(wrongBinaryOutput);
+    assert.equal(
+      wrongBinaryReport.checks.find((check) => check.id === 'phase1-binaries-match')?.status,
+      'FAIL',
+    );
+    assert.equal(wrongBinaryReport.recovery, undefined, 'binary mismatch must fail before engine start');
+    fs.writeFileSync(sessionEvidencePath, `${JSON.stringify(originalSessionEvidence, null, 2)}\n`);
+    fs.writeFileSync(phase1Report, `${JSON.stringify(originalPhase1Report, null, 2)}\n`);
 
     const beforeOutput = path.join(root, 'before-inspect');
     const before = spawnSync(
@@ -921,6 +1133,7 @@ function testAbnormalEngineShutdownIntegration(mode, expectedStatus, expectedOve
 
 testArgs();
 testInputSampleFormatBits();
+testBootOverrideIsolation();
 testConfigurations();
 testProgressSummary();
 testInventoryChecks();
@@ -928,6 +1141,7 @@ testEngineExitChecks();
 testWavInspection();
 testTimestamp();
 testShortProtocolIntegration();
+testBadExportManifestRejected();
 testPowerCutArmingIntegration();
 testPowerCutRecoveryIntegration();
 testAbnormalEngineShutdownIntegration('nonzero', 1, 'FAIL');

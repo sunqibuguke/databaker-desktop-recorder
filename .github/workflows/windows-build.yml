@@ -112,12 +112,65 @@ jobs:
             throw "Packaged acceptance inventory did not record protocol traffic"
           }
 
+      - name: Verify generated installer payload
+        shell: pwsh
+        run: |
+          $installers = @(Get-ChildItem -LiteralPath "dist" -Filter "DataBaker-Recorder-*-Windows-x64.exe" -File)
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one Windows x64 installer, found $($installers.Count)"
+          }
+          $installer = $installers[0]
+          if ($installer.Length -lt 1MB) {
+            throw "Generated installer is unexpectedly small: $($installer.Length) bytes"
+          }
+
+          $installRoot = Join-Path $env:RUNNER_TEMP "databaker-installed-payload"
+          if (Test-Path -LiteralPath $installRoot) {
+            Remove-Item -LiteralPath $installRoot -Recurse -Force
+          }
+          $install = Start-Process -FilePath $installer.FullName -ArgumentList @("/S", "/D=$installRoot") -Wait -PassThru
+          if ($install.ExitCode -ne 0) {
+            throw "Silent installer smoke test failed with exit $($install.ExitCode)"
+          }
+
+          $installedLauncher = Join-Path $installRoot "resources/acceptance/run-windows-audio-acceptance.cmd"
+          $installedEngine = Join-Path $installRoot "resources/bin/recorder-engine.exe"
+          foreach ($required in @($installedLauncher, $installedEngine)) {
+            if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+              throw "Installed production payload is missing: $required"
+            }
+          }
+          $installedInventoryRoot = Join-Path $env:RUNNER_TEMP "databaker-installed-inventory"
+          if (Test-Path -LiteralPath $installedInventoryRoot) {
+            Remove-Item -LiteralPath $installedInventoryRoot -Recurse -Force
+          }
+          $PSNativeCommandUseErrorActionPreference = $false
+          & $installedLauncher --mode inventory --output $installedInventoryRoot --yes
+          $inventoryExit = $LASTEXITCODE
+          if ($inventoryExit -notin @(0, 1)) {
+            throw "Installed acceptance toolkit was incomplete (exit $inventoryExit)"
+          }
+          $reportFile = Get-ChildItem -LiteralPath $installedInventoryRoot -Filter "acceptance-report.json" -File -Recurse |
+            Select-Object -First 1
+          if ($null -eq $reportFile) {
+            throw "Installed acceptance toolkit did not write a report"
+          }
+          $report = Get-Content -LiteralPath $reportFile.FullName -Raw | ConvertFrom-Json
+          $cleanExit = $report.checks | Where-Object { $_.id -eq "engine-clean-exit" } | Select-Object -First 1
+          if ($report.overall -notin @("PASS", "FAIL") -or $null -ne $report.tool_error -or $cleanExit.status -ne "PASS") {
+            throw "Installed recorder-engine did not complete a clean JSONL lifecycle"
+          }
+
+          $sha256 = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$sha256 *$($installer.Name)" | Set-Content -LiteralPath "dist/SHA256SUMS.txt" -Encoding ascii
+
       - name: Upload Windows installer
         uses: actions/upload-artifact@v6
         with:
           name: databaker-recorder-windows-x64
           path: |
             dist/DataBaker-Recorder-*-Windows-x64.exe
+            dist/SHA256SUMS.txt
             dist/*.blockmap
             dist/latest.yml
           if-no-files-found: error

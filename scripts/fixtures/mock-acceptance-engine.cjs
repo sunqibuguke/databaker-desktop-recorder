@@ -55,6 +55,32 @@ function makeWav(sampleRate, bitDepth, frames) {
   return buffer;
 }
 
+function csvCell(value) {
+  return `"${String(value ?? '').replace(/"/g, '""')}"`;
+}
+
+function exportCsv(exported) {
+  const lines = [
+    'id,text,label,attempt_id,start_sample,recording_started_sample,content_started_sample,content_started_seconds,end_sample,duration_samples,file',
+  ];
+  for (const row of exported) {
+    lines.push([
+      csvCell(row.id),
+      csvCell(row.text),
+      csvCell(row.label),
+      csvCell(row.attempt_id),
+      row.start_sample,
+      row.recording_started_sample,
+      row.content_started_sample,
+      Number(row.content_started_seconds).toFixed(6),
+      row.end_sample,
+      row.duration_samples,
+      csvCell(row.file),
+    ].join(','));
+  }
+  return `${lines.join('\n')}\n`;
+}
+
 function sealInterruptedSession(directory) {
   const snapshotPath = path.join(directory, 'metadata', 'items.snapshot.json');
   const recovered = JSON.parse(fs.readFileSync(snapshotPath, 'utf8'));
@@ -229,6 +255,22 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       updateAudio();
       stopped = true;
       snapshot.status = 'stopped';
+      if (process.env.DATABAKER_ACCEPTANCE_MOCK_EXPORT_ACCEPTED_ITEM === '1') {
+        const item = snapshot.items[0];
+        const endSample = Math.max(2, Math.min(snapshot.committed_samples, snapshot.audio_format.sample_rate));
+        const attempt = {
+          attempt_id: `${item.id}-a1`,
+          start_sample: 0,
+          recording_started_sample: 0,
+          content_started_sample: 1,
+          end_sample: endSample,
+          status: 'accepted',
+          created_at: new Date().toISOString(),
+        };
+        item.status = 'accepted';
+        item.attempts = [attempt];
+        item.selected_attempt_id = attempt.attempt_id;
+      }
       snapshot.updated_at = new Date().toISOString();
       fs.writeFileSync(
         path.join(sessionDirectory, 'metadata', 'items.snapshot.json'),
@@ -253,14 +295,91 @@ createInterface({ input: process.stdin }).on('line', (line) => {
         break;
       }
       const source = path.join(sessionDirectory, 'audio', 'segments', 'master-000001.wav');
-      const destination = path.join(sessionDirectory, 'export', 'full-track.wav');
+      const exportDirectory = path.join(sessionDirectory, 'export');
+      const destination = path.join(exportDirectory, 'full-track.wav');
       fs.copyFileSync(source, destination);
+      const exportSource = {
+        journal_seq: snapshot.journal_seq,
+        committed_samples: snapshot.committed_samples,
+        selected_attempts: snapshot.items.map((item) => ({
+          id: item.id,
+          attempt_id: item.selected_attempt_id,
+        })),
+      };
+      const exported = [];
+      const skipped = [];
+      for (const item of snapshot.items) {
+        const attempt = item.attempts.find((candidate) => candidate.attempt_id === item.selected_attempt_id);
+        if (!attempt) {
+          skipped.push({ id: item.id, reason: item.status });
+          continue;
+        }
+        const fileName = `${item.id}.wav`;
+        const durationSamples = attempt.end_sample - attempt.start_sample;
+        fs.writeFileSync(
+          path.join(exportDirectory, 'sentences', fileName),
+          makeWav(snapshot.audio_format.sample_rate, snapshot.audio_format.bit_depth, durationSamples),
+        );
+        exported.push({
+          id: item.id,
+          text: item.text,
+          label: item.label,
+          attempt_id: attempt.attempt_id,
+          start_sample: attempt.start_sample,
+          recording_started_sample: attempt.recording_started_sample,
+          content_started_sample: attempt.content_started_sample,
+          content_started_seconds: attempt.content_started_sample / snapshot.audio_format.sample_rate,
+          end_sample: attempt.end_sample,
+          duration_samples: durationSamples,
+          file: `sentences/${fileName}`,
+        });
+      }
+      const metadata = {
+        schema_version: 1,
+        session_id: snapshot.session_id,
+        script_name: snapshot.script_name,
+        device_name: snapshot.device_name,
+        device_id: snapshot.device_id,
+        input_sample_format: snapshot.input_sample_format,
+        audio_format: snapshot.audio_format,
+        storage_layout_version: snapshot.storage_layout_version,
+        segment_frames: snapshot.segment_frames,
+        noise_check: snapshot.noise_check,
+        silence_policy: {
+          duration_ms: snapshot.silence_duration_ms,
+          threshold_dbfs: snapshot.silence_threshold_dbfs,
+        },
+        source: exportSource,
+        full_track: 'full-track.wav',
+        full_track_container: 'riff',
+        exported,
+        skipped,
+      };
+      fs.writeFileSync(path.join(exportDirectory, 'metadata.json'), `${JSON.stringify(metadata, null, 2)}\n`);
+      fs.writeFileSync(
+        path.join(exportDirectory, 'metadata.csv'),
+        exportCsv(exported),
+      );
+      fs.writeFileSync(
+        path.join(exportDirectory, 'status.json'),
+        `${JSON.stringify({
+          schema_version: 2,
+          status: 'complete',
+          export_id: 'mock-export-1',
+          session_id: snapshot.session_id,
+          source: exportSource,
+          exported_count: exported.length,
+          skipped_count: process.env.DATABAKER_ACCEPTANCE_MOCK_BAD_EXPORT_MANIFEST === '1'
+            ? metadata.skipped.length + 1
+            : metadata.skipped.length,
+        }, null, 2)}\n`,
+      );
       response(requestId, {
-        export_dir: path.join(sessionDirectory, 'export'),
+        export_dir: exportDirectory,
         master_file: destination,
         sentences_dir: path.join(sessionDirectory, 'export', 'sentences'),
-        exported_count: 0,
-        skipped_count: 1,
+        exported_count: exported.length,
+        skipped_count: skipped.length,
       });
       break;
     }

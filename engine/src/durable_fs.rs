@@ -1,7 +1,23 @@
 use anyhow::{Context, Result};
+use std::ffi::OsString;
 #[cfg(any(unix, test))]
 use std::fs::File;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static DIRECTORY_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn parent_directory(path: &Path) -> Result<&Path> {
+    path.parent()
+        .map(|parent| {
+            if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            }
+        })
+        .context("durable path has no parent")
+}
 
 #[cfg(windows)]
 fn move_file(source: &Path, destination: &Path, replace: bool) -> Result<()> {
@@ -91,13 +107,10 @@ fn rename_and_sync(source: &Path, destination: &Path) -> Result<()> {
             source.display()
         )
     })?;
-    let destination_parent = destination
-        .parent()
-        .context("durable replacement destination has no parent")?;
+    let destination_parent = parent_directory(destination)?;
     sync_directory(destination_parent)?;
-    if let Some(source_parent) = source.parent()
-        && source_parent != destination_parent
-    {
+    let source_parent = parent_directory(source)?;
+    if source_parent != destination_parent {
         sync_directory(source_parent)?;
     }
     Ok(())
@@ -115,8 +128,101 @@ pub(crate) fn durable_replace(source: &Path, destination: &Path) -> Result<()> {
 }
 
 pub(crate) fn sync_parent_directory(path: &Path) -> Result<()> {
-    let parent = path.parent().context("durable path has no parent")?;
-    sync_directory(parent)
+    sync_directory(parent_directory(path)?)
+}
+
+/// Creates one directory by publishing a unique empty sibling through the same
+/// durable rename primitive used for files. This is important on Windows,
+/// where Rust cannot portably fsync a directory handle: creating the final name
+/// directly can otherwise leave an hour of synced child files reachable only
+/// through a parent entry whose durability was never requested.
+pub(crate) fn durable_create_directory(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .context("durable directory path has no file name")?;
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => anyhow::bail!("refusing to overwrite directory {}", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect directory {}", path.display()));
+        }
+    }
+
+    let temporary = loop {
+        let sequence = DIRECTORY_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let mut temporary_name = OsString::from(".");
+        temporary_name.push(file_name);
+        temporary_name.push(format!(
+            ".creating-directory-{}-{sequence}",
+            std::process::id()
+        ));
+        let candidate = parent.join(temporary_name);
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("create temporary directory {}", candidate.display())
+                });
+            }
+        }
+    };
+
+    let result = durable_rename(&temporary, path).with_context(|| {
+        format!(
+            "publish temporary directory {} as {}",
+            temporary.display(),
+            path.display()
+        )
+    });
+    if result.is_err()
+        && let Ok(metadata) = std::fs::symlink_metadata(&temporary)
+        && metadata.is_dir()
+        && !metadata.file_type().is_symlink()
+    {
+        let _ = std::fs::remove_dir(&temporary);
+    }
+    result
+}
+
+/// Durable equivalent of `create_dir_all`. Existing components are retained;
+/// each missing component is published one at a time so its parent namespace
+/// is committed before a child can contain authoritative recording data.
+pub(crate) fn durable_create_directory_all(path: &Path) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    loop {
+        match std::fs::symlink_metadata(cursor) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    anyhow::bail!(
+                        "durable directory ancestor must be a regular directory: {}",
+                        cursor.display()
+                    );
+                }
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(cursor.to_path_buf());
+                cursor = cursor
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect directory {}", cursor.display()));
+            }
+        }
+    }
+    for directory in missing.into_iter().rev() {
+        durable_create_directory(&directory)?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -170,6 +276,37 @@ mod tests {
         durable_replace(&source, &destination).unwrap();
         assert_eq!(std::fs::read(&destination).unwrap(), b"second");
         assert!(!source.exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn durable_directory_creation_publishes_every_missing_ancestor() {
+        let root = std::env::temp_dir().join(format!(
+            "recorder-durable-directory-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let nested = root.join("recordings/task/audio/segments");
+        durable_create_directory_all(&nested).unwrap();
+        assert!(nested.is_dir());
+        durable_create_directory_all(&nested).unwrap();
+
+        let sibling = root.join("recordings/task/metadata");
+        durable_create_directory(&sibling).unwrap();
+        assert!(sibling.is_dir());
+        assert!(
+            std::fs::read_dir(sibling.parent().unwrap())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("creating-directory"))
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

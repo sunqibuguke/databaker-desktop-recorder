@@ -1,4 +1,4 @@
-use crate::durable_fs::durable_replace;
+use crate::durable_fs::{durable_create_directory_all, durable_replace};
 use anyhow::{Context, Result, bail};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
@@ -358,8 +358,11 @@ impl RecoverableWav {
             bail!("channels must be greater than zero");
         }
         let encoding = WavEncoding::for_bit_depth(bit_depth)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            durable_create_directory_all(parent)
                 .with_context(|| format!("create audio directory {}", parent.display()))?;
         }
         let mut options = OpenOptions::new();

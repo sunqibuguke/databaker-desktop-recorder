@@ -3,10 +3,11 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { randomUUID } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { createInterface } = require('node:readline');
 const { createInterface: createPrompt } = require('node:readline/promises');
+const { isDeepStrictEqual } = require('node:util');
 
 const PROTOCOL_VERSION = 1;
 const TOOL_VERSION = 1;
@@ -24,10 +25,13 @@ const FAULT_MODES = new Set(['unplug', 'disk-full']);
 const BIT_DEPTHS = new Set([16, 24, 32]);
 const PRODUCTION_POWER_CUT_SECONDS = 3_600;
 const DEFAULT_POWER_CUT_MAXIMUM_SECONDS = 3_900;
-const DEFAULT_MAX_TAIL_LOSS_SECONDS = 2;
+const DEFAULT_MAX_TAIL_LOSS_SECONDS = 15;
+const MAX_POWER_CUT_TAIL_LOSS_SECONDS = 30;
+const MAX_NORMAL_COMMIT_LAG_SECONDS = 15;
 const POWER_CUT_EVIDENCE_KIND = 'databaker.power-cut-phase-1';
 const POWER_CUT_SESSION_EVIDENCE = path.join('metadata', 'power-cut.acceptance.json');
 const SEGMENT_DESCRIPTOR_KIND = 'databaker.segmented-wav-header';
+const EXPORT_CSV_HEADER = 'id,text,label,attempt_id,start_sample,recording_started_sample,content_started_sample,content_started_seconds,end_sample,duration_samples,file';
 
 function testTimeout(name, fallback) {
   if (process.env.NODE_ENV !== 'test') return fallback;
@@ -84,7 +88,7 @@ function usage() {
   --poll-seconds <n>             进度落盘间隔，默认 1（soak 默认 5）
   --trigger-delay-seconds <n>    故障操作倒计时，power-cut 生产默认/最小 3600
   --fault-timeout-seconds <n>    等待故障被检测的时间，默认 60
-  --max-tail-loss-seconds <n>    断电证据允许的最大 captured/committed 尾差，默认 2
+  --max-tail-loss-seconds <n>    断电证据允许的最大 captured/committed 尾差，默认 15，上限 30
   --confirm-dedicated-volume     disk-full 确认 1：输出位于可丢弃测试卷
   --confirm-not-system-drive     disk-full 确认 2：该卷不是 Windows 系统盘
   --noise-threshold-dbfs <n>     环境噪声阈值，默认 -40
@@ -352,8 +356,11 @@ function parseArgs(argv) {
   ) {
     throw new Error(`生产 power-cut --trigger-delay-seconds 不能少于 ${PRODUCTION_POWER_CUT_SECONDS}；短时回归必须显式使用 --test-only-power-cut`);
   }
-  if (options.maxTailLossSeconds < 0.1 || options.maxTailLossSeconds > 10) {
-    throw new Error('--max-tail-loss-seconds 必须在 0.1–10 之间');
+  if (
+    options.maxTailLossSeconds < 0.1 ||
+    options.maxTailLossSeconds > MAX_POWER_CUT_TAIL_LOSS_SECONDS
+  ) {
+    throw new Error(`--max-tail-loss-seconds 必须在 0.1–${MAX_POWER_CUT_TAIL_LOSS_SECONDS} 之间`);
   }
   if (options.faultTimeoutSeconds < 10 || options.faultTimeoutSeconds > 3_600) {
     throw new Error('--fault-timeout-seconds 必须在 10–3600 之间');
@@ -430,8 +437,10 @@ function hostBootIdentity(
   nowMs = Date.now(),
   uptimeSeconds = os.uptime(),
   hostname = os.hostname(),
+  allowTestOverride = false,
 ) {
   if (
+    allowTestOverride &&
     environment.NODE_ENV === 'test' &&
     environment.DATABAKER_ACCEPTANCE_TEST_BOOT_ID &&
     environment.DATABAKER_ACCEPTANCE_TEST_BOOTED_AT
@@ -470,6 +479,59 @@ function readJsonRegularFile(filePath, label = 'JSON', maximumBytes = 2 * 1024 *
   } catch (error) {
     throw new Error(`${label} 无法解析: ${filePath}: ${error.message}`);
   }
+}
+
+function readTextRegularFile(filePath, label, maximumBytes = 16 * 1024 * 1024) {
+  const metadata = fs.lstatSync(filePath);
+  if (metadata.isSymbolicLink() || !metadata.isFile()) {
+    throw new Error(`${label} 必须是普通文件，不能是链接: ${filePath}`);
+  }
+  if (metadata.size <= 0 || metadata.size > maximumBytes) {
+    throw new Error(`${label} 大小无效: ${filePath} (${metadata.size} bytes)`);
+  }
+  return fs.readFileSync(filePath, 'utf8');
+}
+
+function sha256RegularFile(filePath, label = '文件') {
+  const metadata = fs.lstatSync(filePath);
+  if (metadata.isSymbolicLink() || !metadata.isFile()) {
+    throw new Error(`${label} 必须是普通文件，不能是链接: ${filePath}`);
+  }
+  return createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+}
+
+// Capture the script bytes at process load. A long power-cut run must not hash
+// a different on-disk script that an updater replaced after this code started.
+const ACCEPTANCE_TOOL_SHA256 = sha256RegularFile(__filename, '验收工具');
+
+function exportCsvCell(value) {
+  return `"${String(value ?? '').replace(/"/g, '""')}"`;
+}
+
+function expectedExportCsv(exported) {
+  const lines = [EXPORT_CSV_HEADER];
+  for (const row of exported) {
+    const integer = (value) => Number.isSafeInteger(Number(value)) && Number(value) >= 0
+      ? String(Number(value))
+      : '0';
+    const seconds = Number.isFinite(Number(row?.content_started_seconds))
+      ? Number(row.content_started_seconds).toFixed(6)
+      : '0.000000';
+    lines.push([
+      exportCsvCell(row?.id),
+      exportCsvCell(row?.text),
+      exportCsvCell(row?.label),
+      exportCsvCell(row?.attempt_id),
+      integer(row?.start_sample),
+      integer(row?.recording_started_sample),
+      integer(row?.content_started_sample),
+      seconds,
+      integer(row?.end_sample),
+      integer(row?.duration_samples),
+      exportCsvCell(row?.file),
+    ].join(','));
+  }
+  return `${lines.join('\n')}\n`;
 }
 
 function loadPhase1Evidence(sourcePath) {
@@ -520,6 +582,11 @@ function buildPowerCutEvidence(report, options, sessionDirectory, row) {
     segment_count: Number(row.segment_count),
     tool_version: TOOL_VERSION,
     protocol_version: PROTOCOL_VERSION,
+    binary_identity: {
+      acceptance_tool_sha256: ACCEPTANCE_TOOL_SHA256,
+      engine_sha256: report.engine.binary_sha256,
+      engine_ready: report.engine.ready,
+    },
     host: {
       hostname: report.host.hostname,
       platform: report.host.platform,
@@ -549,6 +616,15 @@ function writeJsonDurable(filePath, value) {
     fs.copyFileSync(temporary, filePath);
     fs.unlinkSync(temporary);
     if (!fs.existsSync(filePath)) throw error;
+  }
+  // The temporary contents were synced before rename. Flush the final path as
+  // well so a prompt printed immediately afterwards cannot outrun the renamed
+  // directory entry on Windows/NTFS.
+  const finalFile = fs.openSync(filePath, 'r+');
+  try {
+    fs.fsyncSync(finalFile);
+  } finally {
+    fs.closeSync(finalFile);
   }
 }
 
@@ -1139,6 +1215,13 @@ function inspectSession(sessionDirectory) {
     total_file_bytes: 0,
     full_track: null,
     full_track_error: null,
+    export_bundle_present: false,
+    export_status: null,
+    export_metadata: null,
+    export_csv: null,
+    export_sentence_wavs: [],
+    export_sentence_file_names: [],
+    export_bundle_errors: [],
   };
   if (!inspectDirectory(result, sessionDirectory, '录制根目录')) return result;
   result.exists = true;
@@ -1278,6 +1361,81 @@ function inspectSession(sessionDirectory) {
   const exportExists = pathEntryExists(exportDirectory);
   const exportSafe = !exportExists || inspectDirectory(result, exportDirectory, 'export');
   const fullTrack = path.join(exportDirectory, 'full-track.wav');
+  const exportStatusPath = path.join(exportDirectory, 'status.json');
+  const exportMetadataPath = path.join(exportDirectory, 'metadata.json');
+  const exportCsvPath = path.join(exportDirectory, 'metadata.csv');
+  const bundlePaths = [fullTrack, exportStatusPath, exportMetadataPath, exportCsvPath];
+  result.export_bundle_present = exportExists && exportSafe && bundlePaths.some(pathEntryExists);
+  if (result.export_bundle_present) {
+    const requiredBundleFiles = [
+      [fullTrack, '整轨 WAV'],
+      [exportStatusPath, '导出提交状态'],
+      [exportMetadataPath, '导出 metadata.json'],
+      [exportCsvPath, '导出 metadata.csv'],
+    ];
+    for (const [requiredPath, label] of requiredBundleFiles) {
+      if (!pathEntryExists(requiredPath)) result.export_bundle_errors.push(`${label} 缺失: ${requiredPath}`);
+    }
+  }
+  if (result.export_bundle_present && pathEntryExists(exportStatusPath)) {
+    try {
+      result.export_status = readJsonRegularFile(exportStatusPath, '导出提交状态');
+    } catch (error) {
+      result.export_bundle_errors.push(error.message);
+    }
+  }
+  if (result.export_bundle_present && pathEntryExists(exportMetadataPath)) {
+    try {
+      result.export_metadata = readJsonRegularFile(exportMetadataPath, '导出 metadata.json', 16 * 1024 * 1024);
+    } catch (error) {
+      result.export_bundle_errors.push(error.message);
+    }
+  }
+  if (result.export_bundle_present && pathEntryExists(exportCsvPath)) {
+    try {
+      const text = readTextRegularFile(exportCsvPath, '导出 metadata.csv');
+      result.export_csv = {
+        bytes: Buffer.byteLength(text),
+        header: text.replace(/^\uFEFF/, '').split(/\r?\n/, 1)[0],
+        matches_metadata: Array.isArray(result.export_metadata?.exported) &&
+          text.replace(/^\uFEFF/, '') === expectedExportCsv(result.export_metadata.exported),
+      };
+    } catch (error) {
+      result.export_bundle_errors.push(error.message);
+    }
+  }
+  if (result.export_bundle_present && exportSafe) {
+    const sentenceDirectory = path.join(exportDirectory, 'sentences');
+    if (inspectDirectory(result, sentenceDirectory, 'export/sentences')) {
+      try {
+        result.export_sentence_file_names = fs.readdirSync(sentenceDirectory, { withFileTypes: true })
+          .filter((entry) => entry.isFile() && /\.wav$/i.test(entry.name))
+          .map((entry) => entry.name)
+          .sort();
+      } catch (error) {
+        result.export_bundle_errors.push(`无法枚举导出单句 WAV: ${error.message}`);
+      }
+    } else {
+      result.export_bundle_errors.push('导出 sentences 目录缺失或不是真实目录');
+    }
+  }
+  const exportedRows = Array.isArray(result.export_metadata?.exported)
+    ? result.export_metadata.exported
+    : [];
+  for (const row of exportedRows) {
+    const relativeFile = typeof row?.file === 'string' ? row.file.replace(/\\/g, '/') : '';
+    const match = /^sentences\/([^/]+\.wav)$/.exec(relativeFile);
+    if (!match) {
+      result.export_bundle_errors.push(`导出条目文件路径无效: ${String(row?.file)}`);
+      continue;
+    }
+    const sentencePath = path.join(exportDirectory, 'sentences', match[1]);
+    try {
+      result.export_sentence_wavs.push(inspectWav(sentencePath));
+    } catch (error) {
+      result.export_bundle_errors.push(`导出条目 WAV 无效 ${relativeFile}: ${error.message}`);
+    }
+  }
   if (exportExists && exportSafe && pathEntryExists(fullTrack)) {
     try {
       result.full_track = inspectWav(fullTrack);
@@ -1568,7 +1726,9 @@ function evaluatePhase1Evidence(phase1, options, inspection, currentHost) {
       evidence?.kind === POWER_CUT_EVIDENCE_KIND &&
       evidence?.phase === 'armed' &&
       typeof evidence?.nonce === 'string' &&
-      evidence.nonce.length >= 16,
+      evidence.nonce.length >= 16 &&
+      /^[0-9a-f]{64}$/.test(String(evidence?.binary_identity?.acceptance_tool_sha256 ?? '')) &&
+      /^[0-9a-f]{64}$/.test(String(evidence?.binary_identity?.engine_sha256 ?? '')),
     evidence,
   );
   addCheck(
@@ -1585,12 +1745,19 @@ function evaluatePhase1Evidence(phase1, options, inspection, currentHost) {
   addCheck(
     checks,
     'session-evidence-bound',
-    '会话内的持久证据与显式 phase-1 输入具有同一 nonce 和身份',
+    '会话内证据与独立显式 phase-1 输入逐字段一致',
     localEvidence?.kind === POWER_CUT_EVIDENCE_KIND &&
-      localEvidence?.nonce === evidence?.nonce &&
-      localEvidence?.session_id === evidence?.session_id &&
-      pathsEqual(String(localEvidence?.session_dir ?? ''), String(evidence?.session_dir ?? '')),
-    { source: evidence, session_evidence: localEvidence },
+      !pathsEqual(
+        String(phase1?.source_path ?? ''),
+        path.join(options.sessionDir, POWER_CUT_SESSION_EVIDENCE),
+      ) &&
+      isDeepStrictEqual(localEvidence, evidence),
+    {
+      source_path: phase1?.source_path,
+      session_evidence_path: path.join(options.sessionDir, POWER_CUT_SESSION_EVIDENCE),
+      source: evidence,
+      session_evidence: localEvidence,
+    },
   );
   addCheck(
     checks,
@@ -1753,8 +1920,9 @@ function evaluateCommon(report, options, inspection) {
   addCheck(
     checks,
     'commit-lag',
-    '采集与持久化水位差不超过 10 秒',
-    progress.max_commit_lag_seconds !== null && progress.max_commit_lag_seconds <= 10,
+    `采集与持久化水位差不超过 ${MAX_NORMAL_COMMIT_LAG_SECONDS} 秒`,
+    progress.max_commit_lag_seconds !== null &&
+      progress.max_commit_lag_seconds <= MAX_NORMAL_COMMIT_LAG_SECONDS,
     { maximum_seconds: progress.max_commit_lag_seconds },
   );
   addCheck(
@@ -1857,11 +2025,81 @@ function evaluateNormal(report, options, inspection) {
     options.mode === 'soak' ? 'FAIL' : 'WARN',
   );
   if (options.export) {
-    addCheck(checks, 'full-track-export', '整轨 WAV 导出成功且头部完整', Boolean(inspection.full_track?.exact_header), {
+    addCheck(
+      checks,
+      'full-track-export',
+      '整轨 WAV 导出完整且帧数/格式与会话一致',
+      inspection.full_track?.exact_header === true &&
+        inspection.full_track?.physical_complete_frames === Number(finalSnapshot?.committed_samples) &&
+        inspection.full_track?.sample_rate === finalSnapshot?.audio_format?.sample_rate &&
+        inspection.full_track?.bits_per_sample === finalSnapshot?.audio_format?.bit_depth &&
+        inspection.full_track?.channels === 1,
+      {
       export: report.export,
       wav: inspection.full_track,
       error: inspection.full_track_error,
-    });
+      },
+    );
+    const status = inspection.export_status;
+    const metadata = inspection.export_metadata;
+    const exportResult = report.export?.result;
+    const exported = Array.isArray(metadata?.exported) ? metadata.exported : null;
+    const skipped = Array.isArray(metadata?.skipped) ? metadata.skipped : null;
+    const expectedSelections = Array.isArray(finalSnapshot?.items)
+      ? finalSnapshot.items.map((item) => ({ id: item.id, attempt_id: item.selected_attempt_id }))
+      : null;
+    const manifestCoherent =
+      inspection.export_bundle_present === true &&
+      inspection.export_bundle_errors.length === 0 &&
+      status?.schema_version === 2 &&
+      status?.status === 'complete' &&
+      status?.session_id === finalSnapshot?.session_id &&
+      metadata?.schema_version === 1 &&
+      metadata?.session_id === finalSnapshot?.session_id &&
+      metadata?.full_track === 'full-track.wav' &&
+      isDeepStrictEqual(metadata?.audio_format, finalSnapshot?.audio_format) &&
+      isDeepStrictEqual(status?.source, metadata?.source) &&
+      Number(metadata?.source?.journal_seq) === Number(finalSnapshot?.journal_seq) &&
+      Number(metadata?.source?.committed_samples) === Number(finalSnapshot?.committed_samples) &&
+      expectedSelections !== null &&
+      isDeepStrictEqual(metadata?.source?.selected_attempts, expectedSelections) &&
+      exported !== null &&
+      skipped !== null &&
+      exported.length + skipped.length === expectedSelections.length &&
+      Number(status?.exported_count) === exported.length &&
+      Number(status?.skipped_count) === skipped.length &&
+      Number(exportResult?.exported_count) === exported.length &&
+      Number(exportResult?.skipped_count) === skipped.length &&
+      pathsEqual(String(exportResult?.export_dir ?? ''), path.join(options.sessionDir ?? report.session_dir, 'export')) &&
+      pathsEqual(String(exportResult?.master_file ?? ''), path.join(options.sessionDir ?? report.session_dir, 'export', 'full-track.wav')) &&
+      inspection.export_csv?.header === EXPORT_CSV_HEADER &&
+      inspection.export_csv?.matches_metadata === true &&
+      isDeepStrictEqual(
+        inspection.export_sentence_file_names,
+        exported.map((row) => path.posix.basename(String(row?.file ?? ''))).sort(),
+      ) &&
+      inspection.export_sentence_wavs.length === exported.length &&
+      inspection.export_sentence_wavs.every((wav, index) =>
+        wav.exact_header === true &&
+        wav.sample_rate === finalSnapshot?.audio_format?.sample_rate &&
+        wav.bits_per_sample === finalSnapshot?.audio_format?.bit_depth &&
+        wav.channels === 1 &&
+        wav.physical_complete_frames === Number(exported[index]?.duration_samples)
+      );
+    addCheck(
+      checks,
+      'delivery-manifest-coherent',
+      '导出 status/metadata/CSV/WAV 属于同一已提交交付世代',
+      manifestCoherent,
+      {
+        errors: inspection.export_bundle_errors,
+        status,
+        metadata,
+        csv: inspection.export_csv,
+        sentence_wavs: inspection.export_sentence_wavs,
+        export_result: exportResult,
+      },
+    );
   }
   return checks;
 }
@@ -2021,7 +2259,7 @@ async function monitorCapture(client, sessionDirectory, options, telemetryLog, o
       const maximumLagFrames = Math.ceil(options.maxTailLossSeconds * options.sampleRate);
       const progressing = Boolean(previous) &&
         row.committed_samples > Number(previous.committed_samples ?? 0) &&
-        row.segment_total_bytes >= Number(previous.segment_total_bytes ?? 0);
+        row.segment_total_bytes > Number(previous.segment_total_bytes ?? 0);
       const eligible =
         stateError === null &&
         state?.snapshot?.status === 'recording' &&
@@ -2113,6 +2351,7 @@ async function maybePromptBeforeCapture(options) {
 
 async function runInventory(options, runDirectory, report) {
   const enginePath = findEngine(options.engine);
+  const engineSha256 = sha256RegularFile(enginePath, '录音引擎');
   const client = new EngineClient(
     enginePath,
     runDirectory,
@@ -2123,7 +2362,7 @@ async function runInventory(options, runDirectory, report) {
     const ready = await client.start();
     const inventory = await client.request('list_devices', {}, 30_000);
     printDevices(inventory);
-    report.engine = { path: enginePath, ready };
+    report.engine = { path: enginePath, binary_sha256: engineSha256, ready };
     report.inventory = inventory;
     try {
       report.engine.exit = await client.shutdown();
@@ -2138,10 +2377,10 @@ async function runInventory(options, runDirectory, report) {
     report.tool_error = error.stack ?? error.message;
     report.overall = 'INCOMPLETE';
     try {
-      report.engine = report.engine ?? { path: enginePath, ready: client.readyPayload };
+      report.engine = report.engine ?? { path: enginePath, binary_sha256: engineSha256, ready: client.readyPayload };
       report.engine.exit = await client.shutdown();
     } catch (shutdownError) {
-      report.engine = report.engine ?? { path: enginePath, ready: client.readyPayload };
+      report.engine = report.engine ?? { path: enginePath, binary_sha256: engineSha256, ready: client.readyPayload };
       report.engine.shutdown_error = shutdownError.message;
       report.engine.exit = client.shutdownResult ?? client.exitResult;
     }
@@ -2152,6 +2391,7 @@ async function runInventory(options, runDirectory, report) {
 
 async function runRecover(options, runDirectory, report) {
   let enginePath = null;
+  let engineSha256 = null;
   let client = null;
   try {
     report.session_dir = options.sessionDir;
@@ -2187,9 +2427,29 @@ async function runRecover(options, runDirectory, report) {
       report.overall = 'FAIL';
       return;
     }
+    enginePath = findEngine(options.engine);
+    engineSha256 = sha256RegularFile(enginePath, '录音引擎');
+    const currentBinaryIdentity = {
+      acceptance_tool_sha256: ACCEPTANCE_TOOL_SHA256,
+      engine_sha256: engineSha256,
+    };
+    addCheck(
+      preflightChecks,
+      'phase1-binaries-match',
+      'phase-2 使用与 phase-1 完全相同的验收工具和录音引擎',
+      currentBinaryIdentity.acceptance_tool_sha256 ===
+        phase1.evidence?.binary_identity?.acceptance_tool_sha256 &&
+        currentBinaryIdentity.engine_sha256 === phase1.evidence?.binary_identity?.engine_sha256,
+      { phase1: phase1.evidence?.binary_identity, phase2: currentBinaryIdentity },
+    );
+    if (overallFromChecks(preflightChecks) !== 'PASS') {
+      report.checks = preflightChecks;
+      report.production_eligible = false;
+      report.overall = 'FAIL';
+      return;
+    }
     writeJsonDurable(path.join(runDirectory, 'acceptance-report.json'), report);
 
-    enginePath = findEngine(options.engine);
     client = new EngineClient(
       enginePath,
       runDirectory,
@@ -2197,7 +2457,7 @@ async function runRecover(options, runDirectory, report) {
       path.join(runDirectory, 'engine-stderr.log'),
     );
     const ready = await client.start();
-    report.engine = { path: enginePath, ready };
+    report.engine = { path: enginePath, binary_sha256: engineSha256, ready };
     report.recovery = {
       result: await client.request(
         'seal_interrupted_session',
@@ -2281,11 +2541,19 @@ async function runRecover(options, runDirectory, report) {
     report.overall = 'INCOMPLETE';
     try {
       if (!client) throw error;
-      report.engine = report.engine ?? { path: enginePath, ready: client.readyPayload };
+      report.engine = report.engine ?? {
+        path: enginePath,
+        binary_sha256: engineSha256,
+        ready: client.readyPayload,
+      };
       report.engine.exit = await client.shutdown();
     } catch (shutdownError) {
       if (client) {
-        report.engine = report.engine ?? { path: enginePath, ready: client.readyPayload };
+        report.engine = report.engine ?? {
+          path: enginePath,
+          binary_sha256: engineSha256,
+          ready: client.readyPayload,
+        };
         report.engine.shutdown_error = shutdownError.message;
         report.engine.exit = client.shutdownResult ?? client.exitResult;
       }
@@ -2297,6 +2565,7 @@ async function runRecover(options, runDirectory, report) {
 
 async function runCapture(options, runDirectory, report) {
   const enginePath = findEngine(options.engine);
+  const engineSha256 = sha256RegularFile(enginePath, '录音引擎');
   const client = new EngineClient(
     enginePath,
     runDirectory,
@@ -2311,7 +2580,7 @@ async function runCapture(options, runDirectory, report) {
       throw new Error(`power-cut --session-dir 必须是不存在的新目录: ${sessionDirectory}`);
     }
     const ready = await client.start();
-    report.engine = { path: enginePath, ready };
+    report.engine = { path: enginePath, binary_sha256: engineSha256, ready };
     const inventory = await client.request('list_devices', {}, 30_000);
     report.inventory = inventory;
     printDevices(inventory);
@@ -2356,7 +2625,7 @@ async function runCapture(options, runDirectory, report) {
       const phase1EvidencePath = path.join(runDirectory, 'power-cut-evidence.json');
       report.power_cut = {
         phase: 'recording-not-armed',
-        nonce: randomUUID(),
+        nonce: null,
         test_only: options.testOnlyPowerCut,
         production_eligible: !options.testOnlyPowerCut,
         required_duration_seconds: powerCutRequiredDurationSeconds(options),
@@ -2392,6 +2661,7 @@ async function runCapture(options, runDirectory, report) {
 
     const onPowerCutArm = options.mode === 'power-cut'
       ? async (row) => {
+          report.power_cut.nonce = randomUUID();
           const evidence = buildPowerCutEvidence(report, options, sessionDirectory, row);
           const sessionEvidencePath = path.join(sessionDirectory, POWER_CUT_SESSION_EVIDENCE);
           const phase1EvidencePath = path.join(runDirectory, 'power-cut-evidence.json');
@@ -2503,10 +2773,10 @@ async function runCapture(options, runDirectory, report) {
       sessionStarted = false;
     }
     try {
-      report.engine = report.engine ?? { path: enginePath, ready: client.readyPayload };
+      report.engine = report.engine ?? { path: enginePath, binary_sha256: engineSha256, ready: client.readyPayload };
       report.engine.exit = await client.shutdown();
     } catch (shutdownError) {
-      report.engine = report.engine ?? { path: enginePath, ready: client.readyPayload };
+      report.engine = report.engine ?? { path: enginePath, binary_sha256: engineSha256, ready: client.readyPayload };
       report.engine.shutdown_error = shutdownError.message;
       report.engine.exit = client.shutdownResult ?? client.exitResult;
     }
@@ -2555,7 +2825,15 @@ async function main() {
       release: os.release(),
       architecture: process.arch,
       hostname: os.hostname(),
-      boot: hostBootIdentity(),
+      // Test boot injection is deliberately unavailable to production recover.
+      // It is only reachable through the explicit test-only qualification class.
+      boot: hostBootIdentity(
+        process.env,
+        Date.now(),
+        os.uptime(),
+        os.hostname(),
+        options.testOnlyPowerCut,
+      ),
       node: process.version,
       electron: process.versions.electron ?? null,
       cpus: os.cpus().map((cpu) => cpu.model),
@@ -2612,12 +2890,16 @@ module.exports = {
   engineExitWasClean,
   evaluateSealedSession,
   faultMarkerPresent,
+  hostBootIdentity,
   inputSampleFormatBits,
   inspectSession,
   inspectWav,
   matchingConfigurations,
+  MAX_NORMAL_COMMIT_LAG_SECONDS,
+  MAX_POWER_CUT_TAIL_LOSS_SECONDS,
   overallFromChecks,
   parseArgs,
+  sha256RegularFile,
   summarizeProgress,
   timestampForPath,
   validateDiskFullTarget,

@@ -1,4 +1,7 @@
-use crate::durable_fs::{durable_replace, sync_directory, sync_parent_directory};
+use crate::durable_fs::{
+    durable_create_directory, durable_create_directory_all, durable_replace, sync_directory,
+    sync_parent_directory,
+};
 use crate::protocol::Emitter;
 use crate::segmented_wav::{PreparedWavExport, SegmentedWav};
 use crate::session_lock::SessionLock;
@@ -44,11 +47,36 @@ const SESSION_IDENTITY_MAX_BYTES: u64 = 1024 * 1024;
 const LIVE_PREVIEW_MAX_SECONDS: u64 = 10 * 60;
 const LEGACY_PREVIEW_MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
 const WRITER_QUEUE_AUDIO_BUDGET_SECONDS: u64 = 20;
+// Audio is written continuously, but forcing the OS/device cache to stable
+// storage on every callback is unnecessarily expensive on Windows. A normal
+// automatic checkpoint is taken every ten wall-clock seconds or ten seconds of
+// newly-written audio, whichever comes first. Together with the bounded writer
+// queue this keeps the accepted-but-not-checkpointed tail within 30 seconds.
+const WRITER_AUTOMATIC_CHECKPOINT_SECONDS: u64 = 10;
+// Disk-space queries are inexpensive and remain frequent. Keep them separate
+// from the audio checkpoint clock so a studio workflow with many short takes
+// cannot postpone the critical-reserve guard by checkpointing every sentence.
+const WRITER_STORAGE_CHECK_INTERVAL_SECONDS: u64 = 1;
+const WRITER_POWER_LOSS_TAIL_BUDGET_SECONDS: u64 = 30;
+const _: () = {
+    assert!(
+        WRITER_AUTOMATIC_CHECKPOINT_SECONDS + WRITER_QUEUE_AUDIO_BUDGET_SECONDS
+            <= WRITER_POWER_LOSS_TAIL_BUDGET_SECONDS
+    );
+    assert!(WRITER_POWER_LOSS_TAIL_BUDGET_SECONDS <= 30);
+    assert!(WRITER_STORAGE_CHECK_INTERVAL_SECONDS < WRITER_AUTOMATIC_CHECKPOINT_SECONDS);
+};
 const WRITER_QUEUE_CLOSED: u64 = 1 << 63;
 const WRITER_QUEUE_IN_FLIGHT_MASK: u64 = WRITER_QUEUE_CLOSED - 1;
 const WRITER_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(25);
 const WRITER_COMMIT_DEADLINE: Duration = Duration::from_secs(30);
 const CAPTURE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+// A healthy real-time input stream produces non-empty buffers far more often
+// than this, even with unusually large USB-interface buffers. Some Windows
+// drivers can nevertheless leave the stream/process alive after unplug or an
+// internal endpoint failure without invoking CPAL's error callback. Fail closed
+// before such a silent stall can be mistaken for valid room silence.
+const CAPTURE_CALLBACK_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 // Electron gives normal engine commands 20 seconds. Return control to the
 // protocol loop before that deadline so a slow preview worker can never block
 // a subsequent safe-stop request until the 90-second process kill budget.
@@ -326,6 +354,7 @@ struct SilenceMonitor {
     last_signal_sample: Arc<AtomicU64>,
     attempt_signal_start_sample: Arc<AtomicU64>,
     threshold_bits: Arc<AtomicU32>,
+    capture_heartbeat: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -337,6 +366,81 @@ struct WriterQueueBudget {
 
 struct WriterQueueLease<'a> {
     enqueue_state: &'a AtomicU64,
+}
+
+#[derive(Debug)]
+struct CaptureHeartbeatWatchdog {
+    was_armed: bool,
+    last_heartbeat: u64,
+    last_progress_at: Instant,
+    triggered: bool,
+}
+
+impl CaptureHeartbeatWatchdog {
+    fn new(now: Instant) -> Self {
+        Self {
+            was_armed: false,
+            last_heartbeat: 0,
+            last_progress_at: now,
+            triggered: false,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        now: Instant,
+        armed: bool,
+        heartbeat: u64,
+        already_faulted: bool,
+        timeout: Duration,
+    ) -> bool {
+        if !armed {
+            self.was_armed = false;
+            self.last_heartbeat = heartbeat;
+            self.last_progress_at = now;
+            return false;
+        }
+        if !self.was_armed {
+            self.was_armed = true;
+            self.last_heartbeat = heartbeat;
+            self.last_progress_at = now;
+            return false;
+        }
+        if heartbeat != self.last_heartbeat {
+            self.last_heartbeat = heartbeat;
+            self.last_progress_at = now;
+            return false;
+        }
+        if already_faulted || self.triggered || now.duration_since(self.last_progress_at) < timeout
+        {
+            return false;
+        }
+        self.triggered = true;
+        true
+    }
+}
+
+fn trip_stalled_capture(
+    session_dir: &Path,
+    reason: &str,
+    committed: &AtomicU64,
+    faulted: &AtomicBool,
+    queue: &WriterQueueBudget,
+    writer: &Sender<WriterMessage>,
+) -> bool {
+    faulted.store(true, Ordering::Release);
+    // Publish durable evidence before asking the writer to finalize. Even if
+    // the process is terminated in the narrow shutdown window, recovery and
+    // normal export remain fail-closed.
+    persist_audio_fault_marker(session_dir, reason, committed.load(Ordering::Acquire));
+    // Closing and draining the callback-entry gate before the fault sentinel
+    // keeps every buffer that entered before detection ahead of it in FIFO
+    // order. The production writer channel is unbounded, so capacity cannot
+    // discard this terminal control message.
+    queue.close_and_wait();
+    writer
+        .try_send(WriterMessage::FaultAndStop(reason.to_string()))
+        .is_ok()
 }
 
 impl Drop for WriterQueueLease<'_> {
@@ -624,7 +728,10 @@ pub struct RecordingSession {
     writer_queue: WriterQueueBudget,
     writer_join: Option<JoinHandle<()>>,
     telemetry_join: Option<JoinHandle<()>>,
+    capture_watchdog_join: Option<JoinHandle<()>>,
     telemetry_stop: Arc<AtomicBool>,
+    capture_watchdog_armed: Arc<AtomicBool>,
+    capture_heartbeat: Arc<AtomicU64>,
     captured: Arc<AtomicU64>,
     committed: Arc<AtomicU64>,
     overflow: Arc<AtomicU64>,
@@ -750,19 +857,17 @@ impl Engine {
         if let Some(parent) = session_dir.parent()
             && !parent.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(parent)?;
+            durable_create_directory_all(parent)?;
         }
-        std::fs::create_dir(&session_dir).with_context(|| {
+        durable_create_directory(&session_dir).with_context(|| {
             format!(
-                "create a new recording directory {}; the path must not already exist",
+                "durably create a new recording directory {}; the path must not already exist",
                 session_dir.display()
             )
         })?;
-        std::fs::create_dir_all(session_dir.join("audio"))?;
-        std::fs::create_dir_all(session_dir.join("metadata"))?;
-        std::fs::create_dir_all(session_dir.join("script"))?;
-        std::fs::create_dir_all(session_dir.join("preview"))?;
-        std::fs::create_dir_all(session_dir.join("export"))?;
+        for name in ["audio", "metadata", "script", "preview", "export"] {
+            durable_create_directory(&session_dir.join(name))?;
+        }
 
         let now = Utc::now().to_rfc3339();
         let snapshot = SessionSnapshot {
@@ -807,7 +912,7 @@ impl Engine {
                 })
                 .collect(),
         };
-        self.activate_session(session_dir, snapshot, false, "session_started", None)
+        self.activate_session(session_dir, snapshot, false, "session_started", None, None)
     }
 
     pub fn resume_session(&mut self, payload: ResumeSessionPayload) -> Result<Value> {
@@ -828,14 +933,17 @@ impl Engine {
                 bail!("录制任务包含无效的 {name} 目录");
             }
         }
-        ensure_no_audio_fault_marker(&session_dir, "继续录制")?;
         // No individual projection is authoritative enough to make the whole
         // recording undiscoverable. A power loss can leave the final snapshot,
         // its atomically-written temporary/previous generation, and the full
-        // journal projection at different generations. Select the newest valid
-        // candidate instead of requiring the final file to parse first.
-        let mut journal = read_journal(&session_dir)?;
-        let mut snapshot = load_recovery_snapshot(&session_dir, &mut journal)?;
+        // journal projection at different generations. Acquire the task lease
+        // before reading any of them: otherwise a second recorder can read an
+        // old projection, wait for the current owner to stop, then acquire the
+        // lease and overwrite newer sentence metadata with stale journal
+        // sequence numbers. Select the newest valid candidate only while this
+        // lease remains held through activation.
+        let (session_lock, journal, mut snapshot) =
+            load_locked_recovery_snapshot(&session_dir, "继续录制")?;
         if snapshot.status == "faulted" || snapshot.overflow_samples > 0 {
             bail!(
                 "该任务已记录音频采集故障或写盘溢出，为避免污染时间轴，不允许继续向原母轨追加；请先保全原始分段并进行质量检查。"
@@ -876,6 +984,7 @@ impl Engine {
             snapshot,
             true,
             "session_resumed",
+            Some(session_lock),
             Some(journal),
         )?;
         if let Some(object) = result.as_object_mut() {
@@ -890,13 +999,17 @@ impl Engine {
         mut snapshot: SessionSnapshot,
         append: bool,
         event_name: &str,
+        preacquired_session_lock: Option<SessionLock>,
         resume_journal: Option<JournalLog>,
     ) -> Result<Value> {
         let max_frames_per_segment = storage_layout_segment_frames(&snapshot)?;
         // Persist the resolved compatibility value on the next projection so
         // a pre-layout snapshot is upgraded without changing its boundaries.
         snapshot.segment_frames = Some(max_frames_per_segment);
-        let session_lock = SessionLock::acquire(&session_dir, &Utc::now().to_rfc3339())?;
+        let session_lock = match preacquired_session_lock {
+            Some(lock) => lock,
+            None => SessionLock::acquire(&session_dir, &Utc::now().to_rfc3339())?,
+        };
         if append {
             repair_journal_tail(
                 &session_dir,
@@ -1080,6 +1193,8 @@ impl Engine {
             Arc::new(AtomicU32::new(snapshot.silence_threshold_dbfs.to_bits()));
         let (waveform_tx, waveform_rx) = bounded::<Vec<[f32; 2]>>(128);
         let telemetry_stop = Arc::new(AtomicBool::new(false));
+        let capture_watchdog_armed = Arc::new(AtomicBool::new(false));
+        let capture_heartbeat = Arc::new(AtomicU64::new(0));
 
         let writer_captured = Arc::clone(&captured);
         let writer_committed = Arc::clone(&committed);
@@ -1129,7 +1244,10 @@ impl Engine {
             writer_queue,
             writer_join: Some(writer_join),
             telemetry_join: None,
+            capture_watchdog_join: None,
             telemetry_stop,
+            capture_watchdog_armed,
+            capture_heartbeat,
             captured,
             committed,
             overflow,
@@ -1194,6 +1312,7 @@ impl Engine {
                 last_signal_sample: Arc::clone(&last_signal_sample),
                 attempt_signal_start_sample: Arc::clone(&session.attempt_signal_start_sample),
                 threshold_bits: Arc::clone(&session.silence_threshold_bits),
+                capture_heartbeat: Arc::clone(&session.capture_heartbeat),
             },
         ) {
             Ok(stream) => stream,
@@ -1206,6 +1325,63 @@ impl Engine {
             }
         };
         session.stream = Some(stream);
+
+        // Keep the liveness gate independent from protocol telemetry. Stdout
+        // can back up if Electron's event loop is temporarily blocked; a
+        // production capture watchdog must still trip even when UI events
+        // cannot be delivered.
+        let watchdog_stop_thread = Arc::clone(&session.telemetry_stop);
+        let capture_watchdog_armed_thread = Arc::clone(&session.capture_watchdog_armed);
+        let capture_heartbeat_thread = Arc::clone(&session.capture_heartbeat);
+        let watchdog_faulted = Arc::clone(&session.faulted);
+        let watchdog_committed = Arc::clone(&session.committed);
+        let watchdog_session_dir = session.session_dir.clone();
+        let watchdog_writer = session.writer_tx.clone();
+        let watchdog_queue = session.writer_queue.clone();
+        let capture_watchdog_join = match thread::Builder::new()
+            .name("capture-watchdog".to_string())
+            .spawn(move || {
+                let mut watchdog = CaptureHeartbeatWatchdog::new(Instant::now());
+                while !watchdog_stop_thread.load(Ordering::Acquire) {
+                    let already_faulted = watchdog_faulted.load(Ordering::Acquire);
+                    if watchdog.observe(
+                        Instant::now(),
+                        capture_watchdog_armed_thread.load(Ordering::Acquire),
+                        capture_heartbeat_thread.load(Ordering::Acquire),
+                        already_faulted,
+                        CAPTURE_CALLBACK_STALL_TIMEOUT,
+                    ) {
+                        let reason = format!(
+                            "audio input callback produced no non-empty buffers for {} seconds; the driver may have stalled or disconnected without reporting an error",
+                            CAPTURE_CALLBACK_STALL_TIMEOUT.as_secs()
+                        );
+                        eprintln!("{reason}");
+                        if !trip_stalled_capture(
+                            &watchdog_session_dir,
+                            &reason,
+                            &watchdog_committed,
+                            &watchdog_faulted,
+                            &watchdog_queue,
+                            &watchdog_writer,
+                        ) {
+                            eprintln!("audio writer was unavailable after capture watchdog fault");
+                        }
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+            })
+        {
+            Ok(join) => join,
+            Err(error) => {
+                return Err(self.finish_activation_failure(
+                    session,
+                    "start_capture_watchdog",
+                    anyhow!(error).context("start capture heartbeat watchdog"),
+                ));
+            }
+        };
+        session.capture_watchdog_join = Some(capture_watchdog_join);
 
         let emitter = self.emitter.clone();
         let telemetry_stop_thread = Arc::clone(&session.telemetry_stop);
@@ -1330,6 +1506,12 @@ impl Engine {
         {
             return Err(self.finish_activation_failure(session, "play_input_stream", error));
         }
+        // Arm only after `play` succeeds. Initial metadata fsync happens before
+        // this point and may legitimately take longer than the stall timeout on
+        // a stressed disk; it must not be confused with a live driver stall.
+        session
+            .capture_watchdog_armed
+            .store(true, Ordering::Release);
         let result = json!({
             "snapshot": session.snapshot,
             "session_dir": session.session_dir,
@@ -2391,6 +2573,26 @@ fn validate_offline_session_tree(session_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Loads every mutable recovery projection while holding the same exclusive
+/// lease that will be transferred into the live recording session.
+///
+/// Acquiring the lease after reading the journal is unsafe even when the audio
+/// writer later verifies physical EOF: another recorder can commit newer item
+/// decisions, release its lease, and leave this process holding a stale but
+/// otherwise valid full snapshot. Persisting that stale projection twice would
+/// rotate away the newer `.prev` generation and permanently regress sentence
+/// timestamps while the master audio itself continues to grow.
+fn load_locked_recovery_snapshot(
+    session_dir: &Path,
+    operation: &str,
+) -> Result<(SessionLock, JournalLog, SessionSnapshot)> {
+    let session_lock = SessionLock::acquire(session_dir, &Utc::now().to_rfc3339())?;
+    ensure_no_audio_fault_marker(session_dir, operation)?;
+    let mut journal = read_journal(session_dir)?;
+    let snapshot = load_recovery_snapshot(session_dir, &mut journal)?;
+    Ok((session_lock, journal, snapshot))
+}
+
 fn validate_offline_seal_snapshot(snapshot: &SessionSnapshot) -> Result<()> {
     if snapshot.schema_version != 1 || snapshot.session_id.trim().is_empty() {
         bail!("录制任务快照版本或录制 ID 无效");
@@ -3287,6 +3489,10 @@ impl RecordingSession {
     ) -> ActivationCleanupReport {
         let deadline = Instant::now() + timeout;
         let mut warnings = Vec::<String>::new();
+        // A deliberate pause/drop is not a capture stall. Disarm before asking
+        // the backend to stop so the telemetry supervisor cannot race a normal
+        // safe-stop at the watchdog boundary.
+        self.capture_watchdog_armed.store(false, Ordering::Release);
         if let Some(stream) = self.stream.take() {
             if let Err(error) = stream.pause() {
                 warnings.push(format!("pause input stream while stopping: {error}"));
@@ -3309,6 +3515,27 @@ impl RecordingSession {
             Some(_) => {
                 warnings.push(
                     "telemetry thread is still stopping; its handle was retained".to_string(),
+                );
+                false
+            }
+        };
+        let capture_watchdog_joined = match self.capture_watchdog_join.as_ref() {
+            None => true,
+            Some(join) if wait_for_thread_until(join, deadline) => {
+                let join = self
+                    .capture_watchdog_join
+                    .take()
+                    .expect("finished capture watchdog handle disappeared");
+                if join.join().is_err() {
+                    warnings.push("capture watchdog thread panicked while stopping".to_string());
+                    self.faulted.store(true, Ordering::Release);
+                }
+                true
+            }
+            Some(_) => {
+                warnings.push(
+                    "capture watchdog thread is still stopping; its handle was retained"
+                        .to_string(),
                 );
                 false
             }
@@ -3369,7 +3596,8 @@ impl RecordingSession {
                 false
             }
         };
-        let capture_resources_joined = callback_gate_drained && telemetry_joined && writer_joined;
+        let capture_resources_joined =
+            callback_gate_drained && telemetry_joined && capture_watchdog_joined && writer_joined;
         self.capture_stopped = capture_resources_joined;
         // Reload only after a finished writer has been joined. The writer owns
         // this atomic and may advance it after the first Stop wait times out.
@@ -3907,7 +4135,18 @@ fn write_audio_samples(
     writer.write_samples(samples)
 }
 
-fn writer_storage_check_due(storage_directory: &Path, last_checkpoint: Instant) -> bool {
+fn automatic_writer_checkpoint_due(
+    elapsed: Duration,
+    frames_written: u64,
+    committed_frames: u64,
+    sample_rate: u32,
+) -> bool {
+    let frame_interval = u64::from(sample_rate) * WRITER_AUTOMATIC_CHECKPOINT_SECONDS;
+    elapsed >= Duration::from_secs(WRITER_AUTOMATIC_CHECKPOINT_SECONDS)
+        || frames_written.saturating_sub(committed_frames) >= frame_interval
+}
+
+fn writer_storage_check_due(storage_directory: &Path, elapsed: Duration) -> bool {
     #[cfg(not(test))]
     let _ = storage_directory;
     #[cfg(test)]
@@ -3919,7 +4158,7 @@ fn writer_storage_check_due(storage_directory: &Path, last_checkpoint: Instant) 
     {
         return true;
     }
-    last_checkpoint.elapsed() >= Duration::from_secs(1)
+    elapsed >= Duration::from_secs(WRITER_STORAGE_CHECK_INTERVAL_SECONDS)
 }
 
 fn check_writer_storage(
@@ -4048,6 +4287,7 @@ fn writer_loop(
         }
     };
     let mut last_checkpoint = Instant::now();
+    let mut last_storage_check = Instant::now();
     let mut consecutive_storage_check_failures = 0u8;
     let mut shutdown_after_drain = false;
     let mut pending_stop_reply = None::<Sender<Result<u64, String>>>;
@@ -4056,7 +4296,6 @@ fn writer_loop(
     while let Ok(message) = receiver.recv() {
         match message {
             WriterMessage::Samples(samples) => {
-                queue.release(samples.len() as u64);
                 if let Err(error) = write_audio_samples(&mut writer, storage_directory, &samples) {
                     let base_reason = format!("audio write failed: {error:#}");
                     eprintln!("{base_reason}");
@@ -4098,64 +4337,84 @@ fn writer_loop(
                     }
                     break;
                 }
+                // Keep the block charged to the bounded writer backlog until
+                // the complete write returns. This makes the 20-second queue
+                // budget include the in-progress write instead of allowing a
+                // second full queue to accumulate behind it.
+                queue.release(samples.len() as u64);
                 let _ = waveform.try_send(waveform_bins(&samples));
                 let mut fault_stop_reason = None::<String>;
                 if !shutdown_after_drain
-                    && writer_storage_check_due(storage_directory, last_checkpoint)
+                    && automatic_writer_checkpoint_due(
+                        last_checkpoint.elapsed(),
+                        writer.frames_written(),
+                        committed.load(Ordering::Acquire),
+                        sample_rate,
+                    )
                 {
                     match writer.checkpoint() {
                         Ok(frames) => {
                             committed.store(frames, Ordering::Release);
-                            match check_writer_storage(storage_directory, sample_rate, 1, bit_depth)
-                            {
-                                Ok(report) if report.status == StorageStatus::Critical => {
-                                    storage_check_requires_stop(
-                                        &mut consecutive_storage_check_failures,
-                                        true,
-                                    );
-                                    storage_status.store(2, Ordering::Release);
-                                    storage_safe_remaining_seconds
-                                        .store(report.safe_recording_seconds, Ordering::Release);
-                                    fault_stop_reason = Some(format!(
-                                        "recording stopped before exhausting disk space: {} bytes available",
-                                        report.available_bytes
-                                    ));
-                                }
-                                Ok(report) => {
-                                    storage_check_requires_stop(
-                                        &mut consecutive_storage_check_failures,
-                                        true,
-                                    );
-                                    storage_status.store(
-                                        if report.status == StorageStatus::Warning {
-                                            1
-                                        } else {
-                                            0
-                                        },
-                                        Ordering::Release,
-                                    );
-                                    storage_safe_remaining_seconds
-                                        .store(report.safe_recording_seconds, Ordering::Release);
-                                }
-                                Err(error) => {
-                                    eprintln!("disk space check failed: {error:#}");
-                                    if storage_check_requires_stop(
-                                        &mut consecutive_storage_check_failures,
-                                        false,
-                                    ) {
-                                        fault_stop_reason = Some(
-                                            "recording stopped after three consecutive disk space check failures"
-                                                .to_string(),
-                                        );
-                                    }
-                                }
-                            }
                         }
                         Err(error) => {
                             fault_stop_reason = Some(format!("audio checkpoint failed: {error:#}"));
                         }
                     }
                     last_checkpoint = Instant::now();
+                }
+                // Do not tie this inexpensive guard to `last_checkpoint`.
+                // Explicit checkpoints happen at sentence completion and
+                // preview time; resetting the storage clock there could starve
+                // disk protection indefinitely during a sequence of short
+                // takes.
+                if !shutdown_after_drain
+                    && fault_stop_reason.is_none()
+                    && writer_storage_check_due(storage_directory, last_storage_check.elapsed())
+                {
+                    match check_writer_storage(storage_directory, sample_rate, 1, bit_depth) {
+                        Ok(report) if report.status == StorageStatus::Critical => {
+                            storage_check_requires_stop(
+                                &mut consecutive_storage_check_failures,
+                                true,
+                            );
+                            storage_status.store(2, Ordering::Release);
+                            storage_safe_remaining_seconds
+                                .store(report.safe_recording_seconds, Ordering::Release);
+                            fault_stop_reason = Some(format!(
+                                "recording stopped before exhausting disk space: {} bytes available",
+                                report.available_bytes
+                            ));
+                        }
+                        Ok(report) => {
+                            storage_check_requires_stop(
+                                &mut consecutive_storage_check_failures,
+                                true,
+                            );
+                            storage_status.store(
+                                if report.status == StorageStatus::Warning {
+                                    1
+                                } else {
+                                    0
+                                },
+                                Ordering::Release,
+                            );
+                            storage_safe_remaining_seconds
+                                .store(report.safe_recording_seconds, Ordering::Release);
+                        }
+                        Err(error) => {
+                            eprintln!("disk space check failed: {error:#}");
+                            if storage_check_requires_stop(
+                                &mut consecutive_storage_check_failures,
+                                false,
+                            ) {
+                                fault_stop_reason = Some(
+                                    "recording stopped after three consecutive disk space check failures"
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
+                    last_storage_check = Instant::now();
                 }
                 if let Some(reason) = fault_stop_reason {
                     eprintln!("{reason}");
@@ -4177,7 +4436,10 @@ fn writer_loop(
             WriterMessage::Checkpoint(reply) => {
                 let result = writer.checkpoint().map_err(|error| format!("{error:#}"));
                 match &result {
-                    Ok(frames) => committed.store(*frames, Ordering::Release),
+                    Ok(frames) => {
+                        committed.store(*frames, Ordering::Release);
+                        last_checkpoint = Instant::now();
+                    }
                     Err(message) => {
                         eprintln!("audio checkpoint failed: {message}");
                         faulted.store(true, Ordering::Release);
@@ -4214,6 +4476,7 @@ fn writer_loop(
                             Ok(()) => match writer.checkpoint() {
                                 Ok(frames) => {
                                     committed.store(frames, Ordering::Release);
+                                    last_checkpoint = Instant::now();
                                     writer.prepare_export_range_after_checkpoint(
                                         path,
                                         &destination,
@@ -4733,6 +4996,10 @@ where
             if data.is_empty() {
                 return;
             }
+            // Count only buffers that carry timeline data. Repeated empty
+            // backend wakeups must not mask a driver that has stopped
+            // delivering audio packets.
+            saturating_atomic_add(&silence.capture_heartbeat, 1);
             // Register the callback before doing any conversion or metering.
             // A clean stop closes this gate and waits for every callback that
             // already entered it, so a callback descheduled during conversion
@@ -5165,6 +5432,16 @@ fn append_journal_event(
             line.insert(0, b'\n');
         }
     }
+    if checked_journal_append_len(original_len, line.len()).is_none() {
+        return Err(JournalAppendFailure {
+            operation: format!(
+                "journal append would exceed the recoverable {} byte limit (current={original_len}, append={})",
+                JOURNAL_MAX_BYTES,
+                line.len()
+            ),
+            rollback: None,
+        });
+    }
     let operation = (|| -> Result<()> {
         if matches!(
             fault,
@@ -5234,6 +5511,13 @@ fn append_journal_event(
         });
     }
     Ok(())
+}
+
+fn checked_journal_append_len(current_len: u64, append_len: usize) -> Option<u64> {
+    let append_len = u64::try_from(append_len).ok()?;
+    current_len
+        .checked_add(append_len)
+        .filter(|next_len| *next_len <= JOURNAL_MAX_BYTES)
 }
 
 fn snapshot_file_is_valid(path: &Path) -> bool {
@@ -5719,6 +6003,7 @@ mod tests {
             last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+            capture_heartbeat: Arc::new(AtomicU64::new(0)),
         };
         const BLOCKS: usize = 4;
         const FRAMES_PER_BLOCK: usize = 4;
@@ -5915,7 +6200,10 @@ mod tests {
             writer_queue: test_writer_queue(),
             writer_join: None,
             telemetry_join: None,
+            capture_watchdog_join: None,
             telemetry_stop: Arc::new(AtomicBool::new(false)),
+            capture_watchdog_armed: Arc::new(AtomicBool::new(false)),
+            capture_heartbeat: Arc::new(AtomicU64::new(0)),
             captured: Arc::new(AtomicU64::new(0)),
             committed: Arc::new(AtomicU64::new(0)),
             overflow: Arc::new(AtomicU64::new(0)),
@@ -5983,7 +6271,10 @@ mod tests {
             writer_queue: queue,
             writer_join: Some(writer_join),
             telemetry_join: None,
+            capture_watchdog_join: None,
             telemetry_stop: Arc::new(AtomicBool::new(false)),
+            capture_watchdog_armed: Arc::new(AtomicBool::new(false)),
+            capture_heartbeat: Arc::new(AtomicU64::new(0)),
             captured,
             committed,
             overflow,
@@ -6247,6 +6538,170 @@ mod tests {
     }
 
     #[test]
+    fn capture_heartbeat_watchdog_requires_an_armed_stall_and_resets_on_progress() {
+        let started = Instant::now();
+        let timeout = Duration::from_secs(5);
+        let mut watchdog = CaptureHeartbeatWatchdog::new(started);
+
+        // Slow activation metadata I/O happens while disarmed and must not be
+        // mistaken for a live capture stall.
+        assert!(!watchdog.observe(started + Duration::from_secs(30), false, 0, false, timeout,));
+        let armed_at = started + Duration::from_secs(31);
+        assert!(!watchdog.observe(armed_at, true, 0, false, timeout));
+        assert!(!watchdog.observe(
+            armed_at + timeout - Duration::from_nanos(1),
+            true,
+            0,
+            false,
+            timeout,
+        ));
+
+        // A non-empty callback heartbeat restarts the full deadline.
+        let progressed_at = armed_at + timeout - Duration::from_millis(1);
+        assert!(!watchdog.observe(progressed_at, true, 1, false, timeout));
+        assert!(!watchdog.observe(
+            progressed_at + timeout - Duration::from_nanos(1),
+            true,
+            1,
+            false,
+            timeout,
+        ));
+        assert!(watchdog.observe(progressed_at + timeout, true, 1, false, timeout,));
+        assert!(!watchdog.observe(
+            progressed_at + timeout + Duration::from_secs(1),
+            true,
+            1,
+            false,
+            timeout,
+        ));
+
+        // Safe-stop disarms before pausing the stream, including at the exact
+        // timeout boundary where a racing observer would otherwise trip.
+        let mut stopping_watchdog = CaptureHeartbeatWatchdog::new(started);
+        assert!(!stopping_watchdog.observe(started, true, 9, false, timeout));
+        assert!(!stopping_watchdog.observe(started + timeout, false, 9, false, timeout,));
+        assert!(!stopping_watchdog.observe(
+            started + timeout + Duration::from_secs(30),
+            false,
+            9,
+            false,
+            timeout,
+        ));
+    }
+
+    #[test]
+    fn capture_heartbeat_watchdog_does_not_duplicate_an_existing_capture_fault() {
+        let started = Instant::now();
+        let timeout = Duration::from_secs(5);
+        let mut watchdog = CaptureHeartbeatWatchdog::new(started);
+        assert!(!watchdog.observe(started, true, 7, false, timeout));
+        assert!(!watchdog.observe(started + timeout, true, 7, true, timeout));
+    }
+
+    #[test]
+    fn stalled_capture_fault_is_durable_drains_writer_and_closes_callback_gate() {
+        let root = test_root("capture-watchdog-fault");
+        let path = root.join("audio/master.wav");
+        let (writer_tx, writer_rx) = unbounded::<WriterMessage>();
+        let captured = Arc::new(AtomicU64::new(0));
+        let committed = Arc::new(AtomicU64::new(0));
+        let overflow = Arc::new(AtomicU64::new(0));
+        let faulted = Arc::new(AtomicBool::new(false));
+        let queue = test_writer_queue();
+        let (ready_tx, ready_rx) = bounded(1);
+        let (done_tx, done_rx) = bounded(1);
+        let writer_path = path.clone();
+        let writer_storage_dir = root.clone();
+        let writer_captured = Arc::clone(&captured);
+        let writer_committed = Arc::clone(&committed);
+        let writer_overflow = Arc::clone(&overflow);
+        let writer_faulted = Arc::clone(&faulted);
+        let writer_queue = queue.clone();
+        let writer_join = thread::spawn(move || {
+            writer_loop(
+                writer_rx,
+                &writer_path,
+                48_000,
+                24,
+                false,
+                MasterStorageKind::LegacySingleWav,
+                48_000 * STORAGE_LAYOUT_V1_DEFAULT_SEGMENT_SECONDS,
+                &writer_storage_dir,
+                writer_captured,
+                writer_committed,
+                writer_overflow,
+                writer_faulted,
+                Arc::new(AtomicU32::new(0)),
+                Arc::new(AtomicU64::new(u64::MAX)),
+                writer_queue,
+                disconnected_waveform_sender(),
+                ready_tx,
+            );
+            let _ = done_tx.send(());
+        });
+        assert_eq!(
+            ready_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap(),
+            0
+        );
+
+        let peak = AtomicU32::new(0f32.to_bits());
+        let rms = AtomicU32::new(0f32.to_bits());
+        let silence = SilenceMonitor {
+            silence_samples: Arc::new(AtomicU64::new(0)),
+            last_signal_sample: Arc::new(AtomicU64::new(0)),
+            attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
+            threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+            capture_heartbeat: Arc::new(AtomicU64::new(1)),
+        };
+        publish_block(
+            vec![0.25, -0.25, 0.5, -0.5],
+            &writer_tx,
+            &captured,
+            &overflow,
+            &faulted,
+            &peak,
+            &rms,
+            &queue,
+            &silence,
+        );
+        assert_eq!(captured.load(Ordering::Acquire), 4);
+
+        assert!(trip_stalled_capture(
+            &root,
+            "injected capture callback stall",
+            &committed,
+            &faulted,
+            &queue,
+            &writer_tx,
+        ));
+        done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        writer_join.join().unwrap();
+
+        // This is the same atomic telemetry publishes as `meter.faulted`.
+        assert!(faulted.load(Ordering::Acquire));
+        assert!(queue.enter().is_none());
+        assert_eq!(overflow.load(Ordering::Acquire), 0);
+        assert_eq!(committed.load(Ordering::Acquire), 4);
+        assert!(ensure_no_audio_fault_marker(&root, "生成常规交付").is_err());
+        let marker: Value =
+            serde_json::from_slice(&std::fs::read(root.join(AUDIO_FAULT_MARKER)).unwrap()).unwrap();
+        assert!(
+            marker["reason"]
+                .as_str()
+                .unwrap()
+                .contains("capture callback stall")
+        );
+        assert_eq!(marker["committed_frames"].as_u64(), Some(4));
+        let recovered = RecoverableWav::open_append(&path, 48_000, 1, 24).unwrap();
+        assert_eq!(recovered.frames_written(), 4);
+        drop(recovered);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn waveform_bins_preserve_minimum_and_maximum() {
         let samples = vec![-0.5, -0.03, 0.09, 0.5];
         let bins = waveform_bins(&samples);
@@ -6278,12 +6733,100 @@ mod tests {
     }
 
     #[test]
+    fn automatic_checkpoint_is_ten_seconds_and_tail_budget_is_at_most_thirty() {
+        let sample_rate = 48_000;
+        let nine_seconds = u64::from(sample_rate) * 9;
+        let ten_seconds = u64::from(sample_rate) * WRITER_AUTOMATIC_CHECKPOINT_SECONDS;
+
+        assert!(!automatic_writer_checkpoint_due(
+            Duration::from_secs(9),
+            nine_seconds,
+            0,
+            sample_rate,
+        ));
+        assert!(automatic_writer_checkpoint_due(
+            Duration::from_secs(WRITER_AUTOMATIC_CHECKPOINT_SECONDS),
+            nine_seconds,
+            0,
+            sample_rate,
+        ));
+        assert!(automatic_writer_checkpoint_due(
+            Duration::ZERO,
+            ten_seconds,
+            0,
+            sample_rate,
+        ));
+        assert_eq!(
+            WRITER_AUTOMATIC_CHECKPOINT_SECONDS + WRITER_QUEUE_AUDIO_BUDGET_SECONDS,
+            WRITER_POWER_LOSS_TAIL_BUDGET_SECONDS
+        );
+    }
+
+    #[test]
+    fn explicit_checkpoint_clock_cannot_starve_the_storage_guard() {
+        let sample_rate = 48_000;
+        let fully_committed = u64::from(sample_rate) * 5;
+
+        // Model a sentence-completion checkpoint that just reset the expensive
+        // audio-sync clock. The independent disk clock is still due and must
+        // remain able to trip the critical-reserve guard.
+        assert!(!automatic_writer_checkpoint_due(
+            Duration::ZERO,
+            fully_committed,
+            fully_committed,
+            sample_rate,
+        ));
+        assert!(writer_storage_check_due(
+            Path::new("storage-clock-independent-of-checkpoint"),
+            Duration::from_secs(WRITER_STORAGE_CHECK_INTERVAL_SECONDS),
+        ));
+    }
+
+    #[test]
     fn storage_critical_drains_every_preaccepted_sample_and_marks_the_session() {
         assert_storage_fault_drains_backlog(
             "storage-critical-drain",
             vec![WriterStorageCheckOverride::Critical],
             "before exhausting disk space",
         );
+    }
+
+    #[test]
+    fn resume_recovery_acquires_the_session_lock_before_reading_any_projection() {
+        let root = test_root("resume-lock-before-projection");
+        let mut snapshot = test_snapshot();
+        snapshot.journal_seq = 7;
+        write_snapshot_file(&root.join("metadata/items.snapshot.json"), &snapshot);
+        write_journal(&root, &[sequenced_event("attempt_accepted", &snapshot)]);
+
+        let owner = SessionLock::acquire(&root, "2026-08-11T00:00:00Z").unwrap();
+        let journal_path = root.join("metadata/events.jsonl");
+        std::fs::remove_file(&journal_path).unwrap();
+        std::fs::create_dir(&journal_path).unwrap();
+
+        // The competing recovery must fail on the lease without inspecting the
+        // deliberately invalid journal. Reading first would return an event-log
+        // error and retain a stale snapshot that could become writable after the
+        // current owner releases its lock.
+        let error = load_locked_recovery_snapshot(&root, "继续录制")
+            .err()
+            .expect("a competing recovery must not read mutable metadata");
+        assert!(
+            format!("{error:#}").contains("already open in another recorder process"),
+            "unexpected pre-lock recovery error: {error:#}"
+        );
+
+        drop(owner);
+        std::fs::remove_dir(&journal_path).unwrap();
+        write_journal(&root, &[sequenced_event("attempt_accepted", &snapshot)]);
+        let (recovery_lock, journal, recovered) =
+            load_locked_recovery_snapshot(&root, "继续录制").unwrap();
+        assert_eq!(recovered.journal_seq, 7);
+        assert_eq!(journal.entries.len(), 1);
+        assert!(SessionLock::acquire(&root, "2026-08-11T00:00:01Z").is_err());
+        drop(recovery_lock);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -6370,11 +6913,21 @@ mod tests {
         ));
         assert!(!marker.exists());
         assert_eq!(std::fs::read(&temporary).unwrap(), temporary_before);
-        let marker_files = std::fs::read_dir(root.join("metadata"))
+        let mut marker_files = std::fs::read_dir(root.join("metadata"))
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
-        assert_eq!(marker_files, vec![OsString::from("audio-fault.tmp")]);
+        marker_files.sort();
+        assert_eq!(
+            marker_files,
+            vec![
+                OsString::from("audio-fault.tmp"),
+                // Resume now acquires the task lease before consulting the
+                // marker. The persistent owner diagnostic is expected; no
+                // unrecognized fault-marker temporary may be allocated.
+                OsString::from("session.lock"),
+            ]
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -6441,6 +6994,87 @@ mod tests {
         writer_tx.send(WriterMessage::Stop(stop_tx)).unwrap();
         assert_eq!(stop_rx.recv().unwrap().unwrap(), 4);
         join.join().unwrap();
+        assert!(!faulted.load(Ordering::Acquire));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn automatic_checkpoint_commits_ten_seconds_and_stop_commits_the_tail() {
+        let root = test_root("automatic-checkpoint-cadence");
+        let path = root.join("audio/master.wav");
+        let sample_rate = 10;
+        let (writer_tx, writer_rx) = unbounded::<WriterMessage>();
+        let committed = Arc::new(AtomicU64::new(0));
+        let committed_thread = Arc::clone(&committed);
+        let faulted = Arc::new(AtomicBool::new(false));
+        let faulted_thread = Arc::clone(&faulted);
+        let queue = WriterQueueBudget {
+            queued_frames: Arc::new(AtomicU64::new(0)),
+            enqueue_state: Arc::new(AtomicU64::new(0)),
+            max_frames: sample_rate * WRITER_QUEUE_AUDIO_BUDGET_SECONDS,
+        };
+        let writer_queue = queue.clone();
+        let (ready_tx, ready_rx) = bounded(1);
+        let (waveform_tx, waveform_rx) = bounded(3);
+        let writer_path = path.clone();
+        let writer_storage_dir = root.clone();
+        let join = thread::spawn(move || {
+            writer_loop(
+                writer_rx,
+                &writer_path,
+                u32::try_from(sample_rate).unwrap(),
+                16,
+                false,
+                MasterStorageKind::LegacySingleWav,
+                sample_rate * STORAGE_LAYOUT_V1_DEFAULT_SEGMENT_SECONDS,
+                &writer_storage_dir,
+                Arc::new(AtomicU64::new(0)),
+                committed_thread,
+                Arc::new(AtomicU64::new(0)),
+                faulted_thread,
+                Arc::new(AtomicU32::new(0)),
+                Arc::new(AtomicU64::new(u64::MAX)),
+                writer_queue,
+                waveform_tx,
+                ready_tx,
+            )
+        });
+        assert_eq!(ready_rx.recv().unwrap().unwrap(), 0);
+
+        assert!(queue.reserve(99));
+        writer_tx
+            .send(WriterMessage::Samples(vec![0.1; 99]))
+            .unwrap();
+        waveform_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(committed.load(Ordering::Acquire), 0);
+
+        assert!(queue.reserve(1));
+        writer_tx.send(WriterMessage::Samples(vec![0.1])).unwrap();
+        waveform_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while committed.load(Ordering::Acquire) != 100 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(committed.load(Ordering::Acquire), 100);
+
+        assert!(queue.reserve(7));
+        writer_tx
+            .send(WriterMessage::Samples(vec![0.1; 7]))
+            .unwrap();
+        waveform_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(committed.load(Ordering::Acquire), 100);
+
+        let (stop_tx, stop_rx) = bounded(1);
+        writer_tx.send(WriterMessage::Stop(stop_tx)).unwrap();
+        assert_eq!(
+            stop_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap(),
+            107
+        );
+        join.join().unwrap();
+        assert_eq!(committed.load(Ordering::Acquire), 107);
         assert!(!faulted.load(Ordering::Acquire));
         let _ = std::fs::remove_dir_all(root);
     }
@@ -6619,6 +7253,7 @@ mod tests {
             last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+            capture_heartbeat: Arc::new(AtomicU64::new(0)),
         };
         let (write_entered_tx, write_entered_rx) = bounded(1);
         let (release_write_tx, release_write_rx) = bounded(1);
@@ -6902,6 +7537,7 @@ mod tests {
             last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+            capture_heartbeat: Arc::new(AtomicU64::new(0)),
         };
         const BLOCK_FRAMES: usize = 480;
         const BLOCK_COUNT: usize = 600;
@@ -6976,6 +7612,7 @@ mod tests {
             last_signal_sample: Arc::new(AtomicU64::new(11)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(7)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+            capture_heartbeat: Arc::new(AtomicU64::new(0)),
         };
 
         publish_block(
@@ -7054,6 +7691,7 @@ mod tests {
             last_signal_sample: Arc::new(AtomicU64::new(80)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(70)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+            capture_heartbeat: Arc::new(AtomicU64::new(0)),
         };
 
         publish_block(
@@ -7101,6 +7739,7 @@ mod tests {
             last_signal_sample: Arc::new(AtomicU64::new(80)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(70)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+            capture_heartbeat: Arc::new(AtomicU64::new(0)),
         };
         publish_block(
             vec![0.1, 0.2, 0.3],
@@ -7159,6 +7798,7 @@ mod tests {
             last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+            capture_heartbeat: Arc::new(AtomicU64::new(0)),
         };
         const BLOCK_FRAMES: usize = 4_800;
         let block_count = usize::try_from(queue.max_frames).unwrap() / BLOCK_FRAMES;
@@ -7222,7 +7862,10 @@ mod tests {
             writer_queue: queue.clone(),
             writer_join: Some(writer_join),
             telemetry_join: None,
+            capture_watchdog_join: None,
             telemetry_stop: Arc::new(AtomicBool::new(false)),
+            capture_watchdog_armed: Arc::new(AtomicBool::new(false)),
+            capture_heartbeat: Arc::new(AtomicU64::new(0)),
             captured,
             committed,
             overflow,
@@ -7304,7 +7947,10 @@ mod tests {
             writer_queue: test_writer_queue(),
             writer_join: Some(writer_join),
             telemetry_join: None,
+            capture_watchdog_join: None,
             telemetry_stop: Arc::new(AtomicBool::new(false)),
+            capture_watchdog_armed: Arc::new(AtomicBool::new(false)),
+            capture_heartbeat: Arc::new(AtomicU64::new(0)),
             captured,
             committed,
             overflow,
@@ -7843,6 +8489,41 @@ mod tests {
     }
 
     #[test]
+    fn journal_append_size_guard_matches_the_recovery_limit() {
+        assert_eq!(
+            checked_journal_append_len(JOURNAL_MAX_BYTES - 1, 1),
+            Some(JOURNAL_MAX_BYTES)
+        );
+        assert_eq!(checked_journal_append_len(JOURNAL_MAX_BYTES, 1), None);
+        assert_eq!(checked_journal_append_len(u64::MAX, 1), None);
+    }
+
+    #[test]
+    fn journal_append_refuses_to_cross_the_recovery_size_limit() {
+        let root = test_root("journal-size-limit");
+        let path = root.join("metadata/events.jsonl");
+        let events = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        events.set_len(JOURNAL_MAX_BYTES).unwrap();
+        drop(events);
+
+        let failure = append_journal_event(
+            &path,
+            &sequenced_event("session_started", &test_snapshot()),
+            JournalAppendFault::None,
+        )
+        .unwrap_err();
+
+        assert!(failure.operation.contains("would exceed"), "{failure:#}");
+        assert!(failure.rollback.is_none());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), JOURNAL_MAX_BYTES);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn journal_append_separates_a_valid_final_line_without_newline() {
         let root = test_root("journal-valid-tail-without-newline");
         let mut first = test_snapshot();
@@ -8262,7 +8943,10 @@ mod tests {
             writer_queue: test_writer_queue(),
             writer_join: Some(writer_join),
             telemetry_join: Some(telemetry_join),
+            capture_watchdog_join: None,
             telemetry_stop,
+            capture_watchdog_armed: Arc::new(AtomicBool::new(false)),
+            capture_heartbeat: Arc::new(AtomicU64::new(0)),
             captured,
             committed,
             overflow,

@@ -625,6 +625,7 @@ fn run_input(
     // pointer. Keep one aligned scratch allocation for those packets and reuse
     // it for the lifetime of the input thread.
     let mut silent_buffer = Vec::<u64>::new();
+    let mut first_packet_seen = false;
     loop {
         match process_commands_and_await_signal(&mut run_ctxt, error_callback) {
             ControlFlow::Break(()) => break,
@@ -641,6 +642,7 @@ fn run_input(
             data_callback,
             error_callback,
             &mut silent_buffer,
+            &mut first_packet_seen,
         ) {
             emit_error(error_callback, err);
             break;
@@ -762,6 +764,7 @@ fn process_input(
     data_callback: &mut dyn FnMut(&Data, &InputCallbackInfo),
     error_callback: &ErrorCallbackArc,
     silent_buffer: &mut Vec<u64>,
+    first_packet_seen: &mut bool,
 ) -> Result<(), Error> {
     unsafe {
         // Get the available data in the shared buffer.
@@ -791,13 +794,12 @@ fn process_input(
             }
 
             let flags = flags.assume_init();
-            // The discontinuity flag is undefined on the first GetBuffer after
-            // Start, where device_position is still zero. From the second
-            // packet onward, surface every capture glitch to the application so
-            // it can fail closed instead of silently compressing the timeline.
-            if device_position != 0
-                && flags & Audio::AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0
-            {
+            // Windows documents the discontinuity flag as unreliable on the
+            // first capture packet. Track the actual first successful GetBuffer
+            // instead of guessing from device_position: an endpoint clock can
+            // already be non-zero on startup and can later reset to zero after
+            // a real glitch.
+            if capture_packet_has_reportable_discontinuity(first_packet_seen, flags) {
                 let _ = try_emit_error(error_callback, ErrorKind::Xrun.into());
             }
 
@@ -836,6 +838,12 @@ fn process_input(
                 .context("Failed to release capture buffer")?;
         }
     }
+}
+
+fn capture_packet_has_reportable_discontinuity(first_packet_seen: &mut bool, flags: u32) -> bool {
+    let is_first_packet = !*first_packet_seen;
+    *first_packet_seen = true;
+    !is_first_packet && flags & Audio::AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32 != 0
 }
 
 // The loop for writing output data.
@@ -967,5 +975,25 @@ mod tests {
         );
         let data = unsafe { Data::from_parts(pointer, 3, SampleFormat::F64) };
         assert_eq!(data.as_slice::<f64>().unwrap(), &[0.0; 3]);
+    }
+
+    #[test]
+    fn capture_discontinuity_ignores_only_the_actual_first_packet() {
+        let discontinuity = Audio::AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32;
+        let mut first_packet_seen = false;
+
+        assert!(!capture_packet_has_reportable_discontinuity(
+            &mut first_packet_seen,
+            discontinuity,
+        ));
+        assert!(first_packet_seen);
+        assert!(!capture_packet_has_reportable_discontinuity(
+            &mut first_packet_seen,
+            0,
+        ));
+        assert!(capture_packet_has_reportable_discontinuity(
+            &mut first_packet_seen,
+            discontinuity,
+        ));
     }
 }
