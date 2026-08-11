@@ -997,10 +997,18 @@ mod tests {
             let slice = root.join("slice.wav");
             assert_eq!(writer.export_whole(&whole).unwrap(), 8);
             assert_eq!(writer.export_range(&slice, 2, 7).unwrap(), 5);
-            let stitched = writer
+            let segment_paths = writer
                 .segments()
+                .into_iter()
+                .map(|segment| segment.path)
+                .collect::<Vec<_>>();
+            // RecoverableWav deliberately locks the active segment. A second
+            // read handle is rejected on Windows, so release the recorder
+            // handle before independently verifying the physical files.
+            drop(writer);
+            let stitched = segment_paths
                 .iter()
-                .flat_map(|segment| audio_bytes(&segment.path, bit_depth))
+                .flat_map(|path| audio_bytes(path, bit_depth))
                 .collect::<Vec<_>>();
             assert_eq!(audio_bytes(&whole, bit_depth), stitched);
             let frame_bytes = usize::from(bit_depth / 8);
@@ -1008,7 +1016,6 @@ mod tests {
                 audio_bytes(&slice, bit_depth),
                 stitched[2 * frame_bytes..7 * frame_bytes]
             );
-            drop(writer);
             let _ = std::fs::remove_dir_all(root);
         }
     }

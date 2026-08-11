@@ -4008,12 +4008,38 @@ fn append_journal_event(
         Ok(())
     })();
     if let Err(error) = operation {
+        // On Windows an append-only handle is opened with FILE_APPEND_DATA,
+        // which deliberately does not grant the FILE_WRITE_DATA permission
+        // required by SetEndOfFile. Close that handle before reopening the
+        // journal with ordinary write access for the rollback. Keeping the
+        // append handle alive here makes File::set_len fail with ERROR_ACCESS_DENIED
+        // even though the process itself owns the journal.
+        drop(events);
         let rollback = if fault == JournalAppendFault::DuringWriteAndRollback {
             Err(anyhow!("injected journal rollback failure"))
         } else {
             (|| -> Result<()> {
-                events.set_len(original_len)?;
-                events.sync_all()?;
+                let metadata = std::fs::symlink_metadata(path).with_context(|| {
+                    format!("inspect journal before rollback {}", path.display())
+                })?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    bail!("journal path {} is not a regular file", path.display());
+                }
+                if metadata.len() < original_len {
+                    bail!(
+                        "journal {} shrank from {} to {} bytes before rollback",
+                        path.display(),
+                        original_len,
+                        metadata.len()
+                    );
+                }
+                let rollback_events = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .with_context(|| format!("reopen journal for rollback {}", path.display()))?;
+                rollback_events.set_len(original_len)?;
+                rollback_events.sync_all()?;
                 Ok(())
             })()
         };
@@ -4049,6 +4075,9 @@ fn atomic_snapshot_json(path: &Path, value: &SessionSnapshot) -> Result<()> {
     file.write_all(b"\n")?;
     file.flush()?;
     file.sync_all()?;
+    // File destructors run at the end of the scope, not necessarily after the
+    // last use. MoveFileExW rejects an open source handle on Windows.
+    drop(file);
 
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
@@ -4078,6 +4107,7 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     file.write_all(b"\n")?;
     file.flush()?;
     file.sync_all()?;
+    drop(file);
     durable_replace(&temporary, path)?;
     Ok(())
 }
@@ -4089,6 +4119,7 @@ fn atomic_json_line(path: &Path, value: &impl Serialize) -> Result<()> {
     file.write_all(b"\n")?;
     file.flush()?;
     file.sync_all()?;
+    drop(file);
     durable_replace(&temporary, path)?;
     Ok(())
 }
@@ -5550,6 +5581,27 @@ mod tests {
             serde_json::from_slice(&std::fs::read(path.with_extension("prev")).unwrap()).unwrap();
         assert_eq!(final_snapshot.journal_seq, 2);
         assert_eq!(previous_snapshot.journal_seq, 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn atomic_json_publishers_close_temporary_handles_before_replacement() {
+        let root = test_root("atomic-json-handle-lifetime");
+        let json_path = root.join("metadata/value.json");
+        let line_path = root.join("metadata/events.jsonl");
+
+        atomic_json(&json_path, &json!({ "generation": 1 })).unwrap();
+        atomic_json(&json_path, &json!({ "generation": 2 })).unwrap();
+        let value: Value = serde_json::from_slice(&std::fs::read(&json_path).unwrap()).unwrap();
+        assert_eq!(value["generation"], 2);
+        assert!(!json_path.with_extension("tmp").exists());
+
+        atomic_json_line(&line_path, &json!({ "generation": 1 })).unwrap();
+        atomic_json_line(&line_path, &json!({ "generation": 2 })).unwrap();
+        let value: Value = serde_json::from_slice(&std::fs::read(&line_path).unwrap()).unwrap();
+        assert_eq!(value["generation"], 2);
+        assert!(!line_path.with_extension("compact.tmp").exists());
+
         let _ = std::fs::remove_dir_all(root);
     }
 

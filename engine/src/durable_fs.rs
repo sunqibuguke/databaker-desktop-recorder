@@ -156,6 +156,9 @@ mod tests {
         let mut file = File::create(&source).unwrap();
         file.write_all(b"first").unwrap();
         file.sync_all().unwrap();
+        // Windows does not permit MoveFileExW to move a file while this
+        // process still owns an open handle to it.
+        drop(file);
         durable_rename(&source, &destination).unwrap();
         assert_eq!(std::fs::read(&destination).unwrap(), b"first");
         assert!(!source.exists());
@@ -163,6 +166,7 @@ mod tests {
         let mut file = File::create(&source).unwrap();
         file.write_all(b"second").unwrap();
         file.sync_all().unwrap();
+        drop(file);
         durable_replace(&source, &destination).unwrap();
         assert_eq!(std::fs::read(&destination).unwrap(), b"second");
         assert!(!source.exists());
