@@ -9,6 +9,7 @@ async function main() {
   const {
     areAllItemsHandled,
     captureExitAction,
+    captureExitDialog,
     executeSafePause,
     findNextActionableItemIndex,
     idlePrimaryAction,
@@ -120,8 +121,25 @@ async function main() {
   assert.equal(captureExitAction(threeComplete, false), 'complete');
   assert.equal(captureExitAction([item('accepted'), item('pending')], false), 'pause');
   assert.equal(captureExitAction(threeComplete, true), 'fault');
+  assert.equal(
+    captureExitDialog(true, false, 'complete'),
+    'pause',
+    'a live retake in an otherwise complete task must remain safely pausable',
+  );
+  assert.equal(captureExitDialog(false, false, 'complete'), 'finish');
+  assert.equal(captureExitDialog(true, true, 'fault'), 'finish');
   assert.equal(areAllItemsHandled(threeComplete), true, 'three handled rows must enter the terminal state');
   assert.equal(idlePrimaryAction(threeComplete, 2), 'finish', 'the last handled row must offer finish, not another take');
+  assert.equal(
+    idlePrimaryAction(threeComplete, -1),
+    'finish',
+    'a completed task may clear the row selection without losing its finish action',
+  );
+  assert.equal(
+    workflowShortcutAction('Space', ' ', idlePrimaryAction(threeComplete, -1), false),
+    'finish',
+    'Space must still finish after the terminal row selection is cleared',
+  );
   assert.equal(
     workflowShortcutAction('Space', ' ', idlePrimaryAction(threeComplete, 2), true),
     'finish',

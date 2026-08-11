@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import {
   advanceWaveformPlayhead,
   reconcileWaveformBatch,
+  reconcileWaveformTimelineSample,
   WAVEFORM_BIN_SAMPLES,
   waveformSampleHorizontalPosition,
   waveformWindowBinCount,
@@ -11,6 +12,7 @@ export type WaveformBin = [minimum: number, maximum: number];
 
 type Props = {
   bins: WaveformBin[];
+  capturedSamples: number;
   waveformEndSample?: number;
   recording: boolean;
   sampleRate: number;
@@ -61,10 +63,11 @@ function createProgram(gl: WebGLRenderingContext | WebGL2RenderingContext) {
   return program;
 }
 
-export function WebGLWaveform({ bins, waveformEndSample, recording, sampleRate }: Props) {
+export function WebGLWaveform({ bins, capturedSamples, waveformEndSample, recording, sampleRate }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const historyRef = useRef<WaveformBin[]>([]);
-  const latestEndSampleRef = useRef<number | null>(null);
+  const latestWaveformEndSampleRef = useRef<number | null>(null);
+  const latestTimelineSampleRef = useRef<number | null>(null);
   const historyEndSampleRef = useRef<number | null>(null);
   const playheadSampleRef = useRef<number | null>(null);
   const recordingRef = useRef(recording);
@@ -72,21 +75,34 @@ export function WebGLWaveform({ bins, waveformEndSample, recording, sampleRate }
   const [available, setAvailable] = useState(true);
 
   useEffect(() => {
+    const timelineSample = reconcileWaveformTimelineSample(
+      capturedSamples,
+      waveformEndSample,
+      latestTimelineSampleRef.current,
+    );
+    latestTimelineSampleRef.current = timelineSample;
+    playheadSampleRef.current = playheadSampleRef.current === null
+      ? timelineSample
+      : advanceWaveformPlayhead(
+        playheadSampleRef.current,
+        timelineSample,
+        0,
+        sampleRateRef.current,
+      );
+
     if (!bins.length) return;
     const reconciled = reconcileWaveformBatch(
       bins,
       waveformEndSample,
-      latestEndSampleRef.current,
+      latestWaveformEndSampleRef.current,
     );
     if (!reconciled.bins.length) return;
     if (reconciled.reset) {
       historyRef.current.length = 0;
     }
-    latestEndSampleRef.current = reconciled.endSample;
+    latestWaveformEndSampleRef.current = reconciled.endSample;
     historyEndSampleRef.current = reconciled.endSample;
-    playheadSampleRef.current = reconciled.reset
-      ? reconciled.endSample
-      : Math.max(playheadSampleRef.current ?? reconciled.endSample, reconciled.endSample);
+    if (reconciled.reset) playheadSampleRef.current = timelineSample;
 
     // Preview packets are already live capture data. Put them on screen as
     // soon as they cross IPC; replaying them through another real-time queue
@@ -96,7 +112,7 @@ export function WebGLWaveform({ bins, waveformEndSample, recording, sampleRate }
     if (historyRef.current.length > maximumBins) {
       historyRef.current.splice(0, historyRef.current.length - maximumBins);
     }
-  }, [bins, waveformEndSample]);
+  }, [bins, capturedSamples, waveformEndSample]);
 
   useEffect(() => {
     recordingRef.current = recording;
@@ -105,7 +121,8 @@ export function WebGLWaveform({ bins, waveformEndSample, recording, sampleRate }
   useEffect(() => {
     if (sampleRateRef.current !== sampleRate) {
       historyRef.current.length = 0;
-      latestEndSampleRef.current = null;
+      latestWaveformEndSampleRef.current = null;
+      latestTimelineSampleRef.current = null;
       historyEndSampleRef.current = null;
       playheadSampleRef.current = null;
     }
@@ -213,11 +230,11 @@ export function WebGLWaveform({ bins, waveformEndSample, recording, sampleRate }
     const render = (now: number) => {
       const elapsed = Math.max(0, now - lastFrameAt);
       lastFrameAt = now;
-      const latestEndSample = latestEndSampleRef.current;
-      if (latestEndSample !== null) {
+      const latestTimelineSample = latestTimelineSampleRef.current;
+      if (latestTimelineSample !== null) {
         playheadSampleRef.current = advanceWaveformPlayhead(
-          playheadSampleRef.current ?? latestEndSample,
-          latestEndSample,
+          playheadSampleRef.current ?? latestTimelineSample,
+          latestTimelineSample,
           elapsed,
           sampleRateRef.current,
         );

@@ -6,6 +6,7 @@ type PersistedNoiseCheck = { passed: boolean } | null | undefined;
 export type IdlePrimaryAction = 'finish' | 'accept' | 'start' | 'retake-only' | 'none';
 export type WorkflowShortcutAction = 'finish' | 'accept' | 'start' | 'retake' | 'none';
 export type CaptureExitAction = 'pause' | 'complete' | 'fault';
+export type CaptureExitDialog = 'pause' | 'finish';
 export type SessionNoiseGate = 'pending' | 'checking' | 'failed' | 'ready';
 export type SessionNoiseCheckOperation = Readonly<{
   activation: number;
@@ -38,6 +39,18 @@ export function captureExitAction(
   return areAllItemsHandled(items) ? 'complete' : 'pause';
 }
 
+export function captureExitDialog(
+  isRecording: boolean,
+  hasCaptureFault: boolean,
+  action: CaptureExitAction,
+): CaptureExitDialog {
+  if (hasCaptureFault || action === 'fault') return 'finish';
+  // A retake can be active while every item is still marked handled. It must
+  // close through the safe-pause flow instead of presenting a terminal finish
+  // dialog that cannot close the live sentence.
+  return isRecording || action === 'pause' ? 'pause' : 'finish';
+}
+
 export function findNextActionableItemIndex(
   items: readonly WorkflowItem[],
   currentIndex: number,
@@ -58,10 +71,10 @@ export function idlePrimaryAction(
   items: readonly WorkflowItem[],
   currentIndex: number,
 ): IdlePrimaryAction {
+  if (areAllItemsHandled(items)) return 'finish';
   const currentItem = items[currentIndex];
   if (!currentItem) return 'none';
   if (currentItem.status === 'review') return 'accept';
-  if (areAllItemsHandled(items)) return 'finish';
   if (currentItem.status === 'pending') return 'start';
   return 'retake-only';
 }

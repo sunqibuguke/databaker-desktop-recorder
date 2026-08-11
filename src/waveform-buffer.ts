@@ -4,10 +4,10 @@ export const WAVEFORM_WINDOW_SECONDS = 12;
 // right border. This small future gutter makes a new consonant visible on the
 // first packet rather than only after it has travelled into the viewport.
 export const WAVEFORM_LIVE_EDGE_GUTTER_SECONDS = 0.5;
-// Rust normally publishes a preview packet every 80 ms. The renderer may move
-// the time cursor a little beyond the newest packet so motion remains smooth
-// between packets, but it must stop extrapolating if telemetry stalls.
-export const WAVEFORM_MAX_EXTRAPOLATION_MS = 200;
+// Rust normally publishes a preview packet every 80 ms. Interpolate only up to
+// the authoritative capture cursor. If renderer/IPC congestion creates a much
+// larger gap, snap to that cursor instead of replaying stale data at high speed.
+export const WAVEFORM_MAX_INTERPOLATION_LAG_MS = 250;
 
 export type ReconciledWaveformBatch<T> = {
   bins: T[];
@@ -26,6 +26,30 @@ export function waveformWindowSampleCount(sampleRate: number): number {
   return Math.max(1, sampleRate) * WAVEFORM_WINDOW_SECONDS;
 }
 
+/**
+ * The capture cursor is the live clock; a waveform packet may be older after
+ * IPC or renderer congestion. Never place an old packet on the live edge and
+ * then visually fast-forward it when a newer packet arrives.
+ */
+export function reconcileWaveformTimelineSample(
+  capturedSample: number | undefined,
+  waveformEndSample: number | undefined,
+  previousTimelineSample: number | null,
+): number {
+  const previous = Number.isSafeInteger(previousTimelineSample) && (previousTimelineSample ?? -1) >= 0
+    ? Number(previousTimelineSample)
+    : 0;
+  // captured_samples is authoritative whenever present. waveform_end_sample
+  // is only a compatibility fallback and must never move the display beyond a
+  // valid capture watermark.
+  const received = Number.isSafeInteger(capturedSample) && (capturedSample ?? -1) >= 0
+    ? Number(capturedSample)
+    : Number.isSafeInteger(waveformEndSample) && (waveformEndSample ?? -1) >= 0
+      ? Number(waveformEndSample)
+      : previous;
+  return Math.max(previous, received);
+}
+
 export function advanceWaveformPlayhead(
   currentSample: number,
   latestReceivedSample: number,
@@ -34,10 +58,11 @@ export function advanceWaveformPlayhead(
 ): number {
   const rate = Math.max(1, sampleRate);
   const latest = Math.max(0, latestReceivedSample);
-  const current = Math.max(latest, Number.isFinite(currentSample) ? currentSample : latest);
+  const current = Math.min(latest, Math.max(0, Number.isFinite(currentSample) ? currentSample : latest));
   const advance = Math.max(0, Number.isFinite(elapsedMs) ? elapsedMs : 0) * rate / 1_000;
-  const maximumLead = rate * WAVEFORM_MAX_EXTRAPOLATION_MS / 1_000;
-  return Math.min(latest + maximumLead, current + advance);
+  const maximumInterpolationLag = rate * WAVEFORM_MAX_INTERPOLATION_LAG_MS / 1_000;
+  if (latest - current > maximumInterpolationLag) return latest;
+  return Math.min(latest, current + advance);
 }
 
 export function waveformSampleHorizontalPosition(

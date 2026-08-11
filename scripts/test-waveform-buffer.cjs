@@ -12,19 +12,24 @@ async function main() {
 
   assert.equal(waveform.waveformWindowSampleCount(48_000), 576_000);
   assert.equal(
-    waveform.advanceWaveformPlayhead(48_000, 48_000, 100, 48_000),
-    52_800,
-    'the visual playhead advances at the exact PCM sample rate between packets',
+    waveform.advanceWaveformPlayhead(48_000, 52_800, 50, 48_000),
+    50_400,
+    'the visual playhead advances at the exact PCM sample rate toward a received capture cursor',
   );
   assert.equal(
-    waveform.advanceWaveformPlayhead(52_800, 52_800, 0, 48_000),
+    waveform.advanceWaveformPlayhead(50_400, 52_800, 100, 48_000),
     52_800,
-    'a newly received packet must not move the playhead backwards',
+    'the playhead must stop at the authoritative capture cursor',
   );
   assert.equal(
     waveform.advanceWaveformPlayhead(52_800, 52_800, 2_000, 48_000),
-    62_400,
-    'a telemetry stall must stop visual extrapolation after 200 ms',
+    52_800,
+    'wall time alone must never extrapolate beyond captured audio',
+  );
+  assert.equal(
+    waveform.advanceWaveformPlayhead(48_000, 96_000, 16, 48_000),
+    96_000,
+    'a telemetry stall must snap to the capture cursor instead of replaying stale data quickly',
   );
 
   for (const sampleRate of [44_100, 48_000, 96_000, 192_000]) {
@@ -49,6 +54,31 @@ async function main() {
       `${sampleRate} Hz must move exactly one twelfth of the viewport per second`,
     );
   }
+
+  assert.equal(
+    waveform.reconcileWaveformTimelineSample(192_000, 48_000, null),
+    192_000,
+    'the live capture cursor must keep a delayed waveform packet off the live edge',
+  );
+  assert.equal(
+    waveform.reconcileWaveformTimelineSample(96_000, 192_000, null),
+    96_000,
+    'waveform metadata must never move the timeline beyond a valid capture watermark',
+  );
+  assert.equal(
+    waveform.reconcileWaveformTimelineSample(96_000, 96_000, 192_000),
+    192_000,
+    'stale telemetry must never move the live timeline backwards',
+  );
+  const delayedPacketPosition = waveform.waveformSampleHorizontalPosition(
+    48_000,
+    waveform.reconcileWaveformTimelineSample(192_000, 48_000, null),
+    48_000,
+  );
+  assert(
+    delayedPacketPosition < 0.8,
+    'a waveform packet delayed by three seconds must be drawn at its historical time, not enter from the right',
+  );
 
   const first = waveform.reconcileWaveformBatch(['a', 'b'], 1_128, null);
   assert.deepEqual(first, { bins: ['a', 'b'], endSample: 1_128, reset: false });

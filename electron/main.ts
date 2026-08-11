@@ -171,6 +171,12 @@ const EXPORT_REQUEST_TIMEOUT_MS = (() => {
   const override = Number(process.env.DATABAKER_TEST_EXPORT_TIMEOUT_MS);
   return Number.isSafeInteger(override) && override >= 100 ? override : productionTimeout;
 })();
+// Rust can spend up to two seconds freezing the signal-analysis boundary and
+// another thirty seconds waiting for the writer to durably reach it. Leave
+// additional time for the journal fsync and IPC response instead of timing out
+// while a valid take is still completing.
+const ATTEMPT_REQUEST_TIMEOUT_MS = 60_000;
+const ATTEMPT_STATE_QUERY_TIMEOUT_MS = 40_000;
 
 const allowedCommands = new Set([
   'hello',
@@ -481,7 +487,7 @@ function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
 }
 
-function isValidAttempt(value: unknown): boolean {
+function isValidAttempt(value: unknown): value is Record<string, unknown> {
   if (!isRecord(value)) return false;
   return typeof value.attempt_id === 'string'
     && isNonNegativeSafeInteger(value.start_sample)
@@ -622,6 +628,136 @@ function parseValidSnapshot(value: unknown): Record<string, unknown> | null {
     return null;
   }
   return value;
+}
+
+type AttemptCommand = 'start_attempt' | 'stop_attempt';
+
+type AttemptReconciliationState = Readonly<{
+  snapshot: Record<string, unknown>;
+  item: Record<string, unknown>;
+  activeAttempt: Record<string, unknown> | null;
+  journalSeq: number;
+  sessionId: string;
+}>;
+
+function parseActiveAttempt(value: unknown): Record<string, unknown> | null | undefined {
+  if (value === null) return null;
+  if (!isRecord(value)
+    || typeof value.item_id !== 'string'
+    || value.item_id.trim() === ''
+    || typeof value.attempt_id !== 'string'
+    || value.attempt_id.trim() === ''
+    || !isNonNegativeSafeInteger(value.start_sample)
+    || !isNonNegativeSafeInteger(value.recording_started_sample)) return undefined;
+  return value;
+}
+
+function inspectAttemptReconciliationState(
+  value: EngineOptionalState,
+  expectedSessionDir: string,
+  expectedItemId: string,
+): AttemptReconciliationState {
+  if (value.active !== true
+    || typeof value.session_dir !== 'string'
+    || !isSameSessionDir(value.session_dir, expectedSessionDir)) {
+    throw new Error('录音引擎未返回同一个活动任务');
+  }
+  const snapshot = parseValidSnapshot(value.snapshot);
+  if (!snapshot
+    || snapshot.status !== 'recording'
+    || !isNonNegativeSafeInteger(snapshot.journal_seq)) {
+    throw new Error('录音引擎未返回可对账的 recording 快照');
+  }
+  const item = (snapshot.items as unknown[]).find((candidate) => (
+    isRecord(candidate) && candidate.id === expectedItemId
+  ));
+  if (!isRecord(item)) throw new Error(`对账快照中不存在条目 ${expectedItemId}`);
+  const activeAttempt = parseActiveAttempt(value.active_attempt);
+  if (activeAttempt === undefined) throw new Error('录音引擎返回了无法验证的当前句状态');
+  return {
+    snapshot,
+    item,
+    activeAttempt,
+    journalSeq: snapshot.journal_seq,
+    sessionId: String(snapshot.session_id),
+  };
+}
+
+function itemStateFingerprint(item: Record<string, unknown>): string {
+  return JSON.stringify({
+    id: item.id,
+    text: item.text,
+    label: item.label,
+    status: item.status,
+    attempts: item.attempts,
+    selected_attempt_id: item.selected_attempt_id ?? null,
+  });
+}
+
+function synthesizeTimedOutAttemptResult(
+  command: AttemptCommand,
+  itemId: string,
+  force: boolean,
+  before: AttemptReconciliationState,
+  after: AttemptReconciliationState,
+): Record<string, unknown> {
+  if (after.sessionId !== before.sessionId
+    || after.journalSeq !== before.journalSeq + 1) {
+    throw new Error('录音命令超时后的任务身份或日志序号无法证明命令已提交');
+  }
+
+  if (command === 'start_attempt') {
+    if (before.activeAttempt !== null
+      || after.activeAttempt?.item_id !== itemId
+      || itemStateFingerprint(after.item) !== itemStateFingerprint(before.item)) {
+      throw new Error('开始录音超时后，当前句与请求条目无法一致对账');
+    }
+    return {
+      ...after.activeAttempt,
+      reconciled_after_timeout: true,
+    };
+  }
+
+  const previousAttempt = before.activeAttempt;
+  if (!previousAttempt
+    || previousAttempt.item_id !== itemId
+    || after.activeAttempt !== null) {
+    throw new Error('结束录音超时后，当前句仍未明确封闭');
+  }
+  const previousAttempts = before.item.attempts as unknown[];
+  const currentAttempts = after.item.attempts as unknown[];
+  const attemptId = String(previousAttempt.attempt_id);
+  const completedAttempt = currentAttempts.find((attempt) => (
+    isRecord(attempt) && attempt.attempt_id === attemptId
+  ));
+  if (completedAttempt) {
+    const otherCurrentAttempts = currentAttempts.filter((attempt) => (
+      !isRecord(attempt) || attempt.attempt_id !== attemptId
+    ));
+    if (!isValidAttempt(completedAttempt)
+      || previousAttempts.some((attempt) => isRecord(attempt) && attempt.attempt_id === attemptId)
+      || currentAttempts.length !== previousAttempts.length + 1
+      || JSON.stringify(otherCurrentAttempts) !== JSON.stringify(previousAttempts)) {
+      throw new Error('结束录音超时后，录音版本变化无法唯一对账');
+    }
+    return {
+      item_id: itemId,
+      attempt: completedAttempt,
+      interrupted: completedAttempt.status === 'interrupted',
+      forced: completedAttempt.forced_without_tail_silence === true,
+      reconciled_after_timeout: true,
+    };
+  }
+  if (itemStateFingerprint(after.item) !== itemStateFingerprint(before.item)) {
+    throw new Error('结束录音超时后，条目变化无法证明是无语音取消');
+  }
+  return {
+    item_id: itemId,
+    attempt: null,
+    discarded: true,
+    forced: force,
+    reconciled_after_timeout: true,
+  };
 }
 
 async function findAudioFaultMarker(metadataDir: string): Promise<number | null> {
@@ -1623,6 +1759,81 @@ async function requestSessionWithReconciliation(
     );
   }
   throw requestError;
+}
+
+async function requestAttemptWithReconciliation(
+  command: AttemptCommand,
+  payload: unknown,
+): Promise<unknown> {
+  if (!engine) throw new Error('录音引擎客户端不可用');
+  if (!isRecord(payload)
+    || typeof payload.item_id !== 'string'
+    || payload.item_id.trim() === '') {
+    throw new Error('录音条目 ID 无效');
+  }
+  if (command === 'stop_attempt'
+    && payload.force !== undefined
+    && typeof payload.force !== 'boolean') {
+    throw new Error('结束录音的 force 参数无效');
+  }
+  const itemId = payload.item_id;
+  const force = command === 'stop_attempt' && payload.force === true;
+  const attemptIntent = engineIntent;
+  const expectedSessionDir = attemptIntent.sessionDir;
+  if (!expectedSessionDir) throw new Error('当前没有可对账的录音任务');
+
+  const beforeValue = await engine.request(
+    'get_state_optional',
+    {},
+    ATTEMPT_STATE_QUERY_TIMEOUT_MS,
+  ) as EngineOptionalState;
+  assertCurrentEngineIntent(attemptIntent, ['active']);
+  const before = inspectAttemptReconciliationState(beforeValue, expectedSessionDir, itemId);
+  if (command === 'start_attempt' && before.activeAttempt !== null) {
+    throw new Error('当前已有句子正在录制');
+  }
+  if (command === 'stop_attempt'
+    && (!before.activeAttempt || before.activeAttempt.item_id !== itemId)) {
+    throw new Error('当前录制句与要结束的条目不一致');
+  }
+
+  // item_id is renderer/main-process reconciliation metadata for stop_attempt.
+  // Rust intentionally receives only its existing StopAttemptPayload shape.
+  const enginePayload = command === 'start_attempt'
+    ? { item_id: itemId }
+    : { force };
+  let requestError: unknown;
+  try {
+    const result = await engine.request(
+      command,
+      enginePayload,
+      ATTEMPT_REQUEST_TIMEOUT_MS,
+    );
+    assertCurrentEngineIntent(attemptIntent, ['active']);
+    return result;
+  } catch (error) {
+    if (!(error instanceof EngineRequestTimeoutError) || !engine.running) throw error;
+    assertCurrentEngineIntent(attemptIntent, ['active']);
+    requestError = error;
+  }
+
+  try {
+    // The Rust protocol loop is synchronous, so this query is ordered after the
+    // timed-out mutation. A successful synthesis still requires the same live
+    // session, the same item, and exactly one newly committed journal event.
+    const afterValue = await engine.request(
+      'get_state_optional',
+      {},
+      ATTEMPT_STATE_QUERY_TIMEOUT_MS,
+    ) as EngineOptionalState;
+    assertCurrentEngineIntent(attemptIntent, ['active']);
+    const after = inspectAttemptReconciliationState(afterValue, expectedSessionDir, itemId);
+    return synthesizeTimedOutAttemptResult(command, itemId, force, before, after);
+  } catch (reconciliationError) {
+    if (reconciliationError instanceof EngineIntentSupersededError
+      || !ownsEngineGeneration(attemptIntent)) throw requestError;
+    throw new EngineStateReconciliationError(requestError, reconciliationError);
+  }
 }
 
 async function ensureMicrophoneAccess(): Promise<void> {
@@ -2789,6 +3000,9 @@ function registerIpc(): void {
       return await exportSession(payload);
     }
     assertCanMutateActiveSession(command);
+    if (command === 'start_attempt' || command === 'stop_attempt') {
+      return await requestAttemptWithReconciliation(command, payload);
+    }
     const timeout = 20_000;
     const commandIntent = engineIntent;
     try {

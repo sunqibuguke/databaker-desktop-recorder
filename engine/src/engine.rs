@@ -588,6 +588,17 @@ struct WriterQueueBudget {
     max_frames: u64,
 }
 
+#[derive(Clone)]
+struct CaptureFaultPersistence {
+    session_dir: PathBuf,
+}
+
+impl CaptureFaultPersistence {
+    fn activate_reserved_marker(&self) -> bool {
+        activate_audio_fault_reserve(&self.session_dir)
+    }
+}
+
 struct WriterQueueLease<'a> {
     enqueue_state: &'a AtomicU64,
 }
@@ -1995,6 +2006,9 @@ impl Engine {
                 Arc::clone(&session.captured),
                 Arc::clone(&session.overflow),
                 Arc::clone(&session.faulted),
+                CaptureFaultPersistence {
+                    session_dir: session.session_dir.clone(),
+                },
                 Arc::clone(&capture_fault_code),
                 Arc::clone(&session.peak),
                 Arc::clone(&session.rms),
@@ -2043,11 +2057,13 @@ impl Engine {
                 let mut watchdog = CaptureHeartbeatWatchdog::new(Instant::now());
                 while !watchdog_stop_thread.load(Ordering::Acquire) {
                     let already_faulted = watchdog_faulted.load(Ordering::Acquire);
+                    let fault_evidence_confirmed = already_faulted
+                        && audio_fault_marker_present(&watchdog_session_dir).unwrap_or(false);
                     if watchdog.observe(
                         Instant::now(),
                         capture_watchdog_armed_thread.load(Ordering::Acquire),
                         capture_heartbeat_thread.load(Ordering::Acquire),
-                        already_faulted,
+                        fault_evidence_confirmed,
                         CAPTURE_CALLBACK_STALL_TIMEOUT,
                     ) {
                         latch_capture_fault_code(
@@ -2675,6 +2691,12 @@ impl Engine {
             .find(|item| item.id == active.item_id)
             .ok_or_else(|| anyhow!("item disappeared while recording"))?;
         item.status = "review".to_string();
+        // A retake may start from an already accepted row. Once a new version
+        // reaches review, the previous delivery selection is no longer the
+        // implicit choice: after a renderer restart the reviewer must default
+        // to the newest usable take, while still being free to explicitly
+        // choose the historical version again.
+        item.selected_attempt_id = None;
         item.attempts.push(attempt.clone());
         session.active_attempt = None;
         session.persist(
@@ -6176,6 +6198,7 @@ fn build_stream(
     captured: Arc<AtomicU64>,
     overflow: Arc<AtomicU64>,
     faulted: Arc<AtomicBool>,
+    fault_persistence: CaptureFaultPersistence,
     capture_fault_code: Arc<AtomicU32>,
     peak_bits: Arc<AtomicU32>,
     rms_bits: Arc<AtomicU32>,
@@ -6192,6 +6215,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            fault_persistence,
             capture_fault_code,
             peak_bits,
             rms_bits,
@@ -6208,6 +6232,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            fault_persistence,
             capture_fault_code,
             peak_bits,
             rms_bits,
@@ -6224,6 +6249,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            fault_persistence,
             capture_fault_code,
             peak_bits,
             rms_bits,
@@ -6240,6 +6266,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            fault_persistence,
             capture_fault_code,
             peak_bits,
             rms_bits,
@@ -6256,6 +6283,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            fault_persistence,
             capture_fault_code,
             peak_bits,
             rms_bits,
@@ -6272,6 +6300,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            fault_persistence,
             capture_fault_code,
             peak_bits,
             rms_bits,
@@ -6288,6 +6317,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            fault_persistence,
             capture_fault_code,
             peak_bits,
             rms_bits,
@@ -6304,6 +6334,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            fault_persistence,
             capture_fault_code,
             peak_bits,
             rms_bits,
@@ -6320,6 +6351,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            fault_persistence,
             capture_fault_code,
             peak_bits,
             rms_bits,
@@ -6336,6 +6368,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            fault_persistence,
             capture_fault_code,
             peak_bits,
             rms_bits,
@@ -6352,6 +6385,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            fault_persistence,
             capture_fault_code,
             peak_bits,
             rms_bits,
@@ -6368,6 +6402,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            fault_persistence,
             capture_fault_code,
             peak_bits,
             rms_bits,
@@ -6391,6 +6426,7 @@ fn build_typed_stream<T>(
     captured: Arc<AtomicU64>,
     overflow: Arc<AtomicU64>,
     faulted: Arc<AtomicBool>,
+    fault_persistence: CaptureFaultPersistence,
     capture_fault_code: Arc<AtomicU32>,
     peak_bits: Arc<AtomicU32>,
     rms_bits: Arc<AtomicU32>,
@@ -6413,6 +6449,7 @@ where
     let error_capture_fault_code = Arc::clone(&capture_fault_code);
     let error_writer = writer.clone();
     let error_queue = queue.clone();
+    let error_fault_persistence = fault_persistence.clone();
     let mut waveform_preview =
         CaptureWaveformPreview::new(waveform, captured.load(Ordering::Acquire));
     Ok(device.build_input_stream(
@@ -6450,6 +6487,7 @@ where
                     &queue,
                     enqueue_lease,
                     &silence,
+                    Some(&fault_persistence),
                     Some(&mut waveform_preview),
                 ),
                 Err(error) => fail_capture_block(
@@ -6460,17 +6498,25 @@ where
                     &faulted,
                     &queue,
                     enqueue_lease,
+                    Some(&fault_persistence),
                 ),
             }
         },
         move |error| {
             latch_capture_fault_code(&error_capture_fault_code, input_stream_fault_code(&error));
+            let reason = format!("audio input stream failed: {error}");
             error_emitter.store(true, Ordering::Release);
+            // Reject later callback entries before touching the recording
+            // volume. The driver error callback may be a real-time thread, so
+            // it only activates the already-created generic reserve here; the
+            // writer/telemetry threads enrich it with the detailed reason.
+            error_queue.close();
+            if !error_fault_persistence.activate_reserved_marker() {
+                eprintln!("audio input stream fault could not activate its reserved marker");
+            }
             error_queue.close_and_wait();
             eprintln!("audio stream error: {error}");
-            let _ = error_writer.try_send(WriterMessage::FaultAndStop(format!(
-                "audio input stream failed: {error}"
-            )));
+            let _ = error_writer.try_send(WriterMessage::FaultAndStop(reason));
         },
         None,
     )?)
@@ -6552,17 +6598,28 @@ fn fail_capture_block(
     faulted: &AtomicBool,
     queue: &WriterQueueBudget,
     enqueue_lease: WriterQueueLease<'_>,
+    fault_persistence: Option<&CaptureFaultPersistence>,
 ) {
+    let reason = format!("{reason}; dropped_frames={dropped_frames}");
     faulted.store(true, Ordering::Release);
     saturating_atomic_add(overflow, dropped_frames);
-    // Drop this callback's lease before waiting. Once every older callback has
-    // left its enqueue path, the fault sentinel is guaranteed to sit behind
-    // every Samples message that was accepted before the bad block.
+    // Close the entry gate before touching the recording volume so no later
+    // callback can extend the accepted timeline after this known discontinuity.
+    // The callback only activates the already-created generic reserve; detailed
+    // JSON persistence belongs to the writer/telemetry non-real-time threads.
+    queue.close();
+    if let Some(persistence) = fault_persistence
+        && !persistence.activate_reserved_marker()
+    {
+        eprintln!("capture callback fault could not activate its reserved marker");
+    }
+    // Publish the generic marker before dropping this callback's lease and
+    // waiting. Once every older callback has left its enqueue path, the fault
+    // sentinel is guaranteed to sit behind every Samples message that was
+    // accepted before the bad block.
     drop(enqueue_lease);
     queue.close_and_wait();
-    let _ = writer.try_send(WriterMessage::FaultAndStop(format!(
-        "{reason}; dropped_frames={dropped_frames}"
-    )));
+    let _ = writer.try_send(WriterMessage::FaultAndStop(reason));
 }
 
 #[cfg(any(test, feature = "system-test"))]
@@ -6628,6 +6685,7 @@ fn publish_leased_block(
         enqueue_lease,
         silence,
         None,
+        None,
     );
 }
 
@@ -6643,6 +6701,7 @@ fn publish_leased_block_with_preview(
     queue: &WriterQueueBudget,
     enqueue_lease: WriterQueueLease<'_>,
     silence: &SilenceMonitor,
+    fault_persistence: Option<&CaptureFaultPersistence>,
     mut waveform_preview: Option<&mut CaptureWaveformPreview>,
 ) {
     let frames = mono.len() as u64;
@@ -6659,6 +6718,7 @@ fn publish_leased_block_with_preview(
             faulted,
             queue,
             enqueue_lease,
+            fault_persistence,
         );
         return;
     }
@@ -6684,6 +6744,7 @@ fn publish_leased_block_with_preview(
             faulted,
             queue,
             enqueue_lease,
+            fault_persistence,
         );
         return;
     }
@@ -6697,6 +6758,7 @@ fn publish_leased_block_with_preview(
             faulted,
             queue,
             enqueue_lease,
+            fault_persistence,
         );
         return;
     };
@@ -6722,6 +6784,7 @@ fn publish_leased_block_with_preview(
             faulted,
             queue,
             enqueue_lease,
+            fault_persistence,
         );
         return;
     }
@@ -8461,6 +8524,23 @@ mod tests {
         let mut session = prepare_metadata_test_session(&root);
         session.snapshot.audio_format.sample_rate = 100;
         session.snapshot.silence_duration_ms = 200;
+        session.snapshot.items[0].status = "accepted".to_string();
+        session.snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
+        session.snapshot.items[0].attempts.push(Attempt {
+            attempt_id: "001-a1".to_string(),
+            start_sample: 0,
+            recording_started_sample: 0,
+            head_silence_armed_sample: 0,
+            head_silence_passed_sample: 5,
+            required_head_silence_samples: 5,
+            content_started_sample: 5,
+            end_sample: 10,
+            forced_without_tail_silence: false,
+            tail_silence_samples: 5,
+            required_tail_silence_samples: 5,
+            status: "accepted".to_string(),
+            created_at: "2026-08-11T00:00:00Z".to_string(),
+        });
         session.head_silence = HeadSilenceMonitor::new(20);
         session.captured.store(100, Ordering::Release);
         session.committed.store(100, Ordering::Release);
@@ -8494,7 +8574,7 @@ mod tests {
             .store(HEAD_SILENCE_SPEECH_STARTED, Ordering::Release);
         session.active_attempt = Some(ActiveAttempt {
             item_id: "001".to_string(),
-            attempt_id: "001-a1".to_string(),
+            attempt_id: "001-a2".to_string(),
             start_sample: 0,
             recording_started_sample: 20,
         });
@@ -8504,6 +8584,7 @@ mod tests {
         let stopped = engine.stop_attempt(true).unwrap();
 
         assert_eq!(stopped["forced"], true);
+        assert_eq!(stopped["attempt"]["attempt_id"], "001-a2");
         assert_eq!(stopped["attempt"]["content_started_sample"], 50);
         assert_eq!(stopped["attempt"]["head_silence_armed_sample"], 20);
         assert_eq!(stopped["attempt"]["head_silence_passed_sample"], 40);
@@ -8515,6 +8596,8 @@ mod tests {
         let session = engine.session.as_ref().unwrap();
         assert!(session.active_attempt.is_none());
         assert_eq!(session.snapshot.items[0].status, "review");
+        assert!(session.snapshot.items[0].selected_attempt_id.is_none());
+        assert_eq!(session.snapshot.items[0].attempts.len(), 2);
         engine
             .session
             .as_mut()
@@ -9238,6 +9321,7 @@ mod tests {
             &harness.queue,
             enqueue_lease,
             &harness.silence,
+            None,
             Some(&mut preview),
         );
 
@@ -10289,6 +10373,73 @@ mod tests {
     }
 
     #[test]
+    fn callback_fault_closes_gate_and_activates_generic_marker_before_waiting() {
+        let root = test_root("callback-fault-marker-before-wait");
+        ensure_audio_fault_reserve(&root).unwrap();
+        let queue = test_writer_queue();
+        let older_callback = queue.enter().unwrap();
+        let overflow = Arc::new(AtomicU64::new(0));
+        let faulted = Arc::new(AtomicBool::new(false));
+        let persistence = CaptureFaultPersistence {
+            session_dir: root.clone(),
+        };
+        let (writer, receiver) = unbounded::<WriterMessage>();
+        let queue_for_fault = queue.clone();
+        let overflow_for_fault = Arc::clone(&overflow);
+        let faulted_for_fault = Arc::clone(&faulted);
+        let (done_tx, done_rx) = bounded(1);
+        let join = thread::spawn(move || {
+            let faulting_callback = queue_for_fault.enter().unwrap();
+            fail_capture_block(
+                "injected callback discontinuity".to_string(),
+                64,
+                &writer,
+                &overflow_for_fault,
+                &faulted_for_fault,
+                &queue_for_fault,
+                faulting_callback,
+                Some(&persistence),
+            );
+            let _ = done_tx.send(());
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !audio_fault_marker_present(&root).unwrap() && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert!(
+            audio_fault_marker_present(&root).unwrap(),
+            "known callback discontinuity lacked durable evidence while close_and_wait was blocked"
+        );
+        assert!(faulted.load(Ordering::Acquire));
+        assert_eq!(overflow.load(Ordering::Acquire), 64);
+        assert!(
+            queue.enter().is_none(),
+            "known callback fault left the callback-entry gate open"
+        );
+        assert!(
+            done_rx.try_recv().is_err(),
+            "fault path did not wait for the older callback"
+        );
+
+        drop(older_callback);
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        join.join().unwrap();
+        match receiver.try_recv().unwrap() {
+            WriterMessage::FaultAndStop(reason) => {
+                assert!(reason.contains("injected callback discontinuity"));
+                assert!(reason.contains("dropped_frames=64"));
+            }
+            _ => panic!("capture fault did not reach the writer"),
+        }
+        let marker: Value =
+            serde_json::from_slice(&std::fs::read(root.join(AUDIO_FAULT_MARKER)).unwrap()).unwrap();
+        assert_eq!(marker["reserved_audio_fault"].as_bool(), Some(true));
+        assert_eq!(marker["committed_frames"].as_u64(), Some(0));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn malformed_capture_blocks_fault_before_samples_or_timeline_updates() {
         let errors = [
             convert_frames(&[1i16, 2, 3], 2, 0, f32::from).unwrap_err(),
@@ -10310,6 +10461,7 @@ mod tests {
                 &faulted,
                 &queue,
                 lease,
+                None,
             );
 
             match receiver.try_recv().unwrap() {

@@ -175,6 +175,20 @@ async function hardKill(client) {
   return result;
 }
 
+async function waitForAutomaticCheckpoint(client, minimumFrames, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  let lastState = null;
+  while (Date.now() < deadline) {
+    lastState = await client.requestOk('get_state_optional');
+    if (Number(lastState.snapshot?.committed_samples ?? 0) >= minimumFrames) return lastState;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error(
+    `automatic audio checkpoint did not reach ${minimumFrames} frames; last state: `
+      + JSON.stringify(lastState),
+  );
+}
+
 function sha256(filePath) {
   return crypto.createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
 }
@@ -279,6 +293,11 @@ function verifyRecoveredSession(sessionDir, recovery, expected) {
   );
   assert.equal(journalSource.endsWith('\n'), true, 'recovered journal lacks a final newline');
   const journal = journalSource.trimEnd().split('\n').map((line) => JSON.parse(line));
+  assert.equal(
+    journal.some((entry) => entry.event === 'system_test_checkpoint'),
+    false,
+    'forced-kill qualification must exercise the automatic writer checkpoint, not a test command',
+  );
   const finalEvent = journal.at(-1);
   assert.equal(finalEvent.event, 'session_interrupted_sealed');
   assert.equal(finalEvent.journal_seq, snapshot.journal_seq);
@@ -295,11 +314,14 @@ async function main() {
 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'databaker-engine-system-faults-'));
   const sessionDir = path.join(root, 'forced-kill-session');
-  const sampleRate = 8_000;
+  // Exercise the production-default format. The synthetic source bypasses
+  // hardware but the release recovery path reads the same 48 kHz / 24-bit
+  // segmented WAV bytes used in a studio session.
+  const sampleRate = 48_000;
   const bitDepth = 24;
   const segmentFrames = sampleRate;
-  const checkpointFrames = 12_000;
-  const tailFrames = 2_000;
+  const checkpointFrames = sampleRate * 10;
+  const tailFrames = sampleRate / 4;
   const capturedFrames = checkpointFrames + tailFrames;
   let passed = false;
   let captureClient = null;
@@ -337,9 +359,12 @@ async function main() {
       block_frames: 256,
     });
     assert.equal(initial.captured_samples, checkpointFrames);
-    const checkpoint = await captureClient.requestOk('test_checkpoint');
-    assert.equal(checkpoint.captured_samples, checkpointFrames);
-    assert.equal(checkpoint.committed_samples, checkpointFrames);
+    const automaticallyCheckpointed = await waitForAutomaticCheckpoint(
+      captureClient,
+      checkpointFrames,
+    );
+    assert.equal(automaticallyCheckpointed.snapshot.captured_samples, checkpointFrames);
+    assert.equal(automaticallyCheckpointed.snapshot.committed_samples, checkpointFrames);
     const tail = await captureClient.requestOk('test_feed_pcm', {
       frames: tailFrames,
       seed: 0xc0de,
@@ -383,7 +408,7 @@ async function main() {
     passed = true;
     process.stdout.write(
       `engine system fault ${profile} passed: killed=${JSON.stringify(killed)}, `
-      + `checkpoint=${checkpointFrames}, captured=${capturedFrames}, recovered=${durableFrames}\n`,
+      + `automatic_checkpoint=${checkpointFrames}, captured=${capturedFrames}, recovered=${durableFrames}\n`,
     );
   } finally {
     if (captureClient && !captureClient.exited) {
