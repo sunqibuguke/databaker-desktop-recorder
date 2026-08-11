@@ -163,6 +163,9 @@ function testArgs() {
   assert.throws(() => parseArgs(['--mode', 'soak', '--hours', '1']), /2–8/);
   assert.throws(() => parseArgs(['--mode', 'short', '--bit-depth', '20']), /16、24/);
   assert.throws(() => parseArgs(['--mode', 'disk-full']), /confirm-dedicated-volume/);
+  const replug = parseArgs(['--mode', 'replug', '--seconds', '5']);
+  assert.equal(replug.mode, 'replug');
+  assert.equal(replug.seconds, 5);
   assert.throws(() => parseArgs(['--mode', 'power-cut']), /session-dir/);
   assert.throws(() => parseArgs(['--mode', 'recover']), /session-dir/);
   assert.throws(() => parseArgs(['--mode', 'inspect']), /session-dir/);
@@ -917,12 +920,14 @@ function writeInterruptedSessionFixture(session, phase1Report) {
   return { snapshot, evidence };
 }
 
-function latestReport(outputRoot) {
+function latestReportPath(outputRoot) {
   const runNames = fs.readdirSync(outputRoot);
   assert.equal(runNames.length, 1);
-  return JSON.parse(
-    fs.readFileSync(path.join(outputRoot, runNames[0], 'acceptance-report.json'), 'utf8'),
-  );
+  return path.join(outputRoot, runNames[0], 'acceptance-report.json');
+}
+
+function latestReport(outputRoot) {
+  return JSON.parse(fs.readFileSync(latestReportPath(outputRoot), 'utf8'));
 }
 
 function testPowerCutArmingIntegration() {
@@ -1222,6 +1227,113 @@ function testAbnormalEngineShutdownIntegration(mode, expectedStatus, expectedOve
   }
 }
 
+function testReplugIntegration(scenario, expectedStatus, expectedOverall, failedCheck = null) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `databaker-acceptance-replug-${scenario}-`));
+  try {
+    const tool = path.join(__dirname, 'windows-audio-acceptance.cjs');
+    const mockEngine = path.join(__dirname, 'fixtures', 'mock-acceptance-engine.cjs');
+    const result = spawnSync(
+      process.execPath,
+      [
+        tool,
+        '--mode', 'replug',
+        '--engine', mockEngine,
+        '--output', root,
+        '--device-id', 'mock:usb-interface',
+        '--sample-rate', '48000',
+        '--bit-depth', '24',
+        '--channel', '1',
+        '--seconds', '5',
+        '--trigger-delay-seconds', '2',
+        '--fault-timeout-seconds', '10',
+        '--poll-seconds', '0.25',
+        '--skip-noise-check',
+        '--yes',
+      ],
+      {
+        encoding: 'utf8',
+        timeout: 30_000,
+        env: {
+          ...process.env,
+          NODE_ENV: 'test',
+          DATABAKER_ACCEPTANCE_TEST_FAULT_DRAIN_MS: '250',
+          DATABAKER_ACCEPTANCE_TEST_REPLUG_TIMEOUT_MS: '900',
+          DATABAKER_ACCEPTANCE_MOCK_REPLUG: scenario,
+          DATABAKER_ACCEPTANCE_MOCK_UNPLUG_AFTER_MS: scenario === 'early-fault' ? '1250' : '2250',
+        },
+      },
+    );
+    assert.equal(result.error, undefined, result.error?.stack);
+    assert.equal(result.status, expectedStatus, `stdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+    const report = latestReport(root);
+    assert.equal(report.overall, expectedOverall);
+    if (failedCheck) {
+      assert.equal(
+        report.checks.find((check) => check.id === failedCheck)?.status,
+        'FAIL',
+        `${failedCheck} should fail for ${scenario}`,
+      );
+    }
+    const runDirectory = path.dirname(latestReportPath(root));
+    const telemetryRows = fs.readFileSync(path.join(runDirectory, 'telemetry.jsonl'), 'utf8')
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => JSON.parse(line));
+    const protocolRows = fs.readFileSync(path.join(runDirectory, 'protocol.jsonl'), 'utf8')
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => JSON.parse(line));
+    const startRequests = protocolRows.filter((row) =>
+      row.direction === 'tool' && row.message?.command === 'start_session');
+    if (scenario === 'success') {
+      assert.equal(startRequests.length, 2);
+      assert.equal(report.replug.transition.disappearance.target_present, false);
+      assert.equal(report.replug.transition.reappearance.consecutive_matches, 2);
+      assert.equal(report.replug.before.stop.result.snapshot.status, 'faulted');
+      assert.equal(report.replug.before.inspection.fault_marker_exists, true);
+      assert.equal(report.replug.before.export.expected_rejection, true);
+      assert.equal(report.replug.before.resume.expected_rejection, true);
+      assert.equal(report.replug.after.stop.result.snapshot.status, 'stopped');
+      assert(Number(report.replug.after.progress_summary.last.elapsed_seconds) >= 5);
+      assert.equal(
+        report.replug.after.inspection.total_physical_frames,
+        report.replug.after.stop.result.snapshot.committed_samples,
+      );
+      assert.equal(report.replug.before.healthy_prefix_summary.maximum_peak_dbfs > -50, true);
+      assert.notEqual(
+        report.replug.before.start.snapshot.session_id,
+        report.replug.after.start.snapshot.session_id,
+      );
+      assert.notEqual(report.replug.before.session_dir, report.replug.after.session_dir);
+      assert(fs.statSync(report.replug.before.session_dir).isDirectory());
+      assert(fs.statSync(report.replug.after.session_dir).isDirectory());
+      assert.deepEqual(
+        telemetryRows
+          .filter((row) => row.phase === 'replug-inventory')
+          .map((row) => row.state),
+        [
+          'present-before-unplug',
+          'absent-after-unplug',
+          'matching-reappearance',
+          'stable-reappearance',
+        ],
+      );
+    } else if (['second-wrong-device', 'second-stop-fails', 'second-tail-loss'].includes(scenario)) {
+      assert.equal(startRequests.length, 2);
+    } else {
+      assert.equal(startRequests.length, 1);
+    }
+    if (scenario === 'different-id') {
+      assert(
+        telemetryRows.some((row) =>
+          row.phase === 'replug-inventory' && row.state === 'same-name-different-id'),
+      );
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
 testArgs();
 testInputSampleFormatBits();
 testFaultEvidenceProjectionRace();
@@ -1236,6 +1348,13 @@ testShortProtocolIntegration();
 testBadExportManifestRejected();
 testPowerCutArmingIntegration();
 testPowerCutRecoveryIntegration();
+testReplugIntegration('success', 0, 'PASS');
+testReplugIntegration('never-disappeared', 1, 'FAIL', 'replug-target-disappeared');
+testReplugIntegration('different-id', 1, 'FAIL', 'replug-same-endpoint-stable');
+testReplugIntegration('second-wrong-device', 1, 'FAIL', 'replug-second-device-exact');
+testReplugIntegration('early-fault', 1, 'FAIL', 'replug-a-fault-after-trigger');
+testReplugIntegration('second-tail-loss', 1, 'FAIL', 'replug-b-exact-sample-watermark');
+testReplugIntegration('second-stop-fails', 2, 'INCOMPLETE', 'replug-b-safe-stop');
 testAbnormalEngineShutdownIntegration('nonzero', 1, 'FAIL');
 testAbnormalEngineShutdownIntegration('hang', 2, 'INCOMPLETE');
 process.stdout.write('windows audio acceptance tool tests passed\n');

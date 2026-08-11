@@ -323,7 +323,10 @@ function assertPcm24SegmentDescriptor(wavPath) {
 async function recover(sessionDir) {
   const engine = new EngineClient();
   try {
-    const response = await engine.request('seal_interrupted_session', { session_dir: sessionDir });
+    const response = await engine.request('seal_interrupted_session', {
+      session_dir: sessionDir,
+      expected_session_id: path.basename(sessionDir),
+    });
     assert.equal(response.ok, true, response.error?.message);
     return response.result;
   } finally {
@@ -491,6 +494,9 @@ async function main() {
         for (const command of ['resume_session', 'export_session']) {
           const response = await engine.request(command, {
             session_dir: fixtureInfo.killedSession,
+            ...(command === 'resume_session'
+              ? { expected_session_id: 'killed-recording' }
+              : {}),
           });
           assert.equal(response.ok, false, `${command} unexpectedly succeeded`);
           assert.match(response.error.message, /不可忽略的音频采集故障/);

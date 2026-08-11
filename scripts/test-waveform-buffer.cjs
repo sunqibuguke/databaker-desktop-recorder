@@ -6,11 +6,12 @@ async function main() {
   const modulePath = path.join(__dirname, '..', 'src', 'waveform-buffer.ts');
   const waveform = await import(pathToFileURL(modulePath).href);
 
-  assert.equal(waveform.waveformWindowBinCount(44_100), 8_269);
-  assert.equal(waveform.waveformWindowBinCount(48_000), 9_000);
-  assert.equal(waveform.waveformWindowBinCount(96_000), 18_000);
+  assert.equal(waveform.WAVEFORM_WINDOW_SECONDS, 20);
+  assert.equal(waveform.waveformWindowBinCount(44_100), 13_782);
+  assert.equal(waveform.waveformWindowBinCount(48_000), 15_000);
+  assert.equal(waveform.waveformWindowBinCount(96_000), 30_000);
 
-  assert.equal(waveform.waveformWindowSampleCount(48_000), 576_000);
+  assert.equal(waveform.waveformWindowSampleCount(48_000), 960_000);
   assert.equal(
     waveform.advanceWaveformPlayhead(48_000, 52_800, 50, 48_000),
     50_400,
@@ -44,14 +45,19 @@ async function main() {
       markerSample + sampleRate,
       sampleRate,
     );
-    assert(Math.abs(markerAtLiveEdge - (1 - 1 / 12)) < 1e-12);
-    assert(Math.abs(markerAfterOneSecond - 0.75) < 1e-12);
+    const expectedLiveEdge = 1
+      - 2 * waveform.WAVEFORM_LIVE_EDGE_GUTTER_SECONDS / waveform.WAVEFORM_WINDOW_SECONDS;
+    assert(Math.abs(markerAtLiveEdge - expectedLiveEdge) < 1e-12);
+    assert(
+      Math.abs(markerAfterOneSecond - (expectedLiveEdge - 2 / waveform.WAVEFORM_WINDOW_SECONDS))
+        < 1e-12,
+    );
     assert(
       Math.abs(
         (markerAtLiveEdge - markerAfterOneSecond) / 2
         - 1 / waveform.WAVEFORM_WINDOW_SECONDS,
       ) < 1e-12,
-      `${sampleRate} Hz must move exactly one twelfth of the viewport per second`,
+      `${sampleRate} Hz must move exactly one window fraction per second`,
     );
   }
 

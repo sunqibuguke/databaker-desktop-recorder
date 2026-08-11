@@ -205,7 +205,25 @@ export function WebGLWaveform({ bins, capturedSamples, waveformEndSample, record
       const history = historyRef.current;
       const historyEndSample = historyEndSampleRef.current;
       if (!history.length || historyEndSample === null) return;
-      const vertices = new Float32Array(history.length * 4);
+      // A 20-second window contains 15k bins at 48 kHz and 60k bins at
+      // 192 kHz, while the canvas has only about 1.5k physical columns. Merge
+      // bins that land on the same column so high sample rates do not allocate
+      // and upload tens of megabytes of visually redundant vertices per second.
+      const vertices = new Float32Array(Math.max(1, width) * 4);
+      let vertexLines = 0;
+      let currentColumn = -1;
+      let columnMinimum = 1;
+      let columnMaximum = -1;
+      const flushColumn = () => {
+        if (currentColumn < 0 || columnMaximum < columnMinimum) return;
+        const x = -1 + (currentColumn + 0.5) / width * 2;
+        const cursor = vertexLines * 4;
+        vertices[cursor] = x;
+        vertices[cursor + 1] = Math.max(-1, Math.min(1, columnMinimum * 0.92));
+        vertices[cursor + 2] = x;
+        vertices[cursor + 3] = Math.max(-1, Math.min(1, columnMaximum * 0.92));
+        vertexLines += 1;
+      };
       for (let index = 0; index < history.length; index += 1) {
         const binCenterSample = historyEndSample
           - (history.length - index - 0.5) * WAVEFORM_BIN_SAMPLES;
@@ -214,17 +232,25 @@ export function WebGLWaveform({ bins, capturedSamples, waveformEndSample, record
           playheadSample,
           sampleRateRef.current,
         );
+        if (x < -1 || x > 1) continue;
+        const column = Math.max(0, Math.min(width - 1, Math.floor((x + 1) * width / 2)));
         const [minimum, maximum] = history[index];
-        const cursor = index * 4;
-        vertices[cursor] = x;
-        vertices[cursor + 1] = Math.max(-1, Math.min(1, minimum * 0.92));
-        vertices[cursor + 2] = x;
-        vertices[cursor + 3] = Math.max(-1, Math.min(1, maximum * 0.92));
+        if (column !== currentColumn) {
+          flushColumn();
+          currentColumn = column;
+          columnMinimum = minimum;
+          columnMaximum = maximum;
+        } else {
+          columnMinimum = Math.min(columnMinimum, minimum);
+          columnMaximum = Math.max(columnMaximum, maximum);
+        }
       }
+      flushColumn();
+      if (!vertexLines) return;
       const color: [number, number, number, number] = recordingRef.current
         ? [0.88, 0.36, 0.40, 0.82]
         : [0.35, 0.72, 0.70, 0.78];
-      uploadAndDraw(vertices, gl.LINES, color);
+      uploadAndDraw(vertices.subarray(0, vertexLines * 4), gl.LINES, color);
     };
 
     const render = (now: number) => {

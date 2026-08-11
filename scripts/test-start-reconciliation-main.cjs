@@ -161,9 +161,14 @@ class FakeEngineClient extends EventEmitter {
     }
 
     if (command === 'resume_session') {
+      assert.equal(
+        payload.expected_session_id,
+        path.basename(payload.session_dir),
+        'every foreground and automatic resume must bind the exact persisted session identity',
+      );
       this.resumeSessionCalls += 1;
       this.sessionDir = payload.session_dir;
-      this.snapshot = validSnapshot(path.basename(payload.session_dir), 'recording', 1);
+      this.snapshot = validSnapshot(payload.expected_session_id, 'recording', 1);
       if (this.resumeCrashOnNextDispatch) {
         this.resumeCrashOnNextDispatch = false;
         this.active = false;
@@ -364,6 +369,17 @@ async function main() {
     );
     assert.equal(engine.resumeSessionCalls, 0);
 
+    await fs.writeFile(path.join(resumeSessionDir, 'session.json'), '{broken');
+    await handlers.get('engine:request')(event, 'resume_session', {
+      session_dir: resumeSessionDir,
+    });
+    assert.equal(
+      engine.resumeSessionCalls,
+      1,
+      'a damaged session.json must not block a resume backed by consistent snapshots',
+    );
+    await handlers.get('engine:request')(event, 'stop_session', {});
+
     await fs.writeFile(
       path.join(resumeSessionDir, 'session.json'),
       `${JSON.stringify({ schema_version: 1, session_id: 'replaced-identity' })}\n`,
@@ -375,7 +391,7 @@ async function main() {
       /\u8eab\u4efd.*\u4e0d\u4e00\u81f4/,
       'a replaced task identity must be rejected before resume_session dispatch',
     );
-    assert.equal(engine.resumeSessionCalls, 0);
+    assert.equal(engine.resumeSessionCalls, 1);
     await fs.writeFile(
       path.join(resumeSessionDir, 'session.json'),
       `${JSON.stringify({ schema_version: 1, session_id: resumeSessionId })}\n`,
@@ -384,7 +400,7 @@ async function main() {
     await handlers.get('engine:request')(event, 'resume_session', {
       session_dir: resumeSessionDir,
     });
-    assert.equal(engine.resumeSessionCalls, 1);
+    assert.equal(engine.resumeSessionCalls, 2);
     engine.stopSessionCrash = true;
     await assert.rejects(
       handlers.get('engine:request')(event, 'stop_session', {}),
@@ -423,7 +439,7 @@ async function main() {
     await waitFor(() => engine.running, 'idle helper restart after resume preflight crash');
     assert.equal(
       engine.resumeSessionCalls,
-      1,
+      2,
       'pre-dispatch offline must not auto-resume the raw or unresolved path',
     );
     await assert.rejects(

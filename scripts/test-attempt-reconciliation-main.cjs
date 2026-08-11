@@ -101,6 +101,10 @@ async function persistSessionTree(sessionDir, value) {
     path.join(sessionDir, 'session.json'),
     `${JSON.stringify({ schema_version: 1, session_id: value.session_id })}\n`,
   );
+  await fs.writeFile(
+    path.join(sessionDir, 'metadata', 'items.snapshot.json'),
+    `${JSON.stringify(value)}\n`,
+  );
 }
 
 class FakeEngineClient extends EventEmitter {

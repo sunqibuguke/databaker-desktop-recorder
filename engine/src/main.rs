@@ -35,6 +35,12 @@ struct ExportPayload {
     session_dir: String,
 }
 
+#[derive(Deserialize)]
+struct SealInterruptedSessionPayload {
+    session_dir: String,
+    expected_session_id: String,
+}
+
 #[cfg(feature = "system-test")]
 #[derive(Deserialize)]
 struct SystemTestFeedPayload {
@@ -218,8 +224,11 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
         "get_state_optional" => Ok(engine.get_state_optional()),
         "stop_session" => engine.stop_session(),
         "seal_interrupted_session" => {
-            let payload: ExportPayload = parse(command.payload)?;
-            engine.seal_interrupted_session(&PathBuf::from(payload.session_dir))
+            let payload: SealInterruptedSessionPayload = parse(command.payload)?;
+            engine.seal_interrupted_session_expected(
+                &PathBuf::from(payload.session_dir),
+                &payload.expected_session_id,
+            )
         }
         "export_session" => {
             let payload: ExportPayload = parse(command.payload)?;
@@ -281,6 +290,27 @@ mod tests {
         .unwrap_err();
 
         assert!(is_no_active_session_error(&error), "{error:#}");
+    }
+
+    #[test]
+    fn identity_bound_protocol_commands_require_an_expected_session_id() {
+        for command in ["resume_session", "seal_interrupted_session"] {
+            let mut engine = Engine::new(Emitter::new());
+            let error = dispatch(
+                &mut engine,
+                CommandEnvelope {
+                    protocol_version: PROTOCOL_VERSION,
+                    request_id: format!("missing-identity-{command}"),
+                    command: command.to_string(),
+                    payload: json!({ "session_dir": "/not/opened/without/an/identity" }),
+                },
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("expected_session_id"),
+                "{command} unexpectedly accepted an unbound directory: {error:#}"
+            );
+        }
     }
 
     #[test]
@@ -349,7 +379,10 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 request_id: "seal-1".to_string(),
                 command: "seal_interrupted_session".to_string(),
-                payload: json!({ "session_dir": root.to_string_lossy() }),
+                payload: json!({
+                    "session_dir": root.to_string_lossy(),
+                    "expected_session_id": snapshot.session_id,
+                }),
             },
         )
         .unwrap();

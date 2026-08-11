@@ -10,7 +10,7 @@ const { spawnSync } = require('node:child_process');
 
 const scenario = process.argv[2];
 if (!scenario) {
-  for (const name of ['success', 'active', 'swap', 'timeout']) {
+  for (const name of ['success', 'damaged-identity', 'active', 'swap', 'timeout']) {
     const result = spawnSync(process.execPath, [__filename, name], { encoding: 'utf8' });
     if (result.status !== 0) {
       process.stderr.write(result.stdout);
@@ -103,6 +103,11 @@ class FakeEngineClient extends EventEmitter {
       return { active: false };
     }
     if (command === 'seal_interrupted_session') {
+      assert.equal(
+        payload.expected_session_id,
+        path.basename(payload.session_dir),
+        'offline sealing must bind the exact persisted session identity',
+      );
       if (this.mode === 'timeout') throw new FakeTimeoutError(command);
       if (this.mode === 'success' && scenario === 'success') {
         sealStartedResolve();
@@ -223,12 +228,19 @@ async function runScenario() {
   await fs.mkdir(path.join(sessionDir, 'metadata'), { recursive: true });
   await fs.writeFile(path.join(sessionDir, 'session.json'), `${JSON.stringify({ schema_version: 1, session_id: sessionId })}\n`);
   await fs.writeFile(path.join(sessionDir, 'metadata', 'items.snapshot.json'), `${JSON.stringify(validSnapshot(sessionId))}\n`);
+  if (scenario === 'damaged-identity') {
+    await fs.writeFile(path.join(sessionDir, 'session.json'), '{broken');
+  }
   process.env.DATABAKER_DEFAULT_OUTPUT = root;
 
   replaceSessionBeforeRequest = async () => {
     await fs.rename(sessionDir, `${sessionDir}-old`);
-    await fs.mkdir(sessionDir);
+    await fs.mkdir(path.join(sessionDir, 'metadata'), { recursive: true });
     await fs.writeFile(path.join(sessionDir, 'session.json'), `${JSON.stringify({ schema_version: 1, session_id: sessionId })}\n`);
+    await fs.writeFile(
+      path.join(sessionDir, 'metadata', 'items.snapshot.json'),
+      `${JSON.stringify(validSnapshot(sessionId))}\n`,
+    );
   };
 
   const handlers = new Map();
@@ -312,6 +324,14 @@ async function runScenario() {
       assert.equal(result.durable_frames, 48000);
       assert.equal(engine.commands.filter(({ command }) => command === 'seal_interrupted_session').length, 1);
       tray.emit('click');
+    } else if (scenario === 'damaged-identity') {
+      const result = await invokeSeal();
+      assert.equal(result.durable_frames, 48000);
+      assert.equal(
+        engine.commands.filter(({ command }) => command === 'seal_interrupted_session').length,
+        1,
+        'consistent snapshots must authorize offline sealing when session.json alone is damaged',
+      );
     } else if (scenario === 'active') {
       await assert.rejects(invokeSeal(), /正在处理另一个任务/);
       assert.equal(engine.commands.some(({ command }) => command === 'seal_interrupted_session'), false);

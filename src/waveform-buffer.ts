@@ -1,5 +1,7 @@
 export const WAVEFORM_BIN_SAMPLES = 64;
-export const WAVEFORM_WINDOW_SECONDS = 12;
+// A wider viewport keeps the live trace readable on production workstations
+// without slowing or otherwise falsifying the authoritative PCM timeline.
+export const WAVEFORM_WINDOW_SECONDS = 20;
 // Keep the live edge inside the canvas instead of drawing it on the clipped
 // right border. This small future gutter makes a new consonant visible on the
 // first packet rather than only after it has travelled into the viewport.

@@ -14,7 +14,7 @@ if (!scenario) {
     'success',
     'seal-failure',
     'persisted-mismatch',
-    'identity-unknown',
+    'identity-file-missing',
     'unsafe-helper-stop',
   ]) {
     const result = spawnSync(process.execPath, [__filename, name], { encoding: 'utf8' });
@@ -126,6 +126,11 @@ class FakeEngineClient extends EventEmitter {
       };
     }
     if (command === 'seal_interrupted_session') {
+      assert.equal(
+        payload.expected_session_id,
+        path.basename(payload.session_dir),
+        'crash sealing must bind the exact persisted session identity',
+      );
       if (scenario === 'seal-failure') {
         throw new FakeRequestError('mock offline seal failed');
       }
@@ -287,7 +292,7 @@ async function runScenario() {
     assert.equal((await list({}, root)).length, 1, 'history scan captures the trusted session identity');
     await request(event, 'resume_session', { session_dir: sessionDir });
 
-    if (scenario === 'identity-unknown') {
+    if (scenario === 'identity-file-missing') {
       await fs.unlink(path.join(sessionDir, 'session.json'));
     }
     engine.crash();
@@ -295,7 +300,7 @@ async function runScenario() {
     appEvents.get('before-quit')({ preventDefault: () => { prevented = true; } });
     assert.equal(prevented, true, 'quit must be intercepted after the unexpected exit');
 
-    if (scenario === 'success') {
+    if (scenario === 'success' || scenario === 'identity-file-missing') {
       await waitFor(() => quitCalls === 1, 'offline seal and safe quit');
       const sealIndex = engine.timeline.indexOf('seal_interrupted_session');
       const stopIndex = engine.timeline.indexOf('engine-safe-stop');
@@ -340,19 +345,11 @@ async function runScenario() {
       await waitFor(() => dialogCalls.length === 1, 'unconfirmed crash-seal gate');
       assert.equal(dialogCalls[0].options.title, '中断任务封存未确认');
       assert.equal(quitCalls, 0, 'unknown or failed seal must never autoquit');
-      if (scenario !== 'identity-unknown') {
-        assert.equal(
-          engine.commands.some(({ command }) => command === 'seal_interrupted_session'),
-          true,
-          'the production seal was attempted before its failure or persistence mismatch was gated',
-        );
-      } else {
-        assert.equal(
-          engine.commands.some(({ command }) => command === 'seal_interrupted_session'),
-          false,
-          'identity failure is rejected before the engine can mutate the task',
-        );
-      }
+      assert.equal(
+        engine.commands.some(({ command }) => command === 'seal_interrupted_session'),
+        true,
+        'the production seal was attempted before its failure or persistence mismatch was gated',
+      );
       dialogCalls[0].resolve({ response: 0 });
       await new Promise((resolve) => setTimeout(resolve, 20));
       assert.equal(quitCalls, 0, 'acknowledging the warning keeps the application open');

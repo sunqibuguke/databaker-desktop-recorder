@@ -16,12 +16,14 @@ const MODES = new Set([
   'short',
   'soak',
   'unplug',
+  'replug',
   'disk-full',
   'power-cut',
   'recover',
   'inspect',
 ]);
-const FAULT_MODES = new Set(['unplug', 'disk-full']);
+const DEVICE_UNPLUG_MODES = new Set(['unplug', 'replug']);
+const FAULT_MODES = new Set(['unplug', 'replug', 'disk-full']);
 const BIT_DEPTHS = new Set([16, 24, 32]);
 const PRODUCTION_POWER_CUT_SECONDS = 3_600;
 const DEFAULT_POWER_CUT_MAXIMUM_SECONDS = 3_900;
@@ -47,16 +49,26 @@ const SHUTDOWN_EXIT_TIMEOUT_MS = testTimeout(
   'DATABAKER_ACCEPTANCE_TEST_SHUTDOWN_EXIT_TIMEOUT_MS',
   30_000,
 );
+const FAULT_DRAIN_OBSERVATION_MS = testTimeout(
+  'DATABAKER_ACCEPTANCE_TEST_FAULT_DRAIN_MS',
+  5_000,
+);
 
 let abortRequested = false;
-process.on('SIGINT', () => {
-  if (abortRequested) {
-    process.stderr.write('\n已在安全停止，请勿反复强制结束进程。\n');
-    return;
-  }
-  abortRequested = true;
-  process.stderr.write('\n收到 Ctrl+C：将先封存当前音频，验收结果会标记为 INCOMPLETE。\n');
-});
+let abortHandlerInstalled = false;
+
+function installAbortHandler() {
+  if (abortHandlerInstalled) return;
+  abortHandlerInstalled = true;
+  process.on('SIGINT', () => {
+    if (abortRequested) {
+      process.stderr.write('\n已在安全停止，请勿反复强制结束进程。\n');
+      return;
+    }
+    abortRequested = true;
+    process.stderr.write('\n收到 Ctrl+C：将先封存当前音频，验收结果会标记为 INCOMPLETE。\n');
+  });
+}
 
 function usage() {
   return `DataBaker Windows 外置声卡验收工具
@@ -69,6 +81,7 @@ function usage() {
   short       短录音、进度监测、安全停止、WAV 头和 RIFF/RF64 整轨导出验证
   soak        2–8 小时连续录音和文件增长监测（默认不拷贝整轨）
   unplug      进行中人工拔出 USB 声卡，验证 fail-closed 和故障标记
+  replug      拔出后确认设备消失，重插同一 endpoint 并开启全新健康会话
   disk-full   在专用测试卷上人工降低剩余空间，验证磁盘保护
   power-cut   阶段1：开始录音并等待人工断电，需 --session-dir
   recover     阶段2：重启后离线封存并严格验证断电会话，需 --session-dir
@@ -986,6 +999,48 @@ function matchingConfigurations(device, sampleRate, inputChannel) {
       Number(config.max_sample_rate) >= sampleRate &&
       Number(config.channels) >= inputChannel,
   );
+}
+
+function replugInventoryEvidence(inventory, selected, options) {
+  const devices = Array.isArray(inventory?.devices) ? inventory.devices : [];
+  const endpointMatches = devices.filter((device) => device?.id === selected?.id);
+  const exact = endpointMatches.length === 1 ? endpointMatches[0] : null;
+  const nameMatches = exact?.name === selected?.name;
+  const configurationMatches = Boolean(
+    exact && matchingConfigurations(exact, options.sampleRate, options.channel).length > 0,
+  );
+  return {
+    target_id: selected?.id ?? null,
+    target_name: selected?.name ?? null,
+    observed_device_ids: devices.map((device) => device?.id).filter(Boolean),
+    observed_same_name_ids: devices
+      .filter((device) => device?.name === selected?.name)
+      .map((device) => device?.id)
+      .filter(Boolean),
+    target_match_count: endpointMatches.length,
+    target_present: endpointMatches.length > 0,
+    target_name_matches: nameMatches,
+    target_configuration_matches: configurationMatches,
+    exact_match: endpointMatches.length === 1 && nameMatches && configurationMatches,
+    target_device: exact,
+  };
+}
+
+function replugPollTimeoutMs(options) {
+  return testTimeout(
+    'DATABAKER_ACCEPTANCE_TEST_REPLUG_TIMEOUT_MS',
+    options.faultTimeoutSeconds * 1_000,
+  );
+}
+
+function replugInventoryTelemetry(state, evidence, consecutiveMatches = 0) {
+  return {
+    at: new Date().toISOString(),
+    phase: 'replug-inventory',
+    state,
+    ...evidence,
+    consecutive_matches: consecutiveMatches,
+  };
 }
 
 function segmentStatSnapshot(sessionDirectory) {
@@ -2016,6 +2071,21 @@ function evaluateNormal(report, options, inspection) {
   const finalSnapshot = report.stop?.result?.snapshot ?? inspection.snapshot;
   addCheck(checks, 'safe-stop', '录制安全停止并封存', Boolean(report.stop?.result) && !report.stop?.error, report.stop);
   addCheck(checks, 'stopped-status', '最终会话状态为 stopped', finalSnapshot?.status === 'stopped', { status: finalSnapshot?.status });
+  const captured = Number(finalSnapshot?.captured_samples);
+  const committed = Number(finalSnapshot?.committed_samples);
+  const physical = Number(inspection?.total_physical_frames);
+  addCheck(
+    checks,
+    'exact-sample-watermark',
+    '安全停止后采集、持久化与物理 WAV 样本水位完全一致',
+    Number.isSafeInteger(captured) &&
+      Number.isSafeInteger(committed) &&
+      Number.isSafeInteger(physical) &&
+      captured >= 0 &&
+      captured === committed &&
+      committed === physical,
+    { captured_samples: captured, committed_samples: committed, physical_frames: physical },
+  );
   addCheck(checks, 'no-overflow', '无音频队列溢出', Number(finalSnapshot?.overflow_samples ?? 0) === 0, {
     overflow_samples: finalSnapshot?.overflow_samples,
   });
@@ -2163,12 +2233,26 @@ function evaluateFault(report, options, inspection) {
   const fault = report.fault;
   addCheck(checks, 'healthy-prefix', '故障前已持续采集至少 2 秒', Number(fault?.captured_before_trigger ?? 0) >= options.sampleRate * 2, fault);
   addCheck(checks, 'fault-detected', '引擎检测到采集/存储故障', Boolean(fault?.detected_at), fault);
-  if (options.mode === 'unplug') {
+  if (DEVICE_UNPLUG_MODES.has(options.mode)) {
+    const unplugLatency =
+      typeof fault?.seconds_after_trigger === 'number'
+        ? fault.seconds_after_trigger
+        : Number.NaN;
+    addCheck(
+      checks,
+      'fault-after-trigger',
+      '采集故障不得早于拔出操作提示',
+      fault?.fault_before_trigger == null && Number.isFinite(unplugLatency) && unplugLatency >= 0,
+      {
+        seconds_after_trigger: fault?.seconds_after_trigger,
+        fault_before_trigger: fault?.fault_before_trigger ?? null,
+      },
+    );
     addCheck(
       checks,
       'unplug-detection-latency',
       '拔出提示后 15 秒内进入 fail-closed',
-      Number(fault?.seconds_after_trigger) <= 15,
+      Number.isFinite(unplugLatency) && unplugLatency >= 0 && unplugLatency <= 15,
       fault,
     );
     addCheck(
@@ -2238,12 +2322,21 @@ async function safeStopSession(client) {
   return { result: null, error: lastError?.message ?? '未知停止错误', attempts: 4 };
 }
 
-async function monitorCapture(client, sessionDirectory, options, telemetryLog, onPowerCutArm = null) {
+async function monitorCapture(
+  client,
+  sessionDirectory,
+  options,
+  telemetryLog,
+  onPowerCutArm = null,
+  monitorOptions = {},
+) {
   const rows = [];
   const started = Date.now();
-  const normalDurationMs = options.mode === 'soak' ? options.hours * 3_600_000 : options.seconds * 1_000;
-  const expectedFault = FAULT_MODES.has(options.mode);
-  const powerCut = options.mode === 'power-cut';
+  const normalDurationMs = monitorOptions.durationMs ??
+    (options.mode === 'soak' ? options.hours * 3_600_000 : options.seconds * 1_000);
+  const expectedFault = monitorOptions.expectedFault ?? FAULT_MODES.has(options.mode);
+  const powerCut = monitorOptions.powerCut ?? options.mode === 'power-cut';
+  const phasePrefix = String(monitorOptions.phasePrefix ?? '');
   const triggerAtMs = expectedFault || powerCut ? started + options.triggerDelaySeconds * 1_000 : null;
   const deadlineMs = expectedFault
     ? triggerAtMs + options.faultTimeoutSeconds * 1_000
@@ -2251,18 +2344,18 @@ async function monitorCapture(client, sessionDirectory, options, telemetryLog, o
   let announcedTrigger = false;
   let detectedAtMs = null;
   let detectedElapsedSeconds = null;
+  let faultBeforeTrigger = null;
   let capturedBeforeTrigger = null;
   let firstCriticalElapsed = null;
   let lastConsoleSecond = -1;
 
   while (!abortRequested) {
     const now = Date.now();
-    if (expectedFault && !announcedTrigger && now >= triggerAtMs) {
+    if (expectedFault && !announcedTrigger && detectedAtMs === null && now >= triggerAtMs) {
       announcedTrigger = true;
-      capturedBeforeTrigger = Number(client.latestMeter?.captured_samples ?? 0);
       process.stdout.write('\x07\n============================================================\n');
       process.stdout.write(
-        options.mode === 'unplug'
+        DEVICE_UNPLUG_MODES.has(options.mode)
           ? '现在拔出 USB 声卡（不要点停止），工具正在计时。\n'
           : '现在在专用测试卷上启动填充器，降低剩余空间（勿填系统盘）。\n',
       );
@@ -2286,10 +2379,11 @@ async function monitorCapture(client, sessionDirectory, options, telemetryLog, o
       at: new Date().toISOString(),
       elapsed_seconds: Number(elapsedSeconds.toFixed(3)),
       phase: expectedFault && announcedTrigger
-        ? 'fault-observation'
+        ? `${phasePrefix}fault-observation`
         : powerCut && announcedTrigger
           ? 'power-cut-armed'
-          : 'recording',
+          : `${phasePrefix}recording`,
+      session_id: state?.snapshot?.session_id ?? null,
       captured_samples: Number(state?.snapshot?.captured_samples ?? meter.captured_samples ?? 0),
       committed_samples: Number(state?.snapshot?.committed_samples ?? meter.committed_samples ?? 0),
       overflow_samples: Number(state?.snapshot?.overflow_samples ?? meter.overflow_samples ?? 0),
@@ -2313,6 +2407,9 @@ async function monitorCapture(client, sessionDirectory, options, telemetryLog, o
       row.overflow_samples > 0 ||
       markerExists ||
       state?.snapshot?.status === 'faulted';
+    if (expectedFault && announcedTrigger && capturedBeforeTrigger === null) {
+      capturedBeforeTrigger = row.captured_samples;
+    }
     let armedThisRow = false;
     if (powerCut && !announcedTrigger && now >= triggerAtMs && !isFault) {
       const previous = rows.at(-1) ?? null;
@@ -2354,7 +2451,14 @@ async function monitorCapture(client, sessionDirectory, options, telemetryLog, o
     if (isFault && detectedAtMs === null) {
       detectedAtMs = Date.now();
       detectedElapsedSeconds = elapsedSeconds;
-      process.stdout.write(`\n已检测故障: t=${elapsedSeconds.toFixed(1)}s，继续观察时间轴排空。\n`);
+      if (expectedFault && !announcedTrigger) {
+        faultBeforeTrigger = row;
+        process.stdout.write(
+          `\n故障发生在操作提示前: t=${elapsedSeconds.toFixed(1)}s，本轮不得计入拔插验收；继续安全排空。\n`,
+        );
+      } else {
+        process.stdout.write(`\n已检测故障: t=${elapsedSeconds.toFixed(1)}s，继续观察时间轴排空。\n`);
+      }
     }
 
     const wholeSecond = Math.floor(elapsedSeconds);
@@ -2368,7 +2472,10 @@ async function monitorCapture(client, sessionDirectory, options, telemetryLog, o
 
     if (!expectedFault && (Date.now() >= deadlineMs || isFault)) break;
     if (expectedFault) {
-      if (detectedAtMs !== null && Date.now() - detectedAtMs >= Math.max(5_000, options.pollSeconds * 3_000)) break;
+      if (
+        detectedAtMs !== null &&
+        Date.now() - detectedAtMs >= Math.max(FAULT_DRAIN_OBSERVATION_MS, options.pollSeconds * 3_000)
+      ) break;
       if (Date.now() >= deadlineMs) break;
     }
     await sleep(options.pollSeconds * 1_000);
@@ -2394,6 +2501,7 @@ async function monitorCapture(client, sessionDirectory, options, telemetryLog, o
     // deliberately uses its own first explicit evidence row.
     first_fault_row: firstFaultRow,
     first_fault_kind_row: firstFaultKindRow,
+    fault_before_trigger: faultBeforeTrigger,
   };
 }
 
@@ -2405,11 +2513,24 @@ async function maybePromptBeforeCapture(options) {
     if (options.mode === 'short') message = '准备好后按 Enter。噪声检测时请保持安静，之后持续朗读或播放测试音。';
     if (options.mode === 'soak') message = '确认信号源、供电、USB 和专用存储均已准备，按 Enter 启动长稳。';
     if (options.mode === 'unplug') message = '保持声卡连接，按 Enter 启动；倒计时结束后按提示拔出。';
+    if (options.mode === 'replug') message = '保持声卡连接，按 Enter 启动；只在提示时拔出，确认消失后再按提示插回。';
     if (options.mode === 'disk-full') message = '确认输出在可丢弃的专用测试卷，按 Enter 启动；勿对系统盘做填满测试。';
     if (options.mode === 'power-cut') {
       message = '确认已使用可丢弃的 Windows 测试机和指定录制目录，按 Enter 开始；只在倒计时结束后切断整机电源。';
     }
     await prompt.question(`${message}\n`);
+  } finally {
+    prompt.close();
+  }
+}
+
+async function promptForReplug(options) {
+  const message = '已确认目标 endpoint 从 Windows 输入列表消失。现在插回同一声卡（使用原 USB 端口）。';
+  process.stdout.write(`\n${message}\n`);
+  if (options.yes || !process.stdin.isTTY || !process.stdout.isTTY) return;
+  const prompt = createPrompt({ input: process.stdin, output: process.stdout });
+  try {
+    await prompt.question('插回后按 Enter，工具将轮询同一 endpoint ID。\n');
   } finally {
     prompt.close();
   }
@@ -2527,7 +2648,10 @@ async function runRecover(options, runDirectory, report) {
     report.recovery = {
       result: await client.request(
         'seal_interrupted_session',
-        { session_dir: options.sessionDir },
+        {
+          session_dir: options.sessionDir,
+          expected_session_id: phase1.evidence?.session_id,
+        },
         10 * 60_000,
       ),
     };
@@ -2626,6 +2750,473 @@ async function runRecover(options, runDirectory, report) {
     }
   } finally {
     client?.closeLogs();
+  }
+}
+
+function replugStartPayload(sessionDirectory, sessionId, selected, options, phase) {
+  return {
+    session_dir: sessionDirectory,
+    session_id: sessionId,
+    script_name: `Windows replug ${phase} acceptance`,
+    device_id: selected.id,
+    device_name: selected.name,
+    sample_rate: options.sampleRate,
+    bit_depth: options.bitDepth,
+    input_channel: options.channel,
+    silence_duration_ms: 1_000,
+    silence_threshold_dbfs: options.noiseThresholdDbfs,
+    items: [{
+      id: `QA-REPLUG-${phase.toUpperCase()}`,
+      text: 'DataBaker Windows external audio interface replug acceptance',
+      label: `replug-${phase}`,
+    }],
+  };
+}
+
+function prefixChecks(prefix, checks) {
+  return checks.map((check) => ({
+    ...check,
+    id: `${prefix}-${check.id}`,
+    label: `${prefix === 'replug-a' ? '拔出前/故障会话' : '重插后新会话'}: ${check.label}`,
+  }));
+}
+
+async function runReplug(options, runDirectory, report) {
+  const enginePath = findEngine(options.engine);
+  const engineSha256 = sha256RegularFile(enginePath, '录音引擎');
+  const client = new EngineClient(
+    enginePath,
+    runDirectory,
+    path.join(runDirectory, 'protocol.jsonl'),
+    path.join(runDirectory, 'engine-stderr.log'),
+  );
+  const telemetry = new NdjsonLog(path.join(runDirectory, 'telemetry.jsonl'));
+  const beforeDirectory = path.join(runDirectory, 'recording-before-unplug');
+  const afterDirectory = path.join(runDirectory, 'recording-after-replug');
+  let activeSession = false;
+  let beforeRows = [];
+  let afterRows = [];
+  try {
+    if (pathEntryExists(beforeDirectory) || pathEntryExists(afterDirectory)) {
+      throw new Error('replug 两个会话目录必须均不存在');
+    }
+    const ready = await client.start();
+    report.engine = { path: enginePath, binary_sha256: engineSha256, ready };
+    const inventory = await client.request('list_devices', {}, 30_000);
+    report.inventory = inventory;
+    printDevices(inventory);
+    const selected = await selectDevice(inventory, options);
+    const configurations = matchingConfigurations(selected, options.sampleRate, options.channel);
+    if (configurations.length === 0) {
+      throw new Error(`设备 ${selected.name} 不支持 ${options.sampleRate} Hz / 输入 ${options.channel}`);
+    }
+    report.selected_device = selected;
+    report.requested = {
+      sample_rate: options.sampleRate,
+      wav_bit_depth: options.bitDepth,
+      minimum_input_format_bits: options.minimumInputFormatBits,
+      output_channels: 1,
+      input_channel: options.channel,
+      matching_driver_configurations: configurations,
+    };
+    report.session_dir = afterDirectory;
+    report.replug = {
+      required_consecutive_matches: 2,
+      before: { session_dir: beforeDirectory },
+      transition: {
+        target_id: selected.id,
+        target_name: selected.name,
+        disappearance: null,
+        disappearance_timed_out: false,
+        reappearance: null,
+        reappearance_timed_out: false,
+      },
+      after: { session_dir: afterDirectory },
+    };
+    const initialEvidence = replugInventoryEvidence(inventory, selected, options);
+    report.replug.transition.initial = initialEvidence;
+    telemetry.write(
+      replugInventoryTelemetry('present-before-unplug', initialEvidence),
+      true,
+    );
+    await maybePromptBeforeCapture(options);
+
+    const beforeSessionId = `acceptance-${timestampForPath().toLowerCase()}-replug-a-${options.bitDepth}bit`;
+    const beforeStart = await client.request(
+      'start_session',
+      replugStartPayload(beforeDirectory, beforeSessionId, selected, options, 'a'),
+      60_000,
+    );
+    activeSession = true;
+    report.replug.before.start = beforeStart;
+    writeJsonDurable(path.join(runDirectory, 'acceptance-report.json'), report);
+    process.stdout.write(`\n已启动会话 A: ${beforeStart.snapshot.device_name}\nID: ${beforeStart.snapshot.device_id}\n\n`);
+    if (!options.skipNoiseCheck) {
+      try {
+        report.replug.before.noise_check = await client.request(
+          'check_noise',
+          { threshold_dbfs: options.noiseThresholdDbfs },
+          20_000,
+        );
+      } catch (error) {
+        report.replug.before.noise_check_error = error.message;
+      }
+    }
+    const beforeMonitor = await monitorCapture(
+      client,
+      beforeDirectory,
+      options,
+      telemetry,
+      null,
+      { expectedFault: true, powerCut: false, phasePrefix: 'replug-a-' },
+    );
+    beforeRows = beforeMonitor.rows;
+    report.replug.before.progress_summary = summarizeProgress(
+      beforeRows,
+      options.sampleRate,
+      options.pollSeconds,
+    );
+    report.replug.before.fault = {
+      trigger_at: beforeMonitor.trigger_at,
+      detected_at: beforeMonitor.detected_at,
+      detected_elapsed_seconds: beforeMonitor.detected_elapsed_seconds,
+      captured_before_trigger: beforeMonitor.captured_before_trigger,
+      seconds_after_trigger: beforeMonitor.seconds_after_trigger,
+      first_storage_critical_elapsed_seconds: beforeMonitor.first_storage_critical_elapsed_seconds,
+      seconds_after_storage_critical: beforeMonitor.seconds_after_storage_critical,
+      first_fault_row: beforeMonitor.first_fault_row,
+      first_fault_kind_row: beforeMonitor.first_fault_kind_row,
+      fault_before_trigger: beforeMonitor.fault_before_trigger,
+    };
+    report.replug.before.stop = await safeStopSession(client);
+    activeSession = !report.replug.before.stop.result;
+    try {
+      const unexpected = await client.request(
+        'export_session',
+        { session_dir: beforeDirectory },
+        120_000,
+      );
+      report.replug.before.export = { expected_rejection: false, unexpected_result: unexpected };
+    } catch (error) {
+      report.replug.before.export = { expected_rejection: true, error: error.message };
+    }
+    try {
+      const unexpected = await client.request(
+        'resume_session',
+        { session_dir: beforeDirectory, expected_session_id: beforeSessionId },
+        60_000,
+      );
+      activeSession = true;
+      report.replug.before.resume = { expected_rejection: false, unexpected_result: unexpected };
+      report.replug.before.unexpected_resume_cleanup = await safeStopSession(client);
+      activeSession = !report.replug.before.unexpected_resume_cleanup.result;
+    } catch (error) {
+      report.replug.before.resume = { expected_rejection: true, error: error.message };
+    }
+    report.replug.before.inspection = inspectSession(beforeDirectory);
+
+    let disappearanceEvidence = null;
+    const disappearanceDeadline = Date.now() + replugPollTimeoutMs(options);
+    while (!abortRequested && Date.now() <= disappearanceDeadline) {
+      const disappearanceInventory = await client.request('list_devices', {}, 30_000);
+      disappearanceEvidence = replugInventoryEvidence(
+        disappearanceInventory,
+        selected,
+        options,
+      );
+      const disappearanceRow = replugInventoryTelemetry(
+        disappearanceEvidence.target_present ? 'still-present-after-unplug' : 'absent-after-unplug',
+        disappearanceEvidence,
+      );
+      telemetry.write(disappearanceRow, !disappearanceEvidence.target_present);
+      report.replug.transition.last_disappearance_observation = disappearanceRow;
+      if (!disappearanceEvidence.target_present) {
+        report.replug.transition.disappearance = disappearanceRow;
+        break;
+      }
+      await sleep(options.pollSeconds * 1_000);
+    }
+    if (!report.replug.transition.disappearance) {
+      report.replug.transition.disappearance = report.replug.transition.last_disappearance_observation;
+    }
+    report.replug.transition.disappearance_timed_out =
+      report.replug.transition.disappearance?.target_present !== false;
+
+    const beforeSnapshot = report.replug.before.stop?.result?.snapshot ??
+      report.replug.before.inspection?.snapshot;
+    const canWaitForReappearance =
+      beforeSnapshot?.status === 'faulted' &&
+      report.replug.before.fault?.first_fault_kind_row?.fault_kind === 'device_unavailable' &&
+      faultMarkerPresent(report.replug.before.inspection) &&
+      report.replug.before.export?.expected_rejection === true &&
+      report.replug.before.resume?.expected_rejection === true &&
+      report.replug.before.fault?.fault_before_trigger == null &&
+      disappearanceEvidence?.target_present === false;
+
+    let stableReappearance = null;
+    if (canWaitForReappearance) {
+      await promptForReplug(options);
+      const deadline = Date.now() + replugPollTimeoutMs(options);
+      let consecutiveMatches = 0;
+      while (!abortRequested && Date.now() <= deadline) {
+        const observedInventory = await client.request('list_devices', {}, 30_000);
+        const evidence = replugInventoryEvidence(observedInventory, selected, options);
+        consecutiveMatches = evidence.exact_match ? consecutiveMatches + 1 : 0;
+        const state = consecutiveMatches >= report.replug.required_consecutive_matches
+          ? 'stable-reappearance'
+          : evidence.exact_match
+            ? 'matching-reappearance'
+            : evidence.target_present
+              ? 'nonmatching-target-reappearance'
+              : evidence.observed_same_name_ids.length > 0
+                ? 'same-name-different-id'
+                : 'waiting-reappearance';
+        const row = replugInventoryTelemetry(state, evidence, consecutiveMatches);
+        telemetry.write(row, state === 'stable-reappearance');
+        report.replug.transition.last_observation = row;
+        if (state === 'stable-reappearance') {
+          stableReappearance = row;
+          report.replug.transition.reappearance = row;
+          break;
+        }
+        await sleep(options.pollSeconds * 1_000);
+      }
+      report.replug.transition.reappearance_timed_out = stableReappearance === null;
+    }
+
+    if (stableReappearance) {
+      const afterSessionId = `acceptance-${timestampForPath().toLowerCase()}-replug-b-${options.bitDepth}bit`;
+      try {
+        report.replug.after.start = await client.request(
+          'start_session',
+          replugStartPayload(afterDirectory, afterSessionId, selected, options, 'b'),
+          60_000,
+        );
+        activeSession = true;
+      } catch (error) {
+        report.replug.after.start_error = error.message;
+      }
+      if (activeSession) {
+        if (!options.skipNoiseCheck) {
+          try {
+            report.replug.after.noise_check = await client.request(
+              'check_noise',
+              { threshold_dbfs: options.noiseThresholdDbfs },
+              20_000,
+            );
+          } catch (error) {
+            report.replug.after.noise_check_error = error.message;
+          }
+        }
+        const afterMonitor = await monitorCapture(
+          client,
+          afterDirectory,
+          options,
+          telemetry,
+          null,
+          {
+            expectedFault: false,
+            powerCut: false,
+            phasePrefix: 'replug-b-',
+            durationMs: options.seconds * 1_000,
+          },
+        );
+        afterRows = afterMonitor.rows;
+        report.replug.after.progress_summary = summarizeProgress(
+          afterRows,
+          options.sampleRate,
+          options.pollSeconds,
+        );
+        report.replug.after.stop = await safeStopSession(client);
+        activeSession = !report.replug.after.stop.result;
+        report.replug.after.export = { skipped: true };
+        report.replug.after.inspection = inspectSession(afterDirectory);
+      }
+    }
+
+    try {
+      report.engine.exit = await client.shutdown();
+    } catch (error) {
+      report.engine.shutdown_error = error.message;
+      report.engine.exit = client.shutdownResult ?? client.exitResult;
+    }
+
+    const checks = [];
+    const beforeView = {
+      ...report,
+      session_dir: beforeDirectory,
+      start: report.replug.before.start,
+      stop: report.replug.before.stop,
+      export: report.replug.before.export,
+      inspection: report.replug.before.inspection,
+      progress_summary: report.replug.before.progress_summary,
+      progress_rows: beforeRows,
+      fault: report.replug.before.fault,
+    };
+    checks.push(...prefixChecks(
+      'replug-a',
+      evaluateFault(beforeView, options, report.replug.before.inspection),
+    ));
+    const healthyPrefixRows = beforeRows.filter((row) => row.phase === 'replug-a-recording');
+    const healthyPrefix = summarizeProgress(
+      healthyPrefixRows,
+      options.sampleRate,
+      options.pollSeconds,
+    );
+    report.replug.before.healthy_prefix_summary = healthyPrefix;
+    addCheck(
+      checks,
+      'replug-a-healthy-prefix-clock',
+      '拔出前健康前缀的采样时钟与请求一致',
+      healthyPrefix.observed_capture_rate !== null &&
+        healthyPrefix.observed_capture_rate >= options.sampleRate * 0.95 &&
+        healthyPrefix.observed_capture_rate <= options.sampleRate * 1.05,
+      healthyPrefix,
+    );
+    addCheck(
+      checks,
+      'replug-a-healthy-prefix-signal',
+      '拔出前健康前缀检测到有效信号',
+      healthyPrefix.maximum_peak_dbfs > -50,
+      { maximum_peak_dbfs: healthyPrefix.maximum_peak_dbfs },
+    );
+    addCheck(
+      checks,
+      'replug-old-export-blocked',
+      '故障会话禁止常规导出',
+      report.replug.before.export?.expected_rejection === true,
+      report.replug.before.export,
+    );
+    addCheck(
+      checks,
+      'replug-old-resume-blocked',
+      '故障会话禁止继续追加',
+      report.replug.before.resume?.expected_rejection === true,
+      report.replug.before.resume,
+    );
+    addCheck(
+      checks,
+      'replug-target-disappeared',
+      '拔出后 Windows 输入列表至少一次确认目标 endpoint ID 消失',
+      report.replug.transition.disappearance?.target_present === false,
+      report.replug.transition.disappearance,
+    );
+    addCheck(
+      checks,
+      'replug-same-endpoint-stable',
+      '同一 endpoint ID、名称和所需配置连续至少两次出现',
+      report.replug.transition.reappearance?.exact_match === true &&
+        Number(report.replug.transition.reappearance?.consecutive_matches) >= 2,
+      report.replug.transition.reappearance ?? report.replug.transition.last_observation,
+    );
+
+    const beforeIdentity = report.replug.before.start?.snapshot;
+    const afterIdentity = report.replug.after.start?.snapshot;
+    addCheck(
+      checks,
+      'replug-first-device-exact',
+      '故障会话精确绑定计划中的 endpoint ID 和名称',
+      beforeIdentity?.device_id === selected.id && beforeIdentity?.device_name === selected.name,
+      { expected: selected, actual: beforeIdentity },
+    );
+    addCheck(
+      checks,
+      'replug-distinct-session',
+      '重插后使用不同目录和不同 session ID 开启全新会话',
+      Boolean(beforeIdentity?.session_id) && Boolean(afterIdentity?.session_id) &&
+        beforeIdentity.session_id !== afterIdentity.session_id &&
+        !pathsEqual(beforeDirectory, afterDirectory),
+      {
+        before_session_id: beforeIdentity?.session_id,
+        after_session_id: afterIdentity?.session_id,
+        before_directory: beforeDirectory,
+        after_directory: afterDirectory,
+      },
+    );
+    addCheck(
+      checks,
+      'replug-second-device-exact',
+      '新会话精确绑定原 endpoint ID 和名称，未回退到同名或默认设备',
+      afterIdentity?.device_id === selected.id && afterIdentity?.device_name === selected.name,
+      { expected: selected, actual: afterIdentity },
+    );
+
+    if (report.replug.after.start && report.replug.after.stop && report.replug.after.inspection) {
+      const afterView = {
+        ...report,
+        session_dir: afterDirectory,
+        start: report.replug.after.start,
+        stop: report.replug.after.stop,
+        export: report.replug.after.export,
+        inspection: report.replug.after.inspection,
+        progress_summary: report.replug.after.progress_summary,
+        progress_rows: afterRows,
+      };
+      checks.push(...prefixChecks(
+        'replug-b',
+        evaluateNormal(afterView, options, report.replug.after.inspection),
+      ));
+      addCheck(
+        checks,
+        'replug-b-duration',
+        `重插后新会话健康采集至少 ${options.seconds} 秒`,
+        Number(report.replug.after.progress_summary?.last?.elapsed_seconds) >= options.seconds,
+        report.replug.after.progress_summary,
+      );
+    } else {
+      addCheck(
+        checks,
+        'replug-b-session-complete',
+        '重插后新会话已完整启动、采集和安全停止',
+        false,
+        report.replug.after,
+      );
+    }
+    const stderrText = client.refreshStderrText();
+    const panic = /panicked|fatal runtime error|stack overflow/i.test(stderrText);
+    addCheck(checks, 'engine-no-panic', '引擎无 panic/fatal runtime error', !panic, {
+      stderr_tail: stderrText.slice(-8_000),
+    });
+    report.checks = checks;
+    report.aborted = abortRequested;
+    report.overall = overallFromChecks(
+      checks,
+      report.aborted ||
+        !report.replug.before.stop?.result ||
+        (Boolean(report.replug.after.start) && !report.replug.after.stop?.result) ||
+        Boolean(report.engine.shutdown_error),
+    );
+    report.start = report.replug.after.start ?? null;
+    report.stop = report.replug.after.stop ?? null;
+    report.inspection = report.replug.after.inspection ?? null;
+    report.progress_summary = report.replug.after.progress_summary ?? null;
+    report.progress_samples_recorded = beforeRows.length + afterRows.length;
+  } catch (error) {
+    report.tool_error = error.stack ?? error.message;
+    report.overall = 'INCOMPLETE';
+    if (activeSession) {
+      report.emergency_stop = await safeStopSession(client);
+      activeSession = !report.emergency_stop.result;
+    }
+    try {
+      report.engine = report.engine ?? {
+        path: enginePath,
+        binary_sha256: engineSha256,
+        ready: client.readyPayload,
+      };
+      report.engine.exit = await client.shutdown();
+    } catch (shutdownError) {
+      report.engine = report.engine ?? {
+        path: enginePath,
+        binary_sha256: engineSha256,
+        ready: client.readyPayload,
+      };
+      report.engine.shutdown_error = shutdownError.message;
+      report.engine.exit = client.shutdownResult ?? client.exitResult;
+    }
+  } finally {
+    telemetry.close();
+    client.closeLogs();
   }
 }
 
@@ -2864,6 +3455,7 @@ function printSummary(report, reportPath) {
 }
 
 async function main() {
+  installAbortHandler();
   let options;
   try {
     options = parseArgs(process.argv.slice(2));
@@ -2934,6 +3526,8 @@ async function main() {
       await runInventory(options, runDirectory, report);
     } else if (options.mode === 'recover') {
       await runRecover(options, runDirectory, report);
+    } else if (options.mode === 'replug') {
+      await runReplug(options, runDirectory, report);
     } else {
       await runCapture(options, runDirectory, report);
     }

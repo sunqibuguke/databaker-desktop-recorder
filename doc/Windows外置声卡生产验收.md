@@ -24,7 +24,7 @@
 ## 2. 安全规则
 
 1. `inventory`、`inspect` 是只读模式。`short`默认只录 20 秒。
-2. 所有录制都写入新建的 `acceptance-results/<timestamp>-<mode>-<pid>/recording`，不复用客户任务目录。
+2. 所有录制都写入新建的 `acceptance-results/<timestamp>-<mode>-<pid>/`，不复用客户任务目录；普通模式使用 `recording`，`replug` 使用两个独立的 `recording-before-unplug` / `recording-after-replug` 会话目录。
 3. Ctrl+C 第一次不会直接杀引擎；工具会先执行安全停止，并把报告标为 `INCOMPLETE`。
 4. `disk-full` 模式不会自动写填充数据。它要求显式 `--output`、两个确认参数，并在 Windows 上直接拒绝 `SystemDrive`。
 5. 磁盘故障验收只能在可删除的 VHD/VHDX 或独立测试盘上进行，禁止对 Windows 系统盘、用户数据盘或客户交付盘做填满测试。
@@ -87,6 +87,8 @@ protocol.jsonl           命令、响应和低频引擎事件
 engine-stderr.log        Rust/WASAPI 日志
 recording/               本次验收的原始录制目录
 ```
+
+`replug` 报告目录会以 `recording-before-unplug/` 和 `recording-after-replug/` 代替单个 `recording/`；两份原始会话都属于必归档证据。
 
 报告、日志和 `recording/` 必须一起归档，不要只截图保存 `PASS`。
 
@@ -161,6 +163,8 @@ $device = "<inventory 返回的完整设备 ID>"
 
 ## 7. 录制中拔出 USB 声卡
 
+### 7.1 拔出后 fail-closed
+
 ```powershell
 .\run-windows-audio-acceptance.cmd --mode unplug --device-id $device --sample-rate 48000 --bit-depth 24 --channel 1 --trigger-delay-seconds 10 --fault-timeout-seconds 60
 ```
@@ -183,6 +187,33 @@ $device = "<inventory 返回的完整设备 ID>"
 - 不出现界面或 CLI 无限卡住；如写入线程仍在封存，必须明确返回可重试错误并保留会话锁。
 
 拔设备故障会话是保护性封存，不应直接恢复当作正常交付。重连声卡后新建一次验收录制。
+
+### 7.2 拔出并重插同一 endpoint 后开启新会话
+
+```powershell
+.\run-windows-audio-acceptance.cmd --mode replug --device-id $device --sample-rate 48000 --bit-depth 24 --channel 1 --seconds 30 --trigger-delay-seconds 10 --fault-timeout-seconds 60
+```
+
+操作：
+
+1. 开始时保持目标声卡连接、固定在生产使用的 USB 端口，并持续输入声音。
+2. 终端第一次鸣铃并提示后拔出声卡，不点停止，也不要立即插回。
+3. 等工具明确确认设备列表中目标 endpoint ID 已至少消失一次，并提示重插后，再把同一声卡插回同一 USB 端口。
+4. 重插后继续提供可检测的音频信号，等待新会话完成 `--seconds` 指定的健康采集和安全停止。
+
+强制通过标准：
+
+- 会话 A 在拔出前有至少 2 秒健康采集、有效信号和正确采样时钟；拔出后明确进入 `device_unavailable` / `faulted`，持久化故障标记，并保留完整物理 WAV 帧。
+- 首个故障证据必须出现在终端明确打印“现在拔出”之后，且检测延迟必须在 `0–15` 秒内。过早拔出、测试前已断开或负延迟都必须失败，不得借后续重插补成 PASS。
+- 会话 A 的常规导出和恢复追加都必须被拒绝；不能把故障时间轴继续用作新录制。
+- `list_devices` 至少一次确认计划中的目标 endpoint ID 不存在。只有此证据成立后工具才进入重插等待，过早插回导致从未观察到消失时应 `FAIL`。
+- 重插后的设备必须以原 endpoint ID、原名称和所需采样率/通道配置连续至少两次出现。仅同名但 ID 不同、系统默认设备或另一块声卡都不得替代。
+- 协议中必须恰好有两次成功 `start_session`：会话 B 使用新的 session ID 和新的目录，且仍显式绑定原 endpoint ID/名称/格式。
+- 会话 B 健康采集至少 `--seconds`，检测到有效信号，平均样本速率在请求值 ±5% 内；最终安全停止，无 fault/overflow/故障标记，且必须满足 `captured_samples = committed_samples = 物理 WAV 完整帧数`，不允许用“正常录制时可容忍的 checkpoint 延迟”解释停止后的尾音丢失。
+
+报告中的 `replug.before`、`replug.transition`、`replug.after` 分别保存故障会话、消失/重现证据和新会话。资格聚合器不只信任报告内嵌的 `inspection`：它会重新读取两个录音目录中的 `items.snapshot.json`、`session.json`、fault marker 和所有分段 WAV，独立解析头部/EOF/物理帧并与会话身份、水位交叉绑定。它还会读取 `telemetry.jsonl` 验证“出现 → 提示后故障 → 消失 → 连续重现 → B 录制”的顺序，读取 `protocol.jsonl` 验证两次 start、两个会话的成功 stop、旧会话导出/恢复拒绝和引擎 shutdown，最后将两个录音目录都纳入证据哈希。
+
+这里验证的是 Windows/WASAPI endpoint 身份，不是声卡机身序列号。驱动更新、换 USB 口或 USB 拓扑变化可能生成不同 endpoint ID；遇到这种情况本项应 fail-closed，先按新的生产端口重新建立资格计划，不能用同名回退绕过。
 
 ## 8. 磁盘临界/写满保护
 
@@ -348,7 +379,7 @@ $installerSha256 = "<SHA256SUMS.txt 中的 64 位哈希>"
 
 聚合器只在以下条件全部满足时返回 `QUALIFIED`：44.1/48/96 kHz × 16/24/32-bit × 每个生产通道的 30 秒完整导出矩阵；三个采样率各至少 2 小时长稳；主力组合 8 小时；一次超过 RIFF 容量的 RF64 整轨导出；枚举、拔出、默认设备切换、重连后新录制、critical 磁盘保护、瞬时真实 ENOSPC 后恢复、真实断电恢复和严格复核。它还要求全部报告属于同一资格 ID、安装包、引擎、验收工具、Windows 主机和稳定设备 ID，且所有 check 都是 `PASS`、没有未处理 `WARN`。通过后会生成 `qualification-report.json` 和覆盖计划、报告、日志、原始录音及安装包的 `qualification-evidence.sha256`。
 
-**当前 `default-switch`、`replug` 和 `abrupt-enospc` 验收模式尚未实现。** 聚合器会将这三项标为 `NOT_IMPLEMENTED` 并返回 `NOT_QUALIFIED`；不允许删掉它们、修改示例或用人工声明获得整套资格。
+**当前 `default-switch` 和 `abrupt-enospc` 验收模式尚未实现。** 聚合器会将这两项标为 `NOT_IMPLEMENTED` 并返回 `NOT_QUALIFIED`；不允许删掉它们、修改示例或用人工声明获得整套资格。`replug` 已实现，但仍必须在真实 Windows、真实外置声卡和固定生产 USB 端口上留下完整双会话证据才能通过。
 
 ## 10. 发布判定与工单清单
 
@@ -363,7 +394,7 @@ $installerSha256 = "<SHA256SUMS.txt 中的 64 位哈希>"
 | 超大整轨 | 超过 RIFF 容量的实际 RF64 导出及下游交付链解析 PASS |
 | USB 拔出 | `unplug` PASS |
 | 默认设备切换 | 指定声卡录制期间切换系统默认输入，`default-switch` PASS（当前模式待实现） |
-| 拔出后重连 | 声卡拔出、插回后开启新会话，`replug` PASS（当前模式待实现） |
+| 拔出后重连 | 声卡拔出、确认 endpoint 消失、同一 ID/名称/配置连续两次重现后开启独立新会话，`replug` PASS |
 | 磁盘临界保护 | 专用测试卷 `disk-full` PASS，证明 critical 保留线上提前 fail-closed |
 | 瞬时真实 ENOSPC | 可丢弃 VHDX 上制造真实 ENOSPC，kill/reboot 后释放空间并 seal/inspect，`abrupt-enospc` PASS（当前模式待实现） |
 | 整机断电 | 阶段 1 录制至少 1h 后真实断电；重启后 `recover` PASS，严格 `inspect` 复核 PASS |

@@ -112,7 +112,7 @@ async function main() {
       }],
     };
     await fs.writeFile(path.join(metadataDir, 'events.jsonl'), [
-      JSON.stringify({ event: 'foreign', journal_seq: 99, snapshot: foreign }),
+      JSON.stringify({ event: 'foreign', journal_seq: 98, snapshot: foreign }),
       '{broken middle line',
       JSON.stringify({ event: 'latest', journal_seq: 4, snapshot: latest }),
       '',
@@ -122,6 +122,7 @@ async function main() {
     assert.equal(recovered?.snapshot.session_id, 'session-a');
     assert.equal(recovered?.snapshot.journal_seq, 4);
 
+    await fs.writeFile(path.join(sessionDir, 'session.json'), '{broken');
     const binding = await bindAuthorizedSession(sessionDir, [root], 'session-a');
     await assertAuthorizedSessionUnchanged(binding, [root]);
     await assert.rejects(
@@ -132,24 +133,51 @@ async function main() {
       bindAuthorizedSession(sessionDir, [path.dirname(root)], 'session-a'),
       /离开授权的保存位置/,
     );
+    await writeJson(path.join(sessionDir, 'session.json'), {
+      schema_version: 1,
+      session_id: 'session-a',
+    });
+    await writeJson(
+      path.join(metadataDir, 'items.snapshot.backup'),
+      snapshot('other-session', 5),
+    );
+    assert.equal(
+      await loadHistorySnapshot(sessionDir, metadataDir),
+      null,
+      'conflicting valid identity sources must not appear as a recoverable history task',
+    );
+    await assert.rejects(
+      bindAuthorizedSession(sessionDir, [root], 'session-a'),
+      /多个持久化来源身份不一致/,
+      'authorization must fail closed when valid persisted generations disagree',
+    );
+    await fs.unlink(path.join(metadataDir, 'items.snapshot.backup'));
 
     const replaceableSession = path.join(root, 'session-replaceable');
-    await fs.mkdir(replaceableSession);
+    await fs.mkdir(path.join(replaceableSession, 'metadata'), { recursive: true });
     await writeJson(path.join(replaceableSession, 'session.json'), {
       schema_version: 1,
       session_id: 'session-replaceable',
     });
+    await writeJson(
+      path.join(replaceableSession, 'metadata', 'items.snapshot.json'),
+      snapshot('session-replaceable', 1),
+    );
     const replaceableBinding = await bindAuthorizedSession(
       replaceableSession,
       [root],
       'session-replaceable',
     );
     await fs.rename(replaceableSession, `${replaceableSession}-old`);
-    await fs.mkdir(replaceableSession);
+    await fs.mkdir(path.join(replaceableSession, 'metadata'), { recursive: true });
     await writeJson(path.join(replaceableSession, 'session.json'), {
       schema_version: 1,
       session_id: 'session-replaceable',
     });
+    await writeJson(
+      path.join(replaceableSession, 'metadata', 'items.snapshot.json'),
+      snapshot('session-replaceable', 1),
+    );
     await assert.rejects(
       assertAuthorizedSessionUnchanged(replaceableBinding, [root]),
       /操作前被替换/,

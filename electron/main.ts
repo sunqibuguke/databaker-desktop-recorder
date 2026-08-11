@@ -25,6 +25,13 @@ import {
   type CaptureFaultNotice,
 } from './capture-fault';
 import { CapturePresetRepository, type CapturePresetDraft } from './capture-presets';
+import {
+  ENGINE_EVENT_CHANNEL,
+  ENGINE_METER_ACK_CHANNEL,
+  ENGINE_METER_CHANNEL,
+  isMeterEngineEvent,
+  LatestOnlyMeterBackpressure,
+} from './meter-backpressure';
 
 let mainWindow: BrowserWindow | null = null;
 let prompterWindow: BrowserWindow | null = null;
@@ -48,6 +55,15 @@ const allowedOutputRoots = new Set<string>();
 const canonicalOutputRoots = new Map<string, string>();
 const knownSessionDirs = new Set<string>();
 const knownSessionIds = new Map<string, string>();
+const meterBackpressure = new LatestOnlyMeterBackpressure<Electron.WebContents, unknown>(
+  (target, deliveryId, message) => {
+    if (target.isDestroyed()) throw new Error('main renderer is unavailable');
+    target.send(ENGINE_METER_CHANNEL, deliveryId, message);
+  },
+  (error) => {
+    console.error('无法向主面板发送实时电平：', error);
+  },
+);
 
 type EnginePhase = 'idle' | 'starting' | 'active' | 'stopping' | 'recovering' | 'sealing' | 'exporting' | 'quitting';
 
@@ -104,6 +120,12 @@ type HistorySnapshotCandidate = {
   ordinal: number;
   modifiedAtMs: number;
 };
+
+type PersistedSessionEvidence = Readonly<{
+  candidates: readonly HistorySnapshotCandidate[];
+  sessionId: string | null;
+  conflictingSessionIds: readonly string[];
+}>;
 
 export type AuthorizedSessionBinding = Readonly<{
   canonicalPath: string;
@@ -847,6 +869,86 @@ async function readSessionIdentity(sessionDir: string): Promise<string | null> {
   }
 }
 
+async function readHistorySnapshotCandidates(
+  metadataDir: string,
+): Promise<HistorySnapshotCandidate[]> {
+  const candidates: HistorySnapshotCandidate[] = [];
+  const generations = snapshotGenerationPaths(metadataDir);
+  for (let ordinal = 0; ordinal < generations.length; ordinal += 1) {
+    const generation = generations[ordinal];
+    const source = await readBoundedRegularFile(generation.filePath, SNAPSHOT_MAX_BYTES);
+    if (!source) continue;
+    try {
+      const snapshot = parseValidSnapshot(JSON.parse(source.bytes.toString('utf8')) as unknown);
+      if (!snapshot) continue;
+      candidates.push({
+        snapshot,
+        journalSeq: typeof snapshot.journal_seq === 'number' ? snapshot.journal_seq : 0,
+        priority: generation.priority,
+        ordinal,
+        modifiedAtMs: source.modifiedAtMs,
+      });
+    } catch {
+      // A different persisted generation or journal projection may still be recoverable.
+    }
+  }
+
+  const validFileCandidateCount = candidates.length;
+  const journalSource = await readBoundedRegularFile(
+    path.join(metadataDir, 'events.jsonl'),
+    JOURNAL_MAX_BYTES,
+  );
+  if (journalSource) {
+    const lines = journalSource.bytes.toString('utf8').split('\n');
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index].trim();
+      if (!line) continue;
+      try {
+        const event = JSON.parse(line) as unknown;
+        if (!isRecord(event) || typeof event.event !== 'string' || event.event === '') continue;
+        if (!isNonNegativeSafeInteger(event.journal_seq) || event.journal_seq === 0) continue;
+        const snapshot = parseValidSnapshot(event.snapshot);
+        if (!snapshot) continue;
+        const journalSeq = typeof snapshot.journal_seq === 'number' ? snapshot.journal_seq : 0;
+        if (journalSeq !== event.journal_seq) continue;
+        candidates.push({
+          snapshot,
+          journalSeq,
+          priority: 40,
+          ordinal: validFileCandidateCount + index,
+          modifiedAtMs: journalSource.modifiedAtMs,
+        });
+      } catch {
+        // Ignore a damaged line; each sequenced event contains a complete projection.
+      }
+    }
+  }
+  return candidates;
+}
+
+async function readPersistedSessionEvidence(
+  sessionDir: string,
+  metadataDir: string,
+): Promise<PersistedSessionEvidence> {
+  const candidates = await readHistorySnapshotCandidates(metadataDir);
+  if (candidates.length === 0) {
+    return { candidates, sessionId: null, conflictingSessionIds: [] };
+  }
+
+  const sessionIds = new Set<string>();
+  const identityFileSessionId = await readSessionIdentity(sessionDir);
+  if (identityFileSessionId) sessionIds.add(identityFileSessionId);
+  for (const candidate of candidates) {
+    sessionIds.add(String(candidate.snapshot.session_id));
+  }
+  const conflictingSessionIds = [...sessionIds].sort();
+  return {
+    candidates,
+    sessionId: conflictingSessionIds.length === 1 ? conflictingSessionIds[0] : null,
+    conflictingSessionIds: conflictingSessionIds.length > 1 ? conflictingSessionIds : [],
+  };
+}
+
 export async function bindAuthorizedSession(
   candidate: string,
   authorizedRoots: readonly string[],
@@ -867,16 +969,34 @@ export async function bindAuthorizedSession(
     if (!rootAuthorized || !isSameSessionDir(path.dirname(canonicalPath), canonicalRoot)) {
       throw new AuthorizedSessionBindingError('录制任务已离开授权的保存位置，请重新选择保存目录');
     }
-    const sessionId = await readSessionIdentity(canonicalPath);
-    if (!sessionId || sessionId !== expectedSessionId) {
+    const evidence = await readPersistedSessionEvidence(
+      canonicalPath,
+      path.join(canonicalPath, 'metadata'),
+    );
+    if (evidence.conflictingSessionIds.length > 0) {
+      throw new AuthorizedSessionBindingError(
+        '录制任务的多个持久化来源身份不一致，请停止操作并检查任务目录',
+      );
+    }
+    if (!evidence.sessionId || evidence.sessionId !== expectedSessionId) {
       throw new AuthorizedSessionBindingError('录制任务身份与历史列表不一致，请刷新任务后重试');
+    }
+    const afterReadMetadata = await fs.lstat(lexical, { bigint: true });
+    if (!afterReadMetadata.isDirectory()
+      || afterReadMetadata.isSymbolicLink()
+      || (metadata.dev !== 0n && afterReadMetadata.dev !== 0n
+        && metadata.dev !== afterReadMetadata.dev)
+      || (metadata.ino !== 0n && afterReadMetadata.ino !== 0n
+        && metadata.ino !== afterReadMetadata.ino)
+      || !isSameSessionDir(await fs.realpath(lexical), canonicalPath)) {
+      throw new AuthorizedSessionBindingError('录制任务目录在身份确认期间被替换，请刷新任务后重试');
     }
     return {
       canonicalPath,
       canonicalRoot,
-      sessionId,
-      device: metadata.dev,
-      inode: metadata.ino,
+      sessionId: evidence.sessionId,
+      device: afterReadMetadata.dev,
+      inode: afterReadMetadata.ino,
     };
   } catch (error) {
     if (error instanceof AuthorizedSessionBindingError) throw error;
@@ -1005,72 +1125,10 @@ export async function loadHistorySnapshot(
   sessionDir: string,
   metadataDir: string,
 ): Promise<{ snapshot: Record<string, unknown>; modifiedAtMs: number } | null> {
-  const candidates: HistorySnapshotCandidate[] = [];
-  const generations = snapshotGenerationPaths(metadataDir);
-  for (let ordinal = 0; ordinal < generations.length; ordinal += 1) {
-    const generation = generations[ordinal];
-    const source = await readBoundedRegularFile(generation.filePath, SNAPSHOT_MAX_BYTES);
-    if (!source) continue;
-    try {
-      const snapshot = parseValidSnapshot(JSON.parse(source.bytes.toString('utf8')) as unknown);
-      if (!snapshot) continue;
-      candidates.push({
-        snapshot,
-        journalSeq: typeof snapshot.journal_seq === 'number' ? snapshot.journal_seq : 0,
-        priority: generation.priority,
-        ordinal,
-        modifiedAtMs: source.modifiedAtMs,
-      });
-    } catch {
-      // A different persisted generation or journal projection may still be recoverable.
-    }
-  }
-
-  const validFileCandidateCount = candidates.length;
-  const journalSource = await readBoundedRegularFile(
-    path.join(metadataDir, 'events.jsonl'),
-    JOURNAL_MAX_BYTES,
-  );
-  if (journalSource) {
-    const lines = journalSource.bytes.toString('utf8').split('\n');
-    for (let index = 0; index < lines.length; index += 1) {
-      const line = lines[index].trim();
-      if (!line) continue;
-      try {
-        const event = JSON.parse(line) as unknown;
-        if (!isRecord(event) || typeof event.event !== 'string' || event.event === '') continue;
-        if (!isNonNegativeSafeInteger(event.journal_seq) || event.journal_seq === 0) continue;
-        const snapshot = parseValidSnapshot(event.snapshot);
-        if (!snapshot) continue;
-        const journalSeq = typeof snapshot.journal_seq === 'number' ? snapshot.journal_seq : 0;
-        if (journalSeq !== event.journal_seq) continue;
-        candidates.push({
-          snapshot,
-          journalSeq,
-          priority: 40,
-          ordinal: validFileCandidateCount + index,
-          modifiedAtMs: journalSource.modifiedAtMs,
-        });
-      } catch {
-        // Ignore a damaged line; each sequenced event contains a complete projection.
-      }
-    }
-  }
-  if (candidates.length === 0) return null;
-
-  const newestJournal = candidates
-    .filter((candidate) => candidate.priority === 40)
-    .sort(compareSnapshotCandidate)
-    .at(-1);
-  const fallback = [...candidates].sort(compareSnapshotCandidate).at(-1);
-  const expectedSessionId = await readSessionIdentity(sessionDir)
-    ?? (typeof newestJournal?.snapshot.session_id === 'string'
-      ? newestJournal.snapshot.session_id
-      : null)
-    ?? (typeof fallback?.snapshot.session_id === 'string' ? fallback.snapshot.session_id : null);
-  if (!expectedSessionId) return null;
-  const selected = candidates
-    .filter((candidate) => candidate.snapshot.session_id === expectedSessionId)
+  const evidence = await readPersistedSessionEvidence(sessionDir, metadataDir);
+  if (!evidence.sessionId || evidence.conflictingSessionIds.length > 0) return null;
+  const selected = evidence.candidates
+    .filter((candidate) => candidate.snapshot.session_id === evidence.sessionId)
     .sort(compareSnapshotCandidate)
     .at(-1);
   if (!selected) return null;
@@ -1185,6 +1243,21 @@ async function listRecordings(root: string): Promise<unknown[]> {
 function sendToMain(channel: string, ...args: unknown[]): void {
   const window = mainWindow;
   if (!window || window.isDestroyed() || window.webContents.isDestroyed()) return;
+  if (channel === ENGINE_EVENT_CHANNEL && args.length === 1) {
+    if (isMeterEngineEvent(args[0])) {
+      // A navigation tears down preload listeners. Do not create an in-flight
+      // delivery in that gap because no renderer may exist to ACK it.
+      if (typeof window.webContents.isLoading === 'function'
+        && window.webContents.isLoading()) return;
+      meterBackpressure.enqueue(window.webContents, args[0]);
+      return;
+    }
+    // Lifecycle/error events are authoritative state. Keep them on the
+    // immediate lane and discard any older unsent periodic meter packet.
+    meterBackpressure.clearPending(window.webContents);
+  } else if (channel === 'engine:offline') {
+    meterBackpressure.clearPending(window.webContents);
+  }
   try {
     window.webContents.send(channel, ...args);
   } catch (error) {
@@ -1913,7 +1986,7 @@ async function runEngineRecovery(job: EngineRecoveryJob): Promise<void> {
       assertCurrentEngineIntent(intent, ['recovering']);
       const state = await requestSessionWithReconciliation(
         'resume_session',
-        { session_dir: sessionDir },
+        { session_dir: sessionDir, expected_session_id: binding.sessionId },
         sessionDir,
         30_000,
         intent,
@@ -2279,6 +2352,7 @@ async function createWindow(): Promise<BrowserWindow> {
     }
     window.on('closed', () => {
       if (unresponsiveTimer) clearTimeout(unresponsiveTimer);
+      meterBackpressure.reset(window.webContents);
       if (mainWindow === window) mainWindow = null;
       prompterWindow?.close();
     });
@@ -2294,9 +2368,13 @@ async function createWindow(): Promise<BrowserWindow> {
       clearTimeout(unresponsiveTimer);
       unresponsiveTimer = null;
     });
+    window.webContents.on('did-start-loading', () => {
+      meterBackpressure.reset(window.webContents);
+    });
     window.webContents.on('render-process-gone', (_event, details) => {
       if (unresponsiveTimer) clearTimeout(unresponsiveTimer);
       unresponsiveTimer = null;
+      meterBackpressure.reset(window.webContents);
       void recoverMainWindow(window, `Renderer 进程结束（${details.reason}）`);
     });
     try {
@@ -2462,7 +2540,7 @@ async function executeAuthorizedOfflineSeal(
   assertCurrentEngineIntent(intent, ['sealing']);
   const rawResult = await engine.request(
     'seal_interrupted_session',
-    { session_dir: canonical },
+    { session_dir: canonical, expected_session_id: binding.sessionId },
     120_000,
   );
   assertCurrentEngineIntent(intent, ['sealing']);
@@ -2840,6 +2918,13 @@ function registerIpc(): void {
   const capturePresets = new CapturePresetRepository(
     path.join(app.getPath('userData'), 'capture-presets.json'),
   );
+  ipcMain.on(ENGINE_METER_ACK_CHANNEL, (event, deliveryId: unknown) => {
+    if (!mainWindow
+      || mainWindow.isDestroyed()
+      || mainWindow.webContents.isDestroyed()
+      || event.sender !== mainWindow.webContents) return;
+    meterBackpressure.acknowledge(event.sender, deliveryId);
+  });
   ipcMain.handle('engine:request', async (event, command: string, payload: unknown) => {
     assertMainRenderer(event.sender);
     if (!allowedCommands.has(command)) throw new Error(`不允许的录音引擎命令：${command}`);
@@ -2944,7 +3029,7 @@ function registerIpc(): void {
         assertCurrentEngineIntent(resumeIntent, ['starting']);
         const result = await requestSessionWithReconciliation(
           'resume_session',
-          { session_dir: canonical },
+          { session_dir: canonical, expected_session_id: binding.sessionId },
           canonical,
           30_000,
           resumeIntent,

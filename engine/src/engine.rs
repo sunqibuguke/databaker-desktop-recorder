@@ -324,6 +324,7 @@ pub struct SystemTestStartSessionPayload {
 #[derive(Debug, Deserialize)]
 pub struct ResumeSessionPayload {
     pub session_dir: String,
+    pub expected_session_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1358,18 +1359,24 @@ impl Engine {
     pub fn list_devices(&self) -> Result<Value> {
         let host = cpal::default_host();
         let default_device = host.default_input_device();
-        let default_name = default_device.as_ref().map(ToString::to_string);
         let default_device_id = default_device
             .as_ref()
             .and_then(|device| device.id().ok())
             .map(|id| id.to_string());
+        let mut default_name = None::<String>;
         let mut devices = Vec::new();
         for device in host.input_devices().context("enumerate input devices")? {
-            let name = device.to_string();
             let id = match device.id() {
                 Ok(id) => id.to_string(),
                 Err(error) => {
-                    eprintln!("skip input device without stable id {name}: {error}");
+                    eprintln!("skip input device without stable id: {error}");
+                    continue;
+                }
+            };
+            let name = match input_device_name(&device) {
+                Ok(name) => name,
+                Err(error) => {
+                    eprintln!("skip unavailable input device {id}: {error:#}");
                     continue;
                 }
             };
@@ -1400,6 +1407,12 @@ impl Engine {
                 continue;
             }
             let is_default = default_device_id.as_deref() == Some(id.as_str());
+            if is_default {
+                // Derive the display name from the same explicitly enumerated
+                // endpoint as the ID. Querying the dynamic default handle a
+                // second time could pair the old ID with a newly-routed name.
+                default_name = Some(name.clone());
+            }
             devices.push(json!({
                 "id": id,
                 "name": name,
@@ -1417,6 +1430,7 @@ impl Engine {
     }
 
     pub fn start_session(&mut self, payload: StartSessionPayload) -> Result<Value> {
+        require_explicit_input_device_id(payload.device_id.as_deref(), "开始录制")?;
         let (session_dir, snapshot) = self.prepare_new_session(payload, None)?;
         self.activate_session(
             session_dir,
@@ -1579,8 +1593,13 @@ impl Engine {
         // lease and overwrite newer sentence metadata with stale journal
         // sequence numbers. Select the newest valid candidate only while this
         // lease remains held through activation.
+        let expected_session_id = payload.expected_session_id.trim();
+        if expected_session_id.is_empty() {
+            bail!("继续录制需要明确的录制任务身份");
+        }
         let (session_lock, journal, mut snapshot) =
-            load_locked_recovery_snapshot(&session_dir, "继续录制")?;
+            load_locked_recovery_snapshot(&session_dir, "继续录制", Some(expected_session_id))?;
+        require_explicit_input_device_id(Some(snapshot.device_id.as_str()), "继续录制")?;
         if snapshot.status == "faulted" || snapshot.overflow_samples > 0 {
             bail!(
                 "该任务已记录音频采集故障或写盘溢出，为避免污染时间轴，不允许继续向原母轨追加；请先保全原始分段并进行质量检查。"
@@ -1665,16 +1684,16 @@ impl Engine {
             match capture_activation {
                 CaptureActivation::Device => {
                     let host = cpal::default_host();
-                    let requested_device_id =
-                        (!snapshot.device_id.is_empty()).then_some(snapshot.device_id.as_str());
-                    let requested_device_name =
-                        (!snapshot.device_name.is_empty()).then_some(snapshot.device_name.as_str());
-                    let device = select_device(&host, requested_device_id, requested_device_name)?;
+                    let requested_device_id = require_explicit_input_device_id(
+                        Some(snapshot.device_id.as_str()),
+                        "启动采集流",
+                    )?;
+                    let device = select_device(&host, requested_device_id)?;
                     let device_id = device
                         .id()
                         .context("read stable input device id")?
                         .to_string();
-                    let device_name = device.to_string();
+                    let device_name = input_device_name(&device)?;
                     let supported = select_config(
                         &device,
                         snapshot.audio_format.sample_rate,
@@ -2868,13 +2887,40 @@ impl Engine {
     /// Finalize a recording left active by a process or machine crash without
     /// opening an input device. The physical WAV EOF is authoritative: repair
     /// and durably checkpoint it before committing the recovered metadata.
-    pub fn seal_interrupted_session(&self, session_dir: &Path) -> Result<Value> {
+    #[cfg(test)]
+    fn seal_interrupted_session(&self, session_dir: &Path) -> Result<Value> {
         self.seal_interrupted_session_inner(session_dir, JournalAppendFault::None)
     }
 
+    pub fn seal_interrupted_session_expected(
+        &self,
+        session_dir: &Path,
+        expected_session_id: &str,
+    ) -> Result<Value> {
+        let expected_session_id = expected_session_id.trim();
+        if expected_session_id.is_empty() {
+            bail!("离线封存需要明确的录制任务身份");
+        }
+        self.seal_interrupted_session_inner_expected(
+            session_dir,
+            Some(expected_session_id),
+            JournalAppendFault::None,
+        )
+    }
+
+    #[cfg(test)]
     fn seal_interrupted_session_inner(
         &self,
         session_dir: &Path,
+        journal_fault: JournalAppendFault,
+    ) -> Result<Value> {
+        self.seal_interrupted_session_inner_expected(session_dir, None, journal_fault)
+    }
+
+    fn seal_interrupted_session_inner_expected(
+        &self,
+        session_dir: &Path,
+        expected_session_id: Option<&str>,
         journal_fault: JournalAppendFault,
     ) -> Result<Value> {
         if self.session.is_some() {
@@ -2885,7 +2931,8 @@ impl Engine {
         let mut journal = read_journal(session_dir)?;
         let journal_requires_rewrite =
             journal.truncate_to.is_some() || !journal.warnings.is_empty();
-        let mut snapshot = load_recovery_snapshot(session_dir, &mut journal)?;
+        let mut snapshot =
+            load_recovery_snapshot_for_session(session_dir, &mut journal, expected_session_id)?;
         validate_offline_seal_snapshot(&snapshot)?;
         let storage_kind = MasterStorageKind::from_snapshot(&snapshot)?;
         let master_relative = Path::new(&snapshot.master_audio);
@@ -3569,11 +3616,13 @@ fn validate_offline_session_tree(session_dir: &Path) -> Result<()> {
 fn load_locked_recovery_snapshot(
     session_dir: &Path,
     operation: &str,
+    expected_session_id: Option<&str>,
 ) -> Result<(SessionLock, JournalLog, SessionSnapshot)> {
     let session_lock = SessionLock::acquire(session_dir, &Utc::now().to_rfc3339())?;
     ensure_no_audio_fault_marker(session_dir, operation)?;
     let mut journal = read_journal(session_dir)?;
-    let snapshot = load_recovery_snapshot(session_dir, &mut journal)?;
+    let snapshot =
+        load_recovery_snapshot_for_session(session_dir, &mut journal, expected_session_id)?;
     Ok((session_lock, journal, snapshot))
 }
 
@@ -4108,6 +4157,14 @@ fn read_session_identity(session_dir: &Path, warnings: &mut Vec<String>) -> Opti
 }
 
 fn load_recovery_snapshot(session_dir: &Path, journal: &mut JournalLog) -> Result<SessionSnapshot> {
+    load_recovery_snapshot_for_session(session_dir, journal, None)
+}
+
+fn load_recovery_snapshot_for_session(
+    session_dir: &Path,
+    journal: &mut JournalLog,
+    externally_expected_session_id: Option<&str>,
+) -> Result<SessionSnapshot> {
     let mut candidates = Vec::<SnapshotCandidate>::new();
     for (ordinal, (path, source, priority)) in snapshot_candidate_paths(session_dir)
         .into_iter()
@@ -4173,10 +4230,41 @@ fn load_recovery_snapshot(session_dir: &Path, journal: &mut JournalLog) -> Resul
             )
         })
         .map(|candidate| candidate.snapshot.session_id.clone());
-    let expected_session_id = read_session_identity(session_dir, &mut journal.warnings)
-        .or(journal_identity)
-        .or(fallback_identity)
-        .context("无法确定录制任务身份")?;
+    let identity_file_session_id = read_session_identity(session_dir, &mut journal.warnings);
+    let expected_session_id = if let Some(expected) = externally_expected_session_id {
+        let expected = expected.trim();
+        if expected.is_empty() {
+            bail!("录制任务的预期身份为空");
+        }
+        if identity_file_session_id
+            .as_deref()
+            .is_some_and(|identity| identity != expected)
+        {
+            bail!("录制任务身份文件与预期任务不一致");
+        }
+        if let Some(conflict) = candidates
+            .iter()
+            .find(|candidate| candidate.snapshot.session_id != expected)
+        {
+            bail!(
+                "{} 属于其他录制 {} ，已阻止继续写入。",
+                conflict.source,
+                conflict.snapshot.session_id
+            );
+        }
+        if !candidates
+            .iter()
+            .any(|candidate| candidate.snapshot.session_id == expected)
+        {
+            bail!("录制任务没有与预期身份匹配的可恢复投影");
+        }
+        expected.to_string()
+    } else {
+        identity_file_session_id
+            .or(journal_identity)
+            .or(fallback_identity)
+            .context("无法确定录制任务身份")?
+    };
 
     let mut matching = Vec::<SnapshotCandidate>::new();
     for candidate in candidates {
@@ -6002,42 +6090,39 @@ fn writer_loop(
     }
 }
 
-fn select_device(
-    host: &cpal::Host,
-    requested_id: Option<&str>,
-    legacy_requested_name: Option<&str>,
-) -> Result<Device> {
-    if let Some(requested_id) = requested_id {
-        let parsed = requested_id
-            .parse::<cpal::DeviceId>()
-            .with_context(|| format!("invalid stable input device id: {requested_id}"))?;
-        let device = host.device_by_id(&parsed).ok_or_else(|| {
+fn require_explicit_input_device_id<'a>(
+    requested_id: Option<&'a str>,
+    operation: &str,
+) -> Result<&'a str> {
+    requested_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
             anyhow!(
-                "指定的录音设备已断开或设备 ID 已变化：{requested_id}；为避免录错输入，软件不会自动切换到同名设备"
+                "{operation}需要明确的稳定设备 ID；为避免录错输入，软件不会自动切换到系统默认或同名设备。新任务请返回设备设置重新选择输入；旧任务请保留原始目录并联系项目管理员迁移，当前版本尚不支持恢复时重新绑定设备"
             )
-        })?;
-        if !device.supports_input() {
-            bail!("指定的设备不再提供录音输入：{requested_id}");
-        }
-        return Ok(device);
+        })
+}
+
+fn input_device_name(device: &Device) -> Result<String> {
+    device
+        .description()
+        .map(|description| description.name().to_string())
+        .context("read input device description")
+}
+
+fn select_device(host: &cpal::Host, requested_id: &str) -> Result<Device> {
+    let parsed = requested_id
+        .parse::<cpal::DeviceId>()
+        .with_context(|| format!("invalid stable input device id: {requested_id}"))?;
+    let device = host.device_by_id(&parsed).ok_or_else(|| {
+        anyhow!(
+            "指定的录音设备已断开或设备 ID 已变化：{requested_id}；为避免录错输入，软件不会自动切换到系统默认或同名设备"
+        )
+    })?;
+    if !device.supports_input() {
+        bail!("指定的设备已断开或不再提供录音输入：{requested_id}");
     }
-    if let Some(requested_name) = legacy_requested_name {
-        let mut matches = host
-            .input_devices()
-            .context("enumerate legacy input devices")?
-            .filter(|device| device.to_string() == requested_name);
-        let first = matches
-            .next()
-            .ok_or_else(|| anyhow!("input device not found: {requested_name}"))?;
-        if matches.next().is_some() {
-            bail!(
-                "旧录制任务只保存了设备名称“{requested_name}”，当前存在多个同名输入；为避免录错声卡，无法自动恢复，请明确重新绑定设备"
-            );
-        }
-        return Ok(first);
-    }
-    host.default_input_device()
-        .ok_or_else(|| anyhow!("no default input device is available"))
+    Ok(device)
 }
 
 fn is_supported_input_format(format: SampleFormat) -> bool {
@@ -7604,6 +7689,28 @@ mod tests {
 
     fn test_stream_reaper() -> StreamReaper {
         StreamReaper::spawn("test-audio-stream-reaper").unwrap()
+    }
+
+    #[test]
+    fn production_capture_requires_an_explicit_stable_device_id() {
+        for missing in [None, Some(""), Some("   ")] {
+            let error = require_explicit_input_device_id(missing, "继续录制").unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("稳定设备 ID"));
+            assert!(message.contains("不会自动切换"));
+        }
+
+        assert_eq!(
+            require_explicit_input_device_id(Some("wasapi:stable-endpoint"), "继续录制").unwrap(),
+            "wasapi:stable-endpoint"
+        );
+    }
+
+    #[test]
+    fn device_selection_rejects_invalid_stable_id_without_fallback() {
+        let host = cpal::default_host();
+        let error = select_device(&host, "not-a-stable-device-id").unwrap_err();
+        assert!(format!("{error:#}").contains("invalid stable input device id"));
     }
 
     #[test]
@@ -9436,9 +9543,10 @@ mod tests {
         // deliberately invalid journal. Reading first would return an event-log
         // error and retain a stale snapshot that could become writable after the
         // current owner releases its lock.
-        let error = load_locked_recovery_snapshot(&root, "继续录制")
-            .err()
-            .expect("a competing recovery must not read mutable metadata");
+        let error =
+            load_locked_recovery_snapshot(&root, "继续录制", Some(snapshot.session_id.as_str()))
+                .err()
+                .expect("a competing recovery must not read mutable metadata");
         assert!(
             format!("{error:#}").contains("already open in another recorder process"),
             "unexpected pre-lock recovery error: {error:#}"
@@ -9448,11 +9556,113 @@ mod tests {
         std::fs::remove_dir(&journal_path).unwrap();
         write_journal(&root, &[sequenced_event("attempt_accepted", &snapshot)]);
         let (recovery_lock, journal, recovered) =
-            load_locked_recovery_snapshot(&root, "继续录制").unwrap();
+            load_locked_recovery_snapshot(&root, "继续录制", Some(snapshot.session_id.as_str()))
+                .unwrap();
         assert_eq!(recovered.journal_seq, 7);
         assert_eq!(journal.entries.len(), 1);
         assert!(SessionLock::acquire(&root, "2026-08-11T00:00:01Z").is_err());
         drop(recovery_lock);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resume_recovery_rejects_any_identity_conflict_while_holding_the_lease() {
+        let root = test_root("resume-expected-identity-consensus");
+        let mut snapshot = test_snapshot();
+        snapshot.journal_seq = 2;
+        write_snapshot_file(&root.join("metadata/items.snapshot.json"), &snapshot);
+        write_journal(&root, &[sequenced_event("session_started", &snapshot)]);
+
+        let mut foreign = snapshot.clone();
+        foreign.session_id = "replaced-after-electron-preflight".to_string();
+        foreign.journal_seq = 3;
+        write_snapshot_file(&root.join("metadata/items.snapshot.backup"), &foreign);
+
+        let error =
+            load_locked_recovery_snapshot(&root, "继续录制", Some(snapshot.session_id.as_str()))
+                .err()
+                .expect("conflicting persisted identities must fail closed");
+        assert!(format!("{error:#}").contains("属于其他录制"));
+        assert!(SessionLock::acquire(&root, "2026-08-12T00:00:00Z").is_ok());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn expected_identity_must_agree_with_the_identity_file_and_every_journal_projection() {
+        for conflict_source in ["session-file", "journal"] {
+            let root = test_root(&format!("resume-{conflict_source}-identity-conflict"));
+            let mut snapshot = test_snapshot();
+            snapshot.journal_seq = 2;
+            write_snapshot_file(&root.join("metadata/items.snapshot.json"), &snapshot);
+            write_journal(&root, &[sequenced_event("session_started", &snapshot)]);
+
+            let mut foreign = snapshot.clone();
+            foreign.session_id = format!("foreign-{conflict_source}");
+            foreign.journal_seq = 3;
+            match conflict_source {
+                "session-file" => std::fs::write(
+                    root.join("session.json"),
+                    serde_json::to_vec_pretty(&json!({
+                        "schema_version": 1,
+                        "session_id": foreign.session_id,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap(),
+                "journal" => write_journal(
+                    &root,
+                    &[
+                        sequenced_event("session_started", &snapshot),
+                        sequenced_event("attempt_started", &foreign),
+                    ],
+                ),
+                _ => unreachable!(),
+            }
+
+            let error = load_locked_recovery_snapshot(
+                &root,
+                "继续录制",
+                Some(snapshot.session_id.as_str()),
+            )
+            .err()
+            .expect("every valid persisted identity must agree");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("身份文件与预期任务不一致") || message.contains("属于其他录制"),
+                "unexpected {conflict_source} error: {message}"
+            );
+            assert!(SessionLock::acquire(&root, "2026-08-12T00:00:00Z").is_ok());
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn resume_without_a_stable_device_id_fails_closed_without_fallback() {
+        let root = test_root("resume-missing-stable-device-id");
+        for name in ["audio", "script", "preview", "export"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        let mut snapshot = test_snapshot();
+        snapshot.journal_seq = 1;
+        snapshot.device_id.clear();
+        write_snapshot_file(&root.join("metadata/items.snapshot.json"), &snapshot);
+        write_journal(&root, &[sequenced_event("session_started", &snapshot)]);
+
+        let mut engine = Engine::new(Emitter::new());
+        let error = engine
+            .resume_session(ResumeSessionPayload {
+                session_dir: root.to_string_lossy().into_owned(),
+                expected_session_id: snapshot.session_id.clone(),
+            })
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("稳定设备 ID"));
+        assert!(message.contains("不会自动切换"));
+        assert!(message.contains("当前版本尚不支持恢复时重新绑定设备"));
+        assert!(message.contains("保留原始目录"));
+        assert!(engine.session.is_none());
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -9482,6 +9692,7 @@ mod tests {
         let resume_error = engine
             .resume_session(ResumeSessionPayload {
                 session_dir: root.to_string_lossy().into_owned(),
+                expected_session_id: "audio-fault-marker-gate".to_string(),
             })
             .unwrap_err();
         assert!(format!("{resume_error:#}").contains("禁止继续录制"));
@@ -9526,6 +9737,7 @@ mod tests {
         let resume_error = engine
             .resume_session(ResumeSessionPayload {
                 session_dir: root.to_string_lossy().into_owned(),
+                expected_session_id: "audio-fault-synced-temporary".to_string(),
             })
             .unwrap_err();
         assert!(format!("{resume_error:#}").contains("禁止继续录制"));
@@ -12140,6 +12352,29 @@ mod tests {
         let warnings = recover_interrupted_attempts(&journal, &mut snapshot, 120).unwrap();
         assert!(warnings.is_empty());
         assert_eq!(snapshot.items[0].attempts.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offline_seal_rejects_a_mismatched_expected_identity_before_mutating_audio_or_metadata() {
+        let (root, snapshot, _) = offline_seal_fixture("offline-seal-identity-mismatch");
+        let master = root.join(LEGACY_MASTER_AUDIO);
+        let audio_before = std::fs::read(&master).unwrap();
+        let snapshot_path = root.join("metadata/items.snapshot.json");
+        let snapshot_before = std::fs::read(&snapshot_path).unwrap();
+        let journal_path = root.join("metadata/events.jsonl");
+        let journal_before = std::fs::read(&journal_path).unwrap();
+
+        let engine = Engine::new(Emitter::new());
+        let error = engine
+            .seal_interrupted_session_expected(&root, "different-recording")
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("属于其他录制"));
+        assert_eq!(std::fs::read(&master).unwrap(), audio_before);
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), snapshot_before);
+        assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+        assert_eq!(snapshot.status, "recording");
+
         let _ = std::fs::remove_dir_all(root);
     }
 

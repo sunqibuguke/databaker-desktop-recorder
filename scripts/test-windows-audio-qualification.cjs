@@ -30,6 +30,63 @@ function writeJson(filePath, value) {
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
 }
 
+function makeWav(sampleRate, bitDepth, frames) {
+  const isFloat = bitDepth === 32;
+  const sampleBytes = bitDepth / 8;
+  const headerLength = isFloat ? 56 : 44;
+  const dataBytes = frames * sampleBytes;
+  const buffer = Buffer.alloc(headerLength + dataBytes);
+  buffer.write('RIFF', 0, 'ascii');
+  buffer.writeUInt32LE(headerLength - 8 + dataBytes, 4);
+  buffer.write('WAVE', 8, 'ascii');
+  buffer.write('fmt ', 12, 'ascii');
+  buffer.writeUInt32LE(16, 16);
+  buffer.writeUInt16LE(isFloat ? 3 : 1, 20);
+  buffer.writeUInt16LE(1, 22);
+  buffer.writeUInt32LE(sampleRate, 24);
+  buffer.writeUInt32LE(sampleRate * sampleBytes, 28);
+  buffer.writeUInt16LE(sampleBytes, 32);
+  buffer.writeUInt16LE(bitDepth, 34);
+  let dataMarker = 36;
+  if (isFloat) {
+    buffer.write('fact', 36, 'ascii');
+    buffer.writeUInt32LE(4, 40);
+    buffer.writeUInt32LE(frames, 44);
+    dataMarker = 48;
+  }
+  buffer.write('data', dataMarker, 'ascii');
+  buffer.writeUInt32LE(dataBytes, dataMarker + 4);
+  return buffer;
+}
+
+function writeReplugSessionFixture(directory, snapshot, faulted) {
+  for (const name of ['audio/segments', 'metadata', 'script']) {
+    fs.mkdirSync(path.join(directory, name), { recursive: true });
+  }
+  fs.writeFileSync(
+    path.join(directory, 'audio', 'segments', 'master-000001.wav'),
+    makeWav(
+      snapshot.audio_format.sample_rate,
+      snapshot.audio_format.bit_depth,
+      snapshot.committed_samples,
+    ),
+  );
+  writeJson(path.join(directory, 'metadata', 'items.snapshot.json'), snapshot);
+  writeJson(path.join(directory, 'session.json'), {
+    schema_version: snapshot.schema_version,
+    journal_seq: snapshot.journal_seq,
+    session_id: snapshot.session_id,
+    status: snapshot.status,
+  });
+  if (faulted) {
+    writeJson(path.join(directory, 'metadata', 'audio-fault.json'), {
+      kind: 'device_unavailable',
+      committed_samples: snapshot.committed_samples,
+      at: '2026-08-11T00:00:03.750Z',
+    });
+  }
+}
+
 function buildRequiredRuns() {
   const runs = [{ id: 'inventory', mode: 'inventory' }];
   for (const sampleRate of [44_100, 48_000, 96_000]) {
@@ -117,6 +174,216 @@ function makeHost(bootId = 'fixture-phase2-boot', bootedAt = '2026-08-11T23:00:0
     release: WINDOWS_RELEASE,
     boot: { id: bootId, booted_at: bootedAt },
   };
+}
+
+function configureReplugFixture(report, requirement, runDirectory, afterDirectory) {
+  const beforeDirectory = path.join(runDirectory, 'recording-before-unplug');
+  const device = {
+    id: DEVICE_ID,
+    name: 'Fixture USB Interface',
+    configurations: [{
+      min_sample_rate: requirement.sample_rate,
+      max_sample_rate: requirement.sample_rate,
+      channels: 2,
+      sample_format: 'f32',
+    }],
+  };
+  const beforeSessionId = 'session-replug-before-fixture';
+  const afterSessionId = 'session-replug-after-fixture';
+  const beforeStart = {
+    ...makeSnapshot(requirement, beforeSessionId),
+    status: 'recording',
+    captured_samples: 0,
+    committed_samples: 0,
+  };
+  const beforeFinal = {
+    ...beforeStart,
+    status: 'faulted',
+    journal_seq: 8,
+    captured_samples: 144_000,
+    committed_samples: 144_000,
+  };
+  const afterStart = {
+    ...makeSnapshot(requirement, afterSessionId),
+    status: 'recording',
+    captured_samples: 0,
+    committed_samples: 0,
+  };
+  const afterFinal = {
+    ...afterStart,
+    status: 'stopped',
+    journal_seq: 7,
+    captured_samples: 240_000,
+    committed_samples: 240_000,
+  };
+  const segment = (frames) => ({
+    file_name: 'master-000001.wav',
+    sample_rate: requirement.sample_rate,
+    bits_per_sample: requirement.bit_depth,
+    channels: 1,
+    physical_complete_frames: frames,
+    exact_header: true,
+    trailing_bytes: 0,
+  });
+  const beforeProgress = {
+    first: { elapsed_seconds: 0, captured_samples: 0 },
+    last: { elapsed_seconds: 3, captured_samples: 144_000 },
+    observed_capture_rate: 48_000,
+    maximum_peak_dbfs: -12,
+  };
+  const afterProgress = {
+    first: { elapsed_seconds: 0, captured_samples: 0 },
+    last: { elapsed_seconds: 5, captured_samples: 240_000 },
+    observed_capture_rate: 48_000,
+    maximum_peak_dbfs: -12,
+  };
+  const inventoryEvidence = (present, consecutiveMatches = 0) => ({
+    target_id: DEVICE_ID,
+    target_name: 'Fixture USB Interface',
+    observed_device_ids: present ? [DEVICE_ID] : [],
+    observed_same_name_ids: present ? [DEVICE_ID] : [],
+    target_match_count: present ? 1 : 0,
+    target_present: present,
+    target_name_matches: present,
+    target_configuration_matches: present,
+    exact_match: present,
+    target_device: present ? device : null,
+    consecutive_matches: consecutiveMatches,
+  });
+  const beforeInspection = {
+    session_dir: beforeDirectory,
+    snapshot: beforeFinal,
+    fault_marker_exists: true,
+    fault_marker_parse_error: false,
+    total_physical_frames: 144_000,
+    segments: [segment(144_000)],
+  };
+  const afterInspection = {
+    session_dir: afterDirectory,
+    snapshot: afterFinal,
+    fault_marker_exists: false,
+    fault_marker_parse_error: false,
+    total_physical_frames: 240_000,
+    segments: [segment(240_000)],
+  };
+  report.options.seconds = 5;
+  report.start = { snapshot: afterStart };
+  report.stop = { result: { snapshot: afterFinal }, error: null };
+  report.progress_summary = afterProgress;
+  report.session_dir = afterDirectory;
+  report.inspection = afterInspection;
+  report.replug = {
+    required_consecutive_matches: 2,
+    before: {
+      session_dir: beforeDirectory,
+      start: { snapshot: beforeStart },
+      progress_summary: beforeProgress,
+      healthy_prefix_summary: beforeProgress,
+      fault: {
+        captured_before_trigger: 120_000,
+        detected_at: '2026-08-11T00:00:03.000Z',
+        seconds_after_trigger: 0.25,
+        fault_before_trigger: null,
+        first_fault_kind_row: { fault_kind: 'device_unavailable' },
+      },
+      stop: { result: { snapshot: beforeFinal }, error: null },
+      export: { expected_rejection: true, error: 'faulted session cannot be exported' },
+      resume: { expected_rejection: true, error: 'faulted session cannot be resumed' },
+      inspection: beforeInspection,
+    },
+    transition: {
+      target_id: DEVICE_ID,
+      target_name: 'Fixture USB Interface',
+      initial: inventoryEvidence(true, 0),
+      disappearance: {
+        phase: 'replug-inventory',
+        state: 'absent-after-unplug',
+        ...inventoryEvidence(false, 0),
+      },
+      reappearance: {
+        phase: 'replug-inventory',
+        state: 'stable-reappearance',
+        ...inventoryEvidence(true, 2),
+      },
+      disappearance_timed_out: false,
+      reappearance_timed_out: false,
+    },
+    after: {
+      session_dir: afterDirectory,
+      start: { snapshot: afterStart },
+      progress_summary: afterProgress,
+      stop: { result: { snapshot: afterFinal }, error: null },
+      inspection: afterInspection,
+    },
+  };
+
+  writeReplugSessionFixture(beforeDirectory, beforeFinal, true);
+  writeReplugSessionFixture(afterDirectory, afterFinal, false);
+
+  const telemetryRows = [
+    { at: '2026-08-11T00:00:00.100Z', phase: 'replug-inventory', state: 'present-before-unplug', ...inventoryEvidence(true, 0) },
+    { at: '2026-08-11T00:00:01.000Z', phase: 'replug-a-recording', session_id: beforeSessionId, elapsed_seconds: 0, captured_samples: 0, committed_samples: 0, peak: 0.2 },
+    { at: '2026-08-11T00:00:03.500Z', phase: 'replug-a-recording', session_id: beforeSessionId, elapsed_seconds: 2.5, captured_samples: 120_000, committed_samples: 120_000, peak: 0.2 },
+    { at: '2026-08-11T00:00:03.750Z', phase: 'replug-a-fault-observation', session_id: beforeSessionId, elapsed_seconds: 2.75, captured_samples: 144_000, committed_samples: 144_000, faulted: true, fault_kind: 'device_unavailable', fault_marker_exists: true },
+    { at: '2026-08-11T00:00:04.000Z', phase: 'replug-inventory', state: 'absent-after-unplug', ...inventoryEvidence(false, 0) },
+    { at: '2026-08-11T00:00:04.250Z', phase: 'replug-inventory', state: 'matching-reappearance', ...inventoryEvidence(true, 1) },
+    { at: '2026-08-11T00:00:04.500Z', phase: 'replug-inventory', state: 'stable-reappearance', ...inventoryEvidence(true, 2) },
+    { at: '2026-08-11T00:00:05.000Z', phase: 'replug-b-recording', session_id: afterSessionId, elapsed_seconds: 0, captured_samples: 0, committed_samples: 0, peak: 0.2 },
+    { at: '2026-08-11T00:00:10.000Z', phase: 'replug-b-recording', session_id: afterSessionId, elapsed_seconds: 5, captured_samples: 240_000, committed_samples: 240_000, peak: 0.2 },
+  ];
+
+  const protocolRows = [];
+  let protocolSequence = 0;
+  const command = (name, payload, response) => {
+    protocolSequence += 1;
+    const requestId = `replug-fixture-${protocolSequence}`;
+    protocolRows.push({
+      at: `2026-08-11T00:00:${String(protocolSequence).padStart(2, '0')}.000Z`,
+      direction: 'tool',
+      message: { protocol_version: 1, request_id: requestId, command: name, payload },
+    });
+    protocolRows.push({
+      at: `2026-08-11T00:00:${String(protocolSequence).padStart(2, '0')}.100Z`,
+      direction: 'engine',
+      message: { protocol_version: 1, request_id: requestId, ...response },
+    });
+  };
+  protocolRows.push({
+    at: '2026-08-11T00:00:00.000Z',
+    direction: 'engine',
+    message: { protocol_version: 1, event: 'engine_ready', payload: report.engine.ready },
+  });
+  command('list_devices', {}, { ok: true, result: { default_device_id: DEVICE_ID, devices: [device] } });
+  command('start_session', {
+    session_dir: beforeDirectory,
+    session_id: beforeSessionId,
+    device_id: DEVICE_ID,
+    device_name: 'Fixture USB Interface',
+    sample_rate: requirement.sample_rate,
+    bit_depth: requirement.bit_depth,
+    input_channel: requirement.channel,
+  }, { ok: true, result: { snapshot: beforeStart } });
+  command('stop_session', {}, { ok: true, result: { snapshot: beforeFinal } });
+  command('export_session', { session_dir: beforeDirectory }, { ok: false, error: 'faulted' });
+  command('resume_session', {
+    session_dir: beforeDirectory,
+    expected_session_id: beforeSessionId,
+  }, { ok: false, error: 'faulted' });
+  command('list_devices', {}, { ok: true, result: { default_device_id: null, devices: [] } });
+  command('list_devices', {}, { ok: true, result: { default_device_id: DEVICE_ID, devices: [device] } });
+  command('list_devices', {}, { ok: true, result: { default_device_id: DEVICE_ID, devices: [device] } });
+  command('start_session', {
+    session_dir: afterDirectory,
+    session_id: afterSessionId,
+    device_id: DEVICE_ID,
+    device_name: 'Fixture USB Interface',
+    sample_rate: requirement.sample_rate,
+    bit_depth: requirement.bit_depth,
+    input_channel: requirement.channel,
+  }, { ok: true, result: { snapshot: afterStart } });
+  command('stop_session', {}, { ok: true, result: { snapshot: afterFinal } });
+  command('shutdown', {}, { ok: true, result: { shutting_down: true } });
+  return { telemetryRows, protocolRows };
 }
 
 function createFixture() {
@@ -387,13 +654,22 @@ function createFixture() {
       report.recovery = { result: { snapshot } };
     }
     if (requirement.mode === 'abrupt-enospc') report.production_eligible = true;
+    const replugEvidence = requirement.mode === 'replug'
+      ? configureReplugFixture(report, requirement, runDirectory, sessionDirectory)
+      : null;
     const companionNames = requirement.mode === 'inspect'
       ? []
       : requirement.mode === 'inventory' || requirement.mode === 'recover'
         ? ['protocol.jsonl', 'engine-stderr.log']
         : ['telemetry.jsonl', 'protocol.jsonl', 'engine-stderr.log'];
     for (const name of companionNames) {
-      fs.writeFileSync(path.join(runDirectory, name), name === 'engine-stderr.log' ? '' : '{}\n');
+      let contents = name === 'engine-stderr.log' ? '' : '{}\n';
+      if (name === 'telemetry.jsonl' && replugEvidence) {
+        contents = `${replugEvidence.telemetryRows.map((row) => JSON.stringify(row)).join('\n')}\n`;
+      } else if (name === 'protocol.jsonl' && replugEvidence) {
+        contents = `${replugEvidence.protocolRows.map((row) => JSON.stringify(row)).join('\n')}\n`;
+      }
+      fs.writeFileSync(path.join(runDirectory, name), contents);
     }
     const reportPath = path.join(runDirectory, 'acceptance-report.json');
     writeJson(reportPath, report);
@@ -410,6 +686,17 @@ function mutateReport(fixture, runId, mutator) {
   const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
   mutator(report, reportPath);
   writeJson(reportPath, report);
+}
+
+function mutateRunNdjson(fixture, runId, fileName, mutator) {
+  const runDirectory = path.dirname(fixture.reportPaths.get(runId));
+  const filePath = path.join(runDirectory, fileName);
+  const rows = fs.readFileSync(filePath, 'utf8')
+    .trim()
+    .split(/\r?\n/)
+    .map((line) => JSON.parse(line));
+  mutator(rows);
+  fs.writeFileSync(filePath, `${rows.map((row) => JSON.stringify(row)).join('\n')}\n`);
 }
 
 function mutatePhase1Report(fixture, mutator) {
@@ -813,14 +1100,162 @@ async function testCurrentModesFailClosed() {
     });
     assert.equal(result.report.overall, 'NOT_QUALIFIED');
     assert.equal(requirement(result, 'default-switch-48000-24-ch1').status, 'NOT_IMPLEMENTED');
-    assert.equal(requirement(result, 'replug-48000-24-ch1').status, 'NOT_IMPLEMENTED');
+    assert.equal(requirement(result, 'replug-48000-24-ch1').status, 'PASS');
     assert.equal(requirement(result, 'abrupt-enospc-48000-24-ch1').status, 'NOT_IMPLEMENTED');
     assert.equal(fs.existsSync(result.manifestPath), false);
     assert.equal(IMPLEMENTED_ACCEPTANCE_MODES.has('default-switch'), false);
-    assert.equal(IMPLEMENTED_ACCEPTANCE_MODES.has('replug'), false);
+    assert.equal(IMPLEMENTED_ACCEPTANCE_MODES.has('replug'), true);
     assert.equal(IMPLEMENTED_ACCEPTANCE_MODES.has('abrupt-enospc'), false);
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+}
+
+async function testReplugArchiveFailClosed() {
+  const cases = [
+    {
+      name: 'target never disappeared',
+      fileName: 'telemetry.jsonl',
+      checkId: 'replug-telemetry-transition',
+      mutate: (rows) => {
+        const present = rows.find((row) => row.phase === 'replug-inventory' && row.state === 'present-before-unplug');
+        const absent = rows.find((row) => row.phase === 'replug-inventory' && row.state === 'absent-after-unplug');
+        Object.assign(absent, {
+          target_present: true,
+          target_match_count: 1,
+          observed_device_ids: [DEVICE_ID],
+          observed_same_name_ids: [DEVICE_ID],
+          target_name_matches: true,
+          target_configuration_matches: true,
+          exact_match: true,
+          target_device: structuredClone(present.target_device),
+        });
+      },
+    },
+    {
+      name: 'same name returned under a different endpoint ID',
+      fileName: 'telemetry.jsonl',
+      checkId: 'replug-telemetry-transition',
+      mutate: (rows) => {
+        const stable = rows.find((row) => row.phase === 'replug-inventory' && row.state === 'stable-reappearance');
+        stable.target_device.id = 'wasapi:{different-interface}';
+        stable.observed_device_ids = ['wasapi:{different-interface}'];
+        stable.observed_same_name_ids = ['wasapi:{different-interface}'];
+      },
+    },
+    {
+      name: 'second start response bound a wrong device',
+      fileName: 'protocol.jsonl',
+      checkId: 'replug-protocol-two-starts',
+      mutate: (rows) => {
+        const starts = rows.filter((row) => row.direction === 'tool' && row.message?.command === 'start_session');
+        const response = rows.find((row) =>
+          row.direction === 'engine' && row.message?.request_id === starts[1].message.request_id);
+        response.message.result.snapshot.device_id = 'wasapi:{wrong-second-interface}';
+      },
+    },
+    {
+      name: 'fault was already present before the unplug trigger',
+      fileName: 'telemetry.jsonl',
+      checkId: 'replug-telemetry-transition',
+      mutate: (rows) => {
+        const premature = rows.find((row) => row.phase === 'replug-a-recording');
+        premature.faulted = true;
+        premature.fault_kind = 'device_unavailable';
+      },
+    },
+    {
+      name: 'second session has no successful stop transcript',
+      fileName: 'protocol.jsonl',
+      checkId: 'replug-protocol-seals-and-shutdown',
+      mutate: (rows) => {
+        const starts = rows
+          .map((row, index) => ({ row, index }))
+          .filter(({ row }) => row.direction === 'tool' && row.message?.command === 'start_session');
+        const stopIndex = rows.findIndex((row, index) =>
+          index > starts[1].index && row.direction === 'tool' && row.message?.command === 'stop_session');
+        const requestId = rows[stopIndex].message.request_id;
+        for (let index = rows.length - 1; index >= 0; index -= 1) {
+          if (index === stopIndex || rows[index].message?.request_id === requestId) rows.splice(index, 1);
+        }
+      },
+    },
+  ];
+  for (const testCase of cases) {
+    const fixture = createFixture();
+    try {
+      mutateRunNdjson(
+        fixture,
+        'replug-48000-24-ch1',
+        testCase.fileName,
+        testCase.mutate,
+      );
+      const result = await runQualification({
+        plan: fixture.planPath,
+        reports: fixture.root,
+        output: path.join(fixture.root, `replug-negative-${testCase.fileName}`, 'qualification-report.json'),
+        implementedModes: new Set(KNOWN_ACCEPTANCE_MODES),
+      });
+      const replugResult = requirement(result, 'replug-48000-24-ch1');
+      assert.equal(result.report.overall, 'NOT_QUALIFIED', testCase.name);
+      assert.equal(replugResult.status, 'FAIL', testCase.name);
+      assert.equal(
+        replugResult.checks.find((check) => check.id === testCase.checkId)?.status,
+        'FAIL',
+        testCase.name,
+      );
+    } finally {
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }
+
+  for (const testCase of [
+    {
+      name: 'actual B WAV was truncated after acceptance',
+      mutate: (report) => {
+        fs.truncateSync(
+          path.join(report.replug.after.session_dir, 'audio', 'segments', 'master-000001.wav'),
+          24,
+        );
+      },
+    },
+    {
+      name: 'actual B snapshot retained an uncommitted captured tail',
+      mutate: (report) => {
+        const snapshotPath = path.join(
+          report.replug.after.session_dir,
+          'metadata',
+          'items.snapshot.json',
+        );
+        const snapshot = JSON.parse(fs.readFileSync(snapshotPath, 'utf8'));
+        snapshot.captured_samples += snapshot.audio_format.sample_rate;
+        writeJson(snapshotPath, snapshot);
+      },
+    },
+  ]) {
+    const fixture = createFixture();
+    try {
+      const report = JSON.parse(
+        fs.readFileSync(fixture.reportPaths.get('replug-48000-24-ch1'), 'utf8'),
+      );
+      testCase.mutate(report);
+      const result = await runQualification({
+        plan: fixture.planPath,
+        reports: fixture.root,
+        output: path.join(fixture.root, 'replug-actual-tree-negative', 'qualification-report.json'),
+        implementedModes: new Set(KNOWN_ACCEPTANCE_MODES),
+      });
+      const replugResult = requirement(result, 'replug-48000-24-ch1');
+      assert.equal(result.report.overall, 'NOT_QUALIFIED', testCase.name);
+      assert.equal(replugResult.status, 'FAIL', testCase.name);
+      assert.equal(
+        replugResult.checks.find((check) => check.id === 'replug-after-independent-recording-tree')?.status,
+        'FAIL',
+        testCase.name,
+      );
+    } finally {
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
   }
 }
 
@@ -1083,6 +1518,7 @@ async function main() {
   await testRuntimeSchemaValidation();
   await testQualifiedWithFutureModesInjected();
   await testCurrentModesFailClosed();
+  await testReplugArchiveFailClosed();
   await testIdentityAndEvidenceFailures();
   await testDuplicateBindingFailsEvenWithExplicitReport();
   await testAggregateOutputDoesNotHashItself();

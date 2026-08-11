@@ -8,6 +8,61 @@ let snapshot = null;
 let sessionDirectory = null;
 let startedAt = null;
 let stopped = false;
+let faulted = false;
+let sessionSequence = 0;
+let postFaultInventoryCalls = 0;
+const replugScenario = process.env.DATABAKER_ACCEPTANCE_MOCK_REPLUG ?? null;
+const mockUnplugAfterMs = Number(process.env.DATABAKER_ACCEPTANCE_MOCK_UNPLUG_AFTER_MS ?? 3_250);
+
+function mockDevice(id = 'mock:usb-interface', name = 'Mock USB Audio Interface') {
+  return {
+    id,
+    name,
+    is_default: true,
+    sample_rates: [48_000],
+    input_channels: [2],
+    configurations: [
+      { min_sample_rate: 48_000, max_sample_rate: 48_000, channels: 2, sample_format: 'f32' },
+    ],
+  };
+}
+
+function mockInventory() {
+  if (!replugScenario || sessionSequence === 0 || !faulted || !stopped) {
+    const device = mockDevice();
+    return {
+      default_device_id: device.id,
+      default_device_name: device.name,
+      devices: [device],
+    };
+  }
+  postFaultInventoryCalls += 1;
+  if (replugScenario === 'never-disappeared') {
+    const device = mockDevice();
+    return {
+      default_device_id: device.id,
+      default_device_name: device.name,
+      devices: [device],
+    };
+  }
+  if (postFaultInventoryCalls === 1) {
+    return { default_device_id: null, default_device_name: null, devices: [] };
+  }
+  if (replugScenario === 'different-id') {
+    const device = mockDevice('mock:different-interface', 'Mock USB Audio Interface');
+    return {
+      default_device_id: device.id,
+      default_device_name: device.name,
+      devices: [device],
+    };
+  }
+  const device = mockDevice();
+  return {
+    default_device_id: device.id,
+    default_device_name: device.name,
+    devices: [device],
+  };
+}
 
 function emit(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -135,7 +190,7 @@ function sealInterruptedSession(directory) {
 }
 
 function updateAudio() {
-  if (!snapshot || stopped) return;
+  if (!snapshot || stopped || faulted) return;
   const elapsed = Math.max(0, (Date.now() - startedAt) / 1_000);
   const frames = Math.floor(elapsed * snapshot.audio_format.sample_rate);
   snapshot.captured_samples = frames;
@@ -145,6 +200,23 @@ function updateAudio() {
     path.join(sessionDirectory, 'audio', 'segments', 'master-000001.wav'),
     makeWav(snapshot.audio_format.sample_rate, snapshot.audio_format.bit_depth, frames),
   );
+  if (
+    replugScenario &&
+    sessionSequence === 1 &&
+    Date.now() - startedAt >= mockUnplugAfterMs
+  ) {
+    faulted = true;
+    snapshot.status = 'faulted';
+    const marker = {
+      reason: 'mock input device became unavailable',
+      committed_samples: snapshot.committed_samples,
+      at: new Date().toISOString(),
+    };
+    fs.writeFileSync(
+      path.join(sessionDirectory, 'metadata', 'audio-fault.json'),
+      `${JSON.stringify(marker, null, 2)}\n`,
+    );
+  }
 }
 
 emit({
@@ -158,25 +230,11 @@ createInterface({ input: process.stdin }).on('line', (line) => {
   const requestId = command.request_id;
   switch (command.command) {
     case 'list_devices':
-      response(requestId, {
-        default_device_id: 'mock:usb-interface',
-        default_device_name: 'Mock USB Audio Interface',
-        devices: [
-          {
-            id: 'mock:usb-interface',
-            name: 'Mock USB Audio Interface',
-            is_default: true,
-            sample_rates: [48_000],
-            input_channels: [2],
-            configurations: [
-              { min_sample_rate: 48_000, max_sample_rate: 48_000, channels: 2, sample_format: 'f32' },
-            ],
-          },
-        ],
-      });
+      response(requestId, mockInventory());
       break;
     case 'start_session': {
       const payload = command.payload;
+      sessionSequence += 1;
       sessionDirectory = payload.session_dir;
       for (const directory of ['audio/segments', 'metadata', 'script', 'preview', 'export/sentences']) {
         fs.mkdirSync(path.join(sessionDirectory, directory), { recursive: true });
@@ -189,7 +247,10 @@ createInterface({ input: process.stdin }).on('line', (line) => {
         script_name: payload.script_name,
         status: 'recording',
         device_name: 'Mock USB Audio Interface',
-        device_id: 'mock:usb-interface',
+        device_id:
+          replugScenario === 'second-wrong-device' && sessionSequence === 2
+            ? 'mock:wrong-interface'
+            : 'mock:usb-interface',
         input_sample_format: 'f32',
         audio_format: {
           sample_rate: payload.sample_rate,
@@ -214,6 +275,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       };
       startedAt = Date.now();
       stopped = false;
+      faulted = false;
       updateAudio();
       response(requestId, {
         snapshot,
@@ -246,7 +308,9 @@ createInterface({ input: process.stdin }).on('line', (line) => {
           captured_samples: snapshot.captured_samples,
           committed_samples: snapshot.committed_samples,
           overflow_samples: 0,
-          faulted: false,
+          faulted,
+          fault_kind: faulted ? 'device_unavailable' : '',
+          fault_reason: faulted ? 'mock input device became unavailable' : '',
           storage_status: 'healthy',
           storage_safe_remaining_seconds: 100_000,
           peak: 0.25,
@@ -259,8 +323,15 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       break;
     case 'stop_session':
       updateAudio();
+      if (replugScenario === 'second-stop-fails' && sessionSequence === 2) {
+        error(requestId, 'mock second session stop failed before sealing');
+        break;
+      }
       stopped = true;
-      snapshot.status = 'stopped';
+      snapshot.status = faulted ? 'faulted' : 'stopped';
+      if (replugScenario === 'second-tail-loss' && sessionSequence === 2) {
+        snapshot.captured_samples += snapshot.audio_format.sample_rate;
+      }
       if (process.env.DATABAKER_ACCEPTANCE_MOCK_EXPORT_ACCEPTED_ITEM === '1') {
         const item = snapshot.items[0];
         const endSample = Math.max(2, Math.min(snapshot.committed_samples, snapshot.audio_format.sample_rate));
@@ -290,9 +361,21 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       );
       fs.writeFileSync(
         path.join(sessionDirectory, 'session.json'),
-        `${JSON.stringify({ schema_version: 1, session_id: snapshot.session_id, status: snapshot.status }, null, 2)}\n`,
+        `${JSON.stringify({
+          schema_version: 1,
+          journal_seq: snapshot.journal_seq,
+          session_id: snapshot.session_id,
+          status: snapshot.status,
+        }, null, 2)}\n`,
       );
       response(requestId, { session_dir: sessionDirectory, snapshot, warnings: [] });
+      break;
+    case 'resume_session':
+      if (replugScenario && command.payload.session_dir.includes('recording-before-unplug')) {
+        error(requestId, 'faulted session cannot be resumed');
+      } else {
+        error(requestId, 'mock resume_session is unsupported');
+      }
       break;
     case 'seal_interrupted_session':
       try {
@@ -302,6 +385,10 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       }
       break;
     case 'export_session': {
+      if (faulted) {
+        error(requestId, 'faulted session cannot be exported normally');
+        break;
+      }
       if (!stopped) {
         error(requestId, 'recording is still active');
         break;

@@ -4,6 +4,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { createHash } = require('node:crypto');
 const { isDeepStrictEqual } = require('node:util');
+const {
+  evaluateSealedSession,
+  faultMarkerPresent,
+  inspectSession,
+} = require('./windows-audio-acceptance.cjs');
 
 function loadAjv2020() {
   const candidates = ['ajv/dist/2020'];
@@ -39,6 +44,7 @@ const IMPLEMENTED_ACCEPTANCE_MODES = new Set([
   'short',
   'soak',
   'unplug',
+  'replug',
   'disk-full',
   'power-cut',
   'recover',
@@ -47,7 +53,6 @@ const IMPLEMENTED_ACCEPTANCE_MODES = new Set([
 const KNOWN_ACCEPTANCE_MODES = new Set([
   ...IMPLEMENTED_ACCEPTANCE_MODES,
   'default-switch',
-  'replug',
   'abrupt-enospc',
 ]);
 const ENGINE_MODES = new Set([
@@ -1175,6 +1180,569 @@ function validateReport(entry, requirement, plan, reportsRoot) {
   return { checks, evidenceRoots };
 }
 
+function replugConfigurationMatches(device, requirement) {
+  return Array.isArray(device?.configurations) && device.configurations.some((configuration) =>
+    Number(configuration?.min_sample_rate) <= Number(requirement.sample_rate) &&
+    Number(configuration?.max_sample_rate) >= Number(requirement.sample_rate) &&
+    Number(configuration?.channels) >= Number(requirement.channel));
+}
+
+function replugSnapshotMatches(snapshot, sessionDirectory, requirement, plan) {
+  const bitDepth = Number(requirement.bit_depth);
+  return Boolean(snapshot) &&
+    snapshot.device_id === plan.target.device_id &&
+    snapshot.device_name === plan.target.device_name &&
+    typeof snapshot.input_sample_format === 'string' && snapshot.input_sample_format.length > 0 &&
+    Number(snapshot.audio_format?.sample_rate) === Number(requirement.sample_rate) &&
+    Number(snapshot.audio_format?.bit_depth) === bitDepth &&
+    snapshot.audio_format?.encoding === (bitDepth === 32 ? 'float' : 'pcm') &&
+    Number(snapshot.audio_format?.channels) === 1 &&
+    Number(snapshot.audio_format?.input_channels) >= Number(requirement.channel) &&
+    Number(snapshot.audio_format?.input_channel) === Number(requirement.channel) &&
+    (sessionDirectory === null || typeof snapshot.session_id === 'string' && snapshot.session_id.length > 0);
+}
+
+function snapshotWatermarksMatch(actual, reported) {
+  return Boolean(actual) && Boolean(reported) &&
+    actual.session_id === reported.session_id &&
+    actual.status === reported.status &&
+    Number(actual.journal_seq) === Number(reported.journal_seq) &&
+    Number(actual.captured_samples) === Number(reported.captured_samples) &&
+    Number(actual.committed_samples) === Number(reported.committed_samples) &&
+    Number(actual.overflow_samples ?? 0) === Number(reported.overflow_samples ?? 0) &&
+    actual.device_id === reported.device_id &&
+    actual.device_name === reported.device_name &&
+    actual.input_sample_format === reported.input_sample_format &&
+    isDeepStrictEqual(audioFormatIdentity(actual.audio_format), audioFormatIdentity(reported.audio_format));
+}
+
+function sessionSummaryMatchesSnapshot(inspection) {
+  const snapshot = inspection?.snapshot;
+  const summary = inspection?.session_summary;
+  return Boolean(snapshot) && Boolean(summary) &&
+    summary.session_id === snapshot.session_id &&
+    summary.status === snapshot.status &&
+    Number(summary.journal_seq) === Number(snapshot.journal_seq);
+}
+
+function independentFaultSessionChecks(inspection, reportedFinal, startSnapshot, requirement, plan) {
+  const snapshot = inspection?.snapshot;
+  const segments = Array.isArray(inspection?.segments) ? inspection.segments : [];
+  return {
+    passed:
+      inspection?.exists === true &&
+      Array.isArray(inspection?.tree_errors) && inspection.tree_errors.length === 0 &&
+      Array.isArray(inspection?.metadata_errors) && inspection.metadata_errors.length === 0 &&
+      Array.isArray(inspection?.segment_errors) && inspection.segment_errors.length === 0 &&
+      Array.isArray(inspection?.segment_layout_errors) && inspection.segment_layout_errors.length === 0 &&
+      Array.isArray(inspection?.descriptor_errors) && inspection.descriptor_errors.length === 0 &&
+      snapshot?.status === 'faulted' &&
+      replugSnapshotMatches(snapshot, null, requirement, plan) &&
+      snapshot?.session_id === startSnapshot?.session_id &&
+      snapshotWatermarksMatch(snapshot, reportedFinal) &&
+      sessionSummaryMatchesSnapshot(inspection) &&
+      faultMarkerPresent(inspection) &&
+      inspection?.fault_marker_parse_error !== true &&
+      Number.isSafeInteger(Number(inspection?.total_physical_frames)) &&
+      Number(inspection.total_physical_frames) > 0 &&
+      Number(inspection.total_physical_frames) === Number(snapshot?.committed_samples) &&
+      segments.length > 0 &&
+      segments.every((segment) =>
+        segment?.exact_header === true &&
+        Number(segment?.trailing_bytes) === 0 &&
+        Number(segment?.sample_rate) === Number(requirement.sample_rate) &&
+        Number(segment?.bits_per_sample) === Number(requirement.bit_depth) &&
+        Number(segment?.channels) === 1),
+    details: {
+      inspection,
+      reported_final: reportedFinal,
+      expected_session_id: startSnapshot?.session_id,
+    },
+  };
+}
+
+function replugInventoryMatches(inventory, requirement, plan) {
+  const devices = Array.isArray(inventory?.devices) ? inventory.devices : [];
+  const matches = devices.filter((device) => device?.id === plan.target.device_id);
+  return matches.length === 1 &&
+    matches[0]?.name === plan.target.device_name &&
+    replugConfigurationMatches(matches[0], requirement);
+}
+
+function validateReplugArchive(entry, requirement, plan, reportsRoot) {
+  const report = entry?.report;
+  const checks = [];
+  const evidenceRoots = [];
+  const add = (id, passed, details) => checks.push({ id, status: passed ? 'PASS' : 'FAIL', details });
+  if (!report) {
+    add('replug-report-present', false, entry?.path ?? null);
+    return { checks, evidenceRoots };
+  }
+
+  const before = report.replug?.before;
+  const transition = report.replug?.transition;
+  const after = report.replug?.after;
+  const beforeDirectory = path.resolve(String(before?.session_dir ?? ''));
+  const afterDirectory = path.resolve(String(after?.session_dir ?? ''));
+  const directoryIsSafe = (candidate) => {
+    try {
+      const metadata = fs.lstatSync(candidate);
+      return candidate !== path.resolve('.') &&
+        isCanonicalWithin(reportsRoot, candidate) &&
+        metadata.isDirectory() &&
+        !metadata.isSymbolicLink();
+    } catch {
+      return false;
+    }
+  };
+  const beforeDirectorySafe = directoryIsSafe(beforeDirectory);
+  const afterDirectorySafe = directoryIsSafe(afterDirectory);
+  const distinctDirectories = beforeDirectorySafe && afterDirectorySafe &&
+    canonicalPath(beforeDirectory) !== canonicalPath(afterDirectory);
+  add('replug-session-directories', distinctDirectories, {
+    before: beforeDirectory,
+    after: afterDirectory,
+    before_safe: beforeDirectorySafe,
+    after_safe: afterDirectorySafe,
+  });
+  if (beforeDirectorySafe) evidenceRoots.push(canonicalPath(beforeDirectory));
+  if (afterDirectorySafe) evidenceRoots.push(canonicalPath(afterDirectory));
+
+  const beforeStart = before?.start?.snapshot;
+  const beforeFinal = before?.stop?.result?.snapshot ?? before?.inspection?.snapshot;
+  const afterStart = after?.start?.snapshot;
+  const afterFinal = after?.stop?.result?.snapshot ?? after?.inspection?.snapshot;
+  const distinctSessions = typeof beforeStart?.session_id === 'string' && beforeStart.session_id.length > 0 &&
+    typeof afterStart?.session_id === 'string' && afterStart.session_id.length > 0 &&
+    beforeStart.session_id !== afterStart.session_id;
+  add(
+    'replug-session-identities',
+    distinctDirectories && distinctSessions &&
+      replugSnapshotMatches(beforeStart, beforeDirectory, requirement, plan) &&
+      replugSnapshotMatches(afterStart, afterDirectory, requirement, plan) &&
+      beforeFinal?.session_id === beforeStart?.session_id &&
+      afterFinal?.session_id === afterStart?.session_id,
+    {
+      before_session_id: beforeStart?.session_id,
+      after_session_id: afterStart?.session_id,
+      before_device: { id: beforeStart?.device_id, name: beforeStart?.device_name },
+      after_device: { id: afterStart?.device_id, name: afterStart?.device_name },
+    },
+  );
+
+  let actualBeforeInspection = null;
+  let actualAfterInspection = null;
+  let actualBeforeError = null;
+  let actualAfterError = null;
+  if (beforeDirectorySafe) {
+    try {
+      actualBeforeInspection = inspectSession(beforeDirectory);
+    } catch (error) {
+      actualBeforeError = error.message;
+    }
+  }
+  if (afterDirectorySafe) {
+    try {
+      actualAfterInspection = inspectSession(afterDirectory);
+    } catch (error) {
+      actualAfterError = error.message;
+    }
+  }
+  const independentBefore = independentFaultSessionChecks(
+    actualBeforeInspection,
+    beforeFinal,
+    beforeStart,
+    requirement,
+    plan,
+  );
+  add(
+    'replug-before-independent-recording-tree',
+    actualBeforeError === null && independentBefore.passed,
+    { error: actualBeforeError, ...independentBefore.details },
+  );
+  const actualAfterChecks = actualAfterInspection
+    ? evaluateSealedSession(actualAfterInspection)
+    : [];
+  const actualAfterFailures = actualAfterChecks.filter((check) => check.status === 'FAIL');
+  add(
+    'replug-after-independent-recording-tree',
+    actualAfterError === null &&
+      actualAfterInspection !== null &&
+      actualAfterFailures.length === 0 &&
+      replugSnapshotMatches(actualAfterInspection.snapshot, null, requirement, plan) &&
+      actualAfterInspection.snapshot?.session_id === afterStart?.session_id &&
+      snapshotWatermarksMatch(actualAfterInspection.snapshot, afterFinal),
+    {
+      error: actualAfterError,
+      failed_checks: actualAfterFailures,
+      checks: actualAfterChecks,
+      actual_inspection: actualAfterInspection,
+      reported_final: afterFinal,
+    },
+  );
+
+  const beforeProgress = before?.progress_summary;
+  const healthyPrefix = before?.healthy_prefix_summary;
+  const beforePhysicalFrames = Number(before?.inspection?.total_physical_frames);
+  add(
+    'replug-before-fault-archive',
+    beforeFinal?.status === 'faulted' &&
+      before?.fault?.first_fault_kind_row?.fault_kind === 'device_unavailable' &&
+      before?.fault?.fault_before_trigger == null &&
+      typeof before?.fault?.seconds_after_trigger === 'number' &&
+      Number.isFinite(before.fault.seconds_after_trigger) &&
+      Number(before.fault.seconds_after_trigger) >= 0 &&
+      Number(before.fault.seconds_after_trigger) <= 15 &&
+      Number(before?.fault?.captured_before_trigger) >= Number(requirement.sample_rate) * 2 &&
+      Number(healthyPrefix?.observed_capture_rate) >= Number(requirement.sample_rate) * 0.95 &&
+      Number(healthyPrefix?.observed_capture_rate) <= Number(requirement.sample_rate) * 1.05 &&
+      Number(healthyPrefix?.maximum_peak_dbfs) > -50 &&
+      (before?.inspection?.fault_marker_exists === true ||
+        before?.inspection?.fault_marker_temporary_exists === true) &&
+      before?.inspection?.fault_marker_parse_error !== true &&
+      before?.export?.expected_rejection === true &&
+      before?.resume?.expected_rejection === true &&
+      Number.isSafeInteger(beforePhysicalFrames) && beforePhysicalFrames > 0 &&
+      beforePhysicalFrames === Number(beforeFinal?.committed_samples) &&
+      Array.isArray(before?.inspection?.segments) && before.inspection.segments.length > 0 &&
+      before.inspection.segments.every((segment) => Number(segment?.trailing_bytes) === 0),
+    {
+      final_status: beforeFinal?.status,
+      fault: before?.fault,
+      progress: beforeProgress,
+      healthy_prefix: healthyPrefix,
+      fault_marker_exists: before?.inspection?.fault_marker_exists,
+      fault_marker_temporary_exists: before?.inspection?.fault_marker_temporary_exists,
+      physical_frames: beforePhysicalFrames,
+      committed_samples: beforeFinal?.committed_samples,
+      export: before?.export,
+      resume: before?.resume,
+    },
+  );
+
+  const disappeared = transition?.disappearance;
+  const reappeared = transition?.reappearance;
+  add(
+    'replug-report-transition',
+    Number(report.replug?.required_consecutive_matches) >= 2 &&
+      transition?.disappearance_timed_out === false &&
+      transition?.reappearance_timed_out === false &&
+      transition?.target_id === plan.target.device_id &&
+      transition?.target_name === plan.target.device_name &&
+      disappeared?.target_id === plan.target.device_id &&
+      disappeared?.target_name === plan.target.device_name &&
+      disappeared?.target_present === false &&
+      Array.isArray(disappeared?.observed_device_ids) &&
+      !disappeared.observed_device_ids.includes(plan.target.device_id) &&
+      reappeared?.target_id === plan.target.device_id &&
+      reappeared?.target_name === plan.target.device_name &&
+      reappeared?.target_present === true &&
+      reappeared?.target_match_count === 1 &&
+      reappeared?.target_name_matches === true &&
+      reappeared?.target_configuration_matches === true &&
+      reappeared?.exact_match === true &&
+      Number(reappeared?.consecutive_matches) >= 2 &&
+      reappeared?.target_device?.id === plan.target.device_id &&
+      reappeared?.target_device?.name === plan.target.device_name &&
+      replugConfigurationMatches(reappeared?.target_device, requirement),
+    { transition },
+  );
+
+  const afterProgress = after?.progress_summary;
+  const requiredAfterSeconds = Number(report.options?.seconds);
+  const afterPhysicalFrames = Number(after?.inspection?.total_physical_frames);
+  add(
+    'replug-after-capture-archive',
+    Number.isFinite(requiredAfterSeconds) && requiredAfterSeconds >= 5 &&
+      Number(afterProgress?.last?.elapsed_seconds) >= requiredAfterSeconds &&
+      Number(afterProgress?.observed_capture_rate) >= Number(requirement.sample_rate) * 0.95 &&
+      Number(afterProgress?.observed_capture_rate) <= Number(requirement.sample_rate) * 1.05 &&
+      Number(afterProgress?.maximum_peak_dbfs) > -50 &&
+      afterFinal?.status === 'stopped' &&
+      Number(afterFinal?.overflow_samples ?? 0) === 0 &&
+      after?.inspection?.fault_marker_exists !== true &&
+      after?.inspection?.fault_marker_temporary_exists !== true &&
+      Number.isSafeInteger(afterPhysicalFrames) && afterPhysicalFrames > 0 &&
+      Number.isSafeInteger(Number(afterFinal?.captured_samples)) &&
+      Number.isSafeInteger(Number(afterFinal?.committed_samples)) &&
+      Number(afterFinal.captured_samples) === Number(afterFinal.committed_samples) &&
+      afterPhysicalFrames === Number(afterFinal?.committed_samples) &&
+      Array.isArray(after?.inspection?.segments) && after.inspection.segments.length > 0 &&
+      after.inspection.segments.every((segment) =>
+        segment?.exact_header === true &&
+        Number(segment?.trailing_bytes) === 0 &&
+        Number(segment?.sample_rate) === Number(requirement.sample_rate) &&
+        Number(segment?.bits_per_sample) === Number(requirement.bit_depth) &&
+        Number(segment?.channels) === 1),
+    {
+      required_seconds: requiredAfterSeconds,
+      progress: afterProgress,
+      final_status: afterFinal?.status,
+      physical_frames: afterPhysicalFrames,
+      committed_samples: afterFinal?.committed_samples,
+      segments: after?.inspection?.segments,
+    },
+  );
+
+  const reportDirectory = path.dirname(entry.path);
+  let telemetryRows = [];
+  let telemetryError = null;
+  try {
+    telemetryRows = readNdjsonRegularFile(
+      path.join(reportDirectory, 'telemetry.jsonl'),
+      'replug telemetry',
+    );
+  } catch (error) {
+    telemetryError = error.message;
+  }
+  const inventoryRows = telemetryRows
+    .map((row, index) => ({ row, index }))
+    .filter(({ row }) => row?.phase === 'replug-inventory');
+  const presentRows = inventoryRows.filter(({ row }) => row.state === 'present-before-unplug');
+  const absentRows = inventoryRows.filter(({ row }) => row.state === 'absent-after-unplug');
+  const stableRows = inventoryRows.filter(({ row }) => row.state === 'stable-reappearance');
+  const presentIndex = presentRows[0]?.index ?? -1;
+  const absentIndex = absentRows[0]?.index ?? -1;
+  const stableIndex = stableRows[0]?.index ?? -1;
+  const matchingBeforeStable = inventoryRows.filter(({ row, index }) =>
+    index > absentIndex && index < stableIndex &&
+    row?.state === 'matching-reappearance' && row?.exact_match === true &&
+    row?.target_id === plan.target.device_id && row?.target_name === plan.target.device_name &&
+    row?.target_device?.id === plan.target.device_id &&
+    row?.target_device?.name === plan.target.device_name &&
+    replugConfigurationMatches(row?.target_device, requirement));
+  const aRows = telemetryRows
+    .map((row, index) => ({ row, index }))
+    .filter(({ row }) => String(row?.phase ?? '').startsWith('replug-a-'));
+  const bRows = telemetryRows
+    .map((row, index) => ({ row, index }))
+    .filter(({ row }) => String(row?.phase ?? '').startsWith('replug-b-'));
+  const aFaultRows = aRows.filter(({ row }) =>
+    row?.phase === 'replug-a-fault-observation' && row?.fault_kind === 'device_unavailable');
+  const aRecordingRows = aRows.filter(({ row }) => row?.phase === 'replug-a-recording');
+  const aPrematureFaultRows = aRecordingRows.filter(({ row }) =>
+    row?.faulted === true ||
+    Number(row?.overflow_samples ?? 0) > 0 ||
+    row?.fault_marker_exists === true ||
+    typeof row?.fault_kind === 'string' && row.fault_kind.trim() !== '');
+  const bRecordingRows = bRows.filter(({ row }) => row?.phase === 'replug-b-recording');
+  const telemetryRate = (entries) => {
+    const first = entries[0]?.row;
+    const last = entries.at(-1)?.row;
+    const elapsed = Number(last?.elapsed_seconds) - Number(first?.elapsed_seconds);
+    return elapsed > 0
+      ? (Number(last?.captured_samples) - Number(first?.captured_samples)) / elapsed
+      : null;
+  };
+  const aTelemetryRate = telemetryRate(aRecordingRows);
+  const bTelemetryRate = telemetryRate(bRecordingRows);
+  const aMaximumPeak = Math.max(...aRecordingRows.map(({ row }) => Number(row?.peak ?? 0)), 0);
+  const bMaximumPeak = Math.max(...bRecordingRows.map(({ row }) => Number(row?.peak ?? 0)), 0);
+  const bElapsed = bRows.map(({ row }) => Number(row?.elapsed_seconds)).filter(Number.isFinite);
+  add(
+    'replug-telemetry-transition',
+    telemetryError === null &&
+      presentRows.length === 1 && absentRows.length === 1 && stableRows.length === 1 &&
+      presentRows[0]?.row?.exact_match === true &&
+      presentRows[0]?.row?.target_id === plan.target.device_id &&
+      presentRows[0]?.row?.target_name === plan.target.device_name &&
+      presentRows[0]?.row?.target_device?.id === plan.target.device_id &&
+      presentRows[0]?.row?.target_device?.name === plan.target.device_name &&
+      replugConfigurationMatches(presentRows[0]?.row?.target_device, requirement) &&
+      absentRows[0]?.row?.target_id === plan.target.device_id &&
+      absentRows[0]?.row?.target_name === plan.target.device_name &&
+      absentRows[0]?.row?.target_present === false &&
+      Array.isArray(absentRows[0]?.row?.observed_device_ids) &&
+      !absentRows[0].row.observed_device_ids.includes(plan.target.device_id) &&
+      presentIndex < aRows[0]?.index &&
+      aPrematureFaultRows.length === 0 &&
+      aFaultRows.length > 0 && aFaultRows[0].index < absentIndex &&
+      absentIndex < stableIndex && matchingBeforeStable.length >= 1 &&
+      Number(stableRows[0]?.row?.consecutive_matches) >= 2 &&
+      stableRows[0]?.row?.target_device?.id === plan.target.device_id &&
+      stableRows[0]?.row?.target_device?.name === plan.target.device_name &&
+      replugConfigurationMatches(stableRows[0]?.row?.target_device, requirement) &&
+      bRows.length >= 2 && bRows[0].index > stableIndex &&
+      aRows.every(({ row }) => row?.session_id === beforeStart?.session_id) &&
+      bRows.every(({ row }) => row?.session_id === afterStart?.session_id) &&
+      aTelemetryRate !== null &&
+      aTelemetryRate >= Number(requirement.sample_rate) * 0.95 &&
+      aTelemetryRate <= Number(requirement.sample_rate) * 1.05 &&
+      bTelemetryRate !== null &&
+      bTelemetryRate >= Number(requirement.sample_rate) * 0.95 &&
+      bTelemetryRate <= Number(requirement.sample_rate) * 1.05 &&
+      aMaximumPeak > 10 ** (-50 / 20) && bMaximumPeak > 10 ** (-50 / 20) &&
+      bElapsed.length > 0 && Math.max(...bElapsed) >= requiredAfterSeconds,
+    {
+      error: telemetryError,
+      present_rows: presentRows.length,
+      absent_rows: absentRows.length,
+      stable_rows: stableRows.length,
+      matching_before_stable: matchingBeforeStable.length,
+      a_rows: aRows.length,
+      a_fault_rows: aFaultRows.length,
+      a_premature_fault_rows: aPrematureFaultRows.length,
+      b_rows: bRows.length,
+      a_observed_capture_rate: aTelemetryRate,
+      b_observed_capture_rate: bTelemetryRate,
+      a_maximum_peak: aMaximumPeak,
+      b_maximum_peak: bMaximumPeak,
+      b_max_elapsed_seconds: bElapsed.length > 0 ? Math.max(...bElapsed) : null,
+    },
+  );
+
+  let protocolRows = [];
+  let protocolError = null;
+  try {
+    protocolRows = readNdjsonRegularFile(
+      path.join(reportDirectory, 'protocol.jsonl'),
+      'replug protocol',
+    );
+  } catch (error) {
+    protocolError = error.message;
+  }
+  const indexedProtocol = protocolRows.map((row, index) => ({ row, index }));
+  const requests = indexedProtocol.filter(({ row }) => row?.direction === 'tool' && row?.message?.command);
+  const responseFor = ({ row: request, index }) => indexedProtocol.find(({ row, index: responseIndex }) =>
+    responseIndex > index && row?.direction === 'engine' &&
+    row?.message?.request_id === request?.message?.request_id);
+  const commandRequests = (command) => requests.filter(({ row }) => row.message.command === command);
+  const startRequests = commandRequests('start_session');
+  const startPairMatches = (requestEntry, expectedDirectory, expectedSessionId) => {
+    const payload = requestEntry?.row?.message?.payload;
+    const response = requestEntry ? responseFor(requestEntry) : null;
+    const snapshot = response?.row?.message?.result?.snapshot;
+    return Boolean(requestEntry) &&
+      path.resolve(String(payload?.session_dir ?? '')) === path.resolve(expectedDirectory) &&
+      payload?.session_id === expectedSessionId &&
+      payload?.device_id === plan.target.device_id &&
+      payload?.device_name === plan.target.device_name &&
+      Number(payload?.sample_rate) === Number(requirement.sample_rate) &&
+      Number(payload?.bit_depth) === Number(requirement.bit_depth) &&
+      Number(payload?.input_channel) === Number(requirement.channel) &&
+      response?.row?.message?.ok === true &&
+      snapshot?.session_id === expectedSessionId &&
+      replugSnapshotMatches(snapshot, expectedDirectory, requirement, plan);
+  };
+  const firstStart = startRequests[0];
+  const secondStart = startRequests[1];
+  const listPairs = commandRequests('list_devices').map((request) => ({
+    request,
+    response: responseFor(request),
+  }));
+  const firstStartIndex = firstStart?.index ?? Number.POSITIVE_INFINITY;
+  const secondStartIndex = secondStart?.index ?? Number.POSITIVE_INFINITY;
+  const readyRows = indexedProtocol.filter(({ row, index }) =>
+    index < firstStartIndex &&
+    row?.direction === 'engine' &&
+    row?.message?.event === 'engine_ready' &&
+    isDeepStrictEqual(row.message.payload ?? row.message, report.engine?.ready));
+  const initialLists = listPairs.filter(({ request, response }) =>
+    request.index < firstStartIndex && response?.row?.message?.ok === true &&
+    replugInventoryMatches(response.row.message.result, requirement, plan));
+  const betweenLists = listPairs.filter(({ request }) =>
+    request.index > firstStartIndex && request.index < secondStartIndex);
+  let absentListIndex = -1;
+  let reappearanceStreak = 0;
+  let maximumReappearanceStreak = 0;
+  for (let index = 0; index < betweenLists.length; index += 1) {
+    const responseMessage = betweenLists[index].response?.row?.message;
+    if (responseMessage?.ok !== true) {
+      if (absentListIndex >= 0) reappearanceStreak = 0;
+      continue;
+    }
+    const result = responseMessage.result;
+    const devices = Array.isArray(result?.devices) ? result.devices : [];
+    if (absentListIndex < 0 && !devices.some((device) => device?.id === plan.target.device_id)) {
+      absentListIndex = index;
+      reappearanceStreak = 0;
+      continue;
+    }
+    if (absentListIndex >= 0 && replugInventoryMatches(result, requirement, plan)) {
+      reappearanceStreak += 1;
+      maximumReappearanceStreak = Math.max(maximumReappearanceStreak, reappearanceStreak);
+    } else if (absentListIndex >= 0) {
+      reappearanceStreak = 0;
+    }
+  }
+  const oldCommandRejected = (command) => {
+    const matches = commandRequests(command).filter(({ row, index }) =>
+      index > firstStartIndex && index < secondStartIndex &&
+      path.resolve(String(row.message?.payload?.session_dir ?? '')) === beforeDirectory &&
+      (command !== 'resume_session' ||
+        row.message?.payload?.expected_session_id === beforeStart?.session_id));
+    return matches.length === 1 && responseFor(matches[0])?.row?.message?.ok === false;
+  };
+  const oldExport = commandRequests('export_session').find(({ index }) =>
+    index > firstStartIndex && index < secondStartIndex);
+  const oldResume = commandRequests('resume_session').find(({ index }) =>
+    index > firstStartIndex && index < secondStartIndex);
+  const absentProtocolRequestIndex = absentListIndex >= 0
+    ? betweenLists[absentListIndex].request.index
+    : -1;
+  const successfulStops = commandRequests('stop_session')
+    .map((request) => ({ request, response: responseFor(request) }))
+    .filter(({ response }) => response?.row?.message?.ok === true);
+  const beforeStops = successfulStops.filter(({ request, response }) =>
+    request.index > firstStartIndex && request.index < secondStartIndex &&
+    response.row.message.result?.snapshot?.session_id === beforeStart?.session_id &&
+    response.row.message.result?.snapshot?.status === 'faulted');
+  const afterStops = successfulStops.filter(({ request, response }) =>
+    request.index > secondStartIndex &&
+    response.row.message.result?.snapshot?.session_id === afterStart?.session_id &&
+    response.row.message.result?.snapshot?.status === 'stopped');
+  const successfulShutdowns = commandRequests('shutdown')
+    .map((request) => ({ request, response: responseFor(request) }))
+    .filter(({ request, response }) =>
+      request.index > (afterStops.at(-1)?.request?.index ?? Number.POSITIVE_INFINITY) &&
+      response?.row?.message?.ok === true);
+  add(
+    'replug-protocol-two-starts',
+    protocolError === null && startRequests.length === 2 &&
+      startPairMatches(firstStart, beforeDirectory, beforeStart?.session_id) &&
+      startPairMatches(secondStart, afterDirectory, afterStart?.session_id) &&
+      firstStart?.row?.message?.request_id !== secondStart?.row?.message?.request_id,
+    {
+      error: protocolError,
+      start_count: startRequests.length,
+      start_requests: startRequests.map(({ row }) => row.message),
+    },
+  );
+  add(
+    'replug-protocol-transition',
+    protocolError === null && initialLists.length >= 1 &&
+      absentListIndex >= 0 && maximumReappearanceStreak >= 2 &&
+      oldCommandRejected('export_session') && oldCommandRejected('resume_session') &&
+      oldExport?.index < absentProtocolRequestIndex && oldResume?.index < absentProtocolRequestIndex,
+    {
+      error: protocolError,
+      initial_matching_lists: initialLists.length,
+      between_start_list_count: betweenLists.length,
+      absent_list_index: absentListIndex,
+      maximum_reappearance_streak: maximumReappearanceStreak,
+      old_export_rejected: oldCommandRejected('export_session'),
+      old_resume_rejected: oldCommandRejected('resume_session'),
+    },
+  );
+  add(
+    'replug-protocol-seals-and-shutdown',
+    protocolError === null &&
+      readyRows.length >= 1 &&
+      beforeStops.length >= 1 &&
+      afterStops.length >= 1 &&
+      successfulShutdowns.length === 1,
+    {
+      error: protocolError,
+      engine_ready_rows: readyRows.length,
+      before_successful_stops: beforeStops.length,
+      after_successful_stops: afterStops.length,
+      successful_shutdowns: successfulShutdowns.length,
+    },
+  );
+
+  return { checks, evidenceRoots };
+}
+
 function validateBoundRuns(results) {
   const byId = new Map(results.map((result) => [result.id, result]));
   for (const result of results) {
@@ -1379,6 +1947,16 @@ async function runQualification(options) {
     result.report = selected.selected.report;
     const validation = validateReport(selected.selected, requirement, plan, reportsRoot);
     result.checks.push(...validation.checks);
+    if (requirement.mode === 'replug') {
+      const replugValidation = validateReplugArchive(
+        selected.selected,
+        requirement,
+        plan,
+        reportsRoot,
+      );
+      result.checks.push(...replugValidation.checks);
+      validation.evidenceRoots.push(...replugValidation.evidenceRoots);
+    }
     if (requirement.mode === 'recover') {
       const phase1Selection = selectPhase1Report(requirement, plan, reportsRoot, discovered);
       if (!phase1Selection.selected || phase1Selection.error) {

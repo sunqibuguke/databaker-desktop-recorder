@@ -382,7 +382,7 @@ async function main() {
     recoveryClient = new EngineClient(releaseEngine, 'release-recovery');
     const recovery = await recoveryClient.requestOk(
       'seal_interrupted_session',
-      { session_dir: sessionDir },
+      { session_dir: sessionDir, expected_session_id: 'system-fault-quick' },
       30_000,
     );
     const durableFrames = verifyRecoveredSession(sessionDir, recovery, {
@@ -395,7 +395,7 @@ async function main() {
     const treeAfterRecovery = hashRecoveryTree(sessionDir);
     const second = await recoveryClient.requestOk(
       'seal_interrupted_session',
-      { session_dir: sessionDir },
+      { session_dir: sessionDir, expected_session_id: 'system-fault-quick' },
       30_000,
     );
     assert.equal(second.no_op, true);

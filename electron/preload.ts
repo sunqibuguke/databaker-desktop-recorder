@@ -1,4 +1,36 @@
 import { contextBridge, ipcRenderer } from 'electron';
+import {
+  ENGINE_EVENT_CHANNEL,
+  ENGINE_METER_ACK_CHANNEL,
+  ENGINE_METER_CHANNEL,
+} from './meter-backpressure';
+
+type EngineEventListener = (message: unknown) => void;
+
+const engineEventListeners = new Set<EngineEventListener>();
+
+function dispatchEngineEvent(message: unknown): void {
+  for (const listener of [...engineEventListeners]) listener(message);
+}
+
+// Install the meter receiver during preload, before React mounts. Even if no
+// UI listener exists yet, every delivered packet is acknowledged so the main
+// process can keep the latest-only lane moving instead of waiting forever.
+ipcRenderer.on(ENGINE_EVENT_CHANNEL, (_event, message: unknown) => {
+  dispatchEngineEvent(message);
+});
+ipcRenderer.on(
+  ENGINE_METER_CHANNEL,
+  (_event, deliveryId: unknown, message: unknown) => {
+    try {
+      dispatchEngineEvent(message);
+    } finally {
+      if (Number.isSafeInteger(deliveryId) && (deliveryId as number) > 0) {
+        ipcRenderer.send(ENGINE_METER_ACK_CHANNEL, deliveryId);
+      }
+    }
+  },
+);
 
 contextBridge.exposeInMainWorld('recorder', {
   request: (command: string, payload: unknown = {}) => ipcRenderer.invoke('engine:request', command, payload),
@@ -24,9 +56,8 @@ contextBridge.exposeInMainWorld('recorder', {
     return () => ipcRenderer.removeListener('prompter:state', wrapped);
   },
   onEngineEvent: (listener: (message: unknown) => void) => {
-    const wrapped = (_event: Electron.IpcRendererEvent, message: unknown) => listener(message);
-    ipcRenderer.on('engine:event', wrapped);
-    return () => ipcRenderer.removeListener('engine:event', wrapped);
+    engineEventListeners.add(listener);
+    return () => engineEventListeners.delete(listener);
   },
   onEngineOffline: (listener: (message: string) => void) => {
     const wrapped = (_event: Electron.IpcRendererEvent, message: string) => listener(message);

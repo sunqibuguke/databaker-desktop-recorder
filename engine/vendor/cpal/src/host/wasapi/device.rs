@@ -20,9 +20,7 @@ impl From<Audio::EDataFlow> for DeviceDirection {
 }
 use std::{
     ffi::OsString,
-    fmt,
-    hash::Hash,
-    mem,
+    fmt, mem,
     os::windows::ffi::OsStringExt,
     ptr, slice,
     sync::{Arc, Mutex, MutexGuard, OnceLock},
@@ -83,6 +81,10 @@ enum DeviceHandle {
 #[derive(Clone)]
 pub struct Device {
     device: DeviceHandle,
+    // Specific endpoints cache the stable ID while the COM object is known to
+    // be live. Equality, hashing, and identity reads must not call GetId after
+    // a USB hot-unplug, where that call can fail.
+    endpoint_id: Option<String>,
     /// We cache an uninitialized `IAudioClient` so that we can call functions from it without
     /// having to create/destroy audio clients all the time.
     future_audio_client: Arc<Mutex<Option<IAudioClientWrapper>>>, // TODO: add NonZero around the ptr
@@ -102,11 +104,11 @@ impl DeviceTrait for Device {
     }
 
     fn supports_input(&self) -> bool {
-        self.data_flow() == Audio::eCapture
+        data_flow_matches(self.data_flow(), Audio::eCapture)
     }
 
     fn supports_output(&self) -> bool {
-        self.data_flow() == Audio::eRender
+        data_flow_matches(self.data_flow(), Audio::eRender)
     }
 
     fn supported_input_configs(&self) -> Result<Self::SupportedInputConfigs, Error> {
@@ -181,16 +183,8 @@ impl Drop for WaveFormatExPtr {
     }
 }
 
-unsafe fn immendpoint_from_immdevice(device: Audio::IMMDevice) -> Audio::IMMEndpoint {
-    device
-        .cast::<Audio::IMMEndpoint>()
-        .expect("could not query IMMDevice interface for IMMEndpoint")
-}
-
-unsafe fn data_flow_from_immendpoint(endpoint: &Audio::IMMEndpoint) -> Audio::EDataFlow {
-    endpoint
-        .GetDataFlow()
-        .expect("could not get endpoint data_flow")
+fn data_flow_matches(result: Result<Audio::EDataFlow, Error>, expected: Audio::EDataFlow) -> bool {
+    result.is_ok_and(|flow| flow == expected)
 }
 
 // Given the audio client and format, returns whether the shared audio engine accepts that exact
@@ -527,7 +521,7 @@ impl Device {
             // Open the device's property store.
             let property_store = device
                 .OpenPropertyStore(STGM_READ)
-                .expect("could not open property store");
+                .context("Failed to open device property store")?;
 
             // Query all available properties
             let friendly_name = get_property_string(
@@ -569,7 +563,7 @@ impl Device {
             })?;
 
             // Get direction from data flow (eCapture = Input, eRender = Output)
-            let direction = self.data_flow().into();
+            let direction = self.data_flow()?.into();
 
             // Determine device_type and initial interface_type from FormFactor
             let (device_type, mut interface_type) = form_factor
@@ -608,6 +602,9 @@ impl Device {
     }
 
     fn id(&self) -> Result<DeviceId, Error> {
+        if let Some(id) = self.endpoint_id.as_deref() {
+            return Ok(DeviceId::new(crate::platform::HostId::Wasapi, id));
+        }
         let device = self.immdevice().ok_or_else(|| {
             Error::with_message(ErrorKind::DeviceNotAvailable, "Default device not found")
         })?;
@@ -625,16 +622,28 @@ impl Device {
         }
     }
 
-    fn from_immdevice(device: Audio::IMMDevice) -> Self {
-        Device {
+    fn from_immdevice(device: Audio::IMMDevice) -> Result<Self, Error> {
+        let endpoint_id = unsafe {
+            let id = device.GetId().context("Failed to read audio endpoint ID")?;
+            let _guard = ComString(id);
+            id.to_string().map_err(|error| {
+                Error::with_message(
+                    ErrorKind::BackendError,
+                    format!("Failed to convert audio endpoint ID to string: {error}"),
+                )
+            })?
+        };
+        Ok(Device {
             device: DeviceHandle::Specific(device),
+            endpoint_id: Some(endpoint_id),
             future_audio_client: Arc::new(Mutex::new(None)),
-        }
+        })
     }
 
     fn default_output() -> Self {
         Device {
             device: DeviceHandle::DefaultOutput,
+            endpoint_id: None,
             future_audio_client: Arc::new(Mutex::new(None)),
         }
     }
@@ -642,6 +651,7 @@ impl Device {
     fn default_input() -> Self {
         Device {
             device: DeviceHandle::DefaultInput,
+            endpoint_id: None,
             future_audio_client: Arc::new(Mutex::new(None)),
         }
     }
@@ -760,7 +770,7 @@ impl Device {
                 ));
             }
 
-            let is_output = self.data_flow() == Audio::eRender;
+            let is_output = self.data_flow()? == Audio::eRender;
             // Shared-mode IsFormatSupported only proves that the Windows audio
             // engine accepts a client representation; it may convert integer
             // samples to its internal float representation. For capture, cap
@@ -880,7 +890,7 @@ impl Device {
     }
 
     pub fn supported_input_configs(&self) -> Result<SupportedInputConfigs, Error> {
-        if self.data_flow() == Audio::eCapture {
+        if self.data_flow()? == Audio::eCapture {
             self.supported_formats()
         // If it's an output device, assume no input formats.
         } else {
@@ -889,7 +899,7 @@ impl Device {
     }
 
     pub fn supported_output_configs(&self) -> Result<SupportedOutputConfigs, Error> {
-        if self.data_flow() == Audio::eRender {
+        if self.data_flow()? == Audio::eRender {
             self.supported_formats()
         // If it's an input device, assume no output formats.
         } else {
@@ -943,19 +953,19 @@ impl Device {
         }
     }
 
-    pub(crate) fn data_flow(&self) -> Audio::EDataFlow {
+    pub(crate) fn data_flow(&self) -> Result<Audio::EDataFlow, Error> {
         match &self.device {
-            DeviceHandle::DefaultOutput => Audio::eRender,
-            DeviceHandle::DefaultInput => Audio::eCapture,
+            DeviceHandle::DefaultOutput => Ok(Audio::eRender),
+            DeviceHandle::DefaultInput => Ok(Audio::eCapture),
             DeviceHandle::Specific(device) => {
-                let endpoint = Endpoint::from(device.clone());
+                let endpoint = Endpoint::try_from(device.clone())?;
                 endpoint.data_flow()
             }
         }
     }
 
     pub fn default_input_config(&self) -> Result<SupportedStreamConfig, Error> {
-        if self.data_flow() == Audio::eCapture {
+        if self.data_flow()? == Audio::eCapture {
             self.default_format()
         } else {
             Err(Error::with_message(
@@ -966,7 +976,7 @@ impl Device {
     }
 
     pub fn default_output_config(&self) -> Result<SupportedStreamConfig, Error> {
-        let data_flow = self.data_flow();
+        let data_flow = self.data_flow()?;
         if data_flow == Audio::eRender {
             self.default_format()
         } else {
@@ -1001,7 +1011,7 @@ impl Device {
 
             let mut stream_flags = DEFAULT_FLAGS;
 
-            if self.data_flow() == Audio::eRender {
+            if self.data_flow()? == Audio::eRender {
                 stream_flags |= Audio::AUDCLNT_STREAMFLAGS_LOOPBACK;
             }
 
@@ -1208,57 +1218,14 @@ impl Device {
     }
 }
 
-/// Compares the endpoint IDs of two `IMMDevice` objects.
-///
-/// # Safety
-///
-/// Both devices must be valid, live `IMMDevice` COM objects.
-unsafe fn endpoint_ids_equal(a: &Audio::IMMDevice, b: &Audio::IMMDevice) -> bool {
-    let id_a = a.GetId().expect("cpal: GetId failure");
-    let id_b = b.GetId().expect("cpal: GetId failure");
-    let _ga = ComString(id_a);
-    let _gb = ComString(id_b);
-    let mut off = 0isize;
-    loop {
-        let wa = *id_a.0.offset(off);
-        let wb = *id_b.0.offset(off);
-        if wa != wb {
-            return false;
-        }
-        if wa == 0 {
-            return true;
-        }
-        off += 1;
-    }
-}
-
-/// Hashes the endpoint ID of an `IMMDevice` into `state` without allocating.
-///
-/// # Safety
-/// `device` must be a valid, live `IMMDevice` COM object.
-unsafe fn hash_endpoint_id<H: std::hash::Hasher>(device: &Audio::IMMDevice, state: &mut H) {
-    let id = device.GetId().expect("cpal: GetId failure");
-    let _g = ComString(id);
-    let mut off = 0isize;
-    loop {
-        let w = *id.0.offset(off);
-        if w == 0 {
-            break;
-        }
-        w.hash(state);
-        off += 1;
-    }
-}
-
 // Equality and hashing use stable identifiers only.
 impl PartialEq for Device {
     fn eq(&self, other: &Device) -> bool {
         match (&self.device, &other.device) {
             (DeviceHandle::DefaultOutput, DeviceHandle::DefaultOutput)
             | (DeviceHandle::DefaultInput, DeviceHandle::DefaultInput) => true,
-            (DeviceHandle::Specific(a), DeviceHandle::Specific(b)) => {
-                // SAFETY: both IMMDevice handles are valid for the lifetime of their Device.
-                unsafe { endpoint_ids_equal(a, b) }
+            (DeviceHandle::Specific(_), DeviceHandle::Specific(_)) => {
+                self.endpoint_id == other.endpoint_id
             }
             _ => false,
         }
@@ -1269,22 +1236,23 @@ impl Eq for Device {}
 
 impl std::hash::Hash for Device {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        mem::discriminant(&self.device).hash(state);
         match &self.device {
-            DeviceHandle::DefaultOutput | DeviceHandle::DefaultInput => {
-                mem::discriminant(&self.device).hash(state);
-            }
-            DeviceHandle::Specific(device) => {
-                // SAFETY: the IMMDevice handle is valid for the Device's lifetime.
-                unsafe { hash_endpoint_id(device, state) }
-            }
+            DeviceHandle::DefaultOutput | DeviceHandle::DefaultInput => {}
+            DeviceHandle::Specific(_) => self.endpoint_id.hash(state),
         }
     }
 }
 
 impl fmt::Display for Device {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let desc = self.description().map_err(|_| fmt::Error)?;
-        f.write_str(desc.name())
+        match self.description() {
+            Ok(desc) => f.write_str(desc.name()),
+            // Formatting is often used for diagnostics and must not turn a
+            // hot-unplug race into a process panic. Callers that need an
+            // authoritative name must use the fallible `description()` API.
+            Err(_) => f.write_str("Unavailable WASAPI device"),
+        }
     }
 }
 
@@ -1297,18 +1265,24 @@ impl fmt::Debug for Device {
     }
 }
 
-impl From<Audio::IMMDevice> for Endpoint {
-    fn from(device: Audio::IMMDevice) -> Self {
-        unsafe {
-            let endpoint = immendpoint_from_immdevice(device);
-            Endpoint { endpoint }
-        }
+impl TryFrom<Audio::IMMDevice> for Endpoint {
+    type Error = Error;
+
+    fn try_from(device: Audio::IMMDevice) -> Result<Self, Self::Error> {
+        let endpoint = device
+            .cast::<Audio::IMMEndpoint>()
+            .context("Failed to query IMMDevice for IMMEndpoint")?;
+        Ok(Endpoint { endpoint })
     }
 }
 
 impl Endpoint {
-    fn data_flow(&self) -> Audio::EDataFlow {
-        unsafe { data_flow_from_immendpoint(&self.endpoint) }
+    fn data_flow(&self) -> Result<Audio::EDataFlow, Error> {
+        unsafe {
+            self.endpoint
+                .GetDataFlow()
+                .context("Failed to query audio endpoint data flow")
+        }
     }
 }
 
@@ -1454,22 +1428,42 @@ impl Iterator for Devices {
     type Item = Device;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next_item >= self.total_count {
-            return None;
-        }
-
-        unsafe {
-            let device = self.collection.Item(self.next_item).unwrap();
-            self.next_item += 1;
-            Some(Self::Item::from_immdevice(device))
-        }
+        next_successful_indexed(&mut self.next_item, self.total_count, |index| unsafe {
+            self.collection
+                .Item(index)
+                .map_err(Error::from)
+                .and_then(Device::from_immdevice)
+        })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         let num = self.total_count - self.next_item;
         let num = num as usize;
-        (num, Some(num))
+        // Items can disappear after `GetCount` and are skipped by `next`, so
+        // only the upper bound remains exact for the collection snapshot.
+        (0, Some(num))
     }
+}
+
+/// A Windows endpoint collection can become stale while a USB interface is
+/// being removed. Skip only the item that failed and continue walking the
+/// snapshot instead of panicking or hiding later healthy endpoints.
+fn next_successful_indexed<T, E: fmt::Display>(
+    next_index: &mut u32,
+    total_count: u32,
+    mut fetch: impl FnMut(u32) -> Result<T, E>,
+) -> Option<T> {
+    while *next_index < total_count {
+        let index = *next_index;
+        *next_index += 1;
+        match fetch(index) {
+            Ok(value) => return Some(value),
+            Err(error) => {
+                eprintln!("skip unavailable WASAPI endpoint at index {index}: {error}");
+            }
+        }
+    }
+    None
 }
 
 pub fn default_input_device() -> Option<Device> {
@@ -1608,6 +1602,43 @@ fn buffer_duration_to_frames(buffer_duration: i64, sample_rate: SampleRate) -> F
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_data_flow_query_never_claims_input_or_output_support() {
+        assert!(data_flow_matches(Ok(Audio::eCapture), Audio::eCapture));
+        assert!(!data_flow_matches(Ok(Audio::eRender), Audio::eCapture));
+        assert!(!data_flow_matches(
+            Err(Error::new(ErrorKind::DeviceNotAvailable)),
+            Audio::eCapture,
+        ));
+        assert!(!data_flow_matches(
+            Err(Error::new(ErrorKind::BackendError)),
+            Audio::eRender,
+        ));
+    }
+
+    #[test]
+    fn stale_enumeration_items_are_skipped_without_hiding_later_devices() {
+        let mut next_index = 0;
+        let mut visited = Vec::new();
+        let found = next_successful_indexed(&mut next_index, 4, |index| {
+            visited.push(index);
+            match index {
+                0 | 1 => Err("endpoint disappeared"),
+                2 => Ok("healthy endpoint"),
+                _ => Err("unused tail"),
+            }
+        });
+        assert_eq!(found, Some("healthy endpoint"));
+        assert_eq!(visited, vec![0, 1, 2]);
+        assert_eq!(next_index, 3);
+
+        let exhausted = next_successful_indexed(&mut next_index, 4, |_| {
+            Err::<&'static str, _>("last endpoint disappeared")
+        });
+        assert_eq!(exhausted, None);
+        assert_eq!(next_index, 4);
+    }
 
     #[test]
     fn extensible_formats_never_overstate_valid_sample_bits() {
