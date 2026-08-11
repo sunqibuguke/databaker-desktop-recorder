@@ -280,6 +280,14 @@ pub struct StartSessionPayload {
     pub items: Vec<ScriptItem>,
 }
 
+#[cfg(feature = "system-test")]
+#[derive(Debug, Deserialize)]
+pub struct SystemTestStartSessionPayload {
+    #[serde(flatten)]
+    pub session: StartSessionPayload,
+    pub segment_frames: u64,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ResumeSessionPayload {
     pub session_dir: String,
@@ -718,6 +726,13 @@ enum AudioWriterBackend {
     Segmented(SegmentedWav),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureActivation {
+    Device,
+    #[cfg(feature = "system-test")]
+    SystemTestSynthetic,
+}
+
 impl AudioWriterBackend {
     fn frames_written(&self) -> u64 {
         match self {
@@ -899,6 +914,56 @@ impl Engine {
     }
 
     pub fn start_session(&mut self, payload: StartSessionPayload) -> Result<Value> {
+        let (session_dir, snapshot) = self.prepare_new_session(payload, None)?;
+        self.activate_session(
+            session_dir,
+            snapshot,
+            false,
+            "session_started",
+            None,
+            None,
+            CaptureActivation::Device,
+        )
+    }
+
+    #[cfg(feature = "system-test")]
+    pub fn start_system_test_session(
+        &mut self,
+        payload: SystemTestStartSessionPayload,
+    ) -> Result<Value> {
+        if payload.segment_frames == 0 {
+            bail!("system-test segment_frames must be greater than zero");
+        }
+        if !(8_000..=192_000).contains(&payload.session.sample_rate) {
+            bail!("system-test sample_rate must be between 8000 and 192000 Hz");
+        }
+        if payload.session.input_channel != 1 {
+            bail!("system-test synthetic capture exposes exactly one input channel");
+        }
+        let maximum_segment_frames = u64::from(payload.session.sample_rate)
+            .checked_mul(30)
+            .context("system-test segment frame limit overflow")?;
+        if payload.segment_frames > maximum_segment_frames {
+            bail!("system-test segment_frames cannot exceed 30 seconds of audio");
+        }
+        let (session_dir, snapshot) =
+            self.prepare_new_session(payload.session, Some(payload.segment_frames))?;
+        self.activate_session(
+            session_dir,
+            snapshot,
+            false,
+            "session_started",
+            None,
+            None,
+            CaptureActivation::SystemTestSynthetic,
+        )
+    }
+
+    fn prepare_new_session(
+        &self,
+        payload: StartSessionPayload,
+        segment_frames_override: Option<u64>,
+    ) -> Result<(PathBuf, SessionSnapshot)> {
         if self.session.is_some() {
             bail!("当前已有录制进行中");
         }
@@ -906,7 +971,10 @@ impl Engine {
             bail!("script contains no items");
         }
         let output_encoding = WavEncoding::for_bit_depth(payload.bit_depth)?;
-        let segment_frames = storage_layout_v1_default_segment_frames(payload.sample_rate)?;
+        let segment_frames = match segment_frames_override {
+            Some(frames) => frames,
+            None => storage_layout_v1_default_segment_frames(payload.sample_rate)?,
+        };
         if payload.input_channel == 0 {
             bail!("input channel uses one-based numbering and must be at least 1");
         }
@@ -977,7 +1045,8 @@ impl Engine {
                 })
                 .collect(),
         };
-        self.activate_session(session_dir, snapshot, false, "session_started", None, None)
+        storage_layout_segment_frames(&snapshot)?;
+        Ok((session_dir, snapshot))
     }
 
     pub fn resume_session(&mut self, payload: ResumeSessionPayload) -> Result<Value> {
@@ -1051,6 +1120,7 @@ impl Engine {
             "session_resumed",
             Some(session_lock),
             Some(journal),
+            CaptureActivation::Device,
         )?;
         if let Some(object) = result.as_object_mut() {
             object.insert("previous_status".to_string(), json!(previous_status));
@@ -1058,6 +1128,7 @@ impl Engine {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn activate_session(
         &mut self,
         session_dir: PathBuf,
@@ -1066,6 +1137,7 @@ impl Engine {
         event_name: &str,
         preacquired_session_lock: Option<SessionLock>,
         resume_journal: Option<JournalLog>,
+        capture_activation: CaptureActivation,
     ) -> Result<Value> {
         let max_frames_per_segment = storage_layout_segment_frames(&snapshot)?;
         // Persist the resolved compatibility value on the next projection so
@@ -1085,30 +1157,56 @@ impl Engine {
         }
         let output_encoding = WavEncoding::for_bit_depth(snapshot.audio_format.bit_depth)?;
         let previous_capture_source = capture_span_from_snapshot(&snapshot, 0, 0);
-        let host = cpal::default_host();
-        let requested_device_id =
-            (!snapshot.device_id.is_empty()).then_some(snapshot.device_id.as_str());
-        let requested_device_name =
-            (!snapshot.device_name.is_empty()).then_some(snapshot.device_name.as_str());
-        let device = select_device(&host, requested_device_id, requested_device_name)?;
-        let device_id = device
-            .id()
-            .context("read stable input device id")?
-            .to_string();
-        let device_name = device.to_string();
         let input_channel_index = usize::from(snapshot.audio_format.input_channel - 1);
-        let supported = select_config(
-            &device,
-            snapshot.audio_format.sample_rate,
-            input_channel_index,
-            snapshot.audio_format.bit_depth,
-        )?;
-        let input_channels = supported.channels();
-        let sample_format = supported.sample_format();
-        let config = StreamConfig {
-            channels: input_channels,
-            sample_rate: snapshot.audio_format.sample_rate,
-            buffer_size: cpal::BufferSize::Default,
+        let (device_name, device_id, input_channels, sample_format, stream_setup) =
+            match capture_activation {
+                CaptureActivation::Device => {
+                    let host = cpal::default_host();
+                    let requested_device_id =
+                        (!snapshot.device_id.is_empty()).then_some(snapshot.device_id.as_str());
+                    let requested_device_name =
+                        (!snapshot.device_name.is_empty()).then_some(snapshot.device_name.as_str());
+                    let device = select_device(&host, requested_device_id, requested_device_name)?;
+                    let device_id = device
+                        .id()
+                        .context("read stable input device id")?
+                        .to_string();
+                    let device_name = device.to_string();
+                    let supported = select_config(
+                        &device,
+                        snapshot.audio_format.sample_rate,
+                        input_channel_index,
+                        snapshot.audio_format.bit_depth,
+                    )?;
+                    let input_channels = supported.channels();
+                    let sample_format = supported.sample_format();
+                    let config = StreamConfig {
+                        channels: input_channels,
+                        sample_rate: snapshot.audio_format.sample_rate,
+                        buffer_size: cpal::BufferSize::Default,
+                    };
+                    (
+                        device_name,
+                        device_id,
+                        input_channels,
+                        sample_format,
+                        Some((device, config)),
+                    )
+                }
+                #[cfg(feature = "system-test")]
+                CaptureActivation::SystemTestSynthetic => (
+                    "DataBaker system-test synthetic input".to_string(),
+                    "system-test:synthetic".to_string(),
+                    1,
+                    SampleFormat::F32,
+                    None,
+                ),
+            };
+        if usize::from(input_channels) <= input_channel_index {
+            bail!(
+                "input channel {} exceeds the active device channel count {input_channels}",
+                input_channel_index + 1
+            );
         };
         snapshot.device_name = device_name.clone();
         snapshot.device_id = device_id.clone();
@@ -1368,38 +1466,40 @@ impl Engine {
             }
         }
 
-        let stream = match build_stream(
-            &device,
-            &config,
-            sample_format,
-            input_channel_index,
-            session.writer_tx.clone(),
-            Arc::clone(&session.captured),
-            Arc::clone(&session.overflow),
-            Arc::clone(&session.faulted),
-            Arc::clone(&session.peak),
-            Arc::clone(&session.rms),
-            session.writer_queue.clone(),
-            SilenceMonitor {
-                silence_samples: Arc::clone(&session.silence_samples),
-                last_signal_sample: Arc::clone(&session.last_signal_sample),
-                attempt_signal_start_sample: Arc::clone(&session.attempt_signal_start_sample),
-                analyzed_samples: Arc::clone(&session.analyzed_samples),
-                analysis_epoch: Arc::clone(&session.analysis_epoch),
-                threshold_bits: Arc::clone(&session.silence_threshold_bits),
-                capture_heartbeat: Arc::clone(&session.capture_heartbeat),
-            },
-        ) {
-            Ok(stream) => stream,
-            Err(error) => {
-                return Err(self.finish_activation_failure(
-                    session,
-                    "build_input_stream",
-                    error.context("build input stream"),
-                ));
-            }
-        };
-        session.stream = Some(stream);
+        if let Some((device, config)) = stream_setup {
+            let stream = match build_stream(
+                &device,
+                &config,
+                sample_format,
+                input_channel_index,
+                session.writer_tx.clone(),
+                Arc::clone(&session.captured),
+                Arc::clone(&session.overflow),
+                Arc::clone(&session.faulted),
+                Arc::clone(&session.peak),
+                Arc::clone(&session.rms),
+                session.writer_queue.clone(),
+                SilenceMonitor {
+                    silence_samples: Arc::clone(&session.silence_samples),
+                    last_signal_sample: Arc::clone(&session.last_signal_sample),
+                    attempt_signal_start_sample: Arc::clone(&session.attempt_signal_start_sample),
+                    analyzed_samples: Arc::clone(&session.analyzed_samples),
+                    analysis_epoch: Arc::clone(&session.analysis_epoch),
+                    threshold_bits: Arc::clone(&session.silence_threshold_bits),
+                    capture_heartbeat: Arc::clone(&session.capture_heartbeat),
+                },
+            ) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    return Err(self.finish_activation_failure(
+                        session,
+                        "build_input_stream",
+                        error.context("build input stream"),
+                    ));
+                }
+            };
+            session.stream = Some(stream);
+        }
 
         // Keep the liveness gate independent from protocol telemetry. Stdout
         // can back up if Electron's event loop is temporarily blocked; a
@@ -1573,20 +1673,17 @@ impl Engine {
         // boundary for this activation. Only now may the driver emit samples;
         // otherwise a crash during resume could append new-device audio while
         // the disk still attributes the tail to the previous configuration.
-        if let Err(error) = session
-            .stream
-            .as_ref()
-            .context("input stream is unavailable after activation metadata commit")
-            .and_then(|stream| stream.play().context("start input stream"))
-        {
-            return Err(self.finish_activation_failure(session, "play_input_stream", error));
+        if let Some(stream) = session.stream.as_ref() {
+            if let Err(error) = stream.play().context("start input stream") {
+                return Err(self.finish_activation_failure(session, "play_input_stream", error));
+            }
+            // Arm only after `play` succeeds. Initial metadata fsync happens before
+            // this point and may legitimately take longer than the stall timeout on
+            // a stressed disk; it must not be confused with a live driver stall.
+            session
+                .capture_watchdog_armed
+                .store(true, Ordering::Release);
         }
-        // Arm only after `play` succeeds. Initial metadata fsync happens before
-        // this point and may legitimately take longer than the stall timeout on
-        // a stressed disk; it must not be confused with a live driver stall.
-        session
-            .capture_watchdog_armed
-            .store(true, Ordering::Release);
         let result = json!({
             "snapshot": session.snapshot,
             "session_dir": session.session_dir,
@@ -1595,6 +1692,116 @@ impl Engine {
         });
         self.session = Some(session);
         Ok(result)
+    }
+
+    #[cfg(feature = "system-test")]
+    fn active_system_test_session_mut(&mut self) -> Result<&mut RecordingSession> {
+        let session = self.active_session_mut()?;
+        if session.snapshot.device_id != "system-test:synthetic" || session.stream.is_some() {
+            bail!("system-test PCM can only be injected into a synthetic test session");
+        }
+        Ok(session)
+    }
+
+    #[cfg(feature = "system-test")]
+    pub fn system_test_feed(
+        &mut self,
+        frames: u64,
+        seed: u64,
+        block_frames: usize,
+    ) -> Result<Value> {
+        let session = self.active_system_test_session_mut()?;
+        session.ensure_metadata_mutation_allowed()?;
+        if frames == 0 {
+            bail!("system-test feed frames must be greater than zero");
+        }
+        let sample_rate = u64::from(session.snapshot.audio_format.sample_rate);
+        let maximum_command_frames = sample_rate
+            .checked_mul(10)
+            .context("system-test per-command frame limit overflow")?;
+        let maximum_session_frames = sample_rate
+            .checked_mul(30)
+            .context("system-test session frame limit overflow")?;
+        if frames > maximum_command_frames {
+            bail!("system-test feed cannot inject more than 10 seconds per command");
+        }
+        if block_frames == 0 || block_frames > 8_192 {
+            bail!("system-test block_frames must be between 1 and 8192");
+        }
+        let captured_before = session.captured.load(Ordering::Acquire);
+        let captured_after = captured_before
+            .checked_add(frames)
+            .context("system-test capture timeline overflow")?;
+        if captured_after > maximum_session_frames {
+            bail!("system-test session cannot exceed 30 seconds of synthetic audio");
+        }
+        let silence = SilenceMonitor {
+            silence_samples: Arc::clone(&session.silence_samples),
+            last_signal_sample: Arc::clone(&session.last_signal_sample),
+            attempt_signal_start_sample: Arc::clone(&session.attempt_signal_start_sample),
+            analyzed_samples: Arc::clone(&session.analyzed_samples),
+            analysis_epoch: Arc::clone(&session.analysis_epoch),
+            threshold_bits: Arc::clone(&session.silence_threshold_bits),
+            capture_heartbeat: Arc::clone(&session.capture_heartbeat),
+        };
+        let mut emitted = 0u64;
+        while emitted < frames {
+            let chunk_frames = (frames - emitted).min(block_frames as u64) as usize;
+            let global_start = captured_before + emitted;
+            let mut samples = Vec::with_capacity(chunk_frames);
+            for offset in 0..chunk_frames {
+                let index = global_start + offset as u64;
+                let word = seed
+                    .wrapping_add(index.wrapping_mul(6_364_136_223_846_793_005))
+                    .rotate_left(17);
+                let normalized = ((word >> 40) as f32 / 16_777_215.0) * 0.5 - 0.25;
+                samples.push(normalized);
+            }
+            saturating_atomic_add(&session.capture_heartbeat, 1);
+            publish_block(
+                samples,
+                &session.writer_tx,
+                &session.captured,
+                &session.overflow,
+                &session.faulted,
+                &session.peak,
+                &session.rms,
+                &session.writer_queue,
+                &silence,
+            );
+            emitted += chunk_frames as u64;
+            let actual = session.captured.load(Ordering::Acquire);
+            let expected = captured_before + emitted;
+            if actual != expected || session.faulted.load(Ordering::Acquire) {
+                bail!(
+                    "system-test synthetic callback was not accepted: expected captured {expected}, actual {actual}"
+                );
+            }
+        }
+        Ok(json!({
+            "captured_samples": session.captured.load(Ordering::Acquire),
+            "committed_samples": session.committed.load(Ordering::Acquire),
+            "queued_frames": session.writer_queue.queued_frames.load(Ordering::Acquire),
+        }))
+    }
+
+    #[cfg(feature = "system-test")]
+    pub fn system_test_checkpoint(&mut self) -> Result<Value> {
+        let session = self.active_system_test_session_mut()?;
+        session.ensure_metadata_mutation_allowed()?;
+        let captured = session.captured.load(Ordering::Acquire);
+        let committed = session.checkpoint()?;
+        session.persist(
+            "system_test_checkpoint",
+            json!({
+                "captured_samples": captured,
+                "committed_samples": committed,
+            }),
+        )?;
+        Ok(json!({
+            "captured_samples": captured,
+            "committed_samples": committed,
+        }))
     }
 
     pub fn check_noise(&mut self, payload: NoiseCheckPayload) -> Result<Value> {
@@ -5299,7 +5506,7 @@ fn fail_capture_block(
     )));
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "system-test"))]
 #[allow(clippy::too_many_arguments)]
 fn publish_block(
     mono: Vec<f32>,

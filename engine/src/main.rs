@@ -6,6 +6,8 @@ mod session_lock;
 mod storage_guard;
 mod wav;
 
+#[cfg(feature = "system-test")]
+use crate::engine::SystemTestStartSessionPayload;
 use crate::engine::{
     Engine, NoiseCheckPayload, ResumeSessionPayload, StartSessionPayload, StopAttemptPayload,
     is_no_active_session_error,
@@ -31,6 +33,21 @@ struct AttemptPayload {
 #[derive(Deserialize)]
 struct ExportPayload {
     session_dir: String,
+}
+
+#[cfg(feature = "system-test")]
+#[derive(Deserialize)]
+struct SystemTestFeedPayload {
+    frames: u64,
+    #[serde(default)]
+    seed: u64,
+    #[serde(default = "default_system_test_block_frames")]
+    block_frames: usize,
+}
+
+#[cfg(feature = "system-test")]
+fn default_system_test_block_frames() -> usize {
+    256
 }
 
 fn main() -> Result<()> {
@@ -148,6 +165,19 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
                 serde_json::from_value(command.payload).context("invalid start_session payload")?;
             engine.start_session(payload)
         }
+        #[cfg(feature = "system-test")]
+        "test_start_session" => {
+            let payload: SystemTestStartSessionPayload = serde_json::from_value(command.payload)
+                .context("invalid test_start_session payload")?;
+            engine.start_system_test_session(payload)
+        }
+        #[cfg(feature = "system-test")]
+        "test_feed_pcm" => {
+            let payload: SystemTestFeedPayload = parse(command.payload)?;
+            engine.system_test_feed(payload.frames, payload.seed, payload.block_frames)
+        }
+        #[cfg(feature = "system-test")]
+        "test_checkpoint" => engine.system_test_checkpoint(),
         "resume_session" => {
             let payload: ResumeSessionPayload = serde_json::from_value(command.payload)
                 .context("invalid resume_session payload")?;

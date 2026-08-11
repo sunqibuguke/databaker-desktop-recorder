@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "Proprietary"
 
+[features]
+default = []
+system-test = []
+
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }

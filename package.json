@@ -8,6 +8,7 @@
   "scripts": {
     "build:engine": "node scripts/run-cargo.cjs build --manifest-path engine/Cargo.toml",
     "build:engine:release": "node scripts/run-cargo.cjs build --release --manifest-path engine/Cargo.toml",
+    "build:engine:system-test": "cross-env CARGO_TARGET_DIR=engine/target/system-test node scripts/run-cargo.cjs build --manifest-path engine/Cargo.toml --features system-test",
     "build:renderer": "vite build",
     "build:electron": "tsc -p electron/tsconfig.json",
     "build": "npm run build:engine:release && npm run build:renderer && npm run build:electron && node scripts/stage-engine.cjs",
@@ -21,7 +22,8 @@
     "test:engine": "node scripts/run-cargo.cjs test --manifest-path engine/Cargo.toml",
     "test:engine-protocol": "node scripts/run-cargo.cjs build --manifest-path engine/Cargo.toml && node scripts/smoke-engine.cjs",
     "test:crash-recovery": "node scripts/run-cargo.cjs build --manifest-path engine/Cargo.toml && node scripts/test-crash-recovery.cjs",
-    "test": "npm run typecheck && npm run test:acceptance-tool && npm run test:electron && npm run test:engine && npm run test:engine-protocol && npm run test:crash-recovery",
+    "test:engine-system": "npm run build:engine:release && npm run build:engine:system-test && node scripts/test-engine-system-faults.cjs --profile quick",
+    "test": "npm run typecheck && npm run test:acceptance-tool && npm run test:electron && npm run test:engine && npm run test:engine-protocol && npm run test:crash-recovery && npm run test:engine-system",
     "package:dir": "npm run build && electron-builder --dir",
     "package": "npm run build && electron-builder",
     "package:win": "npm run build && electron-builder --win nsis --x64 --publish never"
