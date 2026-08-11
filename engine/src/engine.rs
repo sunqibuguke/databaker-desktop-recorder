@@ -98,6 +98,12 @@ const CAPTURE_FAULT_INPUT_STREAM_ERROR: u32 = 4;
 // a subsequent safe-stop request until the 90-second process kill budget.
 const PREVIEW_RENDER_TIMEOUT: Duration = Duration::from_secs(15);
 const AUDIO_FAULT_MARKER: &str = "metadata/audio-fault.json";
+// Provision this small, already-synced file while the recording volume still
+// has startup headroom. If a later PCM write consumes the last allocatable
+// bytes, publishing a generic fail-closed marker requires only a same-directory
+// rename; enriching it with the exact reason remains best effort.
+const AUDIO_FAULT_RESERVE: &str = "metadata/audio-fault.reserve";
+const AUDIO_FAULT_RESERVE_MAX_BYTES: u64 = 16 * 1024;
 const EXPORT_METADATA_BASE_HEADROOM_BYTES: u64 = 4 * 1024 * 1024;
 const EXPORT_FILE_ALLOCATION_HEADROOM_BYTES: u64 = 64 * 1024;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -707,7 +713,14 @@ fn trip_stalled_capture(
     // Publish durable evidence before asking the writer to finalize. Even if
     // the process is terminated in the narrow shutdown window, recovery and
     // normal export remain fail-closed.
-    persist_audio_fault_marker(session_dir, reason, committed.load(Ordering::Acquire));
+    if !persist_audio_fault_marker_fail_closed(
+        session_dir,
+        reason,
+        committed.load(Ordering::Acquire),
+        faulted,
+    ) {
+        eprintln!("capture watchdog could not publish durable audio fault evidence");
+    }
     // Closing and draining the callback-entry gate before the fault sentinel
     // keeps every buffer that entered before detection ahead of it in FIFO
     // order. The production writer channel is unbounded, so capacity cannot
@@ -1708,6 +1721,12 @@ impl Engine {
                 storage_report.startup_required_bytes as f64 / 1_073_741_824.0,
             );
         }
+        // A storage failure cannot be expected to allocate its own diagnostic
+        // file. Reserve durable fault evidence before the writer or input stream
+        // can accept a single frame. Reuse a validated reserve across clean
+        // stop/resume cycles; a published final/tmp marker was already rejected
+        // by `load_locked_recovery_snapshot` on resume.
+        ensure_audio_fault_reserve(&session_dir)?;
         let mut recovery_warnings = resume_journal
             .as_ref()
             .map(|journal| journal.warnings.clone())
@@ -1934,12 +1953,14 @@ impl Engine {
         match writer_ready_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(Ok(frames)) if frames == expected_existing_frames => {}
             Ok(Ok(frames)) => {
-                session.faulted.store(true, Ordering::Release);
-                persist_audio_fault_marker(
+                if !persist_audio_fault_marker_fail_closed(
                     &session.session_dir,
                     "master audio changed during the writer initialization handshake",
                     session.committed.load(Ordering::Acquire),
-                );
+                    &session.faulted,
+                ) {
+                    eprintln!("writer initialization mismatch has no durable fault marker");
+                }
                 return Err(self.finish_activation_failure(
                     session,
                     "initialize_audio_writer",
@@ -2121,7 +2142,7 @@ impl Engine {
                         let temporary_marker = marker.with_extension("tmp");
                         fault_marker_observed = marker.exists()
                             || temporary_marker.exists()
-                            || persist_audio_fault_marker(
+                            || persist_audio_fault_marker_fail_closed(
                                 &telemetry_session_dir,
                                 if overflow_samples > 0 {
                                     "capture callback could not enqueue audio into the writer"
@@ -2129,6 +2150,7 @@ impl Engine {
                                     "capture fault observed by the telemetry supervisor"
                                 },
                                 committed_thread.load(Ordering::Acquire),
+                                &faulted_thread,
                             );
                         last_fault_marker_attempt = Instant::now();
                     }
@@ -4800,12 +4822,14 @@ impl RecordingSession {
         } else if cleanup.audio_safe {
             "stopped"
         } else {
-            self.faulted.store(true, Ordering::Release);
-            persist_audio_fault_marker(
+            if !persist_audio_fault_marker_fail_closed(
                 &self.session_dir,
                 &format!("recording activation failed during {stage}: {reason}"),
                 cleanup.committed_samples,
-            );
+                &self.faulted,
+            ) {
+                eprintln!("activation failure has no durable audio fault marker");
+            }
             "faulted"
         };
         self.snapshot.status = status.to_string();
@@ -4829,17 +4853,23 @@ impl RecordingSession {
         if self.metadata_fault.is_none() {
             self.metadata_fault = Some(message.clone());
         }
+        // Publish durable fault evidence before closing the callback gate. A
+        // callback may already own an enqueue lease, so waiting for the gate
+        // before latching the fault would leave an unbounded crash window with
+        // no durable evidence.
+        if !persist_audio_fault_marker_fail_closed(
+            &self.session_dir,
+            &format!("metadata journal durability failure: {message}"),
+            self.committed.load(Ordering::Acquire),
+            &self.faulted,
+        ) {
+            eprintln!("metadata durability failure has no durable audio fault marker");
+        }
         // Stop accepting more callback blocks, wait for callbacks already in
         // the enqueue path, then put the fault sentinel behind their sample
         // messages. This gives metadata durability failures the same finite,
         // drain-and-finalize behavior as an audio-device xrun.
-        self.faulted.store(true, Ordering::Release);
         self.writer_queue.close();
-        persist_audio_fault_marker(
-            &self.session_dir,
-            &format!("metadata journal durability failure: {message}"),
-            self.committed.load(Ordering::Acquire),
-        );
         // Keep journal error handling itself bounded. If a callback still owns
         // the enqueue lease, the next stop attempt will wait for it before
         // placing Stop behind the final Samples message.
@@ -4951,11 +4981,14 @@ impl RecordingSession {
         }
         self.snapshot = self.live_snapshot();
         self.snapshot.status = "faulted".to_string();
-        persist_audio_fault_marker(
+        if !persist_audio_fault_marker_fail_closed(
             &self.session_dir,
             &format!("metadata journal durability failure: {metadata_fault}"),
             committed,
-        );
+            &self.faulted,
+        ) {
+            warnings.push("audio fault marker could not be persisted".to_string());
+        }
 
         // The journal itself is the failed component. Publish a best-effort
         // faulted projection without appending another journal event so the
@@ -5033,16 +5066,18 @@ impl RecordingSession {
             );
         }
         let committed = self.committed.load(Ordering::Acquire);
-        if !cleanup.audio_safe {
-            self.faulted.store(true, Ordering::Release);
-            persist_audio_fault_marker(
+        if !cleanup.audio_safe
+            && !persist_audio_fault_marker_fail_closed(
                 &self.session_dir,
                 &format!(
                     "capture resources stopped without a complete durable timeline: captured={}, committed={committed}",
                     cleanup.captured_samples
                 ),
                 committed,
-            );
+                &self.faulted,
+            )
+        {
+            warnings.push("audio fault marker could not be persisted".to_string());
         }
         if self.metadata_fault.is_some() {
             return Err(self.metadata_seal_error(committed, warnings));
@@ -5132,6 +5167,104 @@ fn audio_fault_marker_present(session_dir: &Path) -> Result<bool> {
     Ok(false)
 }
 
+fn audio_fault_reserve_value() -> Value {
+    json!({
+        "schema_version": 1,
+        "reserved_audio_fault": true,
+        "reason": "audio capture entered an unsafe state before detailed fault metadata could be persisted",
+        "committed_frames": 0,
+        "timestamp": Utc::now().to_rfc3339(),
+    })
+}
+
+fn validate_audio_fault_reserve(path: &Path) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect audio fault reserve {}", path.display()))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > AUDIO_FAULT_RESERVE_MAX_BYTES
+    {
+        bail!("audio fault reserve must be a small regular file");
+    }
+    let value: Value = serde_json::from_slice(
+        &std::fs::read(path)
+            .with_context(|| format!("read audio fault reserve {}", path.display()))?,
+    )
+    .with_context(|| format!("parse audio fault reserve {}", path.display()))?;
+    if value.get("schema_version").and_then(Value::as_u64) != Some(1)
+        || value.get("reserved_audio_fault").and_then(Value::as_bool) != Some(true)
+        || !value
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| !reason.trim().is_empty())
+        || value.get("committed_frames").and_then(Value::as_u64) != Some(0)
+        || !value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .is_some_and(|timestamp| !timestamp.trim().is_empty())
+    {
+        bail!("audio fault reserve has invalid recovery evidence");
+    }
+    Ok(())
+}
+
+fn ensure_audio_fault_reserve(session_dir: &Path) -> Result<()> {
+    if audio_fault_marker_present(session_dir)? {
+        bail!("录制任务已存在音频故障标记，禁止启动新的采集流");
+    }
+    let reserve = session_dir.join(AUDIO_FAULT_RESERVE);
+    match std::fs::symlink_metadata(&reserve) {
+        Ok(_) => return validate_audio_fault_reserve(&reserve),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect audio fault reserve {}", reserve.display()));
+        }
+    }
+    atomic_json(&reserve, &audio_fault_reserve_value())
+        .with_context(|| format!("provision audio fault reserve {}", reserve.display()))?;
+    validate_audio_fault_reserve(&reserve)
+}
+
+/// Publishes preallocated generic fault evidence without allocating a new data
+/// file. A concurrent fault reporter may win the same rename; re-check the
+/// marker after an error before declaring that no durable evidence exists.
+fn activate_audio_fault_reserve(session_dir: &Path) -> bool {
+    match audio_fault_marker_present(session_dir) {
+        Ok(true) => return true,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("could not inspect existing audio fault evidence: {error:#}");
+            return false;
+        }
+    }
+    let reserve = session_dir.join(AUDIO_FAULT_RESERVE);
+    let marker = session_dir.join(AUDIO_FAULT_MARKER);
+    if let Err(error) = validate_audio_fault_reserve(&reserve) {
+        if error
+            .downcast_ref::<std::io::Error>()
+            .is_none_or(|io_error| io_error.kind() != std::io::ErrorKind::NotFound)
+        {
+            eprintln!(
+                "could not validate preallocated audio fault reserve {}: {error:#}",
+                reserve.display()
+            );
+        }
+        return false;
+    }
+    match durable_replace(&reserve, &marker) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!(
+                "could not activate preallocated audio fault reserve {} as {}: {error:#}",
+                reserve.display(),
+                marker.display()
+            );
+            audio_fault_marker_present(session_dir).unwrap_or(false)
+        }
+    }
+}
+
 fn ensure_no_audio_fault_marker(session_dir: &Path, operation: &str) -> Result<()> {
     let marker = session_dir.join(AUDIO_FAULT_MARKER);
     let temporary = marker.with_extension("tmp");
@@ -5153,7 +5286,69 @@ fn ensure_no_audio_fault_marker(session_dir: &Path, operation: &str) -> Result<(
 }
 
 fn persist_audio_fault_marker(session_dir: &Path, reason: &str, committed_frames: u64) -> bool {
-    persist_audio_fault_marker_inner(session_dir, reason, committed_frames, false)
+    let generic_evidence_published = activate_audio_fault_reserve(session_dir);
+    let detailed_evidence_published =
+        persist_audio_fault_marker_inner(session_dir, reason, committed_frames, false);
+    generic_evidence_published || detailed_evidence_published
+}
+
+fn persist_audio_fault_marker_fail_closed(
+    session_dir: &Path,
+    reason: &str,
+    committed_frames: u64,
+    faulted: &AtomicBool,
+) -> bool {
+    // The inability to publish fault evidence can never make a live session
+    // safer. Latch the in-memory unsafe state before touching the failing volume.
+    faulted.store(true, Ordering::Release);
+    let persisted = persist_audio_fault_marker(session_dir, reason, committed_frames);
+    if !persisted {
+        eprintln!(
+            "audio fault evidence could not be persisted; the live session remains unsafe: {reason}"
+        );
+    }
+    persisted
+}
+
+#[cfg(test)]
+fn injected_storage_full_error() -> std::io::Error {
+    #[cfg(windows)]
+    const STORAGE_FULL_RAW_ERROR: i32 = 112; // ERROR_DISK_FULL
+    #[cfg(not(windows))]
+    const STORAGE_FULL_RAW_ERROR: i32 = 28; // ENOSPC on supported Unix targets
+    std::io::Error::from_raw_os_error(STORAGE_FULL_RAW_ERROR)
+}
+
+#[cfg(test)]
+fn audio_fault_detail_create_failures() -> &'static std::sync::Mutex<HashMap<PathBuf, usize>> {
+    static FAILURES: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, usize>>> =
+        std::sync::OnceLock::new();
+    FAILURES.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn set_audio_fault_detail_create_failures(session_dir: &Path, count: usize) {
+    audio_fault_detail_create_failures()
+        .lock()
+        .unwrap()
+        .insert(session_dir.to_path_buf(), count);
+}
+
+#[cfg(test)]
+fn take_audio_fault_detail_create_failure(session_dir: &Path) -> bool {
+    let mut failures = audio_fault_detail_create_failures().lock().unwrap();
+    let Some(remaining) = failures.get_mut(session_dir) else {
+        return false;
+    };
+    if *remaining == 0 {
+        failures.remove(session_dir);
+        return false;
+    }
+    *remaining -= 1;
+    if *remaining == 0 {
+        failures.remove(session_dir);
+    }
+    true
 }
 
 fn persist_audio_fault_marker_inner(
@@ -5200,6 +5395,11 @@ fn persist_audio_fault_marker_inner(
         "timestamp": Utc::now().to_rfc3339(),
     });
     let result = (|| -> Result<()> {
+        #[cfg(test)]
+        if take_audio_fault_detail_create_failure(session_dir) {
+            return Err(injected_storage_full_error())
+                .context("injected ENOSPC while creating detailed audio fault marker");
+        }
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -5237,9 +5437,10 @@ fn latch_audio_fault_marker(
     latched_reason: &mut Option<String>,
     reason: impl Into<String>,
     committed_frames: u64,
-) {
+    faulted: &AtomicBool,
+) -> bool {
     let reason = latched_reason.get_or_insert_with(|| reason.into());
-    persist_audio_fault_marker(session_dir, reason, committed_frames);
+    persist_audio_fault_marker_fail_closed(session_dir, reason, committed_frames, faulted)
 }
 
 #[cfg(test)]
@@ -5295,7 +5496,7 @@ fn write_audio_samples(
     {
         let _ = gate.entered.send(());
         let _ = gate.release.recv();
-        bail!("injected audio write failure");
+        return Err(injected_storage_full_error()).context("injected audio write failure");
     }
     writer.write_samples(samples)
 }
@@ -5441,12 +5642,14 @@ fn writer_loop(
         Err(error) => {
             let reason = format!("audio writer initialization failed: {error:#}");
             eprintln!("{reason}");
-            faulted.store(true, Ordering::Release);
-            persist_audio_fault_marker(
+            if !persist_audio_fault_marker_fail_closed(
                 storage_directory,
                 &reason,
                 committed.load(Ordering::Acquire),
-            );
+                &faulted,
+            ) {
+                eprintln!("audio writer initialization failed without durable fault evidence");
+            }
             let _ = ready.send(Err(reason));
             return;
         }
@@ -5464,17 +5667,21 @@ fn writer_loop(
                 if let Err(error) = write_audio_samples(&mut writer, storage_directory, &samples) {
                     let base_reason = format!("audio write failed: {error:#}");
                     eprintln!("{base_reason}");
-                    faulted.store(true, Ordering::Release);
+                    // Latch the unsafe state and publish the preallocated
+                    // generic marker before waiting for callbacks that already
+                    // entered the enqueue path. A stuck callback must not leave
+                    // a crash window where recovery sees an ordinary interrupt.
+                    let initial_marker_persisted = persist_audio_fault_marker_fail_closed(
+                        storage_directory,
+                        &base_reason,
+                        committed.load(Ordering::Acquire),
+                        &faulted,
+                    );
                     // Reject new callbacks and wait through every callback that
                     // already entered before measuring accepted audio. The
                     // remaining channel backlog cannot be written safely after
                     // a storage error, so it is accounted as lost explicitly.
                     queue.close_and_wait();
-                    persist_audio_fault_marker(
-                        storage_directory,
-                        &base_reason,
-                        committed.load(Ordering::Acquire),
-                    );
                     let mut checkpoint_failure = None::<String>;
                     let durable_frames = match writer.checkpoint() {
                         Ok(frames) => {
@@ -5496,7 +5703,15 @@ fn writer_loop(
                     if let Some(checkpoint_error) = checkpoint_failure {
                         message.push_str(&format!("; checkpoint_failed={checkpoint_error}"));
                     }
-                    persist_audio_fault_marker(storage_directory, &message, durable_frames);
+                    let detailed_marker_persisted = persist_audio_fault_marker_fail_closed(
+                        storage_directory,
+                        &message,
+                        durable_frames,
+                        &faulted,
+                    );
+                    if !initial_marker_persisted && !detailed_marker_persisted {
+                        message.push_str("; audio_fault_marker_persistence_failed=true");
+                    }
                     if let Some(reply) = pending_stop_reply.take() {
                         let _ = reply.send(Err(message.clone()));
                     }
@@ -5589,13 +5804,15 @@ fn writer_loop(
                     // that already entered the enqueue path. Their sample
                     // messages are now a finite FIFO backlog whose frame count
                     // is tracked by `queue`.
-                    faulted.store(true, Ordering::Release);
-                    latch_audio_fault_marker(
+                    if !latch_audio_fault_marker(
                         storage_directory,
                         &mut latched_fault_reason,
                         &reason,
                         committed.load(Ordering::Acquire),
-                    );
+                        &faulted,
+                    ) {
+                        eprintln!("writer storage fault has no durable marker");
+                    }
                     queue.close_and_wait();
                     shutdown_after_drain = true;
                 }
@@ -5609,13 +5826,15 @@ fn writer_loop(
                     }
                     Err(message) => {
                         eprintln!("audio checkpoint failed: {message}");
-                        faulted.store(true, Ordering::Release);
-                        latch_audio_fault_marker(
+                        if !latch_audio_fault_marker(
                             storage_directory,
                             &mut latched_fault_reason,
                             format!("audio checkpoint failed: {message}"),
                             committed.load(Ordering::Acquire),
-                        );
+                            &faulted,
+                        ) {
+                            eprintln!("writer checkpoint fault has no durable marker");
+                        }
                         queue.close_and_wait();
                         shutdown_after_drain = true;
                     }
@@ -5657,13 +5876,15 @@ fn writer_loop(
                                     let reason = format!(
                                         "audio checkpoint failed before preview: {error:#}"
                                     );
-                                    faulted.store(true, Ordering::Release);
-                                    latch_audio_fault_marker(
+                                    if !latch_audio_fault_marker(
                                         storage_directory,
                                         &mut latched_fault_reason,
                                         &reason,
                                         committed.load(Ordering::Acquire),
-                                    );
+                                        &faulted,
+                                    ) {
+                                        eprintln!("preview checkpoint fault has no durable marker");
+                                    }
                                     queue.close_and_wait();
                                     shutdown_after_drain = true;
                                     Err(anyhow!(reason))
@@ -5699,13 +5920,15 @@ fn writer_loop(
             }
             WriterMessage::FaultAndStop(reason) => {
                 eprintln!("audio writer stopping after capture fault: {reason}");
-                faulted.store(true, Ordering::Release);
-                latch_audio_fault_marker(
+                if !latch_audio_fault_marker(
                     storage_directory,
                     &mut latched_fault_reason,
                     &reason,
                     committed.load(Ordering::Acquire),
-                );
+                    &faulted,
+                ) {
+                    eprintln!("capture fault has no durable marker");
+                }
                 queue.close_and_wait();
                 shutdown_after_drain = true;
             }
@@ -5720,26 +5943,33 @@ fn writer_loop(
             }
         }
         if shutdown_after_drain && queue.queued_frames.load(Ordering::Acquire) == 0 {
-            let result = writer.finalize().map_err(|error| format!("{error:#}"));
+            let mut result = writer.finalize().map_err(|error| format!("{error:#}"));
             match &result {
                 Ok(frames) => committed.store(*frames, Ordering::Release),
                 Err(message) => {
                     eprintln!("audio writer final checkpoint failed: {message}");
-                    faulted.store(true, Ordering::Release);
-                    latch_audio_fault_marker(
+                    if !latch_audio_fault_marker(
                         storage_directory,
                         &mut latched_fault_reason,
                         format!("audio writer final checkpoint failed: {message}"),
                         committed.load(Ordering::Acquire),
-                    );
+                        &faulted,
+                    ) {
+                        eprintln!("writer finalization fault has no durable marker");
+                    }
                 }
             }
-            if let Some(reason) = latched_fault_reason.as_deref() {
-                persist_audio_fault_marker(
+            if let Some(reason) = latched_fault_reason.as_deref()
+                && !persist_audio_fault_marker_fail_closed(
                     storage_directory,
                     reason,
                     committed.load(Ordering::Acquire),
-                );
+                    &faulted,
+                )
+            {
+                result = Err(format!(
+                    "{reason}; audio_fault_marker_persistence_failed=true"
+                ));
             }
             if let Some(reply) = pending_stop_reply.take() {
                 let _ = reply.send(result);
@@ -9554,6 +9784,7 @@ mod tests {
     fn writer_failure_closes_the_gate_and_accounts_an_inflight_backlog() {
         let root = test_root("writer-failure-backlog-accounting");
         let path = root.join("audio/master.wav");
+        ensure_audio_fault_reserve(&root).unwrap();
         let (writer_tx, writer_rx) = unbounded::<WriterMessage>();
         let captured = Arc::new(AtomicU64::new(0));
         let committed = Arc::new(AtomicU64::new(0));
@@ -9643,6 +9874,14 @@ mod tests {
             queue.enqueue_state.load(Ordering::Acquire) & WRITER_QUEUE_CLOSED,
             0
         );
+        assert!(
+            faulted.load(Ordering::Acquire),
+            "the unsafe state must latch before waiting for an in-flight callback"
+        );
+        assert!(
+            root.join(AUDIO_FAULT_MARKER).is_file(),
+            "durable fault evidence must exist before the in-flight callback is released"
+        );
         publish_leased_block(
             vec![0.2; 2],
             &writer_tx,
@@ -9671,6 +9910,91 @@ mod tests {
         assert_eq!(marker["committed_frames"].as_u64(), Some(0));
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn writer_enospc_activates_reserve_when_detailed_fault_marker_cannot_be_created() {
+        let root = test_root("writer-enospc-reserved-fault-marker");
+        let path = root.join("audio/master.wav");
+        ensure_audio_fault_reserve(&root).unwrap();
+        let reserve = root.join(AUDIO_FAULT_RESERVE);
+        assert!(reserve.is_file());
+
+        // Model the dangerous ordering from production: the PCM write consumes
+        // the remaining allocatable space, and both attempts to create the
+        // detailed `audio-fault.tmp` fail with ENOSPC. The pre-synced reserve
+        // must still become the final fail-closed marker.
+        set_audio_fault_detail_create_failures(&root, 2);
+        let (write_entered_tx, write_entered_rx) = bounded(1);
+        let (release_write_tx, release_write_rx) = bounded(1);
+        writer_write_failure_gates().lock().unwrap().insert(
+            root.clone(),
+            WriterWriteFailureGate {
+                entered: write_entered_tx,
+                release: release_write_rx,
+            },
+        );
+
+        let (writer_tx, writer_rx) = unbounded::<WriterMessage>();
+        let captured = Arc::new(AtomicU64::new(4));
+        let committed = Arc::new(AtomicU64::new(0));
+        let overflow = Arc::new(AtomicU64::new(0));
+        let faulted = Arc::new(AtomicBool::new(false));
+        let queue = test_writer_queue();
+        let (ready_tx, ready_rx) = bounded(1);
+        let writer_path = path.clone();
+        let writer_storage_dir = root.clone();
+        let writer_captured = Arc::clone(&captured);
+        let writer_committed = Arc::clone(&committed);
+        let writer_overflow = Arc::clone(&overflow);
+        let writer_faulted = Arc::clone(&faulted);
+        let writer_queue = queue.clone();
+        let join = thread::spawn(move || {
+            writer_loop(
+                writer_rx,
+                &writer_path,
+                48_000,
+                24,
+                false,
+                MasterStorageKind::LegacySingleWav,
+                48_000 * STORAGE_LAYOUT_V1_DEFAULT_SEGMENT_SECONDS,
+                &writer_storage_dir,
+                writer_captured,
+                writer_committed,
+                writer_overflow,
+                writer_faulted,
+                Arc::new(AtomicU32::new(0)),
+                Arc::new(AtomicU64::new(u64::MAX)),
+                writer_queue,
+                disconnected_waveform_sender(),
+                ready_tx,
+            )
+        });
+        assert_eq!(ready_rx.recv().unwrap().unwrap(), 0);
+        assert!(queue.reserve(4));
+        writer_tx
+            .send(WriterMessage::Samples(vec![0.1, 0.2, 0.3, 0.4]))
+            .unwrap();
+        write_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        release_write_tx.send(()).unwrap();
+        join.join().unwrap();
+
+        assert!(faulted.load(Ordering::Acquire));
+        assert_eq!(captured.load(Ordering::Acquire), 4);
+        assert_eq!(committed.load(Ordering::Acquire), 0);
+        assert_eq!(overflow.load(Ordering::Acquire), 4);
+        assert_eq!(queue.queued_frames.load(Ordering::Acquire), 0);
+        assert!(!reserve.exists());
+        assert!(!root.join("metadata/audio-fault.tmp").exists());
+        let marker_path = root.join(AUDIO_FAULT_MARKER);
+        let marker: Value = serde_json::from_slice(&std::fs::read(&marker_path).unwrap()).unwrap();
+        assert_eq!(marker["reserved_audio_fault"].as_bool(), Some(true));
+        assert_eq!(marker["committed_frames"].as_u64(), Some(0));
+        assert!(marker["reason"].as_str().unwrap().contains("unsafe state"));
+        assert!(ensure_no_audio_fault_marker(&root, "继续录制").is_err());
         let _ = std::fs::remove_dir_all(root);
     }
 
