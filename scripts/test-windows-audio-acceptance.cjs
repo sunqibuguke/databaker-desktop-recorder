@@ -89,6 +89,13 @@ function makeRf64(sampleRate, bitDepth, frames) {
 }
 
 function testArgs() {
+  const systemDrive = String(process.env.SystemDrive ?? 'C:')
+    .replace(/[\\/]+$/, '')
+    .toUpperCase();
+  const syntheticTestDrive = systemDrive === 'Q:' ? 'R:' : 'Q:';
+  const dedicatedVolume = process.platform === 'win32'
+    ? path.win32.join(`${syntheticTestDrive}\\`, 'dedicated-audio-qa-volume')
+    : path.join(os.tmpdir(), 'dedicated-audio-qa-volume');
   assert.equal(
     defaultOutputRoot('win32', { LOCALAPPDATA: 'C:\\Users\\qa\\AppData\\Local' }, 'D:\\source'),
     'C:\\Users\\qa\\AppData\\Local\\DataBaker\\acceptance-results',
@@ -133,7 +140,7 @@ function testArgs() {
         '--mode',
         'disk-full',
         '--output',
-        path.join(os.tmpdir(), 'dedicated-audio-qa-volume'),
+        dedicatedVolume,
         '--confirm-dedicated-volume',
       ]),
     /confirm-not-system-drive/,
@@ -142,7 +149,7 @@ function testArgs() {
     '--mode',
     'disk-full',
     '--output',
-    path.join(os.tmpdir(), 'dedicated-audio-qa-volume'),
+    dedicatedVolume,
     '--confirm-dedicated-volume',
     '--confirm-not-system-drive',
   ]);
