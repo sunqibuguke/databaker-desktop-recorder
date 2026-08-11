@@ -1,4 +1,15 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, screen, shell, Tray } from 'electron';
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  Menu,
+  nativeImage,
+  screen,
+  shell,
+  systemPreferences,
+  Tray,
+} from 'electron';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import {
@@ -9,6 +20,11 @@ import {
   EngineUnsafeStopError,
   type EngineStoppedOutcome,
 } from './engine-client';
+import {
+  captureFaultNoticeFromEngineEvent,
+  type CaptureFaultNotice,
+} from './capture-fault';
+import { CapturePresetRepository, type CapturePresetDraft } from './capture-presets';
 
 let mainWindow: BrowserWindow | null = null;
 let prompterWindow: BrowserWindow | null = null;
@@ -39,7 +55,19 @@ type EngineIntent = Readonly<{
   generation: number;
   phase: EnginePhase;
   sessionDir: string | null;
+  // `starting` only means the main process owns an activation operation. This
+  // flag tracks whether that operation reached a capture command; an older
+  // interrupted task remains represented separately by `pendingCrashSeal`.
+  captureMayHaveStarted: boolean;
+  authorizedBinding: AuthorizedSessionBinding | null;
 }>;
+
+type LatchedCaptureFault = Readonly<{
+  generation: number;
+  notice: CaptureFaultNotice;
+}>;
+
+let latchedCaptureFault: LatchedCaptureFault | null = null;
 
 type EngineOptionalState = {
   active?: unknown;
@@ -50,6 +78,7 @@ type EngineOptionalState = {
 
 type EngineRecoveryJob = {
   intent: EngineIntent;
+  binding: AuthorizedSessionBinding;
   originalError: string;
 };
 
@@ -96,6 +125,8 @@ let engineIntent: EngineIntent = {
   generation: engineIntentSequence,
   phase: 'idle',
   sessionDir: null,
+  captureMayHaveStarted: false,
+  authorizedBinding: null,
 };
 
 class EngineIntentSupersededError extends Error {
@@ -166,14 +197,51 @@ const SESSION_LIVE_PHASES: readonly EnginePhase[] = [
   'recovering',
 ];
 
-function beginEngineIntent(phase: EnginePhase, sessionDir: string | null): EngineIntent {
+function beginEngineIntent(
+  phase: EnginePhase,
+  sessionDir: string | null,
+  options: Readonly<{
+    newSessionGeneration?: boolean;
+    captureMayHaveStarted?: boolean;
+    authorizedBinding?: AuthorizedSessionBinding | null;
+  }> = {},
+): EngineIntent {
+  const previousGeneration = engineIntent.generation;
   const intent: EngineIntent = {
     generation: ++engineIntentSequence,
     phase,
     sessionDir,
+    captureMayHaveStarted: options.captureMayHaveStarted
+      ?? (options.newSessionGeneration ? false : engineIntent.captureMayHaveStarted),
+    authorizedBinding: options.authorizedBinding !== undefined
+      ? options.authorizedBinding
+      : (options.newSessionGeneration ? null : engineIntent.authorizedBinding),
   };
   engineIntent = intent;
+  if (options.newSessionGeneration) {
+    latchedCaptureFault = null;
+  } else if (latchedCaptureFault?.generation === previousGeneration) {
+    // Stopping, recovery and quit intents may advance the command generation
+    // while they still own the same capture. Carry the first fault forward so
+    // no later background path can accidentally advertise healthy recording.
+    latchedCaptureFault = {
+      ...latchedCaptureFault,
+      generation: intent.generation,
+    };
+  }
   return intent;
+}
+
+function currentCaptureFault(): CaptureFaultNotice | null {
+  return latchedCaptureFault?.generation === engineIntent.generation
+    ? latchedCaptureFault.notice
+    : null;
+}
+
+function clearCurrentCaptureFault(): void {
+  if (latchedCaptureFault?.generation === engineIntent.generation) {
+    latchedCaptureFault = null;
+  }
 }
 
 function ownsEngineGeneration(intent: EngineIntent): boolean {
@@ -204,8 +272,29 @@ function transitionEngineIntent(
     generation: intent.generation,
     phase,
     sessionDir,
+    captureMayHaveStarted: engineIntent.captureMayHaveStarted,
+    authorizedBinding: engineIntent.authorizedBinding,
   };
   return engineIntent;
+}
+
+function markCaptureMayHaveStarted(intent: EngineIntent): void {
+  if (!ownsEngineGeneration(intent)) throw new EngineIntentSupersededError();
+  engineIntent = {
+    ...engineIntent,
+    captureMayHaveStarted: true,
+  };
+}
+
+function attachAuthorizedBinding(
+  intent: EngineIntent,
+  binding: AuthorizedSessionBinding | null,
+): void {
+  if (!ownsEngineGeneration(intent)) throw new EngineIntentSupersededError();
+  engineIntent = {
+    ...engineIntent,
+    authorizedBinding: binding,
+  };
 }
 
 function isQuitting(): boolean {
@@ -983,7 +1072,10 @@ async function hasActiveEngineSession(): Promise<boolean> {
     const state = await engine.request('get_state_optional', {}, 3_000) as EngineOptionalState;
     if (!ownsEngineGeneration(observedIntent) || isQuitting()) return intentTracksLiveSession();
     if (state.active === true && typeof state.session_dir === 'string') {
-      beginEngineIntent(observedLivePhase(state), state.session_dir);
+      beginEngineIntent(observedLivePhase(state), state.session_dir, {
+        newSessionGeneration: true,
+        captureMayHaveStarted: true,
+      });
       knownSessionDirs.add(state.session_dir);
       return true;
     }
@@ -1022,7 +1114,39 @@ function recordingTrayMenu(status: string, canOpen: boolean): Electron.Menu {
   ]);
 }
 
-function ensureRecordingTray(status = '● 后台录音正在进行'): void {
+function captureFaultTrayStatus(fault: CaptureFaultNotice): string {
+  if (engineIntent.phase === 'stopping' || engineIntent.phase === 'quitting') {
+    return `⚠ ${fault.title} · 正在安全停止`;
+  }
+  if (engineIntent.phase === 'recovering') {
+    return `⚠ ${fault.title} · 采集中断，正在恢复引擎`;
+  }
+  if (engineIntent.phase === 'sealing') {
+    return `⚠ ${fault.title} · 正在封存已保留音频`;
+  }
+  if (engineIntent.phase === 'exporting') {
+    return `⚠ ${fault.title} · 正在导出已保留音频`;
+  }
+  return `⚠ ${fault.title} · 已停止写入`;
+}
+
+function effectiveRecordingTrayStatus(requestedStatus?: string): string {
+  const fault = currentCaptureFault();
+  if (fault) return captureFaultTrayStatus(fault);
+  switch (engineIntent.phase) {
+    case 'starting': return '◌ 录音正在启动，尚未确认写入';
+    case 'active': return requestedStatus ?? '● 后台录音正在进行';
+    case 'stopping': return '◌ 正在安全停止并封存母轨';
+    case 'recovering': return '⚠ 采集中断，正在恢复录音引擎';
+    case 'sealing': return '◌ 正在修复并封存已保留音频';
+    case 'exporting': return '◌ 正在导出已保留音频';
+    case 'quitting': return '◌ 正在安全停止并退出';
+    case 'idle': return requestedStatus ?? '录音引擎待命';
+  }
+}
+
+function ensureRecordingTray(requestedStatus?: string): void {
+  const status = effectiveRecordingTrayStatus(requestedStatus);
   app.setBadgeCount(1);
   if (!recordingTray) {
     const icon = nativeImage.createFromDataURL(TRAY_ICON_DATA_URL);
@@ -1031,8 +1155,33 @@ function ensureRecordingTray(status = '● 后台录音正在进行'): void {
     recordingTray.on('click', () => void showMainWindow());
     recordingTray.on('double-click', () => void showMainWindow());
   }
-  recordingTray.setToolTip('DataBaker 音频采集 — 后台录音中');
+  recordingTray.setToolTip(`DataBaker 音频采集 — ${status.replace(/^[●⚠◌]\s*/, '')}`);
   recordingTray.setContextMenu(recordingTrayMenu(status, !isQuitting()));
+}
+
+function handleCaptureFaultEvent(message: unknown): void {
+  const fault = captureFaultNoticeFromEngineEvent(message);
+  if (!fault || !SESSION_LIVE_PHASES.includes(engineIntent.phase)) return;
+  if (latchedCaptureFault?.generation === engineIntent.generation) return;
+  latchedCaptureFault = {
+    generation: engineIntent.generation,
+    notice: fault,
+  };
+
+  // A fault may arrive while the main window is still visible and no Tray has
+  // been created. The latch above is therefore the source of truth; if a Tray
+  // exists already, refresh it immediately as a convenience.
+  if (recordingTray) ensureRecordingTray();
+  if (process.platform === 'win32'
+    && mainWindow
+    && !mainWindow.isDestroyed()
+    && !mainWindow.isFocused()) {
+    const alertedWindow = mainWindow;
+    alertedWindow.flashFrame(true);
+    alertedWindow.once('focus', () => {
+      if (!alertedWindow.isDestroyed()) alertedWindow.flashFrame(false);
+    });
+  }
 }
 
 async function showMainWindow(): Promise<BrowserWindow> {
@@ -1416,10 +1565,22 @@ async function requestSessionWithReconciliation(
   timeoutMs: number,
   intent: EngineIntent,
   allowedPhases: readonly EnginePhase[],
+  beforeDispatch?: () => Promise<void>,
 ): Promise<unknown> {
   if (!engine) throw new Error('录音引擎客户端不可用');
+  await ensureMicrophoneAccess();
+  assertCurrentEngineIntent(intent, allowedPhases);
+  if (beforeDispatch) {
+    await beforeDispatch();
+    assertCurrentEngineIntent(intent, allowedPhases);
+  }
   let requestError: unknown;
   try {
+    // No await may be introduced between this mark and request dispatch. An
+    // engine exit before this point is a preflight failure, not proof that this
+    // start/resume request opened capture resources.
+    if (!engine.running) throw new Error('录音引擎在开始采集前已退出');
+    markCaptureMayHaveStarted(intent);
     const result = await engine.request(command, payload, timeoutMs);
     assertCurrentEngineIntent(intent, allowedPhases);
     if (!isRecord(result)
@@ -1462,6 +1623,27 @@ async function requestSessionWithReconciliation(
     );
   }
   throw requestError;
+}
+
+async function ensureMicrophoneAccess(): Promise<void> {
+  if (process.platform !== 'darwin') return;
+  const status = systemPreferences.getMediaAccessStatus('microphone');
+  if (status === 'granted') return;
+  if (status === 'not-determined') {
+    let granted = false;
+    try {
+      granted = await systemPreferences.askForMediaAccess('microphone');
+    } catch (error) {
+      throw new Error(
+        `macOS 无法请求麦克风权限：${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (granted) return;
+  }
+  const applicationName = app.isPackaged ? 'DataBaker 音频采集' : 'Electron（开发模式）';
+  throw new Error(
+    `麦克风权限未开启。请在“系统设置 → 隐私与安全性 → 麦克风”中允许 ${applicationName}，然后重启应用。`,
+  );
 }
 
 async function notifyEngineRecovered(
@@ -1507,9 +1689,9 @@ async function notifyEngineRecoveryFailed(intent: EngineIntent, latestError: str
 }
 
 async function runEngineRecovery(job: EngineRecoveryJob): Promise<void> {
-  const { intent, originalError } = job;
+  const { intent, binding, originalError } = job;
   const sessionDir = intent.sessionDir;
-  if (!sessionDir) return;
+  if (!sessionDir || !isSameSessionDir(sessionDir, binding.canonicalPath)) return;
   let latestError = originalError;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, attempt * 1_000));
@@ -1525,9 +1707,11 @@ async function runEngineRecovery(job: EngineRecoveryJob): Promise<void> {
         30_000,
         intent,
         ['recovering'],
+        () => assertAuthorizedSessionUnchanged(binding, [binding.canonicalRoot]),
       );
       assertCurrentEngineIntent(intent, ['recovering']);
       transitionEngineIntent(intent, 'active', sessionDir);
+      clearCurrentCaptureFault();
       clearCrashSealObligation(sessionDir);
       sendToMain('engine:event', {
         protocol_version: 1,
@@ -1546,6 +1730,18 @@ async function runEngineRecovery(job: EngineRecoveryJob): Promise<void> {
         || !isCurrentEngineIntent(intent, ['recovering'])) return;
       latestError = error instanceof Error ? error.message : String(error);
       console.error(`录音引擎第 ${attempt} 次自动恢复失败：`, error);
+      if (error instanceof AuthorizedSessionBindingError) {
+        transitionEngineIntent(intent, 'idle', null);
+        clearBackgroundRecordingStatus();
+        sendToMain('engine:offline', latestError);
+        sendToMain('engine:event', {
+          protocol_version: 1,
+          event: 'engine_recovery_failed',
+          payload: { session_dir: sessionDir, error: latestError },
+        });
+        void notifyEngineRecoveryFailed(intent, latestError);
+        return;
+      }
       if (error instanceof EngineSessionConflictError) {
         transitionEngineIntent(intent, error.phase, error.sessionDir);
         knownSessionDirs.add(error.sessionDir);
@@ -1614,12 +1810,121 @@ function ensureEngineRecoveryDrain(): Promise<void> {
   return operation;
 }
 
-function recoverEngineAfterCrash(sessionDir: string, originalError: string): Promise<void> {
+function recoverEngineAfterCrash(
+  sessionDir: string,
+  binding: AuthorizedSessionBinding,
+  originalError: string,
+): Promise<void> {
   if (engineIntent.phase === 'stopping' || isQuitting()) return Promise.resolve();
-  const intent = beginEngineIntent('recovering', sessionDir);
-  pendingEngineRecovery = { intent, originalError };
+  const intent = beginEngineIntent('recovering', sessionDir, { authorizedBinding: binding });
+  pendingEngineRecovery = { intent, binding, originalError };
   if (recordingTray) ensureRecordingTray('⚠ 录音引擎异常，正在自动恢复…');
   return ensureEngineRecoveryDrain();
+}
+
+type MainWindowCloseCopy = Readonly<{
+  title: string;
+  message: string;
+  detail: string;
+  backgroundButton: string;
+  exitButton: string;
+}>;
+
+function mainWindowCloseCopy(fault: CaptureFaultNotice | null): MainWindowCloseCopy {
+  if (fault) {
+    const phaseDetail = engineIntent.phase === 'recovering'
+      ? '录音引擎正在恢复，恢复确认前不能继续朗读。'
+      : engineIntent.phase === 'stopping' || engineIntent.phase === 'quitting'
+        ? '录音引擎正在安全停止并封存已接收音频。'
+        : engineIntent.phase === 'sealing'
+          ? '已保留音频正在离线修复并封存。'
+          : engineIntent.phase === 'exporting'
+            ? '已保留音频正在导出。'
+            : '母轨已停止写入。';
+    const backgroundButton = engineIntent.phase === 'recovering'
+      ? '暂留后台等待恢复（不会继续录音）'
+      : engineIntent.phase === 'stopping' || engineIntent.phase === 'quitting'
+        ? '暂留后台等待安全停止'
+        : engineIntent.phase === 'sealing'
+          ? '暂留后台等待封存'
+          : engineIntent.phase === 'exporting'
+            ? '暂留后台等待导出'
+            : '暂留后台（不会继续录音）';
+    return {
+      title: '音频采集已停止写入',
+      message: `${fault.title}，${phaseDetail}`,
+      detail: '暂留后台不会恢复录音。请停止朗读；需要恢复时等待软件明确确认，否则优先安全停止并保留已落盘母轨。',
+      backgroundButton,
+      exitButton: engineIntent.phase === 'exporting' ? '导出完成后退出' : '安全停止并退出',
+    };
+  }
+
+  switch (engineIntent.phase) {
+    case 'starting':
+      return {
+        title: '录音正在启动',
+        message: '输入设备和母轨写入尚未确认就绪。',
+        detail: '暂留后台只会等待启动结果；在主面板明确显示录制就绪前，请不要开始朗读。',
+        backgroundButton: '暂留后台等待启动',
+        exitButton: '取消启动并退出',
+      };
+    case 'recovering':
+      return {
+        title: '录音引擎正在恢复',
+        message: '当前采集已中断，暂时不能确认母轨继续写入。',
+        detail: '请立即停止朗读。暂留后台只会等待恢复；只有软件明确确认恢复成功后才能继续。',
+        backgroundButton: '暂留后台等待恢复',
+        exitButton: '安全停止并退出',
+      };
+    case 'stopping':
+      return {
+        title: '录音正在安全停止',
+        message: '引擎正在排空并封存已接收音频，不会继续采集新音频。',
+        detail: '暂留后台会继续等待安全停止完成；不要继续朗读或启动其他任务。',
+        backgroundButton: '暂留后台等待安全停止',
+        exitButton: '安全停止并退出',
+      };
+    case 'sealing':
+      return {
+        title: '任务正在离线封存',
+        message: '已落盘母轨正在修复并封存，不会采集新音频。',
+        detail: '暂留后台会保留引擎并继续封存；安全退出会等待当前封存完成。',
+        backgroundButton: '暂留后台等待封存',
+        exitButton: '封存完成后退出',
+      };
+    case 'exporting':
+      return {
+        title: '录音交付正在导出',
+        message: '整轨和分句文件仍在写入交付目录，不会采集新音频。',
+        detail: '暂留后台会继续导出；导出完成后退出会等待交付状态持久化，再安全结束引擎。',
+        backgroundButton: '暂留后台等待导出',
+        exitButton: '导出完成后退出',
+      };
+    case 'active':
+      return {
+        title: '录音正在进行',
+        message: '持续母轨仍在录制，关闭面板不应该无声地继续。',
+        detail: '取消可继续使用录音面板；后台录音会保留引擎并在系统托盘持续显示；安全停止会先封存 WAV 再退出。',
+        backgroundButton: '继续后台录音',
+        exitButton: '安全停止并退出',
+      };
+    case 'quitting':
+      return {
+        title: '应用正在安全退出',
+        message: '引擎正在停止并封存，不会继续采集新音频。',
+        detail: '请等待安全退出完成。',
+        backgroundButton: '暂留后台等待退出',
+        exitButton: '继续安全退出',
+      };
+    case 'idle':
+      return {
+        title: '录音引擎待命',
+        message: '当前没有正在处理的录音任务。',
+        detail: '可以直接关闭录音面板。',
+        backgroundButton: '关闭面板',
+        exitButton: '退出',
+      };
+  }
 }
 
 async function handleMainWindowClose(window: BrowserWindow): Promise<void> {
@@ -1629,27 +1934,17 @@ async function handleMainWindowClose(window: BrowserWindow): Promise<void> {
     closeWindowWithoutPrompt(window);
     return;
   }
-  const sealingOfflineTask = engineIntent.phase === 'sealing';
-  const exportingTask = engineIntent.phase === 'exporting';
+  const captureFault = currentCaptureFault();
+  const copy = mainWindowCloseCopy(captureFault);
   const result = await dialog.showMessageBox(window, {
     type: 'warning',
-    title: exportingTask
-      ? '录音交付正在导出'
-      : sealingOfflineTask ? '任务正在离线封存' : '录音正在进行',
-    message: exportingTask
-      ? '整轨和分句文件仍在写入，关闭面板不应该中断交付。'
-      : sealingOfflineTask
-        ? '中断任务仍在修复并封存，关闭面板不应该隐藏其进度。'
-        : '持续母轨仍在录制，关闭面板不应该无声地继续。',
-    detail: exportingTask
-      ? '取消可继续查看；后台运行会保留引擎；导出完成后退出会等待交付状态持久化，再安全结束引擎。'
-      : sealingOfflineTask
-        ? '取消可继续查看；后台运行会保留引擎并在系统托盘显示；安全停止并退出会等待当前封存完成。'
-        : '取消可继续使用录音面板；后台录音会保留引擎并在系统托盘持续显示；安全停止会先封存 WAV 再退出。',
+    title: copy.title,
+    message: copy.message,
+    detail: copy.detail,
     buttons: [
       '取消',
-      exportingTask ? '继续后台导出' : sealingOfflineTask ? '继续后台封存' : '继续后台录音',
-      exportingTask ? '导出完成后退出' : '安全停止并退出',
+      copy.backgroundButton,
+      copy.exitButton,
     ],
     defaultId: 0,
     cancelId: 0,
@@ -1664,9 +1959,7 @@ async function handleMainWindowClose(window: BrowserWindow): Promise<void> {
     }
     window.hide();
     prompterWindow?.close();
-    ensureRecordingTray(exportingTask
-      ? '录音交付正在后台导出…'
-      : sealingOfflineTask ? '中断任务正在后台修复并封存…' : undefined);
+    ensureRecordingTray();
     return;
   }
   await requestSafeStopAndQuit('主窗口关闭选择');
@@ -1684,7 +1977,7 @@ async function recoverMainWindow(failedWindow: BrowserWindow, reason: string): P
   if (isQuitting() || forceCloseWindows.has(failedWindow) || mainWindow !== failedWindow) return;
   if (windowRecoveryPromise) return windowRecoveryPromise;
   const operation = (async () => {
-    const recordingContinues = await hasActiveEngineSession();
+    const operationStillOwned = await hasActiveEngineSession();
     console.error(`录音面板异常，正在重建：${reason}`);
     forceCloseWindows.add(failedWindow);
     mainWindow = null;
@@ -1695,12 +1988,21 @@ async function recoverMainWindow(failedWindow: BrowserWindow, reason: string): P
       clearBackgroundRecordingStatus();
       replacement.show();
       replacement.focus();
-      if (recordingContinues && await hasActiveEngineSession()) {
+      if (operationStillOwned && await hasActiveEngineSession()) {
+        const captureFault = currentCaptureFault();
+        const verifiedHealthyCapture = engineIntent.phase === 'active' && !captureFault;
+        const operationCopy = mainWindowCloseCopy(captureFault);
         await dialog.showMessageBox(replacement, {
-          type: 'info',
-          title: '录音面板已恢复',
-          message: '后台录音仍在继续',
-          detail: '录音引擎未被重启或暂停，新面板已重新连接当前任务。',
+          type: verifiedHealthyCapture ? 'info' : 'warning',
+          title: verifiedHealthyCapture
+            ? '录音面板已恢复'
+            : captureFault
+              ? '录音面板已恢复，采集故障仍在'
+              : `${operationCopy.title}，面板已恢复`,
+          message: verifiedHealthyCapture ? '后台录音仍在继续' : operationCopy.message,
+          detail: verifiedHealthyCapture
+            ? '录音引擎未被重启或暂停，新面板已重新连接当前任务。'
+            : `${operationCopy.detail} 新面板只恢复了控制界面，不代表采集已经恢复。`,
           buttons: ['知道了'],
           defaultId: 0,
           cancelId: 0,
@@ -1708,7 +2010,13 @@ async function recoverMainWindow(failedWindow: BrowserWindow, reason: string): P
       }
     } catch (error) {
       console.error('录音面板自动恢复失败：', error);
-      if (recordingContinues) ensureRecordingTray('⚠ 面板恢复失败，后台录音仍在继续');
+      if (operationStillOwned) {
+        ensureRecordingTray(
+          engineIntent.phase === 'active' && !currentCaptureFault()
+            ? '⚠ 面板恢复失败，后台录音仍在继续'
+            : undefined,
+        );
+      }
     }
   })().finally(() => {
     if (windowRecoveryPromise === operation) windowRecoveryPromise = null;
@@ -1865,6 +2173,11 @@ function adoptObservedActiveSession(intent: EngineIntent, state: EngineOptionalS
   }
   const activeSessionDir = path.resolve(state.session_dir);
   const activePhase = observedLivePhase(state);
+  if (engineIntent.authorizedBinding
+    && !isSameSessionDir(engineIntent.authorizedBinding.canonicalPath, activeSessionDir)) {
+    attachAuthorizedBinding(intent, null);
+  }
+  markCaptureMayHaveStarted(intent);
   transitionEngineIntent(intent, activePhase, activeSessionDir);
   knownSessionDirs.add(activeSessionDir);
   throw new EngineSessionConflictError(activeSessionDir, activePhase);
@@ -2172,6 +2485,7 @@ async function finishPendingEngineStop(): Promise<unknown> {
     assertCurrentEngineIntent(stopIntent, ['stopping']);
     await engine.start();
     assertCurrentEngineIntent(stopIntent, ['stopping']);
+    clearCurrentCaptureFault();
   } catch (error) {
     retainStoppingIntentAfterEngineStopFailure(
       stopIntent,
@@ -2246,6 +2560,7 @@ async function stopActiveSession(): Promise<unknown> {
     const result = await engine.request('stop_session', {}, 120_000);
     assertCurrentEngineIntent(stopIntent, ['stopping']);
     transitionEngineIntent(stopIntent, 'idle', null);
+    clearCurrentCaptureFault();
     return result;
   } catch (error) {
     if (error instanceof EngineIntentSupersededError || !ownsEngineGeneration(stopIntent)) throw error;
@@ -2270,6 +2585,7 @@ async function stopActiveSession(): Promise<unknown> {
           && (recovered.snapshot.status === 'stopped'
             || recovered.snapshot.status === 'faulted')) {
           transitionEngineIntent(stopIntent, 'idle', null);
+          clearCurrentCaptureFault();
           clearCrashSealObligation(stoppedSessionDir);
           return {
             session_dir: stoppedSessionDir,
@@ -2286,6 +2602,7 @@ async function stopActiveSession(): Promise<unknown> {
         );
       }
       transitionEngineIntent(stopIntent, 'idle', null);
+      clearCurrentCaptureFault();
     }
   } catch (reconciliationError) {
     if (!ownsEngineGeneration(stopIntent)) throw requestError;
@@ -2302,12 +2619,16 @@ async function stopActiveSession(): Promise<unknown> {
       throw requestError;
     }
     if (ownsEngineGeneration(stopIntent)) transitionEngineIntent(stopIntent, 'idle', null);
+    clearCurrentCaptureFault();
   }
   throw requestError;
 }
 
 function registerIpc(): void {
   allowedOutputRoots.add(path.resolve(defaultOutputRoot()));
+  const capturePresets = new CapturePresetRepository(
+    path.join(app.getPath('userData'), 'capture-presets.json'),
+  );
   ipcMain.handle('engine:request', async (event, command: string, payload: unknown) => {
     assertMainRenderer(event.sender);
     if (!allowedCommands.has(command)) throw new Error(`不允许的录音引擎命令：${command}`);
@@ -2318,7 +2639,9 @@ function registerIpc(): void {
       const resolved = path.resolve(sessionDir);
       if (!isAllowedNewSession(resolved)) throw new Error('新录制必须保存在已授权目录的直接子目录中');
       assertCanStartOrResume();
-      const startIntent = beginEngineIntent('starting', resolved);
+      const startIntent = beginEngineIntent('starting', resolved, {
+        newSessionGeneration: true,
+      });
       try {
         const canonicalRoot = await resolveAuthorizedOutputRoot(path.dirname(resolved), true);
         assertCurrentEngineIntent(startIntent, ['starting']);
@@ -2366,8 +2689,16 @@ function registerIpc(): void {
             new Error('新建录制任务的持久化身份无法确认'),
           );
         }
-        transitionEngineIntent(startIntent, 'active', canonical);
+        let binding: AuthorizedSessionBinding;
+        try {
+          binding = await bindAuthorizedSession(canonical, [canonicalRoot], requestedSessionId);
+          assertCurrentEngineIntent(startIntent, ['starting']);
+        } catch (error) {
+          return await rejectStartedSession(startIntent, error);
+        }
+        attachAuthorizedBinding(startIntent, binding);
         rememberKnownSession(canonical, requestedSessionId);
+        transitionEngineIntent(startIntent, 'active', canonical);
         return result;
       } catch (error) {
         return await failStartingSession(startIntent, error);
@@ -2380,18 +2711,24 @@ function registerIpc(): void {
       // path. Keep the quit obligation until resume_session is confirmed, then
       // clear it below; unrelated sessions remain blocked.
       assertCanStartOrResume(crashSealMatches(sessionDir));
-      const resumeIntent = beginEngineIntent('starting', path.resolve(sessionDir));
+      const resumeIntent = beginEngineIntent('starting', path.resolve(sessionDir), {
+        newSessionGeneration: true,
+      });
       try {
         const canonical = await resolveKnownSession(sessionDir);
         assertCurrentEngineIntent(resumeIntent, ['starting']);
         if (!canonical) throw new Error('只能继续已授权保存位置中的录制任务');
         transitionEngineIntent(resumeIntent, 'starting', canonical);
-        const canonicalRoot = await fs.realpath(path.dirname(canonical));
+        const expectedSessionId = knownSessionId(canonical);
+        if (!expectedSessionId) throw new Error('无法确认录制任务身份，请刷新任务列表后重试');
+        const authorizedRoots = Array.from(canonicalOutputRoots.values());
+        const binding = await bindAuthorizedSession(
+          canonical,
+          authorizedRoots,
+          expectedSessionId,
+        );
         assertCurrentEngineIntent(resumeIntent, ['starting']);
-        if (!Array.from(canonicalOutputRoots.values()).includes(canonicalRoot)
-          || path.dirname(canonical) !== canonicalRoot) {
-          throw new Error('录制任务已离开授权的保存位置，请重新选择保存目录');
-        }
+        attachAuthorizedBinding(resumeIntent, binding);
         await engine.start();
         assertCurrentEngineIntent(resumeIntent, ['starting']);
         const result = await requestSessionWithReconciliation(
@@ -2401,6 +2738,7 @@ function registerIpc(): void {
           30_000,
           resumeIntent,
           ['starting'],
+          () => assertAuthorizedSessionUnchanged(binding, authorizedRoots),
         );
         assertCurrentEngineIntent(resumeIntent, ['starting']);
         transitionEngineIntent(resumeIntent, 'active', canonical);
@@ -2430,6 +2768,7 @@ function registerIpc(): void {
         );
         canonical = sealed.canonical;
         transitionEngineIntent(sealIntent, 'idle', null);
+        clearCurrentCaptureFault();
         rememberKnownSession(canonical, expectedSessionId);
         clearCrashSealObligation(canonical);
         return sealed.result;
@@ -2461,10 +2800,14 @@ function registerIpc(): void {
         if (engineIntent.phase === 'idle'
           && state.active === true
           && typeof state.session_dir === 'string') {
-          beginEngineIntent(observedLivePhase(state), state.session_dir);
+          beginEngineIntent(observedLivePhase(state), state.session_dir, {
+            newSessionGeneration: true,
+            captureMayHaveStarted: true,
+          });
           knownSessionDirs.add(state.session_dir);
         } else if (engineIntent.phase === 'active' && state.active !== true) {
           beginEngineIntent('idle', null);
+          clearCurrentCaptureFault();
         }
       }
       return result;
@@ -2472,6 +2815,7 @@ function registerIpc(): void {
       if (error instanceof EngineRequestError && error.code === 'NO_ACTIVE_SESSION') {
         if (ownsEngineGeneration(commandIntent) && engineIntent.phase === 'active') {
           beginEngineIntent('idle', null);
+          clearCurrentCaptureFault();
         }
       }
       throw error;
@@ -2508,6 +2852,24 @@ function registerIpc(): void {
   });
 
   ipcMain.handle('app:default-output', () => defaultOutputRoot());
+  ipcMain.handle('capture-presets:load', (event) => {
+    assertMainRenderer(event.sender);
+    return capturePresets.load();
+  });
+  ipcMain.handle('capture-presets:save', (event, preset: unknown) => {
+    assertMainRenderer(event.sender);
+    return capturePresets.save(preset as CapturePresetDraft);
+  });
+  ipcMain.handle('capture-presets:delete', (event, id: unknown) => {
+    assertMainRenderer(event.sender);
+    if (typeof id !== 'string' || !id.trim()) throw new Error('采集预设 ID 无效');
+    return capturePresets.delete(id.trim());
+  });
+  ipcMain.handle('capture-presets:select', (event, id: unknown) => {
+    assertMainRenderer(event.sender);
+    if (id !== null && (typeof id !== 'string' || !id.trim())) throw new Error('采集预设 ID 无效');
+    return capturePresets.select(typeof id === 'string' ? id.trim() : null);
+  });
   ipcMain.handle('prompter:open', async (event) => {
     assertMainRenderer(event.sender);
     await createPrompterWindow();
@@ -2570,11 +2932,34 @@ app.whenReady().then(async () => {
   if (!hasSingleInstanceLock) return;
   registerIpc();
   engine = new EngineClient(engineExecutable());
-  engine.on('event', (message) => sendToMain('engine:event', message));
+  engine.on('event', (message) => {
+    sendToMain('engine:event', message);
+    handleCaptureFaultEvent(message);
+  });
   engine.on('offline', (message) => {
-    sendToMain('engine:offline', message);
     const interruptedIntent = engineIntent;
     if (interruptedIntent.phase === 'quitting') return;
+    if (interruptedIntent.phase === 'starting'
+      && !interruptedIntent.captureMayHaveStarted) {
+      // A new-session preflight owns the UI, but no capture command has reached
+      // the engine yet. Do not manufacture an interrupted task for a proposed
+      // directory that may not exist. Restart the idle helper so the operator
+      // can retry without restarting the whole application.
+      pendingEngineRecovery = null;
+      idleWhenEngineStopsGeneration = null;
+      const restartIntent = beginEngineIntent('idle', null);
+      clearBackgroundRecordingStatus();
+      console.error(`录音开始前引擎退出，未建立恢复任务：${message}`);
+      void engine?.start().catch((error) => {
+        if (!isCurrentEngineIntent(restartIntent, ['idle'])) return;
+        sendToMain(
+          'engine:offline',
+          `录音开始前引擎退出，且无法重新启动：${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+      return;
+    }
+    sendToMain('engine:offline', message);
     if (interruptedIntent.phase === 'stopping') {
       const interruptedSessionDir = interruptedIntent.sessionDir;
       if (interruptedSessionDir) retainCrashSealObligation(interruptedSessionDir, message);
@@ -2606,7 +2991,29 @@ app.whenReady().then(async () => {
     }
     if (interruptedIntent.sessionDir && SESSION_LIVE_PHASES.includes(interruptedIntent.phase)) {
       retainCrashSealObligation(interruptedIntent.sessionDir, message);
-      void recoverEngineAfterCrash(interruptedIntent.sessionDir, message);
+      const binding = interruptedIntent.authorizedBinding;
+      if (!binding || !isSameSessionDir(binding.canonicalPath, interruptedIntent.sessionDir)) {
+        pendingEngineRecovery = null;
+        idleWhenEngineStopsGeneration = null;
+        const recoveryIntent = beginEngineIntent('idle', null, { authorizedBinding: null });
+        const recoveryError = '录音引擎异常退出，但本次采集尚未建立可信任务绑定；已禁止自动续录';
+        clearBackgroundRecordingStatus();
+        sendToMain('engine:event', {
+          protocol_version: 1,
+          event: 'engine_recovery_failed',
+          payload: { session_dir: interruptedIntent.sessionDir, error: recoveryError },
+        });
+        void engine?.start().catch((error) => {
+          if (!isCurrentEngineIntent(recoveryIntent, ['idle'])) return;
+          sendToMain(
+            'engine:offline',
+            `录音中断后无法重启待命引擎：${error instanceof Error ? error.message : String(error)}`,
+          );
+        });
+        void notifyEngineRecoveryFailed(recoveryIntent, recoveryError);
+        return;
+      }
+      void recoverEngineAfterCrash(interruptedIntent.sessionDir, binding, message);
     } else if (ownsEngineGeneration(interruptedIntent)) {
       transitionEngineIntent(interruptedIntent, 'idle', null);
     }
@@ -2616,6 +3023,11 @@ app.whenReady().then(async () => {
       if (!forceExitConfirmed) void handleUnsafeEngineStop(outcome);
       return;
     }
+    // Recovery deliberately stops a failed helper between retries while still
+    // owning the same interrupted capture. Keep its fault latched until a
+    // resumed recording is positively confirmed. Other safe sidecar stops are
+    // terminal for their current capture and may retire the latch.
+    if (engineIntent.phase !== 'recovering') clearCurrentCaptureFault();
     if (idleWhenEngineStopsGeneration === engineIntent.generation
       && engineIntent.phase === 'stopping') {
       const completedIntent = engineIntent;
@@ -2664,11 +3076,7 @@ app.on('window-all-closed', () => {
         || engineIntent.phase === 'stopping'),
   );
   if (keepBackgroundEngine) {
-    ensureRecordingTray(engineIntent.phase === 'exporting'
-      ? '录音交付正在后台导出…'
-      : engineIntent.phase === 'sealing'
-        ? '中断任务正在后台修复并封存…'
-        : '● 后台录音正在进行');
+    ensureRecordingTray();
     return;
   }
   if (process.platform !== 'darwin') app.quit();

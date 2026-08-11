@@ -86,6 +86,23 @@ class FakeEngineClient extends EventEmitter {
   }
 }
 
+class FakeTray extends EventEmitter {
+  static instances = [];
+  constructor() {
+    super();
+    this.destroyed = false;
+    this.menu = null;
+    FakeTray.instances.push(this);
+  }
+  setToolTip() {}
+  setContextMenu(value) { this.menu = value; }
+  destroy() { this.destroyed = true; }
+}
+
+function activeTray() {
+  return FakeTray.instances.findLast((tray) => !tray.destroyed) ?? null;
+}
+
 class FakeWebContents extends EventEmitter {
   isDestroyed() { return false; }
   send() {}
@@ -193,6 +210,10 @@ async function main() {
       getAppPath: () => process.cwd(),
       setBadgeCount: () => undefined,
     },
+    systemPreferences: {
+      getMediaAccessStatus: () => 'granted',
+      askForMediaAccess: async () => true,
+    },
     BrowserWindow: FakeBrowserWindow,
     dialog: {
       showMessageBox: (...args) => new Promise((resolve) => {
@@ -204,15 +225,11 @@ async function main() {
       handle: (name, listener) => handlers.set(name, listener),
       on: () => undefined,
     },
-    Menu: { buildFromTemplate: () => ({}) },
+    Menu: { buildFromTemplate: (template) => template },
     nativeImage: { createFromDataURL: () => ({ setTemplateImage: () => undefined }) },
     screen: { getPrimaryDisplay: () => ({ id: 1, workArea: {} }), getAllDisplays: () => [] },
     shell: { openPath: async () => '' },
-    Tray: class extends EventEmitter {
-      setToolTip() {}
-      setContextMenu() {}
-      destroy() {}
-    },
+    Tray: FakeTray,
   };
 
   const originalLoad = Module._load;
@@ -251,6 +268,11 @@ async function main() {
     const exportPromise = request(event, 'export_session', { session_dir: sessionDir })
       .finally(() => { exportSettled = true; });
     await exportStarted;
+    appEvents.get('window-all-closed')();
+    const tray = activeTray();
+    assert.match(tray.menu[0].label, /正在导出/);
+    assert.doesNotMatch(tray.menu[0].label, /后台录音正在进行/,
+      'export ownership must never be advertised as capture');
     const exportCall = engine.commands.find(({ command }) => command === 'export_session');
     assert.equal(exportCall.timeout, 1000, 'the test-only long export deadline must reach EngineClient');
 

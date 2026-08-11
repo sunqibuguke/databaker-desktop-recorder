@@ -45,7 +45,7 @@ use windows::{
     },
 };
 
-use super::stream::{AudioClientFlow, DefaultDeviceMonitor, Stream, StreamInner};
+use super::stream::{AudioClientFlow, DeviceMonitor, Stream, StreamInner};
 pub use crate::iter::{SupportedInputConfigs, SupportedOutputConfigs};
 use crate::{host::com, traits::DeviceTrait};
 
@@ -139,7 +139,7 @@ impl DeviceTrait for Device {
     {
         let stream_inner = self.build_input_stream_raw_inner(config, sample_format, timeout)?;
         let error_callback: ErrorCallbackArc = Arc::new(Mutex::new(error_callback));
-        let monitor = self.default_device_monitor()?;
+        let monitor = self.device_monitor()?;
         let stream = Stream::new_input(stream_inner, data_callback, error_callback, monitor)?;
         stream.signal_ready();
         Ok(stream)
@@ -159,7 +159,7 @@ impl DeviceTrait for Device {
     {
         let stream_inner = self.build_output_stream_raw_inner(config, sample_format, timeout)?;
         let error_callback: ErrorCallbackArc = Arc::new(Mutex::new(error_callback));
-        let monitor = self.default_device_monitor()?;
+        let monitor = self.device_monitor()?;
         let stream = Stream::new_output(stream_inner, data_callback, error_callback, monitor)?;
         stream.signal_ready();
         Ok(stream)
@@ -655,15 +655,22 @@ impl Device {
         }
     }
 
-    /// Creates a `DefaultDeviceMonitor` for default-device streams, or `None` for specific devices.
-    fn default_device_monitor(&self) -> Result<Option<DefaultDeviceMonitor>, Error> {
-        let flow = match &self.device {
-            DeviceHandle::DefaultOutput => Audio::eRender,
-            DeviceHandle::DefaultInput => Audio::eCapture,
-            DeviceHandle::Specific(_) => return Ok(None),
-        };
+    /// Creates a notification monitor whose semantics match the way this
+    /// Device was selected. Default streams report reroutes as DeviceChanged;
+    /// specific streams watch only their stable endpoint ID and never reroute.
+    fn device_monitor(&self) -> Result<Option<DeviceMonitor>, Error> {
         let enumerator = get_enumerator().0.clone();
-        DefaultDeviceMonitor::new(enumerator, flow).map(Some)
+        match &self.device {
+            DeviceHandle::DefaultOutput => {
+                DeviceMonitor::new_default(enumerator, Audio::eRender).map(Some)
+            }
+            DeviceHandle::DefaultInput => {
+                DeviceMonitor::new_default(enumerator, Audio::eCapture).map(Some)
+            }
+            DeviceHandle::Specific(device) => {
+                DeviceMonitor::new_specific(enumerator, device.clone()).map(Some)
+            }
+        }
     }
 
     /// Ensures that `future_audio_client` contains a `Some` and returns a locked mutex to it.

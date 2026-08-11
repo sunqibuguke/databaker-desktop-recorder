@@ -1,4 +1,4 @@
-import type { Attempt, AudioDevice, HeadSilencePhase, Meter, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SessionSnapshot } from './types';
+import type { Attempt, AudioDevice, CapturePresetDraft, CapturePresetStore, HeadSilencePhase, Meter, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SessionSnapshot } from './types';
 
 type MockActiveAttempt = {
   item_id: string;
@@ -25,9 +25,11 @@ export function installDevRecorderMock() {
   let lastSignalSample = 0;
   let firstAttemptSignalSample = 0;
   let currentSessionDir = '';
+  let currentExportExists = false;
   let mockSampleRate = 48_000;
   let recordingStartedAt = 0;
   let meterTimer: number | undefined;
+  let capturePresetStore: CapturePresetStore = { schemaVersion: 1, lastSelectedPresetId: null, presets: [] };
   const meterListeners = new Set<(message: unknown) => void>();
   const prompterListeners = new Set<(state: PrompterState) => void>();
   const prompterChannel = typeof BroadcastChannel === 'undefined' ? null : new BroadcastChannel('databaker-prompter');
@@ -174,6 +176,8 @@ export function installDevRecorderMock() {
       peak: pulse,
       rms: pulse * .42,
       silence_samples: silenceSamples,
+      digital_silence_samples: 0,
+      digital_silence_suspected: false,
       last_signal_sample: lastSignalSample,
       head_silence_phase: activeAttempt?.head_silence_phase ?? 'idle',
       head_silence_armed_sample: activeAttempt?.head_silence_armed_sample ?? 0,
@@ -213,6 +217,7 @@ export function installDevRecorderMock() {
       lastSignalSample = 0;
       firstAttemptSignalSample = 0;
       currentSessionDir = String(data.session_dir);
+      currentExportExists = false;
       mockSampleRate = Number(data.sample_rate) || 48_000;
       recordingStartedAt = performance.now();
       const items = data.items as ScriptItem[];
@@ -315,6 +320,7 @@ export function installDevRecorderMock() {
       lastSignalSample = 0;
       firstAttemptSignalSample = 0;
       currentSessionDir = target;
+      currentExportExists = recording.export_exists;
       mockSampleRate = recording.sample_rate;
       recordingStartedAt = performance.now() - capturedSamples / mockSampleRate * 1_000;
       snapshot = {
@@ -347,6 +353,11 @@ export function installDevRecorderMock() {
     if (command === 'export_session') {
       const target = String(data.session_dir ?? '');
       const source = snapshot && target === currentSessionDir ? snapshot : null;
+      if (source) currentExportExists = true;
+      else {
+        const historical = previewHistory.find((recording) => recording.session_dir === target);
+        if (historical) historical.export_exists = true;
+      }
       const exportedCount = source
         ? source.items.filter((item) => item.status === 'accepted').length
         : previewHistory.find((recording) => recording.session_dir === target)?.accepted_items ?? 0;
@@ -480,6 +491,28 @@ export function installDevRecorderMock() {
       openScript: async () => null,
       chooseOutput: async () => '/tmp/DataBaker Recordings',
       defaultOutput: async () => '/tmp/DataBaker Recordings',
+      loadCapturePresets: async () => ({ store: structuredClone(capturePresetStore) }),
+      saveCapturePreset: async (draft: CapturePresetDraft) => {
+        const preset = { ...draft, id: draft.id || crypto.randomUUID() };
+        const index = capturePresetStore.presets.findIndex((candidate) => candidate.id === preset.id);
+        const presets = [...capturePresetStore.presets];
+        if (index >= 0) presets[index] = preset;
+        else presets.push(preset);
+        capturePresetStore = { schemaVersion: 1, lastSelectedPresetId: preset.id, presets };
+        return structuredClone(capturePresetStore);
+      },
+      deleteCapturePreset: async (id: string) => {
+        capturePresetStore = {
+          schemaVersion: 1,
+          lastSelectedPresetId: capturePresetStore.lastSelectedPresetId === id ? null : capturePresetStore.lastSelectedPresetId,
+          presets: capturePresetStore.presets.filter((preset) => preset.id !== id),
+        };
+        return structuredClone(capturePresetStore);
+      },
+      setLastCapturePreset: async (id: string | null) => {
+        capturePresetStore = { ...capturePresetStore, lastSelectedPresetId: id };
+        return structuredClone(capturePresetStore);
+      },
       listRecordings: async () => {
         const rows = [...previewHistory];
         if (snapshot && currentSessionDir) {
@@ -505,7 +538,7 @@ export function installDevRecorderMock() {
             review_items: items.filter((item) => item.status === 'review').length,
             pending_items: items.filter((item) => item.status === 'pending').length,
             noise_check: snapshot.noise_check ?? null,
-            export_exists: snapshot.status === 'stopped',
+            export_exists: currentExportExists,
           });
         }
         return rows;

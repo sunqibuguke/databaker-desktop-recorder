@@ -16,6 +16,19 @@ pointer through CPAL could otherwise record unspecified data or construct a
 Rust slice from a null pointer. See Microsoft's `Capturing a Stream` example:
 https://learn.microsoft.com/windows/win32/coreaudio/capturing-a-stream
 
+WASAPI streams created from an explicitly enumerated endpoint also register an
+`IMMNotificationClient` for that stable endpoint ID. A matching disabled,
+not-present, unplugged, or removed notification is handed off to the audio run
+thread as `ErrorKind::DeviceNotAvailable`; the notification thread never calls
+user code and the stream never switches to another endpoint. The notification
+event is reference-counted across COM callbacks and owned by the run context so
+dropping a stream from its error callback cannot race a live HANDLE wait.
+Because Windows does not AddRef/Release registered notification clients, an
+indeterminate unregister failure deliberately retains one callback reference
+(and its event) for the process lifetime; successful unregister and the
+documented E_NOTFOUND result release it normally.
+
 Remove this vendor only after a released CPAL version containing both upstream
-fixes and equivalent silent-packet handling has been adopted, and the Windows
-hardware fault suite passes again.
+fixes, equivalent silent-packet handling, and equivalent explicit-endpoint
+disconnect notification has been adopted, and the Windows hardware fault suite
+passes again.

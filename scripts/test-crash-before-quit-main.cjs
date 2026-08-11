@@ -228,6 +228,10 @@ async function runScenario() {
       getAppPath: () => process.cwd(),
       setBadgeCount: () => undefined,
     },
+    systemPreferences: {
+      getMediaAccessStatus: () => 'granted',
+      askForMediaAccess: async () => true,
+    },
     BrowserWindow: FakeBrowserWindow,
     dialog: {
       showMessageBox: (...args) => new Promise((resolve) => {

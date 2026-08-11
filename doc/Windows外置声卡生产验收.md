@@ -169,7 +169,8 @@ $device = "<inventory 返回的完整设备 ID>"
 强制通过标准：
 
 - 提示拔出前已有至少 2 秒健康采集。
-- 提示后 15 秒内 `faulted=true` / overflow / fault marker 至少一项被检测，引擎进入 fail-closed。
+- 提示后 15 秒内 `faulted=true` 且 `fault_kind=device_unavailable`，引擎进入 fail-closed。
+- 录制中不会自动切到系统麦克风或同名声卡，任务中的稳定设备 ID 保持不变。
 - 出现持久化 `metadata/audio-fault.json` 或其原子写临时代。
 - 排空已接受队列后，`captured_samples` 在至少连续 2 个样本中不再增长。
 - 故障前音频仍是完整物理帧，最终任务状态为 `faulted`。

@@ -405,6 +405,19 @@ function inputSampleFormatBits(format) {
   return Number.isSafeInteger(bits) && bits > 0 ? bits : null;
 }
 
+function faultEvidenceRows(rows) {
+  const isFaultEvidence = (row) => Boolean(
+    row?.faulted || Number(row?.overflow_samples ?? 0) > 0 || row?.fault_marker_exists,
+  );
+  const firstFaultRow = rows.find(isFaultEvidence) ?? null;
+  const firstFaultKindRow = rows.find((row) => (
+    isFaultEvidence(row)
+    && typeof row?.fault_kind === 'string'
+    && row.fault_kind.trim() !== ''
+  )) ?? firstFaultRow;
+  return { firstFaultRow, firstFaultKindRow };
+}
+
 function safeReadJson(filePath) {
   try {
     return JSON.parse(fs.readFileSync(filePath, 'utf8'));
@@ -2125,6 +2138,13 @@ function evaluateFault(report, options, inspection) {
       Number(fault?.seconds_after_trigger) <= 15,
       fault,
     );
+    addCheck(
+      checks,
+      'unplug-fault-kind',
+      '拔出声卡明确报告 device_unavailable',
+      fault?.first_fault_kind_row?.fault_kind === 'device_unavailable',
+      fault?.first_fault_kind_row,
+    );
   } else {
     const latency = fault?.seconds_after_storage_critical;
     addCheck(
@@ -2241,6 +2261,8 @@ async function monitorCapture(client, sessionDirectory, options, telemetryLog, o
       committed_samples: Number(state?.snapshot?.committed_samples ?? meter.committed_samples ?? 0),
       overflow_samples: Number(state?.snapshot?.overflow_samples ?? meter.overflow_samples ?? 0),
       faulted: Boolean(meter.faulted),
+      fault_kind: typeof meter.fault_kind === 'string' ? meter.fault_kind : '',
+      fault_reason: typeof meter.fault_reason === 'string' ? meter.fault_reason : '',
       fault_marker_exists: markerExists,
       storage_status: meter.storage_status ?? null,
       storage_safe_remaining_seconds: meter.storage_safe_remaining_seconds ?? null,
@@ -2319,7 +2341,7 @@ async function monitorCapture(client, sessionDirectory, options, telemetryLog, o
     await sleep(options.pollSeconds * 1_000);
   }
 
-  const firstFault = rows.find((row) => row.faulted || row.overflow_samples > 0 || row.fault_marker_exists) ?? null;
+  const { firstFaultRow, firstFaultKindRow } = faultEvidenceRows(rows);
   return {
     rows,
     started_at: new Date(started).toISOString(),
@@ -2333,7 +2355,12 @@ async function monitorCapture(client, sessionDirectory, options, telemetryLog, o
     first_storage_critical_elapsed_seconds: firstCriticalElapsed,
     seconds_after_storage_critical:
       detectedElapsedSeconds !== null && firstCriticalElapsed !== null ? detectedElapsedSeconds - firstCriticalElapsed : null,
-    first_fault_row: firstFault,
+    // Keep the earliest evidence row for detection timing and timeline
+    // diagnostics. A durable marker may become visible just before the next
+    // telemetry projection carries the stable fault kind, so kind attribution
+    // deliberately uses its own first explicit evidence row.
+    first_fault_row: firstFaultRow,
+    first_fault_kind_row: firstFaultKindRow,
   };
 }
 
@@ -2703,6 +2730,7 @@ async function runCapture(options, runDirectory, report) {
         first_storage_critical_elapsed_seconds: monitor.first_storage_critical_elapsed_seconds,
         seconds_after_storage_critical: monitor.seconds_after_storage_critical,
         first_fault_row: monitor.first_fault_row,
+        first_fault_kind_row: monitor.first_fault_kind_row,
       };
     }
     report.aborted = monitor.aborted;
@@ -2895,6 +2923,7 @@ module.exports = {
   evaluateInventory,
   engineExitWasClean,
   evaluateSealedSession,
+  faultEvidenceRows,
   faultMarkerPresent,
   hostBootIdentity,
   inputSampleFormatBits,

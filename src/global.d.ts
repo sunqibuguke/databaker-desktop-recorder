@@ -2,7 +2,7 @@ export {};
 
 declare module '*.css';
 
-import type { PrompterState, RecordingHistoryEntry } from './types';
+import type { CapturePresetDraft, CapturePresetLoadResult, CapturePresetStore, PrompterState, RecordingHistoryEntry } from './types';
 
 declare global {
   interface Window {
@@ -11,6 +11,10 @@ declare global {
       openScript(): Promise<{ filePath: string; name: string; content: string } | null>;
       chooseOutput(): Promise<string | null>;
       defaultOutput(): Promise<string>;
+      loadCapturePresets(): Promise<CapturePresetLoadResult>;
+      saveCapturePreset(preset: CapturePresetDraft): Promise<CapturePresetStore>;
+      deleteCapturePreset(id: string): Promise<CapturePresetStore>;
+      setLastCapturePreset(id: string | null): Promise<CapturePresetStore>;
       listRecordings(root: string): Promise<RecordingHistoryEntry[]>;
       joinPath(...parts: string[]): Promise<string>;
       readAudio(filePath: string): Promise<ArrayBuffer>;

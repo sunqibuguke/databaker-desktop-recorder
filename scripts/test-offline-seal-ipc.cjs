@@ -45,6 +45,10 @@ let stopGateResolve;
 let stopStartedResolve;
 const stopGate = new Promise((resolve) => { stopGateResolve = resolve; });
 const stopStarted = new Promise((resolve) => { stopStartedResolve = resolve; });
+let sealGateResolve;
+let sealStartedResolve;
+const sealGate = new Promise((resolve) => { sealGateResolve = resolve; });
+const sealStarted = new Promise((resolve) => { sealStartedResolve = resolve; });
 let replaceSessionBeforeRequest = async () => undefined;
 
 class FakeEngineClient extends EventEmitter {
@@ -100,6 +104,10 @@ class FakeEngineClient extends EventEmitter {
     }
     if (command === 'seal_interrupted_session') {
       if (this.mode === 'timeout') throw new FakeTimeoutError(command);
+      if (this.mode === 'success' && scenario === 'success') {
+        sealStartedResolve();
+        await sealGate;
+      }
       const snapshot = {
         ...validSnapshot(path.basename(payload.session_dir)),
         journal_seq: 2,
@@ -146,6 +154,23 @@ class FakeBrowserWindow extends EventEmitter {
   setProgressBar() {}
   close() { this.destroyed = true; this.emit('closed'); }
   destroy() { this.close(); }
+}
+
+class FakeTray extends EventEmitter {
+  static instances = [];
+  constructor() {
+    super();
+    this.destroyed = false;
+    this.menu = null;
+    FakeTray.instances.push(this);
+  }
+  setToolTip() {}
+  setContextMenu(value) { this.menu = value; }
+  destroy() { this.destroyed = true; }
+}
+
+function activeTray() {
+  return FakeTray.instances.findLast((tray) => !tray.destroyed) ?? null;
 }
 
 function validSnapshot(sessionId) {
@@ -219,6 +244,10 @@ async function runScenario() {
       getAppPath: () => process.cwd(),
       setBadgeCount: () => undefined,
     },
+    systemPreferences: {
+      getMediaAccessStatus: () => 'granted',
+      askForMediaAccess: async () => true,
+    },
     BrowserWindow: FakeBrowserWindow,
     dialog: {
       showMessageBox: async () => ({ response: 0 }),
@@ -228,15 +257,11 @@ async function runScenario() {
       handle: (name, listener) => handlers.set(name, listener),
       on: () => undefined,
     },
-    Menu: { buildFromTemplate: () => ({}) },
+    Menu: { buildFromTemplate: (template) => template },
     nativeImage: { createFromDataURL: () => ({ setTemplateImage: () => undefined }) },
     screen: { getPrimaryDisplay: () => ({ id: 1, workArea: {} }), getAllDisplays: () => [] },
     shell: { openPath: async () => '' },
-    Tray: class extends EventEmitter {
-      setToolTip() {}
-      setContextMenu() {}
-      destroy() {}
-    },
+    Tray: FakeTray,
   };
 
   const originalLoad = Module._load;
@@ -275,9 +300,18 @@ async function runScenario() {
     });
 
     if (scenario === 'success') {
-      const result = await invokeSeal();
+      const resultPromise = invokeSeal();
+      await sealStarted;
+      appEvents.get('window-all-closed')();
+      const tray = activeTray();
+      assert.match(tray.menu[0].label, /修复并封存/);
+      assert.doesNotMatch(tray.menu[0].label, /后台录音正在进行/,
+        'offline sealing must never be advertised as capture');
+      sealGateResolve();
+      const result = await resultPromise;
       assert.equal(result.durable_frames, 48000);
       assert.equal(engine.commands.filter(({ command }) => command === 'seal_interrupted_session').length, 1);
+      tray.emit('click');
     } else if (scenario === 'active') {
       await assert.rejects(invokeSeal(), /正在处理另一个任务/);
       assert.equal(engine.commands.some(({ command }) => command === 'seal_interrupted_session'), false);

@@ -4,6 +4,7 @@ type WorkflowItem = Pick<ItemState, 'status'>;
 
 export type IdlePrimaryAction = 'finish' | 'accept' | 'start' | 'retake-only' | 'none';
 export type WorkflowShortcutAction = 'finish' | 'accept' | 'start' | 'retake' | 'none';
+export type CaptureExitAction = 'pause' | 'complete' | 'fault';
 
 export type SafePauseOperations<T> = {
   hasActiveAttempt: boolean;
@@ -20,6 +21,14 @@ export function areAllItemsHandled(items: readonly WorkflowItem[]): boolean {
   return items.length > 0 && items.every((item) => (
     item.status === 'accepted' || item.status === 'skipped'
   ));
+}
+
+export function captureExitAction(
+  items: readonly WorkflowItem[],
+  hasCaptureFault: boolean,
+): CaptureExitAction {
+  if (hasCaptureFault) return 'fault';
+  return areAllItemsHandled(items) ? 'complete' : 'pause';
 }
 
 export function findNextActionableItemIndex(

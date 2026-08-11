@@ -11,6 +11,7 @@ const {
   engineExitWasClean,
   evaluateInventory,
   evaluateSealedSession,
+  faultEvidenceRows,
   faultMarkerPresent,
   hostBootIdentity,
   inputSampleFormatBits,
@@ -238,6 +239,46 @@ function testInputSampleFormatBits() {
   assert.equal(inputSampleFormatBits('u8'), 8);
   assert.equal(inputSampleFormatBits('unknown'), null);
   assert.equal(inputSampleFormatBits(null), null);
+}
+
+function testFaultEvidenceProjectionRace() {
+  const markerBeforeTelemetry = {
+    elapsed_seconds: 10.001,
+    faulted: false,
+    overflow_samples: 0,
+    fault_marker_exists: true,
+    fault_kind: '',
+  };
+  const explicitDeviceFault = {
+    elapsed_seconds: 10.081,
+    faulted: true,
+    overflow_samples: 0,
+    fault_marker_exists: true,
+    fault_kind: 'device_unavailable',
+  };
+  const evidence = faultEvidenceRows([
+    { elapsed_seconds: 9, faulted: false, overflow_samples: 0, fault_marker_exists: false },
+    markerBeforeTelemetry,
+    explicitDeviceFault,
+  ]);
+  assert.equal(
+    evidence.firstFaultRow,
+    markerBeforeTelemetry,
+    'latency evidence must preserve the earliest durable fault observation',
+  );
+  assert.equal(
+    evidence.firstFaultKindRow,
+    explicitDeviceFault,
+    'fault attribution must wait for the first explicit telemetry kind',
+  );
+
+  const unclassified = faultEvidenceRows([markerBeforeTelemetry]);
+  assert.equal(
+    unclassified.firstFaultKindRow,
+    markerBeforeTelemetry,
+    'an unclassified fault still retains its earliest diagnostic row',
+  );
+  assert.deepEqual(faultEvidenceRows([]), { firstFaultRow: null, firstFaultKindRow: null });
 }
 
 function testBootOverrideIsolation() {
@@ -1148,6 +1189,7 @@ function testAbnormalEngineShutdownIntegration(mode, expectedStatus, expectedOve
 
 testArgs();
 testInputSampleFormatBits();
+testFaultEvidenceProjectionRace();
 testBootOverrideIsolation();
 testConfigurations();
 testProgressSummary();

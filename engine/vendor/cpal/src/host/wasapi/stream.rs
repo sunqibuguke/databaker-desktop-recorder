@@ -19,8 +19,8 @@ use windows::Win32::{
 
 use crate::{
     host::{
-        emit_error, equilibrium::fill_equilibrium, frames_to_duration, latch::Latch,
-        try_emit_error, ErrorCallbackArc,
+        com::ComString, emit_error, equilibrium::fill_equilibrium, frames_to_duration,
+        latch::Latch, try_emit_error, ErrorCallbackArc,
     },
     traits::StreamTrait,
     Data, Error, ErrorKind, FrameCount, InputCallbackInfo, InputStreamTimestamp,
@@ -39,37 +39,178 @@ fn get_current_default(flow: Audio::EDataFlow) -> Option<Audio::IMMDevice> {
     super::device::current_default_endpoint(flow)
 }
 
-/// Fires a Windows auto-reset event when the system default audio device changes, allowing
-/// the stream run loop to deliver `ErrorKind::DeviceChanged` to the caller.
-pub(crate) struct DefaultDeviceMonitor {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeviceMonitorEvent {
+    DefaultDeviceChanged,
+    SpecificDeviceUnavailable,
+}
+
+impl DeviceMonitorEvent {
+    fn error(self) -> Error {
+        match self {
+            Self::DefaultDeviceChanged => {
+                Error::with_message(ErrorKind::DeviceChanged, "Default audio device changed")
+            }
+            Self::SpecificDeviceUnavailable => Error::with_message(
+                ErrorKind::DeviceNotAvailable,
+                "Selected audio device is no longer available",
+            ),
+        }
+    }
+
+    fn is_terminal(self) -> bool {
+        self == Self::SpecificDeviceUnavailable
+    }
+}
+
+// `IMMDeviceEnumerator::UnregisterEndpointNotificationCallback` documents
+// E_NOTFOUND as the benign "not registered" result. The SDK does not expose
+// that mmdeviceapi spelling directly, so derive the same HRESULT from
+// ERROR_NOT_FOUND rather than duplicating its numeric representation.
+const ENDPOINT_NOTIFICATION_E_NOTFOUND: windows::core::HRESULT =
+    windows::core::HRESULT::from_win32(Foundation::ERROR_NOT_FOUND.0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NotificationUnregisterOutcome {
+    Unregistered,
+    AlreadyAbsent,
+    IndeterminateFailure,
+}
+
+fn classify_notification_unregister(
+    result: &windows::core::Result<()>,
+) -> NotificationUnregisterOutcome {
+    match result {
+        Ok(()) => NotificationUnregisterOutcome::Unregistered,
+        Err(error) if error.code() == ENDPOINT_NOTIFICATION_E_NOTFOUND => {
+            NotificationUnregisterOutcome::AlreadyAbsent
+        }
+        Err(_) => NotificationUnregisterOutcome::IndeterminateFailure,
+    }
+}
+
+/// Owns the Windows auto-reset event shared by the notification client and the
+/// audio run loop. The final `Arc` closes the HANDLE, so an in-progress COM
+/// callback can never race a close/reuse even if unregistering fails.
+struct NotificationSignal {
+    event: Foundation::HANDLE,
+    pending_after_set_failure: AtomicBool,
+}
+
+// SAFETY: Windows event HANDLEs support concurrent SetEvent/wait operations.
+unsafe impl Send for NotificationSignal {}
+unsafe impl Sync for NotificationSignal {}
+
+impl NotificationSignal {
+    fn new() -> Result<Arc<Self>, Error> {
+        let event =
+            unsafe { Threading::CreateEventW(None, false, false, None) }.map_err(Error::from)?;
+        Ok(Arc::new(Self {
+            event,
+            pending_after_set_failure: AtomicBool::new(false),
+        }))
+    }
+
+    fn notify(&self) {
+        // SAFETY: every callback owns an Arc to this object, so the HANDLE is
+        // live for the complete SetEvent call.
+        unsafe {
+            if Threading::SetEvent(self.event).is_err() {
+                self.pending_after_set_failure
+                    .store(true, Ordering::Release);
+            }
+        }
+    }
+}
+
+impl Drop for NotificationSignal {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = Foundation::CloseHandle(self.event);
+        }
+    }
+}
+
+/// Registration for either a default-device stream or one explicitly bound to
+/// a stable endpoint ID. Notification callbacks only signal an event; the
+/// audio run thread owns this monitor and invokes the user callback.
+pub(crate) struct DeviceMonitor {
     enumerator: Audio::IMMDeviceEnumerator,
     client: Audio::IMMNotificationClient,
-    event: Foundation::HANDLE,
-    pub(crate) pending_device_changed: Arc<AtomicBool>,
+    signal: Arc<NotificationSignal>,
+    event_kind: DeviceMonitorEvent,
 }
 
 // SAFETY: `IMMDeviceEnumerator` and `IMMNotificationClient` are COM objects used only for
-// register/unregister (in new/drop) and `SetEvent` (from the Windows notification thread).
-// All of these are thread-safe operations on Windows.
-unsafe impl Send for DefaultDeviceMonitor {}
-unsafe impl Sync for DefaultDeviceMonitor {}
+// register/unregister. Notification callbacks own their own Arc<NotificationSignal>.
+unsafe impl Send for DeviceMonitor {}
+unsafe impl Sync for DeviceMonitor {}
 
-impl DefaultDeviceMonitor {
-    pub fn new(
+impl DeviceMonitor {
+    pub fn new_default(
         enumerator: Audio::IMMDeviceEnumerator,
         flow: Audio::EDataFlow,
     ) -> Result<Self, Error> {
-        let event =
-            unsafe { Threading::CreateEventW(None, false, false, None).map_err(Error::from)? };
-
-        let pending_device_changed = Arc::new(AtomicBool::new(false));
+        let signal = NotificationSignal::new()?;
         let client: Audio::IMMNotificationClient = DefaultDeviceNotificationImpl {
             flow,
-            event,
-            pending_device_changed: pending_device_changed.clone(),
+            signal: signal.clone(),
         }
         .into();
 
+        Self::register(
+            enumerator,
+            client,
+            signal,
+            DeviceMonitorEvent::DefaultDeviceChanged,
+        )
+    }
+
+    pub fn new_specific(
+        enumerator: Audio::IMMDeviceEnumerator,
+        device: Audio::IMMDevice,
+    ) -> Result<Self, Error> {
+        let endpoint_id = unsafe {
+            let raw = device.GetId().map_err(Error::from)?;
+            let _guard = ComString(raw);
+            raw.to_string().map_err(|error| {
+                Error::with_message(
+                    ErrorKind::BackendError,
+                    format!("Failed to read selected endpoint ID: {error}"),
+                )
+            })?
+        };
+        let signal = NotificationSignal::new()?;
+        let client: Audio::IMMNotificationClient = SpecificDeviceNotificationImpl {
+            endpoint_id,
+            signal: signal.clone(),
+            unavailable_notified: AtomicBool::new(false),
+        }
+        .into();
+
+        let monitor = Self::register(
+            enumerator,
+            client,
+            signal,
+            DeviceMonitorEvent::SpecificDeviceUnavailable,
+        )?;
+
+        // Register first, then inspect current state. A transition before the
+        // registration is visible here; a transition after it is delivered by
+        // IMMNotificationClient, closing the construction race.
+        let state = unsafe { device.GetState().map_err(Error::from)? };
+        if is_endpoint_unavailable_state(state) {
+            monitor.signal.notify();
+        }
+        Ok(monitor)
+    }
+
+    fn register(
+        enumerator: Audio::IMMDeviceEnumerator,
+        client: Audio::IMMNotificationClient,
+        signal: Arc<NotificationSignal>,
+        event_kind: DeviceMonitorEvent,
+    ) -> Result<Self, Error> {
         unsafe {
             enumerator
                 .RegisterEndpointNotificationCallback(&client)
@@ -79,32 +220,50 @@ impl DefaultDeviceMonitor {
         Ok(Self {
             enumerator,
             client,
-            event,
-            pending_device_changed,
+            signal,
+            event_kind,
         })
+    }
+
+    fn event(&self) -> Foundation::HANDLE {
+        self.signal.event
+    }
+
+    fn take_pending_after_set_failure(&self) -> bool {
+        self.signal
+            .pending_after_set_failure
+            .swap(false, Ordering::AcqRel)
     }
 }
 
-impl Drop for DefaultDeviceMonitor {
+impl Drop for DeviceMonitor {
     fn drop(&mut self) {
         // Ensure COM is initialised on this thread before making COM calls. Drop can run on
         // any thread (e.g. the audio run thread), which may not have called CoInitialize.
         crate::host::com::com_initialized();
-        unsafe {
-            // Synchronous: waits for any in-progress IMMNotificationClient callback to finish
-            // before returning. Notification callbacks must not invoke the user error callback:
-            // if the user dropped the Stream in response, this call would deadlock waiting for
-            // the in-progress callback. Instead, callbacks set `pending_device_changed` and
-            // the audio thread delivers the error on its next iteration.
-            //
-            // Only close the event handle on success; if unregister fails the callback may
-            // still hold a reference and could later call SetEvent on a closed/reused handle.
-            if self
-                .enumerator
+        let unregister_result = unsafe {
+            // Synchronous on success: waits for in-progress callbacks. Those
+            // callbacks do not invoke user code, avoiding a drop-from-callback
+            // deadlock.
+            self.enumerator
                 .UnregisterEndpointNotificationCallback(&self.client)
-                .is_ok()
-            {
-                let _ = Foundation::CloseHandle(self.event);
+        };
+        if classify_notification_unregister(&unregister_result)
+            == NotificationUnregisterOutcome::IndeterminateFailure
+        {
+            // Microsoft explicitly documents that Register/Unregister do not
+            // AddRef/Release the application-owned callback. A non-E_NOTFOUND
+            // failure therefore leaves registration state unknown: dropping
+            // our final COM reference could let Windows call a freed object.
+            // Leak one strong COM reference deliberately. The callback owns an
+            // Arc<NotificationSignal>, so this also keeps its event HANDLE
+            // valid for every possible late notification.
+            let retained_client = self.client.clone();
+            mem::forget(retained_client);
+            if let Err(error) = unregister_result {
+                eprintln!(
+                    "failed to unregister WASAPI endpoint notification callback; retaining callback for process lifetime: {error}"
+                );
             }
         }
     }
@@ -113,8 +272,7 @@ impl Drop for DefaultDeviceMonitor {
 #[windows::core::implement(Audio::IMMNotificationClient)]
 struct DefaultDeviceNotificationImpl {
     flow: Audio::EDataFlow,
-    event: Foundation::HANDLE,
-    pending_device_changed: Arc<AtomicBool>,
+    signal: Arc<NotificationSignal>,
 }
 
 impl Audio::IMMNotificationClient_Impl for DefaultDeviceNotificationImpl_Impl {
@@ -125,13 +283,7 @@ impl Audio::IMMNotificationClient_Impl for DefaultDeviceNotificationImpl_Impl {
         _pwstrdefaultdeviceid: &windows::core::PCWSTR,
     ) -> windows::core::Result<()> {
         if flow == self.flow && role == Audio::eConsole {
-            // SAFETY: event handle is valid for the lifetime of DefaultDeviceMonitor, which
-            // outlives all uses of this HANDLE copy.
-            unsafe {
-                if Threading::SetEvent(self.event).is_err() {
-                    self.pending_device_changed.store(true, Ordering::Relaxed);
-                }
-            }
+            self.signal.notify();
         }
         Ok(())
     }
@@ -152,12 +304,7 @@ impl Audio::IMMNotificationClient_Impl for DefaultDeviceNotificationImpl_Impl {
             || dwnewstate == Audio::DEVICE_STATE_NOTPRESENT
             || dwnewstate == Audio::DEVICE_STATE_UNPLUGGED;
         if is_unavailable && get_current_default(self.flow).is_none() {
-            // SAFETY: event handle is valid for the lifetime of DefaultDeviceMonitor.
-            unsafe {
-                if Threading::SetEvent(self.event).is_err() {
-                    self.pending_device_changed.store(true, Ordering::Relaxed);
-                }
-            }
+            self.signal.notify();
         }
         Ok(())
     }
@@ -170,13 +317,102 @@ impl Audio::IMMNotificationClient_Impl for DefaultDeviceNotificationImpl_Impl {
         // Only signal when there is no replacement default; if one exists `OnDefaultDeviceChanged`
         // will fire instead, avoiding a double wakeup.
         if get_current_default(self.flow).is_none() {
-            // SAFETY: event handle is valid for the lifetime of DefaultDeviceMonitor.
-            unsafe {
-                if Threading::SetEvent(self.event).is_err() {
-                    self.pending_device_changed.store(true, Ordering::Relaxed);
-                }
-            }
+            self.signal.notify();
         }
+        Ok(())
+    }
+
+    fn OnPropertyValueChanged(
+        &self,
+        _pwstrdeviceid: &windows::core::PCWSTR,
+        _key: &PROPERTYKEY,
+    ) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpecificEndpointNotification {
+    StateChanged(Audio::DEVICE_STATE),
+    Removed,
+}
+
+fn is_endpoint_unavailable_state(state: Audio::DEVICE_STATE) -> bool {
+    state == Audio::DEVICE_STATE_DISABLED
+        || state == Audio::DEVICE_STATE_NOTPRESENT
+        || state == Audio::DEVICE_STATE_UNPLUGGED
+}
+
+fn specific_endpoint_became_unavailable(
+    selected_endpoint_id: &str,
+    notified_endpoint_id: &str,
+    notification: SpecificEndpointNotification,
+) -> bool {
+    if !selected_endpoint_id.eq_ignore_ascii_case(notified_endpoint_id) {
+        return false;
+    }
+    match notification {
+        SpecificEndpointNotification::StateChanged(state) => is_endpoint_unavailable_state(state),
+        SpecificEndpointNotification::Removed => true,
+    }
+}
+
+#[windows::core::implement(Audio::IMMNotificationClient)]
+struct SpecificDeviceNotificationImpl {
+    endpoint_id: String,
+    signal: Arc<NotificationSignal>,
+    unavailable_notified: AtomicBool,
+}
+
+impl SpecificDeviceNotificationImpl {
+    fn notify_if_unavailable(
+        &self,
+        notified_endpoint_id: &windows::core::PCWSTR,
+        notification: SpecificEndpointNotification,
+    ) {
+        let Ok(notified_endpoint_id) = (unsafe { notified_endpoint_id.to_string() }) else {
+            return;
+        };
+        if specific_endpoint_became_unavailable(
+            &self.endpoint_id,
+            &notified_endpoint_id,
+            notification,
+        ) && !self.unavailable_notified.swap(true, Ordering::AcqRel)
+        {
+            self.signal.notify();
+        }
+    }
+}
+
+impl Audio::IMMNotificationClient_Impl for SpecificDeviceNotificationImpl_Impl {
+    fn OnDefaultDeviceChanged(
+        &self,
+        _flow: Audio::EDataFlow,
+        _role: Audio::ERole,
+        _pwstrdefaultdeviceid: &windows::core::PCWSTR,
+    ) -> windows::core::Result<()> {
+        // A stream explicitly bound to an endpoint never follows the default.
+        Ok(())
+    }
+
+    fn OnDeviceStateChanged(
+        &self,
+        pwstrdeviceid: &windows::core::PCWSTR,
+        dwnewstate: Audio::DEVICE_STATE,
+    ) -> windows::core::Result<()> {
+        self.notify_if_unavailable(
+            pwstrdeviceid,
+            SpecificEndpointNotification::StateChanged(dwnewstate),
+        );
+        Ok(())
+    }
+
+    fn OnDeviceAdded(&self, _pwstrdeviceid: &windows::core::PCWSTR) -> windows::core::Result<()> {
+        Ok(())
+    }
+
+    fn OnDeviceRemoved(&self, pwstrdeviceid: &windows::core::PCWSTR) -> windows::core::Result<()> {
+        self.notify_if_unavailable(pwstrdeviceid, SpecificEndpointNotification::Removed);
         Ok(())
     }
 
@@ -210,11 +446,6 @@ pub struct Stream {
 
     // QueryPerformanceFrequency result, cached at construction (constant for the system lifetime).
     qpc_frequency: u64,
-
-    // Present for default-device streams; fires `ErrorKind::DeviceChanged` when the system
-    // default changes. Dropped after the run thread joins, ensuring the HANDLE is not
-    // waited on when it is closed.
-    _default_device_monitor: Option<DefaultDeviceMonitor>,
 
     // Latch that ensures no callbacks fire before the caller receives the `Stream` handle.
     latch: Latch,
@@ -253,9 +484,9 @@ struct RunContext {
 
     commands: Receiver<Command>,
 
-    // Set by a device-change notification callback when SetEvent fails. The audio loop delivers
-    // DeviceChanged on its next iteration.
-    pending_device_changed: Option<Arc<AtomicBool>>,
+    // Owned by the run loop so dropping a Stream from its own error callback
+    // cannot close a notification HANDLE that this thread may still inspect.
+    device_monitor: Option<DeviceMonitor>,
 
     // Owned here so the worker thread closes it on exit in a self-join case.
     pending_scheduled_event: Foundation::HANDLE,
@@ -314,7 +545,7 @@ impl Stream {
         stream_inner: StreamInner,
         mut data_callback: D,
         error_callback: ErrorCallbackArc,
-        default_device_monitor: Option<DefaultDeviceMonitor>,
+        device_monitor: Option<DeviceMonitor>,
     ) -> Result<Stream, Error>
     where
         D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
@@ -334,18 +565,15 @@ impl Stream {
         }
 
         let mut handles = vec![pending_scheduled_event, stream_inner.event];
-        if let Some(ref monitor) = default_device_monitor {
-            handles.push(monitor.event);
+        if let Some(ref monitor) = device_monitor {
+            handles.push(monitor.event());
         }
 
-        let pending_device_changed = default_device_monitor
-            .as_ref()
-            .map(|m| m.pending_device_changed.clone());
         let run_context = RunContext {
             handles,
             stream: stream_inner,
             commands: rx,
-            pending_device_changed,
+            device_monitor,
             pending_scheduled_event,
         };
 
@@ -374,7 +602,6 @@ impl Stream {
             pending_scheduled_event,
             period_frames,
             qpc_frequency: qpc_frequency as u64,
-            _default_device_monitor: default_device_monitor,
             latch,
         };
         Ok(stream)
@@ -384,7 +611,7 @@ impl Stream {
         stream_inner: StreamInner,
         mut data_callback: D,
         error_callback: ErrorCallbackArc,
-        default_device_monitor: Option<DefaultDeviceMonitor>,
+        device_monitor: Option<DeviceMonitor>,
     ) -> Result<Stream, Error>
     where
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
@@ -404,18 +631,15 @@ impl Stream {
         }
 
         let mut handles = vec![pending_scheduled_event, stream_inner.event];
-        if let Some(ref monitor) = default_device_monitor {
-            handles.push(monitor.event);
+        if let Some(ref monitor) = device_monitor {
+            handles.push(monitor.event());
         }
 
-        let pending_device_changed = default_device_monitor
-            .as_ref()
-            .map(|m| m.pending_device_changed.clone());
         let run_context = RunContext {
             handles,
             stream: stream_inner,
             commands: rx,
-            pending_device_changed,
+            device_monitor,
             pending_scheduled_event,
         };
 
@@ -444,7 +668,6 @@ impl Stream {
             pending_scheduled_event,
             period_frames,
             qpc_frequency: qpc_frequency as u64,
-            _default_device_monitor: default_device_monitor,
             latch,
         };
         Ok(stream)
@@ -725,12 +948,13 @@ fn process_commands_and_await_signal(
         }
     };
 
-    if let Some(ref flag) = run_context.pending_device_changed {
-        if flag.swap(false, Ordering::Relaxed) {
-            emit_error(
-                error_callback,
-                Error::with_message(ErrorKind::DeviceChanged, "Default audio device changed"),
-            );
+    if let Some(ref monitor) = run_context.device_monitor {
+        if monitor.take_pending_after_set_failure() {
+            let event = monitor.event_kind;
+            emit_error(error_callback, event.error());
+            if event.is_terminal() {
+                return ControlFlow::Break(());
+            }
         }
     }
 
@@ -744,14 +968,19 @@ fn process_commands_and_await_signal(
     };
 
     // Handle layout: 0 = pending_scheduled_event (commands), 1 = WASAPI audio event,
-    // 2+ = default-device change event (only present for default-device streams).
+    // 2+ = endpoint-monitor event (at most one per stream).
     // Continue(true)  = audio event fired, proceed to process audio this iteration.
     // Continue(false) = command or device-change event, loop around and wait again.
     if handle_idx >= 2 {
-        emit_error(
-            error_callback,
-            Error::with_message(ErrorKind::DeviceChanged, "Default audio device changed"),
-        );
+        let event = run_context
+            .device_monitor
+            .as_ref()
+            .expect("notification handle without its device monitor")
+            .event_kind;
+        emit_error(error_callback, event.error());
+        if event.is_terminal() {
+            return ControlFlow::Break(());
+        }
         return ControlFlow::Continue(false);
     }
     ControlFlow::Continue(handle_idx != 0)
@@ -950,6 +1179,92 @@ fn output_timestamp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SELECTED_ENDPOINT: &str = "{0.0.1.00000000}.{ABCDEF01-2345-6789-ABCD-EF0123456789}";
+
+    #[test]
+    fn specific_endpoint_unavailable_states_match_only_the_selected_id() {
+        for state in [
+            Audio::DEVICE_STATE_DISABLED,
+            Audio::DEVICE_STATE_NOTPRESENT,
+            Audio::DEVICE_STATE_UNPLUGGED,
+        ] {
+            assert!(specific_endpoint_became_unavailable(
+                SELECTED_ENDPOINT,
+                SELECTED_ENDPOINT,
+                SpecificEndpointNotification::StateChanged(state),
+            ));
+            assert!(specific_endpoint_became_unavailable(
+                SELECTED_ENDPOINT,
+                &SELECTED_ENDPOINT.to_ascii_lowercase(),
+                SpecificEndpointNotification::StateChanged(state),
+            ));
+        }
+
+        assert!(!specific_endpoint_became_unavailable(
+            SELECTED_ENDPOINT,
+            "{0.0.1.00000000}.{00000000-0000-0000-0000-000000000000}",
+            SpecificEndpointNotification::StateChanged(Audio::DEVICE_STATE_UNPLUGGED),
+        ));
+        assert!(!specific_endpoint_became_unavailable(
+            SELECTED_ENDPOINT,
+            SELECTED_ENDPOINT,
+            SpecificEndpointNotification::StateChanged(Audio::DEVICE_STATE_ACTIVE),
+        ));
+    }
+
+    #[test]
+    fn specific_endpoint_removed_matches_only_the_selected_id() {
+        assert!(specific_endpoint_became_unavailable(
+            SELECTED_ENDPOINT,
+            SELECTED_ENDPOINT,
+            SpecificEndpointNotification::Removed,
+        ));
+        assert!(!specific_endpoint_became_unavailable(
+            SELECTED_ENDPOINT,
+            "another-endpoint",
+            SpecificEndpointNotification::Removed,
+        ));
+    }
+
+    #[test]
+    fn specific_device_loss_is_terminal_but_default_change_is_not() {
+        assert!(DeviceMonitorEvent::SpecificDeviceUnavailable.is_terminal());
+        assert!(!DeviceMonitorEvent::DefaultDeviceChanged.is_terminal());
+        assert_eq!(
+            DeviceMonitorEvent::SpecificDeviceUnavailable.error().kind(),
+            ErrorKind::DeviceNotAvailable,
+        );
+        assert_eq!(
+            DeviceMonitorEvent::DefaultDeviceChanged.error().kind(),
+            ErrorKind::DeviceChanged,
+        );
+    }
+
+    #[test]
+    fn notification_unregister_result_releases_only_known_safe_outcomes() {
+        let success = Ok(());
+        assert_eq!(
+            classify_notification_unregister(&success),
+            NotificationUnregisterOutcome::Unregistered,
+        );
+
+        let already_absent = Err(windows::core::Error::from_hresult(
+            ENDPOINT_NOTIFICATION_E_NOTFOUND,
+        ));
+        assert_eq!(
+            classify_notification_unregister(&already_absent),
+            NotificationUnregisterOutcome::AlreadyAbsent,
+        );
+
+        let unknown_failure = Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+            0x8000_4005_u32 as i32,
+        )));
+        assert_eq!(
+            classify_notification_unregister(&unknown_failure),
+            NotificationUnregisterOutcome::IndeterminateFailure,
+        );
+    }
 
     #[test]
     fn silent_capture_buffer_is_aligned_and_uses_sample_equilibrium() {

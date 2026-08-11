@@ -4,18 +4,71 @@ const { pathToFileURL } = require('node:url');
 
 async function main() {
   const modulePath = path.join(__dirname, '..', 'src', 'recording-workflow.ts');
+  const inputQualityModulePath = path.join(__dirname, '..', 'src', 'input-quality.ts');
+  const captureConfigurationModulePath = path.join(__dirname, '..', 'src', 'capture-configuration.ts');
   const {
     areAllItemsHandled,
+    captureExitAction,
     executeSafePause,
     findNextActionableItemIndex,
     idlePrimaryAction,
     isFinalReview,
     workflowShortcutAction,
   } = await import(pathToFileURL(modulePath).href);
+  const {
+    DIGITAL_SILENCE_WARNING,
+    inputQualityWarning,
+    shouldHandleLiveMeter,
+  } = await import(pathToFileURL(inputQualityModulePath).href);
+  const {
+    captureFormatsSupportBitDepth,
+    inputSampleFormatRepresentationBits,
+    minimumInputRepresentationBits,
+  } = await import(pathToFileURL(captureConfigurationModulePath).href);
 
   const item = (status) => ({ status });
 
+  assert.equal(
+    inputQualityWarning(true, false, true),
+    DIGITAL_SILENCE_WARNING,
+    'a live exact-digital-silence run must produce the explicit operator warning',
+  );
+  assert.equal(
+    inputQualityWarning(true, true, true),
+    '',
+    'a capture fault must take visual priority over the non-terminal input-quality warning',
+  );
+  assert.equal(
+    inputQualityWarning(false, false, true),
+    '',
+    'a stopped task must not retain a late input-quality warning',
+  );
+  assert.equal(shouldHandleLiveMeter('running'), true);
+  assert.equal(shouldHandleLiveMeter('home'), false);
+  assert.equal(shouldHandleLiveMeter('setup'), false);
+
+  assert.equal(minimumInputRepresentationBits(16), 16);
+  assert.equal(minimumInputRepresentationBits(24), 24);
+  assert.equal(minimumInputRepresentationBits(32), 24);
+  assert.equal(inputSampleFormatRepresentationBits('F32'), 24);
+  assert.equal(captureFormatsSupportBitDepth(['I16'], 16), true);
+  assert.equal(
+    captureFormatsSupportBitDepth(['I16'], 24),
+    false,
+    'an I16-only input must not be presented as valid for 24-bit delivery',
+  );
+  assert.equal(
+    captureFormatsSupportBitDepth(['I16'], 32),
+    false,
+    'an I16-only input must not enable 32-bit delivery',
+  );
+  assert.equal(captureFormatsSupportBitDepth(['I16', 'I24'], 24), true);
+  assert.equal(captureFormatsSupportBitDepth(['F32'], 32), true);
+
   const threeComplete = [item('accepted'), item('skipped'), item('accepted')];
+  assert.equal(captureExitAction(threeComplete, false), 'complete');
+  assert.equal(captureExitAction([item('accepted'), item('pending')], false), 'pause');
+  assert.equal(captureExitAction(threeComplete, true), 'fault');
   assert.equal(areAllItemsHandled(threeComplete), true, 'three handled rows must enter the terminal state');
   assert.equal(idlePrimaryAction(threeComplete, 2), 'finish', 'the last handled row must offer finish, not another take');
   assert.equal(

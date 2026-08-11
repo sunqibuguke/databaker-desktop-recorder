@@ -82,6 +82,17 @@ const CAPTURE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 // internal endpoint failure without invoking CPAL's error callback. Fail closed
 // before such a silent stall can be mistaken for valid room silence.
 const CAPTURE_CALLBACK_STALL_TIMEOUT: Duration = Duration::from_secs(5);
+// Exact digital equilibrium is materially different from ordinary room
+// silence. A muted interface, wrong input channel, or DSP gate can keep the
+// callback healthy while delivering only zero-valued PCM. Keep recording and
+// writing that valid timeline, but surface a strong operator warning after a
+// sustained run so it cannot be mistaken for a healthy microphone signal.
+const DIGITAL_SILENCE_WARNING_SECONDS: u64 = 10;
+const CAPTURE_FAULT_NONE: u32 = 0;
+const CAPTURE_FAULT_DEVICE_UNAVAILABLE: u32 = 1;
+const CAPTURE_FAULT_DEVICE_STALLED: u32 = 2;
+const CAPTURE_FAULT_INPUT_DISCONTINUITY: u32 = 3;
+const CAPTURE_FAULT_INPUT_STREAM_ERROR: u32 = 4;
 // Electron gives normal engine commands 20 seconds. Return control to the
 // protocol loop before that deadline so a slow preview worker can never block
 // a subsequent safe-stop request until the 90-second process kill budget.
@@ -554,6 +565,7 @@ fn append_waveform_packet(
 #[derive(Clone)]
 struct SilenceMonitor {
     silence_samples: Arc<AtomicU64>,
+    digital_silence_samples: Arc<AtomicU64>,
     last_signal_sample: Arc<AtomicU64>,
     attempt_signal_start_sample: Arc<AtomicU64>,
     analyzed_samples: Arc<AtomicU64>,
@@ -638,6 +650,48 @@ impl CaptureHeartbeatWatchdog {
         }
         self.triggered = true;
         true
+    }
+}
+
+fn input_stream_fault_code(error: &cpal::Error) -> u32 {
+    match error.kind() {
+        cpal::ErrorKind::DeviceNotAvailable => CAPTURE_FAULT_DEVICE_UNAVAILABLE,
+        cpal::ErrorKind::Xrun => CAPTURE_FAULT_INPUT_DISCONTINUITY,
+        _ => CAPTURE_FAULT_INPUT_STREAM_ERROR,
+    }
+}
+
+fn latch_capture_fault_code(capture_fault_code: &AtomicU32, code: u32) {
+    if code == CAPTURE_FAULT_NONE {
+        return;
+    }
+    let _ = capture_fault_code.compare_exchange(
+        CAPTURE_FAULT_NONE,
+        code,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
+fn capture_fault_telemetry(code: u32) -> (&'static str, &'static str) {
+    match code {
+        CAPTURE_FAULT_DEVICE_UNAVAILABLE => (
+            "device_unavailable",
+            "所选音频输入设备已断开或不再可用。录音已停止，已落盘母轨已保留；请检查声卡供电、USB 连接和 Windows 驱动状态。",
+        ),
+        CAPTURE_FAULT_DEVICE_STALLED => (
+            "device_stalled",
+            "声卡连续 5 秒未输送音频数据，可能已断开或驱动停滞。录音已停止，已落盘母轨已保留。",
+        ),
+        CAPTURE_FAULT_INPUT_DISCONTINUITY => (
+            "input_discontinuity",
+            "驱动报告音频输入数据不连续。录音已停止以避免静默交付损坏音频；请检查声卡、USB 连接和系统负载。",
+        ),
+        CAPTURE_FAULT_INPUT_STREAM_ERROR => (
+            "input_stream_error",
+            "音频输入流发生故障。录音已停止，已落盘母轨已保留；请检查声卡、驱动和系统音频设置。",
+        ),
+        _ => ("", ""),
     }
 }
 
@@ -784,6 +838,150 @@ fn wait_for_thread_until(handle: &JoinHandle<()>, deadline: Instant) -> bool {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+enum DropReaperProgress {
+    Joined,
+    Pending,
+    Failed,
+}
+
+/// Owns a pre-created worker that is allowed to block while destroying one
+/// potentially hostile backend resource. `retire` never drops the resource on
+/// its caller: if the worker channel has failed, the resource is deliberately
+/// leaked and the reaper is latched failed so the session remains locked.
+struct DropReaper<T: Send + 'static> {
+    sender: Option<Sender<T>>,
+    join: Option<JoinHandle<()>>,
+    failed: bool,
+}
+
+impl<T: Send + 'static> DropReaper<T> {
+    fn spawn(thread_name: &str) -> std::io::Result<Self> {
+        let (sender, receiver) = unbounded::<T>();
+        let join = thread::Builder::new()
+            .name(thread_name.to_string())
+            .spawn(move || {
+                for resource in receiver {
+                    drop(resource);
+                }
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            join: Some(join),
+            failed: false,
+        })
+    }
+
+    /// Transfers the resource to the worker and closes its single-use input.
+    /// A disconnected worker returns ownership from `send`; forgetting that
+    /// value is intentional because dropping it here would reintroduce the
+    /// unbounded backend wait this type exists to contain.
+    fn retire(&mut self, resource: T) -> bool {
+        let Some(sender) = self.sender.take() else {
+            self.failed = true;
+            std::mem::forget(resource);
+            return false;
+        };
+        match sender.send(resource) {
+            Ok(()) => true,
+            Err(error) => {
+                self.failed = true;
+                std::mem::forget(error.0);
+                false
+            }
+        }
+    }
+
+    fn close_input(&mut self) {
+        self.sender.take();
+    }
+
+    fn finish_until(&mut self, deadline: Instant) -> DropReaperProgress {
+        // An activation that failed before constructing a stream still needs
+        // to close the pre-created worker and join it within the same deadline.
+        self.sender.take();
+        let Some(join) = self.join.as_ref() else {
+            return if self.failed {
+                DropReaperProgress::Failed
+            } else {
+                DropReaperProgress::Joined
+            };
+        };
+        if !wait_for_thread_until(join, deadline) {
+            return DropReaperProgress::Pending;
+        }
+        let join = self
+            .join
+            .take()
+            .expect("finished drop reaper handle disappeared");
+        if join.join().is_err() {
+            self.failed = true;
+        }
+        if self.failed {
+            DropReaperProgress::Failed
+        } else {
+            DropReaperProgress::Joined
+        }
+    }
+}
+
+struct StreamShutdownResource {
+    stream: Option<Stream>,
+    warning: Sender<String>,
+}
+
+impl Drop for StreamShutdownResource {
+    fn drop(&mut self) {
+        let Some(stream) = self.stream.take() else {
+            return;
+        };
+        if let Err(error) = stream.pause() {
+            let _ = self
+                .warning
+                .send(format!("pause input stream while stopping: {error}"));
+        }
+        // CPAL may synchronously join a wedged backend worker here. This Drop
+        // only ever runs on the pre-created reaper thread.
+        drop(stream);
+    }
+}
+
+struct StreamReaper {
+    resources: DropReaper<StreamShutdownResource>,
+    warning_tx: Sender<String>,
+    warning_rx: Receiver<String>,
+}
+
+impl StreamReaper {
+    fn spawn(thread_name: &str) -> std::io::Result<Self> {
+        let (warning_tx, warning_rx) = unbounded();
+        Ok(Self {
+            resources: DropReaper::spawn(thread_name)?,
+            warning_tx,
+            warning_rx,
+        })
+    }
+
+    fn retire(&mut self, stream: Stream) -> bool {
+        self.resources.retire(StreamShutdownResource {
+            stream: Some(stream),
+            warning: self.warning_tx.clone(),
+        })
+    }
+
+    fn close_input(&mut self) {
+        self.resources.close_input();
+    }
+
+    fn finish_until(&mut self, deadline: Instant) -> DropReaperProgress {
+        self.resources.finish_until(deadline)
+    }
+
+    fn drain_warnings(&self, warnings: &mut Vec<String>) {
+        warnings.extend(self.warning_rx.try_iter());
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
 struct CaptureBlockError {
     reason: String,
     dropped_frames: u64,
@@ -793,6 +991,39 @@ fn saturating_atomic_add(counter: &AtomicU64, value: u64) {
     let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         Some(current.saturating_add(value))
     });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DigitalSilenceBlock {
+    all_equilibrium: bool,
+    trailing_samples: u64,
+}
+
+fn analyze_digital_silence_block(samples: &[f32]) -> DigitalSilenceBlock {
+    let trailing_samples = samples
+        .iter()
+        .rev()
+        .take_while(|sample| **sample == 0.0)
+        .count();
+    DigitalSilenceBlock {
+        all_equilibrium: trailing_samples == samples.len(),
+        trailing_samples: u64::try_from(trailing_samples).unwrap_or(u64::MAX),
+    }
+}
+
+fn apply_digital_silence_block(previous: u64, block: DigitalSilenceBlock) -> u64 {
+    if block.all_equilibrium {
+        previous.saturating_add(block.trailing_samples)
+    } else {
+        // A non-zero sample clears the prior run immediately. If the same
+        // callback ends with exact zero, retain only that new trailing run.
+        block.trailing_samples
+    }
+}
+
+fn digital_silence_suspected(samples: u64, sample_rate: u32) -> bool {
+    sample_rate != 0
+        && samples >= u64::from(sample_rate).saturating_mul(DIGITAL_SILENCE_WARNING_SECONDS)
 }
 
 fn reserve_counter_range(counter: &AtomicU64, amount: u64) -> Option<(u64, u64)> {
@@ -978,10 +1209,11 @@ impl AudioWriterBackend {
 }
 
 pub struct RecordingSession {
-    _session_lock: SessionLock,
+    _session_lock: Option<SessionLock>,
     session_dir: PathBuf,
     snapshot: SessionSnapshot,
     stream: Option<Stream>,
+    stream_reaper: StreamReaper,
     writer_tx: Sender<WriterMessage>,
     writer_queue: WriterQueueBudget,
     writer_join: Option<JoinHandle<()>>,
@@ -997,6 +1229,7 @@ pub struct RecordingSession {
     peak: Arc<AtomicU32>,
     rms: Arc<AtomicU32>,
     silence_samples: Arc<AtomicU64>,
+    digital_silence_samples: Arc<AtomicU64>,
     last_signal_sample: Arc<AtomicU64>,
     attempt_signal_start_sample: Arc<AtomicU64>,
     analyzed_samples: Arc<AtomicU64>,
@@ -1010,6 +1243,70 @@ pub struct RecordingSession {
     /// sending a second Stop message or detaching its JoinHandle.
     stop_requested: bool,
     capture_stopped: bool,
+}
+
+/// Performs the non-blocking part of an unexpected live-session teardown.
+///
+/// The normal stop path owns the bounded waits and durable writer finalization.
+/// This helper exists for unwinding or an otherwise unexpected `Engine` drop,
+/// where blocking in a hostile backend destructor would be worse than leaking
+/// process-scoped resources. Close callback admission before transferring the
+/// backend resource, and retain the directory lease before any fallible cleanup
+/// so another recorder cannot open the same task while detached workers live.
+fn fail_closed_abnormal_capture_drop<T, L>(
+    capture_stopped: bool,
+    callback_gate: &WriterQueueBudget,
+    faulted: &AtomicBool,
+    resource: &mut Option<T>,
+    retire_resource: impl FnOnce(T) -> bool,
+    session_lock: &mut Option<L>,
+    retain_lock: impl FnOnce(L),
+) -> bool {
+    if capture_stopped {
+        return false;
+    }
+
+    callback_gate.close();
+    faulted.store(true, Ordering::Release);
+    if let Some(lock) = session_lock.take() {
+        retain_lock(lock);
+    }
+
+    let Some(resource) = resource.take() else {
+        return false;
+    };
+    let _ = retire_resource(resource);
+    true
+}
+
+impl Drop for RecordingSession {
+    fn drop(&mut self) {
+        if self.capture_stopped {
+            return;
+        }
+
+        // Do not let detached supervisors manufacture a normal-looking status
+        // after this owner has disappeared. JoinHandle drops below only detach;
+        // neither store can block the caller or protocol thread.
+        self.capture_watchdog_armed.store(false, Ordering::Release);
+        self.telemetry_stop.store(true, Ordering::Release);
+
+        let stream_reaper = &mut self.stream_reaper;
+        let retired_stream = fail_closed_abnormal_capture_drop(
+            self.capture_stopped,
+            &self.writer_queue,
+            &self.faulted,
+            &mut self.stream,
+            |stream| stream_reaper.retire(stream),
+            &mut self._session_lock,
+            std::mem::forget,
+        );
+        if !retired_stream {
+            // A pre-created reaper with no stream must still be allowed to exit.
+            // Dropping its JoinHandle later detaches rather than joins it.
+            self.stream_reaper.close_input();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1522,6 +1819,7 @@ impl Engine {
         let committed = Arc::new(AtomicU64::new(expected_existing_frames));
         let overflow = Arc::new(AtomicU64::new(snapshot.overflow_samples));
         let faulted = Arc::new(AtomicBool::new(false));
+        let capture_fault_code = Arc::new(AtomicU32::new(CAPTURE_FAULT_NONE));
         let storage_status = Arc::new(AtomicU32::new(match storage_report.status {
             StorageStatus::Healthy => 0,
             StorageStatus::Warning => 1,
@@ -1532,6 +1830,7 @@ impl Engine {
         let peak_bits = Arc::new(AtomicU32::new(0f32.to_bits()));
         let rms_bits = Arc::new(AtomicU32::new(0f32.to_bits()));
         let silence_samples = Arc::new(AtomicU64::new(0));
+        let digital_silence_samples = Arc::new(AtomicU64::new(0));
         let last_signal_sample = Arc::new(AtomicU64::new(0));
         let attempt_signal_start_sample = Arc::new(AtomicU64::new(0));
         // Existing audio was completely classified by its previous capture
@@ -1552,6 +1851,13 @@ impl Engine {
         let telemetry_stop = Arc::new(AtomicBool::new(false));
         let capture_watchdog_armed = Arc::new(AtomicBool::new(false));
         let capture_heartbeat = Arc::new(AtomicU64::new(0));
+
+        // Create the shutdown worker before the CPAL stream exists. A WASAPI
+        // driver can wedge while `Stream::drop` joins its worker/COM teardown;
+        // safe-stop must always have a pre-existing thread to contain that
+        // wait instead of trying to spawn one on the failure path.
+        let stream_reaper = StreamReaper::spawn("audio-stream-reaper")
+            .context("create audio stream shutdown worker")?;
 
         let writer_captured = Arc::clone(&captured);
         let writer_committed = Arc::clone(&committed);
@@ -1593,10 +1899,11 @@ impl Engine {
         // handshake. A slow or wedged WAV open must never make this command
         // release the lock while an unjoined writer still holds the audio.
         let mut session = RecordingSession {
-            _session_lock: session_lock,
+            _session_lock: Some(session_lock),
             session_dir,
             snapshot,
             stream: None,
+            stream_reaper,
             writer_tx,
             writer_queue,
             writer_join: Some(writer_join),
@@ -1612,6 +1919,7 @@ impl Engine {
             peak: peak_bits,
             rms: rms_bits,
             silence_samples,
+            digital_silence_samples,
             last_signal_sample,
             attempt_signal_start_sample,
             analyzed_samples,
@@ -1666,12 +1974,14 @@ impl Engine {
                 Arc::clone(&session.captured),
                 Arc::clone(&session.overflow),
                 Arc::clone(&session.faulted),
+                Arc::clone(&capture_fault_code),
                 Arc::clone(&session.peak),
                 Arc::clone(&session.rms),
                 session.writer_queue.clone(),
                 waveform_tx,
                 SilenceMonitor {
                     silence_samples: Arc::clone(&session.silence_samples),
+                    digital_silence_samples: Arc::clone(&session.digital_silence_samples),
                     last_signal_sample: Arc::clone(&session.last_signal_sample),
                     attempt_signal_start_sample: Arc::clone(&session.attempt_signal_start_sample),
                     analyzed_samples: Arc::clone(&session.analyzed_samples),
@@ -1701,6 +2011,7 @@ impl Engine {
         let capture_watchdog_armed_thread = Arc::clone(&session.capture_watchdog_armed);
         let capture_heartbeat_thread = Arc::clone(&session.capture_heartbeat);
         let watchdog_faulted = Arc::clone(&session.faulted);
+        let watchdog_capture_fault_code = Arc::clone(&capture_fault_code);
         let watchdog_committed = Arc::clone(&session.committed);
         let watchdog_session_dir = session.session_dir.clone();
         let watchdog_writer = session.writer_tx.clone();
@@ -1718,6 +2029,10 @@ impl Engine {
                         already_faulted,
                         CAPTURE_CALLBACK_STALL_TIMEOUT,
                     ) {
+                        latch_capture_fault_code(
+                            &watchdog_capture_fault_code,
+                            CAPTURE_FAULT_DEVICE_STALLED,
+                        );
                         let reason = format!(
                             "audio input callback produced no non-empty buffers for {} seconds; the driver may have stalled or disconnected without reporting an error",
                             CAPTURE_CALLBACK_STALL_TIMEOUT.as_secs()
@@ -1756,11 +2071,13 @@ impl Engine {
         let committed_thread = Arc::clone(&session.committed);
         let overflow_thread = Arc::clone(&session.overflow);
         let faulted_thread = Arc::clone(&session.faulted);
+        let capture_fault_code_thread = Arc::clone(&capture_fault_code);
         let storage_status_thread = Arc::clone(&storage_status);
         let storage_remaining_thread = Arc::clone(&storage_safe_remaining_seconds);
         let peak_thread = Arc::clone(&session.peak);
         let rms_thread = Arc::clone(&session.rms);
         let silence_samples_thread = Arc::clone(&session.silence_samples);
+        let digital_silence_samples_thread = Arc::clone(&session.digital_silence_samples);
         let last_signal_sample_thread = Arc::clone(&session.last_signal_sample);
         let content_started_sample_thread = Arc::clone(&session.attempt_signal_start_sample);
         let silence_threshold_thread = Arc::clone(&session.silence_threshold_bits);
@@ -1790,7 +2107,12 @@ impl Engine {
                         );
                     }
                     let capture_faulted = faulted_thread.load(Ordering::Acquire);
+                    let capture_fault_code = capture_fault_code_thread.load(Ordering::Acquire);
+                    let (fault_kind, fault_reason) =
+                        capture_fault_telemetry(capture_fault_code);
                     let overflow_samples = overflow_thread.load(Ordering::Acquire);
+                    let digital_silence_samples =
+                        digital_silence_samples_thread.load(Ordering::Acquire);
                     if !fault_marker_observed
                         && (capture_faulted || overflow_samples > 0)
                         && last_fault_marker_attempt.elapsed() >= Duration::from_secs(1)
@@ -1817,11 +2139,18 @@ impl Engine {
                             "committed_samples": committed_thread.load(Ordering::Acquire),
                             "overflow_samples": overflow_samples,
                             "faulted": capture_faulted,
+                            "fault_kind": fault_kind,
+                            "fault_reason": fault_reason,
                             "storage_status": storage_status,
                             "storage_safe_remaining_seconds": storage_remaining_thread.load(Ordering::Acquire),
                             "peak": f32::from_bits(peak_thread.load(Ordering::Relaxed)),
                             "rms": f32::from_bits(rms_thread.load(Ordering::Relaxed)),
                             "silence_samples": silence_samples_thread.load(Ordering::Acquire),
+                            "digital_silence_samples": digital_silence_samples,
+                            "digital_silence_suspected": digital_silence_suspected(
+                                digital_silence_samples,
+                                sample_rate,
+                            ),
                             "last_signal_sample": last_signal_sample_thread.load(Ordering::Acquire),
                             "silence_threshold_dbfs": f32::from_bits(silence_threshold_thread.load(Ordering::Relaxed)),
                             "silence_duration_ms": silence_duration_ms,
@@ -1947,6 +2276,7 @@ impl Engine {
         }
         let silence = SilenceMonitor {
             silence_samples: Arc::clone(&session.silence_samples),
+            digital_silence_samples: Arc::clone(&session.digital_silence_samples),
             last_signal_sample: Arc::clone(&session.last_signal_sample),
             attempt_signal_start_sample: Arc::clone(&session.attempt_signal_start_sample),
             analyzed_samples: Arc::clone(&session.analyzed_samples),
@@ -2345,7 +2675,7 @@ impl Engine {
 
     pub fn accept_attempt(&mut self, item_id: &str, attempt_id: &str) -> Result<Value> {
         let session = self.active_session_mut()?;
-        session.ensure_metadata_mutation_allowed()?;
+        session.ensure_delivery_mutation_allowed()?;
         if session.active_attempt.is_some() {
             bail!("cannot accept an attempt while another attempt is recording");
         }
@@ -2381,7 +2711,7 @@ impl Engine {
 
     pub fn skip_item(&mut self, item_id: &str) -> Result<Value> {
         let session = self.active_session_mut()?;
-        session.ensure_metadata_mutation_allowed()?;
+        session.ensure_delivery_mutation_allowed()?;
         if session.active_attempt.is_some() {
             bail!("cannot skip while an attempt is recording");
         }
@@ -4272,6 +4602,16 @@ impl RecordingSession {
         Ok(())
     }
 
+    fn ensure_delivery_mutation_allowed(&self) -> Result<()> {
+        self.ensure_metadata_mutation_allowed()?;
+        if self.faulted.load(Ordering::Acquire) || self.overflow.load(Ordering::Acquire) > 0 {
+            bail!(
+                "音频采集已发生故障或数据溢出，禁止确认或跳过录音条目；请安全结束并保留原始母轨。"
+            );
+        }
+        Ok(())
+    }
+
     /// Makes bounded progress toward stopping every capture resource. Handles
     /// are taken only after their threads report completion; a timeout leaves
     /// the handle and task lock in this session so a later stop can retry.
@@ -4286,10 +4626,17 @@ impl RecordingSession {
         // safe-stop at the watchdog boundary.
         self.capture_watchdog_armed.store(false, Ordering::Release);
         if let Some(stream) = self.stream.take() {
-            if let Err(error) = stream.pause() {
-                warnings.push(format!("pause input stream while stopping: {error}"));
+            if !self.stream_reaper.retire(stream) {
+                warnings.push(
+                    "audio stream shutdown worker was unavailable; the stream handle was retained outside the protocol thread"
+                        .to_string(),
+                );
+                self.faulted.store(true, Ordering::Release);
             }
-            drop(stream);
+        } else {
+            // Let a pre-created but unused worker exit immediately (for
+            // example when activation failed before build_input_stream).
+            self.stream_reaper.close_input();
         }
         self.telemetry_stop.store(true, Ordering::Release);
         let telemetry_joined = match self.telemetry_join.as_ref() {
@@ -4388,8 +4735,30 @@ impl RecordingSession {
                 false
             }
         };
-        let capture_resources_joined =
-            callback_gate_drained && telemetry_joined && capture_watchdog_joined && writer_joined;
+        let stream_reaper_joined = match self.stream_reaper.finish_until(deadline) {
+            DropReaperProgress::Joined => true,
+            DropReaperProgress::Pending => {
+                warnings.push(
+                    "audio stream backend is still stopping; its shutdown handle was retained"
+                        .to_string(),
+                );
+                false
+            }
+            DropReaperProgress::Failed => {
+                warnings.push(
+                    "audio stream shutdown worker failed; the session remains locked for manual recovery"
+                        .to_string(),
+                );
+                self.faulted.store(true, Ordering::Release);
+                false
+            }
+        };
+        self.stream_reaper.drain_warnings(&mut warnings);
+        let capture_resources_joined = callback_gate_drained
+            && stream_reaper_joined
+            && telemetry_joined
+            && capture_watchdog_joined
+            && writer_joined;
         self.capture_stopped = capture_resources_joined;
         // Reload only after a finished writer has been joined. The writer owns
         // this atomic and may advance it after the first Stop wait times out.
@@ -5577,6 +5946,7 @@ fn build_stream(
     captured: Arc<AtomicU64>,
     overflow: Arc<AtomicU64>,
     faulted: Arc<AtomicBool>,
+    capture_fault_code: Arc<AtomicU32>,
     peak_bits: Arc<AtomicU32>,
     rms_bits: Arc<AtomicU32>,
     queue: WriterQueueBudget,
@@ -5592,6 +5962,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            capture_fault_code,
             peak_bits,
             rms_bits,
             queue.clone(),
@@ -5607,6 +5978,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            capture_fault_code,
             peak_bits,
             rms_bits,
             queue.clone(),
@@ -5622,6 +5994,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            capture_fault_code,
             peak_bits,
             rms_bits,
             queue.clone(),
@@ -5637,6 +6010,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            capture_fault_code,
             peak_bits,
             rms_bits,
             queue.clone(),
@@ -5652,6 +6026,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            capture_fault_code,
             peak_bits,
             rms_bits,
             queue.clone(),
@@ -5667,6 +6042,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            capture_fault_code,
             peak_bits,
             rms_bits,
             queue.clone(),
@@ -5682,6 +6058,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            capture_fault_code,
             peak_bits,
             rms_bits,
             queue.clone(),
@@ -5697,6 +6074,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            capture_fault_code,
             peak_bits,
             rms_bits,
             queue.clone(),
@@ -5712,6 +6090,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            capture_fault_code,
             peak_bits,
             rms_bits,
             queue.clone(),
@@ -5727,6 +6106,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            capture_fault_code,
             peak_bits,
             rms_bits,
             queue.clone(),
@@ -5742,6 +6122,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            capture_fault_code,
             peak_bits,
             rms_bits,
             queue.clone(),
@@ -5757,6 +6138,7 @@ fn build_stream(
             captured,
             overflow,
             faulted,
+            capture_fault_code,
             peak_bits,
             rms_bits,
             queue,
@@ -5779,6 +6161,7 @@ fn build_typed_stream<T>(
     captured: Arc<AtomicU64>,
     overflow: Arc<AtomicU64>,
     faulted: Arc<AtomicBool>,
+    capture_fault_code: Arc<AtomicU32>,
     peak_bits: Arc<AtomicU32>,
     rms_bits: Arc<AtomicU32>,
     queue: WriterQueueBudget,
@@ -5797,6 +6180,7 @@ where
         );
     }
     let error_emitter = Arc::clone(&faulted);
+    let error_capture_fault_code = Arc::clone(&capture_fault_code);
     let error_writer = writer.clone();
     let error_queue = queue.clone();
     let mut waveform_preview =
@@ -5850,6 +6234,7 @@ where
             }
         },
         move |error| {
+            latch_capture_fault_code(&error_capture_fault_code, input_stream_fault_code(&error));
             error_emitter.store(true, Ordering::Release);
             error_queue.close_and_wait();
             eprintln!("audio stream error: {error}");
@@ -6047,6 +6432,7 @@ fn publish_leased_block_with_preview(
         );
         return;
     }
+    let digital_silence_block = analyze_digital_silence_block(&mono);
     let mut peak = 0f32;
     let mut square_sum = 0f64;
     for sample in &mono {
@@ -6116,6 +6502,11 @@ fn publish_leased_block_with_preview(
     // finite block has entered the writer queue. Once enqueueing fails, later
     // callbacks are rejected so WAV frames and sample annotations cannot drift.
     let analysis_write = begin_analysis_write(&silence.analysis_epoch);
+    let previous_digital_silence = silence.digital_silence_samples.load(Ordering::Acquire);
+    silence.digital_silence_samples.store(
+        apply_digital_silence_block(previous_digital_silence, digital_silence_block),
+        Ordering::Release,
+    );
     let threshold_dbfs = f32::from_bits(silence.threshold_bits.load(Ordering::Relaxed));
     let threshold_linear = 10f32.powf(threshold_dbfs / 20.0);
     if rms <= threshold_linear {
@@ -6918,6 +7309,149 @@ mod tests {
         HeadSilenceMonitor::new(48_000)
     }
 
+    fn test_stream_reaper() -> StreamReaper {
+        StreamReaper::spawn("test-audio-stream-reaper").unwrap()
+    }
+
+    #[test]
+    fn drop_reaper_timeout_is_bounded_and_can_be_joined_after_release() {
+        struct BlockingDrop {
+            entered: Sender<()>,
+            release: Receiver<()>,
+        }
+
+        impl Drop for BlockingDrop {
+            fn drop(&mut self) {
+                let _ = self.entered.send(());
+                let _ = self.release.recv();
+            }
+        }
+
+        let mut reaper = DropReaper::spawn("blocking-drop-reaper-test").unwrap();
+        let (entered_tx, entered_rx) = bounded(1);
+        let (release_tx, release_rx) = bounded(1);
+        assert!(reaper.retire(BlockingDrop {
+            entered: entered_tx,
+            release: release_rx,
+        }));
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let timeout = Duration::from_millis(50);
+        let started = Instant::now();
+        assert_eq!(
+            reaper.finish_until(started + timeout),
+            DropReaperProgress::Pending
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "blocking Drop escaped the bounded reaper wait"
+        );
+
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            reaper.finish_until(Instant::now() + Duration::from_secs(1)),
+            DropReaperProgress::Joined
+        );
+    }
+
+    #[test]
+    fn drop_reaper_worker_panic_is_fail_closed() {
+        struct PanickingDrop;
+
+        impl Drop for PanickingDrop {
+            fn drop(&mut self) {
+                panic!("injected blocking resource destructor panic");
+            }
+        }
+
+        let mut reaper = DropReaper::spawn("panicking-drop-reaper-test").unwrap();
+        assert!(reaper.retire(PanickingDrop));
+        assert_eq!(
+            reaper.finish_until(Instant::now() + Duration::from_secs(1)),
+            DropReaperProgress::Failed
+        );
+    }
+
+    #[test]
+    fn drop_reaper_missing_worker_never_drops_resource_on_caller() {
+        static DROPPED: AtomicBool = AtomicBool::new(false);
+
+        struct ObservableDrop;
+
+        impl Drop for ObservableDrop {
+            fn drop(&mut self) {
+                DROPPED.store(true, Ordering::Release);
+            }
+        }
+
+        DROPPED.store(false, Ordering::Release);
+        let mut reaper = DropReaper::<ObservableDrop> {
+            sender: None,
+            join: None,
+            failed: false,
+        };
+        assert!(!reaper.retire(ObservableDrop));
+        assert!(!DROPPED.load(Ordering::Acquire));
+        assert_eq!(
+            reaper.finish_until(Instant::now()),
+            DropReaperProgress::Failed
+        );
+    }
+
+    #[test]
+    fn abnormal_capture_drop_retires_off_caller_and_retains_directory_lock() {
+        struct ThreadObservedDrop(Sender<std::thread::ThreadId>);
+
+        impl Drop for ThreadObservedDrop {
+            fn drop(&mut self) {
+                let _ = self.0.send(thread::current().id());
+            }
+        }
+
+        let root = test_root("abnormal-drop-fail-closed");
+        let queue = test_writer_queue();
+        let faulted = AtomicBool::new(false);
+        let (dropped_tx, dropped_rx) = bounded(1);
+        let mut resource = Some(ThreadObservedDrop(dropped_tx));
+        let mut reaper = DropReaper::spawn("abnormal-drop-resource-reaper").unwrap();
+        let mut session_lock = Some(SessionLock::acquire(&root, "2026-08-11T00:00:00Z").unwrap());
+        let mut retained_lock = None;
+        let caller_thread = thread::current().id();
+
+        assert!(fail_closed_abnormal_capture_drop(
+            false,
+            &queue,
+            &faulted,
+            &mut resource,
+            |resource| reaper.retire(resource),
+            &mut session_lock,
+            |lock| retained_lock = Some(lock),
+        ));
+
+        assert!(resource.is_none());
+        assert!(session_lock.is_none());
+        assert!(faulted.load(Ordering::Acquire));
+        assert!(queue.enter().is_none(), "callback gate must stay closed");
+        assert!(
+            SessionLock::acquire(&root, "2026-08-11T00:00:01Z").is_err(),
+            "retained lease must prevent another recorder from reopening the task"
+        );
+        let drop_thread = dropped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_ne!(
+            drop_thread, caller_thread,
+            "backend resource destructor ran on the caller thread"
+        );
+        assert_eq!(
+            reaper.finish_until(Instant::now() + Duration::from_secs(1)),
+            DropReaperProgress::Joined
+        );
+
+        drop(retained_lock.take());
+        let reopened = SessionLock::acquire(&root, "2026-08-11T00:00:02Z").unwrap();
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     struct AttemptAnalysisHarness {
         writer: Sender<WriterMessage>,
         _receiver: Receiver<WriterMessage>,
@@ -6946,6 +7480,7 @@ mod tests {
                 queue: test_writer_queue(),
                 silence: SilenceMonitor {
                     silence_samples: Arc::new(AtomicU64::new(0)),
+                    digital_silence_samples: Arc::new(AtomicU64::new(0)),
                     last_signal_sample: Arc::new(AtomicU64::new(0)),
                     attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
                     analyzed_samples: Arc::new(AtomicU64::new(armed_sample)),
@@ -6973,6 +7508,68 @@ mod tests {
         }
     }
 
+    #[test]
+    fn digital_silence_warning_threshold_uses_the_actual_sample_rate() {
+        for sample_rate in [44_100, 48_000, 96_000] {
+            let threshold = u64::from(sample_rate) * DIGITAL_SILENCE_WARNING_SECONDS;
+            assert!(!digital_silence_suspected(threshold - 1, sample_rate));
+            assert!(digital_silence_suspected(threshold, sample_rate));
+        }
+        assert!(!digital_silence_suspected(u64::MAX, 0));
+    }
+
+    #[test]
+    fn exact_digital_silence_run_resets_on_nonzero_and_keeps_only_trailing_zeroes() {
+        let all_zero = analyze_digital_silence_block(&[0.0, -0.0, 0.0]);
+        assert_eq!(
+            all_zero,
+            DigitalSilenceBlock {
+                all_equilibrium: true,
+                trailing_samples: 3,
+            }
+        );
+        assert_eq!(apply_digital_silence_block(7, all_zero), 10);
+
+        let mixed = analyze_digital_silence_block(&[0.0, f32::EPSILON, 0.0, -0.0]);
+        assert_eq!(
+            mixed,
+            DigitalSilenceBlock {
+                all_equilibrium: false,
+                trailing_samples: 2,
+            }
+        );
+        assert_eq!(apply_digital_silence_block(10, mixed), 2);
+        assert_eq!(
+            apply_digital_silence_block(2, analyze_digital_silence_block(&[0.125])),
+            0
+        );
+    }
+
+    #[test]
+    fn digital_silence_is_quality_telemetry_not_a_capture_fault() {
+        let harness = AttemptAnalysisHarness::armed_at(0, 48_000);
+        harness.publish(vec![0.0; 128]);
+        assert_eq!(
+            harness
+                .silence
+                .digital_silence_samples
+                .load(Ordering::Acquire),
+            128
+        );
+        assert!(!harness.faulted.load(Ordering::Acquire));
+
+        harness.publish(vec![0.25, 0.0, 0.0]);
+        assert_eq!(
+            harness
+                .silence
+                .digital_silence_samples
+                .load(Ordering::Acquire),
+            2
+        );
+        assert!(!harness.faulted.load(Ordering::Acquire));
+        assert_eq!(harness.overflow.load(Ordering::Acquire), 0);
+    }
+
     fn disconnected_waveform_sender() -> Option<Sender<Vec<[f32; 2]>>> {
         None
     }
@@ -6994,6 +7591,7 @@ mod tests {
         let rms = AtomicU32::new(0f32.to_bits());
         let silence = SilenceMonitor {
             silence_samples: Arc::new(AtomicU64::new(0)),
+            digital_silence_samples: Arc::new(AtomicU64::new(0)),
             last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
             analyzed_samples: Arc::new(AtomicU64::new(0)),
@@ -7191,10 +7789,11 @@ mod tests {
     fn metadata_test_session(root: &Path) -> RecordingSession {
         let (writer_tx, _writer_rx) = bounded::<WriterMessage>(1);
         RecordingSession {
-            _session_lock: SessionLock::acquire(root, "2026-08-11T00:00:00Z").unwrap(),
+            _session_lock: Some(SessionLock::acquire(root, "2026-08-11T00:00:00Z").unwrap()),
             session_dir: root.to_path_buf(),
             snapshot: test_snapshot(),
             stream: None,
+            stream_reaper: test_stream_reaper(),
             writer_tx,
             writer_queue: test_writer_queue(),
             writer_join: None,
@@ -7210,6 +7809,7 @@ mod tests {
             peak: Arc::new(AtomicU32::new(0)),
             rms: Arc::new(AtomicU32::new(0)),
             silence_samples: Arc::new(AtomicU64::new(0)),
+            digital_silence_samples: Arc::new(AtomicU64::new(0)),
             last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
             analyzed_samples: Arc::new(AtomicU64::new(0)),
@@ -7231,6 +7831,87 @@ mod tests {
         let mut session = metadata_test_session(root);
         session.snapshot = snapshot;
         session
+    }
+
+    fn assert_delivery_mutations_reject_capture_fault(
+        fixture_name: &str,
+        faulted: bool,
+        overflow_samples: u64,
+    ) {
+        let root = test_root(fixture_name);
+        std::fs::create_dir_all(root.join("script")).unwrap();
+        let mut session = prepare_metadata_test_session(&root);
+        let attempt = Attempt {
+            attempt_id: "001-a1".to_string(),
+            start_sample: 10,
+            recording_started_sample: 0,
+            head_silence_armed_sample: 0,
+            head_silence_passed_sample: 5,
+            required_head_silence_samples: 5,
+            content_started_sample: 10,
+            end_sample: 20,
+            forced_without_tail_silence: false,
+            tail_silence_samples: 5,
+            required_tail_silence_samples: 5,
+            status: "recorded".to_string(),
+            created_at: "2026-08-11T00:00:00Z".to_string(),
+        };
+        session.snapshot.items[0].status = "review".to_string();
+        session.snapshot.items[0].attempts.push(attempt.clone());
+        session
+            .persist(
+                "attempt_stopped",
+                json!({ "item_id": "001", "attempt": attempt }),
+            )
+            .unwrap();
+        session.faulted.store(faulted, Ordering::Release);
+        session.overflow.store(overflow_samples, Ordering::Release);
+
+        // The capture atomics are authoritative before the telemetry thread
+        // publishes its next meter event. Commands must fail closed without
+        // waiting for that UI-facing projection.
+        let snapshot_before = serde_json::to_value(&session.snapshot).unwrap();
+        let journal_before = std::fs::read(root.join("metadata/events.jsonl")).unwrap();
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+
+        let accept_error = engine.accept_attempt("001", "001-a1").unwrap_err();
+        assert!(format!("{accept_error:#}").contains("禁止确认或跳过"));
+        let skip_error = engine.skip_item("001").unwrap_err();
+        assert!(format!("{skip_error:#}").contains("禁止确认或跳过"));
+
+        let session = engine.session.as_ref().unwrap();
+        assert_eq!(
+            serde_json::to_value(&session.snapshot).unwrap(),
+            snapshot_before
+        );
+        assert_eq!(
+            std::fs::read(root.join("metadata/events.jsonl")).unwrap(),
+            journal_before
+        );
+        assert_eq!(session.snapshot.items[0].status, "review");
+        assert_eq!(session.snapshot.items[0].attempts[0].status, "recorded");
+        assert!(session.snapshot.items[0].selected_attempt_id.is_none());
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn faulted_capture_blocks_delivery_mutations_before_the_next_meter_event() {
+        assert_delivery_mutations_reject_capture_fault(
+            "faulted-delivery-mutation-before-meter",
+            true,
+            0,
+        );
+    }
+
+    #[test]
+    fn overflow_blocks_delivery_mutations_before_the_next_meter_event() {
+        assert_delivery_mutations_reject_capture_fault(
+            "overflow-delivery-mutation-before-meter",
+            false,
+            1,
+        );
     }
 
     #[test]
@@ -7738,10 +8419,11 @@ mod tests {
         assert_eq!(ready_rx.recv().unwrap().unwrap(), 0);
 
         RecordingSession {
-            _session_lock: SessionLock::acquire(root, "2026-08-11T00:00:00Z").unwrap(),
+            _session_lock: Some(SessionLock::acquire(root, "2026-08-11T00:00:00Z").unwrap()),
             session_dir: root.to_path_buf(),
             snapshot: test_snapshot(),
             stream: None,
+            stream_reaper: test_stream_reaper(),
             writer_tx,
             writer_queue: queue,
             writer_join: Some(writer_join),
@@ -7757,6 +8439,7 @@ mod tests {
             peak: Arc::new(AtomicU32::new(0)),
             rms: Arc::new(AtomicU32::new(0)),
             silence_samples: Arc::new(AtomicU64::new(0)),
+            digital_silence_samples: Arc::new(AtomicU64::new(0)),
             last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
             analyzed_samples: Arc::new(AtomicU64::new(0)),
@@ -8078,6 +8761,41 @@ mod tests {
     }
 
     #[test]
+    fn input_stream_faults_have_stable_operator_facing_codes() {
+        assert_eq!(
+            input_stream_fault_code(&cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable)),
+            CAPTURE_FAULT_DEVICE_UNAVAILABLE,
+        );
+        assert_eq!(
+            input_stream_fault_code(&cpal::Error::new(cpal::ErrorKind::Xrun)),
+            CAPTURE_FAULT_INPUT_DISCONTINUITY,
+        );
+        assert_eq!(
+            input_stream_fault_code(&cpal::Error::new(cpal::ErrorKind::BackendError)),
+            CAPTURE_FAULT_INPUT_STREAM_ERROR,
+        );
+        assert_eq!(
+            capture_fault_telemetry(CAPTURE_FAULT_DEVICE_UNAVAILABLE).0,
+            "device_unavailable",
+        );
+        assert_eq!(
+            capture_fault_telemetry(CAPTURE_FAULT_DEVICE_STALLED).0,
+            "device_stalled",
+        );
+    }
+
+    #[test]
+    fn capture_fault_code_preserves_the_first_failure() {
+        let code = AtomicU32::new(CAPTURE_FAULT_NONE);
+        latch_capture_fault_code(&code, CAPTURE_FAULT_DEVICE_UNAVAILABLE);
+        latch_capture_fault_code(&code, CAPTURE_FAULT_INPUT_STREAM_ERROR);
+        assert_eq!(
+            code.load(Ordering::Acquire),
+            CAPTURE_FAULT_DEVICE_UNAVAILABLE,
+        );
+    }
+
+    #[test]
     fn stalled_capture_fault_is_durable_drains_writer_and_closes_callback_gate() {
         let root = test_root("capture-watchdog-fault");
         let path = root.join("audio/master.wav");
@@ -8130,6 +8848,7 @@ mod tests {
         let rms = AtomicU32::new(0f32.to_bits());
         let silence = SilenceMonitor {
             silence_samples: Arc::new(AtomicU64::new(0)),
+            digital_silence_samples: Arc::new(AtomicU64::new(0)),
             last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
             analyzed_samples: Arc::new(AtomicU64::new(0)),
@@ -8845,6 +9564,7 @@ mod tests {
         let rms = AtomicU32::new(0f32.to_bits());
         let silence = SilenceMonitor {
             silence_samples: Arc::new(AtomicU64::new(0)),
+            digital_silence_samples: Arc::new(AtomicU64::new(0)),
             last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
             analyzed_samples: Arc::new(AtomicU64::new(0)),
@@ -9132,6 +9852,7 @@ mod tests {
         let rms = AtomicU32::new(0f32.to_bits());
         let silence = SilenceMonitor {
             silence_samples: Arc::new(AtomicU64::new(0)),
+            digital_silence_samples: Arc::new(AtomicU64::new(0)),
             last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
             analyzed_samples: Arc::new(AtomicU64::new(0)),
@@ -9210,6 +9931,7 @@ mod tests {
         let queue = test_writer_queue();
         let silence = SilenceMonitor {
             silence_samples: Arc::new(AtomicU64::new(9)),
+            digital_silence_samples: Arc::new(AtomicU64::new(0)),
             last_signal_sample: Arc::new(AtomicU64::new(11)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(7)),
             analyzed_samples: Arc::new(AtomicU64::new(0)),
@@ -9292,6 +10014,7 @@ mod tests {
         let queue = test_writer_queue();
         let silence = SilenceMonitor {
             silence_samples: Arc::new(AtomicU64::new(9)),
+            digital_silence_samples: Arc::new(AtomicU64::new(0)),
             last_signal_sample: Arc::new(AtomicU64::new(80)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(70)),
             analyzed_samples: Arc::new(AtomicU64::new(0)),
@@ -9343,6 +10066,7 @@ mod tests {
         };
         let silence = SilenceMonitor {
             silence_samples: Arc::new(AtomicU64::new(9)),
+            digital_silence_samples: Arc::new(AtomicU64::new(0)),
             last_signal_sample: Arc::new(AtomicU64::new(80)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(70)),
             analyzed_samples: Arc::new(AtomicU64::new(0)),
@@ -9405,6 +10129,7 @@ mod tests {
         let rms = AtomicU32::new(0f32.to_bits());
         let silence = SilenceMonitor {
             silence_samples: Arc::new(AtomicU64::new(0)),
+            digital_silence_samples: Arc::new(AtomicU64::new(0)),
             last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
             analyzed_samples: Arc::new(AtomicU64::new(0)),
@@ -9467,10 +10192,11 @@ mod tests {
         });
         assert_eq!(ready_rx.recv().unwrap().unwrap(), 0);
         let mut session = RecordingSession {
-            _session_lock: SessionLock::acquire(&root, "2026-08-11T00:00:00Z").unwrap(),
+            _session_lock: Some(SessionLock::acquire(&root, "2026-08-11T00:00:00Z").unwrap()),
             session_dir: root.clone(),
             snapshot: test_snapshot(),
             stream: None,
+            stream_reaper: test_stream_reaper(),
             writer_tx,
             writer_queue: queue.clone(),
             writer_join: Some(writer_join),
@@ -9486,6 +10212,7 @@ mod tests {
             peak: Arc::new(AtomicU32::new(0)),
             rms: Arc::new(AtomicU32::new(0)),
             silence_samples: Arc::new(AtomicU64::new(0)),
+            digital_silence_samples: Arc::new(AtomicU64::new(0)),
             last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
             analyzed_samples: Arc::new(AtomicU64::new(0)),
@@ -9556,10 +10283,11 @@ mod tests {
             .unwrap();
         let attempt_signal_start_sample = Arc::new(AtomicU64::new(2));
         let mut session = RecordingSession {
-            _session_lock: SessionLock::acquire(&root, "2026-08-11T00:00:00Z").unwrap(),
+            _session_lock: Some(SessionLock::acquire(&root, "2026-08-11T00:00:00Z").unwrap()),
             session_dir: root.clone(),
             snapshot: test_snapshot(),
             stream: None,
+            stream_reaper: test_stream_reaper(),
             writer_tx,
             writer_queue: test_writer_queue(),
             writer_join: Some(writer_join),
@@ -9575,6 +10303,7 @@ mod tests {
             peak: Arc::new(AtomicU32::new(0f32.to_bits())),
             rms: Arc::new(AtomicU32::new(0f32.to_bits())),
             silence_samples: Arc::new(AtomicU64::new(0)),
+            digital_silence_samples: Arc::new(AtomicU64::new(0)),
             last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample,
             analyzed_samples: Arc::new(AtomicU64::new(0)),
@@ -10625,10 +11354,11 @@ mod tests {
             }
         });
         let mut session = RecordingSession {
-            _session_lock: SessionLock::acquire(&root, "2026-08-11T00:00:00Z").unwrap(),
+            _session_lock: Some(SessionLock::acquire(&root, "2026-08-11T00:00:00Z").unwrap()),
             session_dir: root.clone(),
             snapshot: test_snapshot(),
             stream: None,
+            stream_reaper: test_stream_reaper(),
             writer_tx,
             writer_queue: test_writer_queue(),
             writer_join: Some(writer_join),
@@ -10644,6 +11374,7 @@ mod tests {
             peak: Arc::new(AtomicU32::new(0)),
             rms: Arc::new(AtomicU32::new(0)),
             silence_samples: Arc::new(AtomicU64::new(0)),
+            digital_silence_samples: Arc::new(AtomicU64::new(0)),
             last_signal_sample: Arc::new(AtomicU64::new(0)),
             attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
             analyzed_samples: Arc::new(AtomicU64::new(0)),

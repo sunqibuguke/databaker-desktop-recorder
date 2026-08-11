@@ -160,6 +160,10 @@ async function main() {
       getAppPath: () => process.cwd(),
       setBadgeCount: () => undefined,
     },
+    systemPreferences: {
+      getMediaAccessStatus: () => 'granted',
+      askForMediaAccess: async () => true,
+    },
     BrowserWindow: FakeBrowserWindow,
     dialog: {
       showMessageBox: async () => ({ response: 0 }),

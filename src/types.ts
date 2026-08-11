@@ -99,16 +99,45 @@ export type AudioDevice = {
   }>;
 };
 
+export type CapturePreset = {
+  id: string;
+  name: string;
+  deviceId: string;
+  deviceName: string;
+  sampleRate: number;
+  bitDepth: 16 | 24 | 32;
+  inputChannel: number;
+  silenceDurationMs: number;
+  silenceThresholdDbfs: number;
+};
+
+export type CapturePresetDraft = Omit<CapturePreset, 'id'> & { id?: string };
+
+export type CapturePresetStore = {
+  schemaVersion: 1;
+  lastSelectedPresetId: string | null;
+  presets: CapturePreset[];
+};
+
+export type CapturePresetLoadResult = {
+  store: CapturePresetStore;
+  warning?: string;
+};
+
 export type Meter = {
   captured_samples: number;
   committed_samples: number;
   overflow_samples: number;
   faulted: boolean;
+  fault_kind?: string;
+  fault_reason?: string;
   storage_status: 'healthy' | 'warning' | 'critical';
   storage_safe_remaining_seconds: number;
   peak: number;
   rms: number;
   silence_samples: number;
+  digital_silence_samples: number;
+  digital_silence_suspected: boolean;
   last_signal_sample: number;
   head_silence_phase?: HeadSilencePhase;
   head_silence_armed_sample?: number;
@@ -149,7 +178,7 @@ export type SealInterruptedSessionResult = {
   warnings?: string[];
 };
 
-export type PrompterCue = 'idle' | 'checking' | 'ready' | 'recording' | 'post-ready' | 'review' | 'complete';
+export type PrompterCue = 'idle' | 'checking' | 'ready' | 'recording' | 'post-ready' | 'review' | 'complete' | 'fault';
 
 export type PrompterState = {
   sessionName: string;
@@ -162,6 +191,7 @@ export type PrompterState = {
   cueLabel: string;
   silenceProgress: number;
   silenceDurationMs: number;
+  qualityWarning?: string;
 };
 
 export type RecordingHistoryEntry = {
