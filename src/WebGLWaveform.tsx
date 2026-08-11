@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  advanceWaveformPlayhead,
   reconcileWaveformBatch,
-  waveformCatchUpCount,
+  WAVEFORM_BIN_SAMPLES,
+  waveformSampleHorizontalPosition,
   waveformWindowBinCount,
 } from './waveform-buffer';
 
@@ -62,9 +64,9 @@ function createProgram(gl: WebGLRenderingContext | WebGL2RenderingContext) {
 export function WebGLWaveform({ bins, waveformEndSample, recording, sampleRate }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const historyRef = useRef<WaveformBin[]>([]);
-  const pendingRef = useRef<WaveformBin[]>([]);
   const latestEndSampleRef = useRef<number | null>(null);
-  const consumeBudgetRef = useRef(0);
+  const historyEndSampleRef = useRef<number | null>(null);
+  const playheadSampleRef = useRef<number | null>(null);
   const recordingRef = useRef(recording);
   const sampleRateRef = useRef(sampleRate);
   const [available, setAvailable] = useState(true);
@@ -79,19 +81,17 @@ export function WebGLWaveform({ bins, waveformEndSample, recording, sampleRate }
     if (!reconciled.bins.length) return;
     if (reconciled.reset) {
       historyRef.current.length = 0;
-      pendingRef.current.length = 0;
-      consumeBudgetRef.current = 0;
     }
     latestEndSampleRef.current = reconciled.endSample;
-    pendingRef.current.push(...reconciled.bins);
+    historyEndSampleRef.current = reconciled.endSample;
+    playheadSampleRef.current = reconciled.reset
+      ? reconciled.endSample
+      : Math.max(playheadSampleRef.current ?? reconciled.endSample, reconciled.endSample);
 
-    // Incoming telemetry is already a real-time stream, not playback media.
-    // Fast-forward any backlog beyond the small smoothing budget immediately;
-    // otherwise a renderer pause would turn into permanent multi-second lag.
-    const catchUp = waveformCatchUpCount(pendingRef.current.length, sampleRateRef.current);
-    if (catchUp > 0) {
-      historyRef.current.push(...pendingRef.current.splice(0, catchUp));
-    }
+    // Preview packets are already live capture data. Put them on screen as
+    // soon as they cross IPC; replaying them through another real-time queue
+    // adds latency and turns renderer hiccups into visible catch-up bursts.
+    historyRef.current.push(...reconciled.bins);
     const maximumBins = waveformWindowBinCount(sampleRateRef.current);
     if (historyRef.current.length > maximumBins) {
       historyRef.current.splice(0, historyRef.current.length - maximumBins);
@@ -105,9 +105,9 @@ export function WebGLWaveform({ bins, waveformEndSample, recording, sampleRate }
   useEffect(() => {
     if (sampleRateRef.current !== sampleRate) {
       historyRef.current.length = 0;
-      pendingRef.current.length = 0;
       latestEndSampleRef.current = null;
-      consumeBudgetRef.current = 0;
+      historyEndSampleRef.current = null;
+      playheadSampleRef.current = null;
     }
     sampleRateRef.current = sampleRate;
   }, [sampleRate]);
@@ -184,14 +184,19 @@ export function WebGLWaveform({ bins, waveformEndSample, recording, sampleRate }
       uploadAndDraw(new Float32Array(vertices), gl.LINES, [0.12, 0.19, 0.18, 0.72]);
     };
 
-    const drawWaveform = () => {
+    const drawWaveform = (playheadSample: number) => {
       const history = historyRef.current;
-      if (!history.length) return;
-      const maximumBins = waveformWindowBinCount(sampleRateRef.current);
+      const historyEndSample = historyEndSampleRef.current;
+      if (!history.length || historyEndSample === null) return;
       const vertices = new Float32Array(history.length * 4);
-      const offset = maximumBins - history.length;
       for (let index = 0; index < history.length; index += 1) {
-        const x = -1 + ((offset + index) / Math.max(1, maximumBins - 1)) * 2;
+        const binCenterSample = historyEndSample
+          - (history.length - index - 0.5) * WAVEFORM_BIN_SAMPLES;
+        const x = waveformSampleHorizontalPosition(
+          binCenterSample,
+          playheadSample,
+          sampleRateRef.current,
+        );
         const [minimum, maximum] = history[index];
         const cursor = index * 4;
         vertices[cursor] = x;
@@ -206,27 +211,16 @@ export function WebGLWaveform({ bins, waveformEndSample, recording, sampleRate }
     };
 
     const render = (now: number) => {
-      // Account for the complete wall-clock interval. Capping this delta made
-      // every long frame permanently delay the waveform by the discarded time.
       const elapsed = Math.max(0, now - lastFrameAt);
       lastFrameAt = now;
-      const pending = pendingRef.current;
-      if (pending.length) {
-        // Rust emits one min/max bin per 64 PCM samples. Consuming at that
-        // fixed media rate keeps the time axis stable even when IPC batches
-        // arrive unevenly.
-        consumeBudgetRef.current += elapsed / 1_000 * Math.max(1, sampleRateRef.current / 64);
-        const consume = Math.min(pending.length, Math.floor(consumeBudgetRef.current));
-        if (consume > 0) {
-          historyRef.current.push(...pending.splice(0, consume));
-          consumeBudgetRef.current -= consume;
-          const maximumBins = waveformWindowBinCount(sampleRateRef.current);
-          if (historyRef.current.length > maximumBins) {
-            historyRef.current.splice(0, historyRef.current.length - maximumBins);
-          }
-        }
-      } else {
-        consumeBudgetRef.current = 0;
+      const latestEndSample = latestEndSampleRef.current;
+      if (latestEndSample !== null) {
+        playheadSampleRef.current = advanceWaveformPlayhead(
+          playheadSampleRef.current ?? latestEndSample,
+          latestEndSample,
+          elapsed,
+          sampleRateRef.current,
+        );
       }
 
       gl.clearColor(0, 0, 0, 0);
@@ -235,7 +229,9 @@ export function WebGLWaveform({ bins, waveformEndSample, recording, sampleRate }
       gl.enable(gl.BLEND);
       gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
       drawGrid();
-      drawWaveform();
+      if (playheadSampleRef.current !== null) {
+        drawWaveform(playheadSampleRef.current);
+      }
       frame = requestAnimationFrame(render);
     };
 

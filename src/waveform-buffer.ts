@@ -1,9 +1,13 @@
 export const WAVEFORM_BIN_SAMPLES = 64;
-export const WAVEFORM_WINDOW_SECONDS = 8;
-// Rust publishes about every 80 ms. Keeping at most another 120 ms of bins
-// gives the renderer enough material for smooth rAF scrolling while bounding
-// source-to-canvas latency to roughly 200 ms including IPC jitter.
-export const WAVEFORM_TARGET_LATENCY_MS = 120;
+export const WAVEFORM_WINDOW_SECONDS = 12;
+// Keep the live edge inside the canvas instead of drawing it on the clipped
+// right border. This small future gutter makes a new consonant visible on the
+// first packet rather than only after it has travelled into the viewport.
+export const WAVEFORM_LIVE_EDGE_GUTTER_SECONDS = 0.5;
+// Rust normally publishes a preview packet every 80 ms. The renderer may move
+// the time cursor a little beyond the newest packet so motion remains smooth
+// between packets, but it must stop extrapolating if telemetry stalls.
+export const WAVEFORM_MAX_EXTRAPOLATION_MS = 200;
 
 export type ReconciledWaveformBatch<T> = {
   bins: T[];
@@ -18,20 +22,35 @@ export function waveformWindowBinCount(sampleRate: number): number {
   );
 }
 
-export function waveformLatencyBinCount(sampleRate: number): number {
-  return Math.max(
-    1,
-    Math.ceil(
-      Math.max(1, sampleRate)
-      * WAVEFORM_TARGET_LATENCY_MS
-      / 1_000
-      / WAVEFORM_BIN_SAMPLES,
-    ),
-  );
+export function waveformWindowSampleCount(sampleRate: number): number {
+  return Math.max(1, sampleRate) * WAVEFORM_WINDOW_SECONDS;
 }
 
-export function waveformCatchUpCount(pendingBins: number, sampleRate: number): number {
-  return Math.max(0, pendingBins - waveformLatencyBinCount(sampleRate));
+export function advanceWaveformPlayhead(
+  currentSample: number,
+  latestReceivedSample: number,
+  elapsedMs: number,
+  sampleRate: number,
+): number {
+  const rate = Math.max(1, sampleRate);
+  const latest = Math.max(0, latestReceivedSample);
+  const current = Math.max(latest, Number.isFinite(currentSample) ? currentSample : latest);
+  const advance = Math.max(0, Number.isFinite(elapsedMs) ? elapsedMs : 0) * rate / 1_000;
+  const maximumLead = rate * WAVEFORM_MAX_EXTRAPOLATION_MS / 1_000;
+  return Math.min(latest + maximumLead, current + advance);
+}
+
+export function waveformSampleHorizontalPosition(
+  sample: number,
+  playheadSample: number,
+  sampleRate: number,
+): number {
+  const liveEdgeGutterSamples = Math.max(1, sampleRate) * WAVEFORM_LIVE_EDGE_GUTTER_SECONDS;
+  return 1 - (
+    (playheadSample - sample + liveEdgeGutterSamples)
+    / waveformWindowSampleCount(sampleRate)
+    * 2
+  );
 }
 
 /**

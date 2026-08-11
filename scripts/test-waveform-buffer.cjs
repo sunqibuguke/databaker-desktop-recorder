@@ -6,18 +6,49 @@ async function main() {
   const modulePath = path.join(__dirname, '..', 'src', 'waveform-buffer.ts');
   const waveform = await import(pathToFileURL(modulePath).href);
 
-  assert.equal(waveform.waveformWindowBinCount(44_100), 5_513);
-  assert.equal(waveform.waveformWindowBinCount(48_000), 6_000);
-  assert.equal(waveform.waveformWindowBinCount(96_000), 12_000);
+  assert.equal(waveform.waveformWindowBinCount(44_100), 8_269);
+  assert.equal(waveform.waveformWindowBinCount(48_000), 9_000);
+  assert.equal(waveform.waveformWindowBinCount(96_000), 18_000);
 
-  const latencyBins = waveform.waveformLatencyBinCount(48_000);
-  assert.equal(latencyBins, 90);
-  assert.equal(latencyBins * 64 / 48_000 * 1_000, 120);
-  assert.equal(waveform.waveformCatchUpCount(750, 48_000), 660);
-  assert(
-    (750 - waveform.waveformCatchUpCount(750, 48_000)) * 64 / 48_000 * 1_000 <= 200,
-    'a one-second renderer pause must catch up to within 200 ms immediately',
+  assert.equal(waveform.waveformWindowSampleCount(48_000), 576_000);
+  assert.equal(
+    waveform.advanceWaveformPlayhead(48_000, 48_000, 100, 48_000),
+    52_800,
+    'the visual playhead advances at the exact PCM sample rate between packets',
   );
+  assert.equal(
+    waveform.advanceWaveformPlayhead(52_800, 52_800, 0, 48_000),
+    52_800,
+    'a newly received packet must not move the playhead backwards',
+  );
+  assert.equal(
+    waveform.advanceWaveformPlayhead(52_800, 52_800, 2_000, 48_000),
+    62_400,
+    'a telemetry stall must stop visual extrapolation after 200 ms',
+  );
+
+  for (const sampleRate of [44_100, 48_000, 96_000, 192_000]) {
+    const markerSample = sampleRate;
+    const markerAtLiveEdge = waveform.waveformSampleHorizontalPosition(
+      markerSample,
+      markerSample,
+      sampleRate,
+    );
+    const markerAfterOneSecond = waveform.waveformSampleHorizontalPosition(
+      markerSample,
+      markerSample + sampleRate,
+      sampleRate,
+    );
+    assert(Math.abs(markerAtLiveEdge - (1 - 1 / 12)) < 1e-12);
+    assert(Math.abs(markerAfterOneSecond - 0.75) < 1e-12);
+    assert(
+      Math.abs(
+        (markerAtLiveEdge - markerAfterOneSecond) / 2
+        - 1 / waveform.WAVEFORM_WINDOW_SECONDS,
+      ) < 1e-12,
+      `${sampleRate} Hz must move exactly one twelfth of the viewport per second`,
+    );
+  }
 
   const first = waveform.reconcileWaveformBatch(['a', 'b'], 1_128, null);
   assert.deepEqual(first, { bins: ['a', 'b'], endSample: 1_128, reset: false });
