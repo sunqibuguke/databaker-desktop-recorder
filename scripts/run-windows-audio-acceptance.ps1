@@ -1,4 +1,10 @@
 $ErrorActionPreference = "Stop"
+# The acceptance tool deliberately uses 0/1/2 as PASS/FAIL/INCOMPLETE. In
+# PowerShell 7, an inherited native-error preference must not turn 1 or 2 into a
+# terminating PowerShell error before we can propagate the exact exit code.
+if (Test-Path Variable:PSNativeCommandUseErrorActionPreference) {
+    $PSNativeCommandUseErrorActionPreference = $false
+}
 
 $acceptanceScript = Join-Path $PSScriptRoot "windows-audio-acceptance.cjs"
 if (-not (Test-Path -LiteralPath $acceptanceScript -PathType Leaf)) {
@@ -23,8 +29,14 @@ if (Test-Path -LiteralPath $packagedEngine -PathType Leaf) {
     $previousRunAsNode = $env:ELECTRON_RUN_AS_NODE
     try {
         $env:ELECTRON_RUN_AS_NODE = "1"
-        & $electronHost.FullName $acceptanceScript @args
-        exit $LASTEXITCODE
+        # Electron is a Windows GUI-subsystem executable even in Node mode.
+        # PowerShell may return immediately when such an executable is the last
+        # pipeline command. Routing stdout through Out-Host makes it a pipeline
+        # producer, which keeps PowerShell attached until the process exits while
+        # preserving the original argv values (including paths with spaces).
+        & $electronHost.FullName $acceptanceScript @args | Out-Host
+        $acceptanceExitCode = $LASTEXITCODE
+        exit $acceptanceExitCode
     }
     finally {
         if ($null -eq $previousRunAsNode) {
