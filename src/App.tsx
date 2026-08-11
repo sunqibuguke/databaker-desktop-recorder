@@ -14,13 +14,17 @@ import {
   executeSafePause,
   findNextActionableItemIndex,
   idlePrimaryAction,
+  isCurrentSessionNoiseCheckOperation,
   isFinalReview,
+  sessionNoiseGate,
+  shouldAutoRunSessionNoiseCheck,
   workflowShortcutAction,
 } from './recording-workflow';
 import { WebGLWaveform } from './WebGLWaveform';
 import { inputQualityWarning, shouldHandleLiveMeter } from './input-quality';
 import { captureFormatsSupportBitDepth, minimumInputRepresentationBits } from './capture-configuration';
-import type { Attempt, AudioDevice, CapturePreset, CapturePresetDraft, CapturePresetStore, EngineEvent, ExportResult, HeadSilencePhase, ItemState, Meter, PrompterState, RecordingHistoryEntry, ScriptItem, SealInterruptedSessionResult, SessionSnapshot } from './types';
+import type { SessionNoiseCheckOperation } from './recording-workflow';
+import type { Attempt, AudioDevice, CapturePreset, CapturePresetDraft, CapturePresetStore, EngineEvent, ExportResult, HeadSilencePhase, ItemState, Meter, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SealInterruptedSessionResult, SessionSnapshot } from './types';
 
 type Phase = 'home' | 'setup' | 'running';
 type EngineStatus = 'connecting' | 'ready' | 'offline';
@@ -52,6 +56,9 @@ type StoppedSessionState = {
 type CaptureExitMode = 'pause' | 'finish' | 'fault';
 type OptionalRunningSessionState = ({ active: true } & RunningSessionState) | { active: false };
 type IconName = 'check' | 'chevron-left' | 'chevron-right' | 'export' | 'file' | 'folder' | 'history' | 'home' | 'headphones' | 'meter' | 'microphone' | 'play' | 'plus' | 'record' | 'refresh' | 'retake' | 'skip' | 'sliders' | 'stop';
+
+const NOISE_CHECK_PROGRESS_STEPS = 15;
+const NOISE_CHECK_PROGRESS_INTERVAL_MS = 200;
 
 const emptyMeter: Meter = {
   captured_samples: 0,
@@ -290,6 +297,9 @@ function RecorderApp() {
   const [meter, setMeter] = useState<Meter>(emptyMeter);
   const [noiseThresholdDbfs, setNoiseThresholdDbfs] = useState(-42);
   const [silenceDurationMs, setSilenceDurationMs] = useState(1_000);
+  const [noiseCheckRunning, setNoiseCheckRunning] = useState(false);
+  const [noiseCheckProgress, setNoiseCheckProgress] = useState(0);
+  const [noiseCheckError, setNoiseCheckError] = useState('');
   const [busy, setBusy] = useState('');
   const [notice, setNotice] = useState('正在连接本地录音引擎…');
   const [error, setError] = useState('');
@@ -314,6 +324,10 @@ function RecorderApp() {
   const resumeOperationRef = useRef(false);
   const sealOperationRef = useRef(false);
   const pauseOperationRef = useRef(false);
+  const noiseCheckActivationRef = useRef(0);
+  const noiseCheckRequestSequenceRef = useRef(0);
+  const noiseCheckOperationRef = useRef<SessionNoiseCheckOperation | null>(null);
+  const activeSessionDirRef = useRef('');
   const initialPresetAppliedRef = useRef(false);
   const outputDirRef = useRef('');
   const phaseRef = useRef<Phase>('home');
@@ -454,9 +468,21 @@ function RecorderApp() {
     captureFault,
     meter.digital_silence_suspected,
   );
+  const currentNoiseGate = sessionNoiseGate(snapshot?.noise_check, noiseCheckRunning);
+  const noiseCheckBlocksAttempt = phase === 'running' && !recording && currentNoiseGate !== 'ready';
+  const noiseCheckProgressRatio = noiseCheckProgress / NOISE_CHECK_PROGRESS_STEPS;
+  const noiseCheckMessage = currentNoiseGate === 'checking'
+    ? `环境噪声检测中 ${noiseCheckProgress} / ${NOISE_CHECK_PROGRESS_STEPS}，请保持安静`
+    : currentNoiseGate === 'failed'
+      ? `环境噪声未通过（峰值 ${snapshot?.noise_check?.maximum_dbfs.toFixed(1) ?? '—'} dBFS），请降低环境噪声后重新检测`
+      : currentNoiseGate === 'pending'
+        ? noiseCheckError || '尚未完成本次环境噪声检测'
+        : '';
   const normalCue = phase !== 'running' || !currentItem
     ? 'idle'
-    : recording
+    : noiseCheckBlocksAttempt
+      ? 'checking'
+      : recording
       ? !headSilencePassed
         ? 'checking'
         : !hasSpoken
@@ -468,7 +494,11 @@ function RecorderApp() {
           ? 'review'
           : 'idle';
   const cue = captureFault ? 'fault' : normalCue;
-  const cueLabel = captureFault ? `立即停止朗读 · ${captureFaultCopy.title}` : ({
+  const cueLabel = captureFault
+    ? `立即停止朗读 · ${captureFaultCopy.title}`
+    : noiseCheckBlocksAttempt
+      ? noiseCheckMessage
+      : ({
     idle: phase === 'running' && currentItem ? '点击开始录音' : '等待任务',
     checking: `头静音检测中 ${(headSilenceProgressSamples / Math.max(sampleRateForDisplay, 1)).toFixed(1)} / ${(effectiveSilenceDurationMs / 1_000).toFixed(1)}s`,
     ready: '头静音达标 · 请开始朗读',
@@ -476,9 +506,11 @@ function RecorderApp() {
     'post-ready': '尾部静音达标 · 可完成',
     review: '本句已录制 · 等待监听确认',
     complete: '全部句子已处理 · 可完成采集',
-  } as const)[normalCue];
+      } as const)[normalCue];
   const displayedSilenceProgress = captureFault
     ? 0
+    : noiseCheckBlocksAttempt
+      ? noiseCheckProgressRatio
     : workflowComplete || normalCue === 'review'
     ? 1
     : recording
@@ -489,14 +521,14 @@ function RecorderApp() {
     sequence: workflowComplete ? items.length : currentItem ? currentIndex + 1 : 0,
     total: items.length,
     id: workflowComplete ? '' : currentItem?.id ?? '',
-    text: captureFault ? captureFaultCopy.title : workflowComplete ? '本次脚本已全部处理' : currentItem?.text ?? '',
-    label: captureFault ? captureFaultCopy.detail : workflowComplete ? '采集完成后可稍后生成交付' : currentItem?.label ?? '',
+    text: captureFault ? captureFaultCopy.title : noiseCheckBlocksAttempt ? '请保持安静' : workflowComplete ? '本次脚本已全部处理' : currentItem?.text ?? '',
+    label: captureFault ? captureFaultCopy.detail : noiseCheckBlocksAttempt ? noiseCheckMessage : workflowComplete ? '采集完成后可稍后生成交付' : currentItem?.label ?? '',
     cue,
     cueLabel,
     silenceProgress: displayedSilenceProgress,
     silenceDurationMs: effectiveSilenceDurationMs,
-    qualityWarning,
-  }), [captureFault, captureFaultCopy.detail, captureFaultCopy.title, cue, cueLabel, currentIndex, currentItem?.id, currentItem?.label, currentItem?.text, displayedSilenceProgress, effectiveSilenceDurationMs, items.length, qualityWarning, sessionName, snapshot?.session_id, workflowComplete]);
+    qualityWarning: noiseCheckBlocksAttempt && currentNoiseGate !== 'checking' ? noiseCheckMessage : qualityWarning,
+  }), [captureFault, captureFaultCopy.detail, captureFaultCopy.title, cue, cueLabel, currentIndex, currentItem?.id, currentItem?.label, currentItem?.text, currentNoiseGate, displayedSilenceProgress, effectiveSilenceDurationMs, items.length, noiseCheckBlocksAttempt, noiseCheckMessage, qualityWarning, sessionName, snapshot?.session_id, workflowComplete]);
 
   async function run<T>(label: string, action: () => Promise<T>): Promise<T | null> {
     setBusy(label);
@@ -508,6 +540,96 @@ function RecorderApp() {
       return null;
     } finally {
       setBusy('');
+    }
+  }
+
+  function clearSessionNoiseCheck(activeSessionDir = '') {
+    noiseCheckActivationRef.current += 1;
+    activeSessionDirRef.current = activeSessionDir;
+    noiseCheckOperationRef.current = null;
+    setNoiseCheckRunning(false);
+    setNoiseCheckProgress(0);
+    setNoiseCheckError('');
+  }
+
+  async function runSessionNoiseCheck(targetSessionDir: string, currentSnapshot: SessionSnapshot) {
+    if (!targetSessionDir
+      || activeSessionDirRef.current !== targetSessionDir
+      || noiseCheckOperationRef.current
+      || currentSnapshot.noise_check?.passed) return;
+    const operation: SessionNoiseCheckOperation = {
+      activation: noiseCheckActivationRef.current,
+      request: ++noiseCheckRequestSequenceRef.current,
+      sessionDir: targetSessionDir,
+    };
+    noiseCheckOperationRef.current = operation;
+    setNoiseCheckRunning(true);
+    setNoiseCheckProgress(0);
+    setNoiseCheckError('');
+    setError('');
+    const progressTimer = window.setInterval(() => {
+      if (!isCurrentSessionNoiseCheckOperation(
+        noiseCheckOperationRef.current,
+        operation,
+        noiseCheckActivationRef.current,
+        activeSessionDirRef.current,
+      )) {
+        window.clearInterval(progressTimer);
+        return;
+      }
+      setNoiseCheckProgress((current) => Math.min(NOISE_CHECK_PROGRESS_STEPS - 1, current + 1));
+    }, NOISE_CHECK_PROGRESS_INTERVAL_MS);
+    try {
+      const result = await window.recorder.request<NoiseCheckResult>('check_noise', {
+        threshold_dbfs: currentSnapshot.silence_threshold_dbfs ?? noiseThresholdDbfs,
+      });
+      if (!isCurrentSessionNoiseCheckOperation(
+        noiseCheckOperationRef.current,
+        operation,
+        noiseCheckActivationRef.current,
+        activeSessionDirRef.current,
+      )) return;
+      setSnapshot((previous) => previous ? {
+        ...previous,
+        noise_check: result,
+        silence_threshold_dbfs: result.threshold_dbfs,
+      } : previous);
+      setNoiseThresholdDbfs(result.threshold_dbfs);
+      setNotice(result.passed
+        ? '环境噪声检测已通过；本次录制的后续句子和重录不再重复检测。'
+        : '环境噪声未通过，请处理噪声后手动重新检测。');
+    } catch (caught) {
+      if (!isCurrentSessionNoiseCheckOperation(
+        noiseCheckOperationRef.current,
+        operation,
+        noiseCheckActivationRef.current,
+        activeSessionDirRef.current,
+      )) return;
+      setNoiseCheckError(`环境噪声检测失败：${errorMessage(caught)}`);
+      setError(`环境噪声检测失败：${errorMessage(caught)}`);
+    } finally {
+      window.clearInterval(progressTimer);
+      if (isCurrentSessionNoiseCheckOperation(
+        noiseCheckOperationRef.current,
+        operation,
+        noiseCheckActivationRef.current,
+        activeSessionDirRef.current,
+      )) {
+        noiseCheckOperationRef.current = null;
+        setNoiseCheckRunning(false);
+        setNoiseCheckProgress(0);
+      }
+    }
+  }
+
+  function activateSessionNoiseCheck(
+    nextSnapshot: SessionSnapshot,
+    targetSessionDir: string,
+    isNewActivation: boolean,
+  ) {
+    clearSessionNoiseCheck(targetSessionDir);
+    if (shouldAutoRunSessionNoiseCheck(nextSnapshot.noise_check, isNewActivation)) {
+      void runSessionNoiseCheck(targetSessionDir, nextSnapshot);
     }
   }
 
@@ -738,6 +860,7 @@ function RecorderApp() {
         });
         setFinishConfirmOpen(false);
         setPauseConfirmOpen(false);
+        clearSessionNoiseCheck();
         setBusy('');
         setDataSafetyAlert('');
         setError(`录音引擎连续三次自动恢复失败：${terminalRecoveryFailure.error}。已返回任务列表，已落盘母音频仍保留；请使用“修复并封存”。`);
@@ -801,13 +924,14 @@ function RecorderApp() {
 
   function enterRunningSession(current: RunningSessionState, wasRecovered: boolean, availableDevices = devices) {
     const nextSnapshot = current.snapshot;
+    const nextSessionDir = current.session_dir || activeSessionDirRef.current || sessionDir;
     const threshold = nextSnapshot.silence_threshold_dbfs ?? nextSnapshot.noise_check?.threshold_dbfs ?? -42;
     const activeIndex = current.active_attempt
       ? nextSnapshot.items.findIndex((item) => item.id === current.active_attempt?.item_id)
       : nextSnapshot.items.findIndex((item) => item.status === 'review' || item.status === 'pending');
     setSnapshot(nextSnapshot);
     if (wasRecovered) setWaveformGeneration((generation) => generation + 1);
-    if (current.session_dir) setSessionDir(current.session_dir);
+    if (nextSessionDir) setSessionDir(nextSessionDir);
     setSessionName(nextSnapshot.session_id);
     setScriptFile(nextSnapshot.script_name ?? '');
     setDeviceId(nextSnapshot.device_id ?? availableDevices.find((device) => device.name === nextSnapshot.device_name)?.id ?? '');
@@ -839,6 +963,7 @@ function RecorderApp() {
     setFinishConfirmOpen(false);
     setPauseConfirmOpen(false);
     setPhase('running');
+    activateSessionNoiseCheck(nextSnapshot, nextSessionDir, wasRecovered);
     setNotice(current.active_attempt
       ? `已重新连接正在录制的 ${current.active_attempt.item_id}`
       : wasRecovered
@@ -911,6 +1036,7 @@ function RecorderApp() {
     setSnapshot(result.snapshot);
     setSessionDir(result.session_dir);
     setPhase('running');
+    activateSessionNoiseCheck(result.snapshot, result.session_dir, true);
     setCurrentIndex(0);
     setMeter(emptyMeter);
     setNotice('录制已建立，请确认实时输入电平后开始第一句。');
@@ -923,7 +1049,7 @@ function RecorderApp() {
   }
 
   async function startAttempt() {
-    if (!currentItem || recording || phase !== 'running' || captureFault) return;
+    if (!currentItem || recording || phase !== 'running' || captureFault || currentNoiseGate !== 'ready') return;
     const result = await run('正在开始…', () => window.recorder.request<{
       attempt_id: string;
       start_sample: number;
@@ -1276,6 +1402,7 @@ function RecorderApp() {
       setResumeError(null);
       setSealConfirmRecording(null);
       setPhase('home');
+      clearSessionNoiseCheck();
       setSnapshot(null);
       setSessionDir('');
       setRecording(false);
@@ -1322,6 +1449,7 @@ function RecorderApp() {
     setResumingSessionDir('');
     setSealConfirmRecording(null);
     setPhase('setup');
+    clearSessionNoiseCheck();
     setSnapshot(null);
     setSessionDir('');
     setRecording(false);
@@ -1351,6 +1479,7 @@ function RecorderApp() {
     setResumeError(null);
     setSealConfirmRecording(null);
     setPhase('home');
+    clearSessionNoiseCheck();
     setSnapshot(null);
     setSessionDir('');
     setRecording(false);
@@ -1565,19 +1694,22 @@ function RecorderApp() {
         <div className="document-tabs"><span className="active"><Icon name="microphone" size={13} /> {workflowComplete ? '任务完成' : currentItem?.id ?? 'Item'} <i>×</i></span></div>
         <div className="editor-toolbar"><div className="editor-nav"><button title="上一句" disabled={recording || captureFault || currentIndex === 0} onClick={() => setCurrentIndex((index) => Math.max(0, index - 1))}><Icon name="chevron-left" /></button><span>{currentIndex + 1} / {items.length}</span><button title="下一句" disabled={recording || captureFault || currentIndex >= items.length - 1} onClick={() => setCurrentIndex((index) => Math.min(items.length - 1, index + 1))}><Icon name="chevron-right" /></button></div><div className="editor-time"><small>{recording ? 'TAKE' : 'TOTAL'}</small><strong className={recording ? 'recording' : ''}>{recording ? attemptDuration : sessionDuration}</strong></div><button className="prompter-launch" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />领读面板</button><div className={`save-health ${captureFault ? 'fault' : meter.storage_status === 'warning' ? 'warning' : ''}`}><i />{captureFault ? `${captureFaultCopy.title} · 立即停止朗读` : meter.storage_status === 'warning' ? `磁盘余量预警 · 约 ${Math.max(0, Math.floor(meter.storage_safe_remaining_seconds / 60))} 分钟安全窗口` : '正在自动写入 · 母轨已保护'}</div></div>
         {captureFault && <div className="capture-fault-banner" role="alert"><Icon name="stop" size={16} /><div><strong>{captureFaultCopy.title}</strong><span>{captureFaultCopy.detail}{snapshot?.device_name ? ` 当前设备：${snapshot.device_name}。` : ' '}请停止朗读，然后安全结束任务。</span></div></div>}
+        {noiseCheckBlocksAttempt && <div className={`session-noise-banner ${currentNoiseGate}`} role="status"><Icon name="meter" size={16} /><div><strong>{currentNoiseGate === 'checking' ? '环境噪声检测中' : currentNoiseGate === 'failed' ? '环境噪声未通过' : '需要环境噪声检测'}</strong><span>{noiseCheckMessage}。通过后，本次录制期间不再重复检测。</span></div><button className="button" onClick={() => snapshot && void runSessionNoiseCheck(sessionDir, snapshot)} disabled={noiseCheckRunning || Boolean(busy)}>{noiseCheckRunning ? '检测中…' : currentNoiseGate === 'failed' || noiseCheckError ? '重新检测' : '开始检测'}</button></div>}
         {qualityWarning && <div className="input-quality-banner" role="alert"><Icon name="meter" size={16} /><div><strong>输入质量强提醒</strong><span>{qualityWarning}。录音仍在持续写入，请确认输入恢复后再继续朗读。</span></div></div>}
         <div className="editor-canvas">
-          <section className={`script-monitor ${hasSpoken && !captureFault ? 'recording' : ''} cue-${cue}`}><header><span>朗读监视器</span><div><span className={`studio-cue ${cue}`}><i />{cueLabel}</span><em>{workflowComplete ? `TOTAL ${items.length}` : `ITEM ${String(currentIndex + 1).padStart(3, '0')}`}</em><span className={`take-state ${captureFault ? 'fault' : workflowComplete ? 'complete' : recording ? cue : currentItem?.status ?? 'pending'}`}>{captureFault ? 'STOP READING' : workflowComplete ? 'COMPLETE' : recording ? cue === 'checking' ? 'CHECKING' : cue === 'ready' ? 'READY' : cue === 'post-ready' ? 'TAIL READY' : 'RECORDING' : statusLabel(currentItem?.status ?? 'pending')}</span></div></header><div className={`prompt-surface ${captureFault ? 'fault' : ''}`}>{captureFault ? <span className="label-chip">立即停止朗读</span> : (workflowComplete || currentItem?.label) && <span className="label-chip">{workflowComplete ? '全部完成' : currentItem?.label}</span>}<p>{captureFault ? captureFaultCopy.title : workflowComplete ? '本次脚本已全部处理' : currentItem?.text ?? '没有可显示的文本'}</p><small>{captureFault ? captureFaultCopy.detail : workflowComplete ? '完成采集后可稍后生成交付' : <>TEXT ID&nbsp;&nbsp;{currentItem?.id}</>}</small></div><div className="silence-progress" aria-label={cueLabel}><i style={{ width: `${Math.min(100, displayedSilenceProgress * 100)}%` }} /></div></section>
+          <section className={`script-monitor ${hasSpoken && !captureFault ? 'recording' : ''} cue-${cue}`}><header><span>朗读监视器</span><div><span className={`studio-cue ${cue}`}><i />{cueLabel}</span><em>{workflowComplete ? `TOTAL ${items.length}` : `ITEM ${String(currentIndex + 1).padStart(3, '0')}`}</em><span className={`take-state ${captureFault ? 'fault' : workflowComplete ? 'complete' : recording ? cue : currentItem?.status ?? 'pending'}`}>{captureFault ? 'STOP READING' : noiseCheckBlocksAttempt ? 'NOISE CHECK' : workflowComplete ? 'COMPLETE' : recording ? cue === 'checking' ? 'CHECKING' : cue === 'ready' ? 'READY' : cue === 'post-ready' ? 'TAIL READY' : 'RECORDING' : statusLabel(currentItem?.status ?? 'pending')}</span></div></header><div className={`prompt-surface ${captureFault ? 'fault' : ''}`}>{captureFault ? <span className="label-chip">立即停止朗读</span> : noiseCheckBlocksAttempt ? <span className="label-chip">环境检测</span> : (workflowComplete || currentItem?.label) && <span className="label-chip">{workflowComplete ? '全部完成' : currentItem?.label}</span>}<p>{captureFault ? captureFaultCopy.title : noiseCheckBlocksAttempt ? '请保持安静' : workflowComplete ? '本次脚本已全部处理' : currentItem?.text ?? '没有可显示的文本'}</p><small>{captureFault ? captureFaultCopy.detail : noiseCheckBlocksAttempt ? noiseCheckMessage : workflowComplete ? '完成采集后可稍后生成交付' : <>TEXT ID&nbsp;&nbsp;{currentItem?.id}</>}</small></div><div className="silence-progress" aria-label={cueLabel}><i style={{ width: `${Math.min(100, displayedSilenceProgress * 100)}%` }} /></div></section>
           <section className="signal-monitor"><header><div><strong>实时 PCM 波形</strong><span>12 SEC · MIN / MAX · WEBGL</span></div><div><span>RMS <b>{db(meter.rms)}</b></span><span>PEAK <b className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</b></span></div></header><div className="signal-scope"><WebGLWaveform key={`${sessionDir}:${waveformGeneration}`} bins={meter.waveform ?? []} waveformEndSample={meter.waveform_end_sample} recording={recording && !captureFault} sampleRate={sampleRateForDisplay} /><div className="scope-scale"><span>−1.0</span><span>−0.5</span><span>0</span><span>+0.5</span><span>+1.0</span></div></div><div className="horizontal-meter"><i className="meter-rms" style={{ width: `${rmsPercent}%` }} /><i className="meter-peak" style={{ left: `${peakPercent}%` }} /></div></section>
           {audioUrl && <audio ref={audioRef} src={audioUrl} controls className="audio-player" />}
           <section className="transport-panel">
             <div className="transport-secondary">
               <button title="试听 P" onClick={() => void previewAttempt()} disabled={captureFault || recording || !currentItem?.attempts.length || Boolean(busy)}><Icon name="play" /><span>试听</span><kbd>P</kbd></button>
-              <button title="重录 R" onClick={() => void startAttempt()} disabled={captureFault || recording || !currentItem || Boolean(busy)}><Icon name="retake" /><span>重录</span><kbd>R</kbd></button>
+              <button title="重录 R" onClick={() => void startAttempt()} disabled={captureFault || noiseCheckBlocksAttempt || recording || !currentItem || Boolean(busy)}><Icon name="retake" /><span>重录</span><kbd>R</kbd></button>
             </div>
             <div className="transport-primary">
               {captureFault
                 ? <button data-testid="main-transport" className="main-transport stop" onClick={finishSession} disabled={Boolean(busy)}><span><Icon name="stop" /></span><strong>安全结束并保留母轨</strong><kbd>SPACE</kbd></button>
+                : noiseCheckBlocksAttempt && primaryAction === 'start'
+                  ? <button data-testid="main-transport" className="main-transport waiting" onClick={() => snapshot && void runSessionNoiseCheck(sessionDir, snapshot)} disabled={noiseCheckRunning || Boolean(busy)}><span><Icon name="meter" /></span><strong>{noiseCheckRunning ? '环境噪声检测中 · 请保持安静' : '先完成环境噪声检测'}</strong><kbd>{noiseCheckRunning ? '…' : 'CLICK'}</kbd></button>
                 : recording
                   ? <button data-testid="main-transport" className={`main-transport ${!headSilencePassed ? 'waiting' : !hasSpoken ? 'record' : postSilenceReady ? 'post-ready' : 'stop'}`} onClick={() => void stopAttempt()} disabled={Boolean(busy)}><span><Icon name="stop" /></span><strong>{!headSilencePassed ? '正在检测头静音 · 点击取消' : !hasSpoken ? '头静音达标 · 请开始朗读' : postSilenceReady ? '尾静音达标 · 完成本句' : '录制中 · 强制完成'}</strong><kbd>SPACE</kbd></button>
                 : primaryAction === 'accept'

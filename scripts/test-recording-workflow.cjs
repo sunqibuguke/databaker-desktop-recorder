@@ -12,7 +12,10 @@ async function main() {
     executeSafePause,
     findNextActionableItemIndex,
     idlePrimaryAction,
+    isCurrentSessionNoiseCheckOperation,
     isFinalReview,
+    sessionNoiseGate,
+    shouldAutoRunSessionNoiseCheck,
     workflowShortcutAction,
   } = await import(pathToFileURL(modulePath).href);
   const {
@@ -27,6 +30,54 @@ async function main() {
   } = await import(pathToFileURL(captureConfigurationModulePath).href);
 
   const item = (status) => ({ status });
+
+  assert.equal(sessionNoiseGate(null, false), 'pending');
+  assert.equal(sessionNoiseGate(null, true), 'checking');
+  assert.equal(sessionNoiseGate({ passed: false }, false), 'failed');
+  assert.equal(sessionNoiseGate({ passed: true }, false), 'ready');
+  assert.equal(
+    shouldAutoRunSessionNoiseCheck(null, true),
+    true,
+    'a newly created or resumed activation must run one ambient-noise check',
+  );
+  assert.equal(
+    shouldAutoRunSessionNoiseCheck(null, false),
+    false,
+    'a renderer reconnect must not duplicate an in-flight or already requested check',
+  );
+  assert.equal(
+    shouldAutoRunSessionNoiseCheck({ passed: false }, true),
+    false,
+    'a failed completed check waits for an explicit retry instead of auto-looping',
+  );
+  assert.equal(
+    shouldAutoRunSessionNoiseCheck({ passed: true }, true),
+    false,
+    'a persisted pass keeps every later sentence and retake open',
+  );
+  const firstNoiseOperation = { activation: 1, request: 1, sessionDir: '/recordings/session-a' };
+  const retryNoiseOperation = { activation: 1, request: 2, sessionDir: '/recordings/session-a' };
+  const recoveredNoiseOperation = { activation: 2, request: 3, sessionDir: '/recordings/session-a' };
+  assert.equal(
+    isCurrentSessionNoiseCheckOperation(firstNoiseOperation, firstNoiseOperation, 1, '/recordings/session-a'),
+    true,
+    'the active request may settle its own activation',
+  );
+  assert.equal(
+    isCurrentSessionNoiseCheckOperation(retryNoiseOperation, firstNoiseOperation, 1, '/recordings/session-a'),
+    false,
+    'an older promise must not settle a newer request in the same activation',
+  );
+  assert.equal(
+    isCurrentSessionNoiseCheckOperation(recoveredNoiseOperation, firstNoiseOperation, 2, '/recordings/session-a'),
+    false,
+    'an older promise must not settle a recovered activation that reuses the same directory',
+  );
+  assert.equal(
+    isCurrentSessionNoiseCheckOperation(firstNoiseOperation, firstNoiseOperation, 1, '/recordings/session-b'),
+    false,
+    'a request must not settle after the active session directory changes',
+  );
 
   assert.equal(
     inputQualityWarning(true, false, true),

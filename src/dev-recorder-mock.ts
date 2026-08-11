@@ -301,6 +301,7 @@ export function installDevRecorderMock() {
         mockSampleRate = snapshot.audio_format.sample_rate;
         recordingStartedAt = performance.now() - capturedSamples / mockSampleRate * 1_000;
         snapshot.status = 'recording';
+        snapshot.noise_check = null;
         snapshot.updated_at = new Date().toISOString();
         window.clearInterval(meterTimer);
         meterTimer = window.setInterval(emitMeter, 100);

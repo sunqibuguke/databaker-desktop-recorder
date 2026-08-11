@@ -1,10 +1,17 @@
 import type { ItemState } from './types';
 
 type WorkflowItem = Pick<ItemState, 'status'>;
+type PersistedNoiseCheck = { passed: boolean } | null | undefined;
 
 export type IdlePrimaryAction = 'finish' | 'accept' | 'start' | 'retake-only' | 'none';
 export type WorkflowShortcutAction = 'finish' | 'accept' | 'start' | 'retake' | 'none';
 export type CaptureExitAction = 'pause' | 'complete' | 'fault';
+export type SessionNoiseGate = 'pending' | 'checking' | 'failed' | 'ready';
+export type SessionNoiseCheckOperation = Readonly<{
+  activation: number;
+  request: number;
+  sessionDir: string;
+}>;
 
 export type SafePauseOperations<T> = {
   hasActiveAttempt: boolean;
@@ -71,6 +78,35 @@ export function workflowShortcutAction(
     return primaryAction;
   }
   return 'none';
+}
+
+export function sessionNoiseGate(
+  noiseCheck: PersistedNoiseCheck,
+  checking: boolean,
+): SessionNoiseGate {
+  if (checking) return 'checking';
+  if (!noiseCheck) return 'pending';
+  return noiseCheck.passed ? 'ready' : 'failed';
+}
+
+export function shouldAutoRunSessionNoiseCheck(
+  noiseCheck: PersistedNoiseCheck,
+  isNewActivation: boolean,
+): boolean {
+  return isNewActivation && !noiseCheck;
+}
+
+export function isCurrentSessionNoiseCheckOperation(
+  activeOperation: SessionNoiseCheckOperation | null,
+  candidate: SessionNoiseCheckOperation,
+  activeActivation: number,
+  activeSessionDir: string,
+): boolean {
+  return activeOperation?.activation === candidate.activation
+    && activeOperation.request === candidate.request
+    && activeOperation.sessionDir === candidate.sessionDir
+    && candidate.activation === activeActivation
+    && candidate.sessionDir === activeSessionDir;
 }
 
 export async function executeSafePause<T>(operations: SafePauseOperations<T>): Promise<T | null> {
