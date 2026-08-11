@@ -65,6 +65,12 @@ function client(mode, gracefulStopTimeoutMs) {
   });
 }
 
+function isRequestedSigtermOutcome(outcome) {
+  return process.platform === 'win32'
+    ? outcome.signal === null && outcome.code !== null && outcome.code !== 0
+    : outcome.code === null && outcome.signal === 'SIGTERM';
+}
+
 async function waitForEvent(target, event, timeoutMs = 2_000) {
   return await new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -121,11 +127,21 @@ async function main() {
     signaled.stop(),
     (error) => error instanceof EngineUnsafeStopError
       && error.shutdownConfirmed === true
-      && error.outcome.signal === 'SIGTERM'
-      && error.outcome.safe === false,
+      && error.outcome.safe === false
+      && isRequestedSigtermOutcome(error.outcome),
     'shutdown acknowledgement plus signal exit must not be accepted as safe',
   );
-  assert.deepEqual((await signaledExit)[0], { safe: false, code: null, signal: 'SIGTERM' });
+  const [signaledOutcome] = await signaledExit;
+  assert.equal(
+    signaledOutcome.safe,
+    false,
+    'the stopped event must never classify abnormal termination as safe',
+  );
+  assert.equal(
+    isRequestedSigtermOutcome(signaledOutcome),
+    true,
+    'the stopped event must preserve the platform-specific abnormal termination outcome',
+  );
 
   const hung = client('hang', 100);
   await hung.start();
