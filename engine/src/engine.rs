@@ -9,8 +9,9 @@ use crate::storage_guard::{
     AtomicExportStep, StorageReport, StorageStatus, check_storage, evaluate_atomic_export_space,
 };
 use crate::wav::{
-    RecoverableWav, WavEncoding, automatic_wav_container_name, automatic_wav_file_size,
-    slice_wav_mono, standard_wav_file_size, validate_standard_wav_size,
+    RecoverableWav, WavEncoding, WavExportMode, WavExportWriter,
+    automatic_wav_container_name, automatic_wav_file_size, slice_wav_mono,
+    standard_wav_file_size, validate_standard_wav_size,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
@@ -325,6 +326,14 @@ pub struct SystemTestStartSessionPayload {
 pub struct ResumeSessionPayload {
     pub session_dir: String,
     pub expected_session_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportArtifact {
+    FullTrack,
+    CutsZip,
+    TimestampsJson,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1443,6 +1452,22 @@ impl Engine {
         )
     }
 
+    pub fn create_session(&self, payload: StartSessionPayload) -> Result<Value> {
+        require_explicit_input_device_id(payload.device_id.as_deref(), "创建录制任务")?;
+        let (session_dir, mut snapshot) = self.prepare_new_session(payload, None)?;
+        snapshot.status = "stopped".to_string();
+        atomic_snapshot_json(&session_dir.join("metadata/items.snapshot.json"), &snapshot)?;
+        atomic_json(&session_dir.join("script/normalized.json"), &snapshot.items)?;
+        atomic_json(&session_dir.join("session.json"), &session_summary_value(&snapshot))?;
+        Ok(json!({
+            "snapshot": snapshot,
+            "session_dir": session_dir,
+            "mode": "inspect",
+            "recovery_warnings": [],
+            "faulted": false,
+        }))
+    }
+
     #[cfg(feature = "system-test")]
     pub fn start_system_test_session(
         &mut self,
@@ -1608,13 +1633,6 @@ impl Engine {
         if snapshot.items.is_empty() {
             bail!("录制任务没有可恢复的脚本条目");
         }
-        if snapshot
-            .items
-            .iter()
-            .all(|item| matches!(item.status.as_str(), "accepted" | "skipped"))
-        {
-            bail!("该录制任务已经全部处理，无需继续录制");
-        }
         MasterStorageKind::from_snapshot(&snapshot)?;
         if snapshot.audio_format.channels != 1 || snapshot.audio_format.input_channel == 0 {
             bail!("录制任务的音频通道配置无效");
@@ -1648,6 +1666,160 @@ impl Engine {
             object.insert("previous_status".to_string(), json!(previous_status));
         }
         Ok(result)
+    }
+
+    pub fn inspect_session_expected(
+        &self,
+        session_dir: &Path,
+        expected_session_id: &str,
+    ) -> Result<Value> {
+        if self.session.is_some() {
+            bail!("当前已有录制进行中，请先安全暂停后再打开其他任务");
+        }
+        let expected_session_id = expected_session_id.trim();
+        if expected_session_id.is_empty() {
+            bail!("打开任务需要明确的录制任务身份");
+        }
+        validate_offline_session_tree(session_dir)?;
+        let _session_lock = SessionLock::acquire(session_dir, &Utc::now().to_rfc3339())?;
+        let mut journal = read_journal(session_dir)?;
+        let snapshot = load_recovery_snapshot_for_session(
+            session_dir,
+            &mut journal,
+            Some(expected_session_id),
+        )?;
+        Ok(json!({
+            "snapshot": snapshot,
+            "session_dir": session_dir,
+            "mode": "inspect",
+            "recovery_warnings": journal.warnings,
+            "faulted": audio_fault_marker_present(session_dir)?,
+            "data_health": if audio_fault_marker_present(session_dir)?
+                || snapshot.status == "faulted"
+                || snapshot.overflow_samples > 0
+            {
+                "readonly"
+            } else if snapshot.status == "recording" || snapshot.status == "stopping" {
+                "needs_repair"
+            } else {
+                "normal"
+            },
+        }))
+    }
+
+    pub fn render_session_attempt_expected(
+        &self,
+        session_dir: &Path,
+        expected_session_id: &str,
+        item_id: &str,
+        attempt_id: &str,
+    ) -> Result<Value> {
+        if self.session.is_some() {
+            bail!("当前已有录制进行中，请使用实时任务试听");
+        }
+        validate_offline_session_tree(session_dir)?;
+        let _session_lock = SessionLock::acquire(session_dir, &Utc::now().to_rfc3339())?;
+        let mut journal = read_journal(session_dir)?;
+        let snapshot = load_recovery_snapshot_for_session(
+            session_dir,
+            &mut journal,
+            Some(expected_session_id.trim()),
+        )?;
+        let attempt = snapshot
+            .items
+            .iter()
+            .find(|item| item.id == item_id)
+            .and_then(|item| item.attempts.iter().find(|attempt| attempt.attempt_id == attempt_id))
+            .cloned()
+            .ok_or_else(|| anyhow!("录音版本不存在"))?;
+        if attempt.status == "interrupted"
+            || attempt.end_sample <= attempt.start_sample
+            || attempt.end_sample > snapshot.committed_samples
+        {
+            bail!("异常中断或样本边界越界的录音版本不能试听");
+        }
+        let preview_dir = session_dir.join("preview");
+        match std::fs::symlink_metadata(&preview_dir) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => bail!("录制任务试听目录无效"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                durable_create_directory(&preview_dir)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let destination = preview_dir.join(format!(
+            "{}.wav",
+            bounded_wav_stem(attempt_id, "")?,
+        ));
+        render_offline_range(
+            session_dir,
+            &snapshot,
+            &destination,
+            attempt.start_sample,
+            attempt.end_sample,
+        )?;
+        Ok(json!({ "file_path": destination }))
+    }
+
+    pub fn select_session_attempt_expected(
+        &self,
+        session_dir: &Path,
+        expected_session_id: &str,
+        item_id: &str,
+        attempt_id: &str,
+    ) -> Result<Value> {
+        if self.session.is_some() {
+            bail!("当前已有录制进行中，请先安全暂停再切换版本");
+        }
+        validate_offline_session_tree(session_dir)?;
+        let _session_lock = SessionLock::acquire(session_dir, &Utc::now().to_rfc3339())?;
+        ensure_no_audio_fault_marker(session_dir, "切换录音版本")?;
+        let mut journal = read_journal(session_dir)?;
+        let mut snapshot = load_recovery_snapshot_for_session(
+            session_dir,
+            &mut journal,
+            Some(expected_session_id.trim()),
+        )?;
+        if snapshot.status != "stopped" {
+            bail!("任务尚未安全暂停，不能离线切换录音版本");
+        }
+        let item = snapshot
+            .items
+            .iter_mut()
+            .find(|item| item.id == item_id)
+            .ok_or_else(|| anyhow!("条目不存在"))?;
+        let selected = item
+            .attempts
+            .iter()
+            .find(|attempt| attempt.attempt_id == attempt_id)
+            .ok_or_else(|| anyhow!("录音版本不存在"))?;
+        if selected.status == "interrupted"
+            || selected.end_sample <= selected.start_sample
+            || selected.end_sample > snapshot.committed_samples
+        {
+            bail!("异常中断或样本边界越界的录音版本不能设为当前版本");
+        }
+        for attempt in &mut item.attempts {
+            if attempt.attempt_id == attempt_id {
+                attempt.status = "accepted".to_string();
+            } else if attempt.status == "accepted" {
+                attempt.status = "rejected_by_operator".to_string();
+            }
+        }
+        item.selected_attempt_id = Some(attempt_id.to_string());
+        item.status = "accepted".to_string();
+        persist_offline_snapshot(
+            session_dir,
+            &mut snapshot,
+            "attempt_selected_offline",
+            json!({ "item_id": item_id, "attempt_id": attempt_id }),
+        )?;
+        Ok(json!({
+            "snapshot": snapshot,
+            "session_dir": session_dir,
+            "item_id": item_id,
+            "attempt_id": attempt_id,
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2709,13 +2881,27 @@ impl Engine {
             .iter_mut()
             .find(|item| item.id == active.item_id)
             .ok_or_else(|| anyhow!("item disappeared while recording"))?;
-        item.status = "review".to_string();
-        // A retake may start from an already accepted row. Once a new version
-        // reaches review, the previous delivery selection is no longer the
-        // implicit choice: after a renderer restart the reviewer must default
-        // to the newest usable take, while still being free to explicitly
-        // choose the historical version again.
-        item.selected_attempt_id = None;
+        let replaces_accepted_version = item.status == "accepted"
+            && item.selected_attempt_id.is_some();
+        item.status = if replaces_accepted_version {
+            "accepted".to_string()
+        } else {
+            "review".to_string()
+        };
+        if replaces_accepted_version {
+            for previous in &mut item.attempts {
+                if previous.status == "accepted" {
+                    previous.status = "rejected_by_operator".to_string();
+                }
+            }
+            item.selected_attempt_id = Some(attempt.attempt_id.clone());
+        } else {
+            item.selected_attempt_id = None;
+        }
+        let mut attempt = attempt;
+        if replaces_accepted_version {
+            attempt.status = "accepted".to_string();
+        }
         item.attempts.push(attempt.clone());
         session.active_attempt = None;
         session.persist(
@@ -2724,6 +2910,7 @@ impl Engine {
                 "item_id": active.item_id,
                 "attempt": attempt,
                 "forced": forced_without_tail_silence,
+                "auto_selected": replaces_accepted_version,
                 "tail_silence_samples": tail_silence_samples,
                 "required_tail_silence_samples": required_silence_samples,
             }),
@@ -2733,6 +2920,7 @@ impl Engine {
             "item_id": active.item_id,
             "attempt": attempt,
             "forced": forced_without_tail_silence,
+            "auto_selected": replaces_accepted_version,
         }))
     }
 
@@ -3058,6 +3246,7 @@ impl Engine {
                 "durable_frames": durable_frames,
                 "recovered_attempts": 0,
                 "fault_preserved": recorded_fault,
+                "data_health": if recorded_fault { "readonly" } else { "normal" },
                 "no_op": true,
                 "warnings": warnings,
             }));
@@ -3162,6 +3351,7 @@ impl Engine {
             "durable_frames": durable_frames,
             "recovered_attempts": recovered_attempts,
             "fault_preserved": fault_preserved,
+            "data_health": if fault_preserved { "readonly" } else { "normal" },
             "no_op": false,
             "warnings": warnings,
         }))
@@ -3169,7 +3359,7 @@ impl Engine {
 
     #[cfg(test)]
     fn export_session(&self, session_dir: &Path) -> Result<Value> {
-        self.export_session_inner_expected(session_dir, None, None)
+        self.export_session_inner_expected(session_dir, None, None, None)
     }
 
     pub fn export_session_expected(
@@ -3181,7 +3371,25 @@ impl Engine {
         if expected_session_id.is_empty() {
             bail!("导出需要明确的录制任务身份");
         }
-        self.export_session_inner_expected(session_dir, Some(expected_session_id), None)
+        self.export_session_inner_expected(session_dir, Some(expected_session_id), None, None)
+    }
+
+    pub fn export_session_artifact_expected(
+        &self,
+        session_dir: &Path,
+        expected_session_id: &str,
+        artifact: ExportArtifact,
+    ) -> Result<Value> {
+        let expected_session_id = expected_session_id.trim();
+        if expected_session_id.is_empty() {
+            bail!("导出需要明确的录制任务身份");
+        }
+        self.export_session_inner_expected(
+            session_dir,
+            Some(expected_session_id),
+            None,
+            Some(artifact),
+        )
     }
 
     #[cfg(test)]
@@ -3190,7 +3398,7 @@ impl Engine {
         session_dir: &Path,
         available_bytes_override: Option<u64>,
     ) -> Result<Value> {
-        self.export_session_inner_expected(session_dir, None, available_bytes_override)
+        self.export_session_inner_expected(session_dir, None, available_bytes_override, None)
     }
 
     fn export_session_inner_expected(
@@ -3198,6 +3406,7 @@ impl Engine {
         session_dir: &Path,
         expected_session_id: Option<&str>,
         available_bytes_override: Option<u64>,
+        requested_artifact: Option<ExportArtifact>,
     ) -> Result<Value> {
         let session_metadata = std::fs::symlink_metadata(session_dir)
             .with_context(|| format!("inspect recording directory {}", session_dir.display()))?;
@@ -3215,12 +3424,20 @@ impl Engine {
         // under the same task lease. Checking the marker first leaves a race
         // where another process can fault/seal the session before this export
         // acquires the lock and then incorrectly publish a normal delivery.
-        ensure_no_audio_fault_marker(session_dir, "导出任务")?;
+        let export_full_track = requested_artifact.is_none_or(|artifact| artifact == ExportArtifact::FullTrack);
+        let export_cuts = requested_artifact.is_none_or(|artifact| artifact == ExportArtifact::CutsZip);
+        let export_timestamps = requested_artifact.is_none_or(|artifact| artifact == ExportArtifact::TimestampsJson);
+        if export_cuts {
+            ensure_no_audio_fault_marker(
+                session_dir,
+                if requested_artifact.is_none() { "导出任务" } else { "导出分段 ZIP" },
+            )?;
+        }
         let mut journal = read_journal(session_dir)?;
         let snapshot =
             load_recovery_snapshot_for_session(session_dir, &mut journal, expected_session_id)?;
         let recovery_warnings = journal.warnings;
-        validate_snapshot_for_export(&snapshot)?;
+        validate_snapshot_for_artifact(&snapshot, requested_artifact)?;
         let storage_kind = MasterStorageKind::from_snapshot(&snapshot)?;
         let master_relative = Path::new(&snapshot.master_audio);
         if master_relative.is_absolute()
@@ -3246,19 +3463,27 @@ impl Engine {
             }
             Err(error) => return Err(error.into()),
         }
-        let source_metadata = std::fs::symlink_metadata(&source)
-            .with_context(|| format!("inspect source audio {}", source.display()))?;
-        let valid_source = match storage_kind {
-            MasterStorageKind::LegacySingleWav => source_metadata.is_file(),
-            MasterStorageKind::SegmentedWav => source_metadata.is_dir(),
+        let pristine_empty = is_pristine_bootstrap(&snapshot) && snapshot.status == "stopped";
+        let source_metadata = match std::fs::symlink_metadata(&source) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && pristine_empty => None,
+            Err(error) => return Err(error)
+                .with_context(|| format!("inspect source audio {}", source.display())),
         };
-        if !valid_source || source_metadata.file_type().is_symlink() {
-            bail!("recording source audio has an invalid type");
+        if let Some(source_metadata) = source_metadata.as_ref() {
+            let valid_source = match storage_kind {
+                MasterStorageKind::LegacySingleWav => source_metadata.is_file(),
+                MasterStorageKind::SegmentedWav => source_metadata.is_dir(),
+            };
+            if !valid_source || source_metadata.file_type().is_symlink() {
+                bail!("recording source audio has an invalid type");
+            }
         }
         let max_frames_per_segment = storage_layout_segment_frames(&snapshot)?;
-        let mut segmented_source = match storage_kind {
-            MasterStorageKind::LegacySingleWav => None,
-            MasterStorageKind::SegmentedWav => Some(SegmentedWav::resume(
+        let mut segmented_source = match (storage_kind, source_metadata.is_some()) {
+            (_, false) => None,
+            (MasterStorageKind::LegacySingleWav, true) => None,
+            (MasterStorageKind::SegmentedWav, true) => Some(SegmentedWav::resume(
                 &source,
                 snapshot.audio_format.sample_rate,
                 1,
@@ -3266,9 +3491,11 @@ impl Engine {
                 max_frames_per_segment,
             )?),
         };
-        let physical_frames = match segmented_source.as_ref() {
-            Some(source) => source.global_frames(),
-            None => RecoverableWav::open_append(
+        let physical_frames = match (segmented_source.as_ref(), source_metadata.is_some()) {
+            (Some(source), true) => source.global_frames(),
+            (Some(_), false) => unreachable!("segmented source requires source metadata"),
+            (None, false) => 0,
+            (None, true) => RecoverableWav::open_append(
                 &source,
                 snapshot.audio_format.sample_rate,
                 1,
@@ -3297,14 +3524,20 @@ impl Engine {
 
         let export_id = format!("{}-{}", std::process::id(), Utc::now().timestamp_micros());
         let export_started_at = Utc::now().to_rfc3339();
-        let export_source = json!({
-            "journal_seq": snapshot.journal_seq,
-            "committed_samples": snapshot.committed_samples,
-            "selected_attempts": snapshot.items.iter().map(|item| json!({
-                "id": item.id,
-                "attempt_id": item.selected_attempt_id,
-            })).collect::<Vec<_>>(),
-        });
+        let export_source = match requested_artifact {
+            Some(ExportArtifact::FullTrack) => json!({
+                "committed_samples": snapshot.committed_samples,
+                "capture_provenance": snapshot.capture_provenance,
+            }),
+            _ => json!({
+                "journal_seq": snapshot.journal_seq,
+                "committed_samples": snapshot.committed_samples,
+                "selected_attempts": snapshot.items.iter().map(|item| json!({
+                    "id": item.id,
+                    "attempt_id": item.selected_attempt_id,
+                })).collect::<Vec<_>>(),
+            }),
+        };
         let in_progress_status = json!({
             "schema_version": 2,
             "status": "in_progress",
@@ -3321,12 +3554,28 @@ impl Engine {
                 skipped.push(json!({ "id": item.id, "reason": item.status }));
                 continue;
             };
-            let attempt_index = item
+            let Some(attempt_index) = item
                 .attempts
                 .iter()
                 .position(|attempt| attempt.attempt_id == selected)
-                .with_context(|| format!("条目 {} 选中的录音版本不存在", item.id))?;
+            else {
+                if export_cuts {
+                    bail!("条目 {} 选中的录音版本不存在", item.id);
+                }
+                skipped.push(json!({ "id": item.id, "reason": "selected_attempt_missing" }));
+                continue;
+            };
             let attempt = &item.attempts[attempt_index];
+            if attempt.status == "interrupted"
+                || attempt.end_sample <= attempt.start_sample
+                || attempt.end_sample > snapshot.committed_samples
+            {
+                if export_cuts {
+                    bail!("条目 {} 选中的录音版本不可安全导出", item.id);
+                }
+                skipped.push(json!({ "id": item.id, "reason": "selected_attempt_unsafe" }));
+                continue;
+            }
             let file_name =
                 allocate_sentence_file_name(&item.id, item_index, &mut used_file_names)?;
             let file_bytes = standard_wav_file_size(
@@ -3343,7 +3592,12 @@ impl Engine {
         }
 
         let master_output = export_dir.join("full-track.wav");
-        let export_status_path = export_dir.join("status.json");
+        let export_status_path = export_dir.join(match requested_artifact {
+            Some(ExportArtifact::FullTrack) => "status-full-track.json",
+            Some(ExportArtifact::CutsZip) => "status-cuts-zip.json",
+            Some(ExportArtifact::TimestampsJson) => "status-timestamps-json.json",
+            None => "status.json",
+        });
         let export_metadata_path = export_dir.join("timestamps.json");
         let export_csv_path = export_dir.join("timestamps.csv");
         let legacy_export_metadata_path = export_dir.join("metadata.json");
@@ -3351,7 +3605,7 @@ impl Engine {
         let cuts_archive_path = export_dir.join("cuts.zip");
         let planned_master_bytes =
             automatic_wav_file_size(physical_frames, 1, snapshot.audio_format.bit_depth)?
-                .max(source_metadata.len());
+                .max(source_metadata.as_ref().map_or(0, std::fs::Metadata::len));
         let mut storage_steps = Vec::<AtomicExportStep>::new();
         storage_steps.push(AtomicExportStep {
             new_bytes: planned_export_allocation(serialized_json_file_size(&in_progress_status)?)?,
@@ -3360,49 +3614,60 @@ impl Engine {
                 "已有导出状态",
             )?),
         });
-        // Once status.json is in_progress, remove every old sentence WAV as a
+        // Once the cuts status is in_progress, remove every old sentence WAV as a
         // separate generation before writing any new sentence. This avoids
         // both Unicode filesystem aliases and double-crediting an old file as
         // the replacement target for more than one planned name.
-        let existing_sentence_sizes = existing_sentence_wav_sizes(&sentences_dir)?;
-        for old_bytes in existing_sentence_sizes {
+        if export_cuts {
+            let existing_sentence_sizes = existing_sentence_wav_sizes(&sentences_dir)?;
+            for old_bytes in existing_sentence_sizes {
+                storage_steps.push(AtomicExportStep {
+                    new_bytes: 0,
+                    replaced_bytes: old_bytes,
+                });
+            }
+        }
+        if export_full_track {
             storage_steps.push(AtomicExportStep {
-                new_bytes: 0,
-                replaced_bytes: old_bytes,
+                new_bytes: planned_export_allocation(planned_master_bytes)?,
+                replaced_bytes: existing_export_allocation(existing_export_file_size(
+                    &master_output,
+                    "已有整轨导出",
+                )?),
             });
         }
-        storage_steps.push(AtomicExportStep {
-            new_bytes: planned_export_allocation(planned_master_bytes)?,
-            replaced_bytes: existing_export_allocation(existing_export_file_size(
-                &master_output,
-                "已有整轨导出",
-            )?),
-        });
-        for plan in &sentence_plans {
+        if export_cuts {
+            for plan in &sentence_plans {
+                storage_steps.push(AtomicExportStep {
+                    new_bytes: planned_export_allocation(plan.file_bytes)?,
+                    replaced_bytes: 0,
+                });
+            }
+            let planned_archive_bytes = stored_zip_size(&sentence_plans)?;
             storage_steps.push(AtomicExportStep {
-                new_bytes: planned_export_allocation(plan.file_bytes)?,
-                // All prior sentence WAVs are removed before this phase.
+                new_bytes: planned_export_allocation(planned_archive_bytes)?,
+                replaced_bytes: existing_export_allocation(existing_export_file_size(
+                    &cuts_archive_path,
+                    "已有切片压缩包",
+                )?),
+            });
+        }
+        if export_timestamps {
+            existing_export_file_size(&export_metadata_path, "已有导出元数据")?;
+            storage_steps.push(AtomicExportStep {
+                new_bytes: export_metadata_headroom(&snapshot)?,
                 replaced_bytes: 0,
             });
         }
-        let planned_archive_bytes = stored_zip_size(&sentence_plans)?;
-        storage_steps.push(AtomicExportStep {
-            new_bytes: planned_export_allocation(planned_archive_bytes)?,
-            replaced_bytes: existing_export_allocation(existing_export_file_size(
-                &cuts_archive_path,
-                "已有切片压缩包",
-            )?),
-        });
-        existing_export_file_size(&export_metadata_path, "已有导出元数据")?;
-        existing_export_file_size(&export_csv_path, "已有 CSV 元数据")?;
-        existing_export_file_size(&legacy_export_metadata_path, "已有兼容导出元数据")?;
-        existing_export_file_size(&legacy_export_csv_path, "已有兼容 CSV 元数据")?;
-        storage_steps.push(AtomicExportStep {
-            new_bytes: export_metadata_headroom(&snapshot)?
-                .checked_mul(2)
-                .context("导出元数据空间估算溢出")?,
-            replaced_bytes: 0,
-        });
+        if requested_artifact.is_none() {
+            existing_export_file_size(&export_csv_path, "已有 CSV 元数据")?;
+            existing_export_file_size(&legacy_export_metadata_path, "已有兼容导出元数据")?;
+            existing_export_file_size(&legacy_export_csv_path, "已有兼容 CSV 元数据")?;
+            storage_steps.push(AtomicExportStep {
+                new_bytes: export_metadata_headroom(&snapshot)?,
+                replaced_bytes: 0,
+            });
+        }
         let storage = check_storage(
             &export_dir,
             snapshot.audio_format.sample_rate,
@@ -3425,33 +3690,45 @@ impl Engine {
             );
         }
         atomic_json(&export_status_path, &in_progress_status)?;
-        remove_all_sentence_wavs(&sentences_dir)?;
-        match segmented_source.as_mut() {
-            Some(source) => {
-                source.export_whole(&master_output)?;
-            }
-            None => {
-                durable_copy_file(&source, &master_output)?;
+        if export_cuts {
+            remove_all_sentence_wavs(&sentences_dir)?;
+        }
+        if export_full_track {
+            match (segmented_source.as_mut(), source_metadata.is_some()) {
+                (Some(source), true) => {
+                    source.export_whole(&master_output)?;
+                }
+                (Some(_), false) => unreachable!("segmented source requires source metadata"),
+                (None, true) => {
+                    durable_copy_file(&source, &master_output)?;
+                }
+                (None, false) => write_empty_wav_export(
+                    &master_output,
+                    snapshot.audio_format.sample_rate,
+                    snapshot.audio_format.bit_depth,
+                )?,
             }
         }
         let mut exported = Vec::new();
         for plan in &sentence_plans {
             let item = &snapshot.items[plan.item_index];
             let attempt = &item.attempts[plan.attempt_index];
-            let output = sentences_dir.join(&plan.file_name);
-            match segmented_source.as_mut() {
-                Some(source) => {
-                    source.export_range(&output, attempt.start_sample, attempt.end_sample)?;
-                }
-                None => {
-                    slice_wav_mono(
-                        &source,
-                        &output,
-                        snapshot.audio_format.sample_rate,
-                        snapshot.audio_format.bit_depth,
-                        attempt.start_sample,
-                        attempt.end_sample,
-                    )?;
+            if export_cuts {
+                let output = sentences_dir.join(&plan.file_name);
+                match segmented_source.as_mut() {
+                    Some(source) => {
+                        source.export_range(&output, attempt.start_sample, attempt.end_sample)?;
+                    }
+                    None => {
+                        slice_wav_mono(
+                            &source,
+                            &output,
+                            snapshot.audio_format.sample_rate,
+                            snapshot.audio_format.bit_depth,
+                            attempt.start_sample,
+                            attempt.end_sample,
+                        )?;
+                    }
                 }
             }
             exported.push(json!({
@@ -3492,16 +3769,36 @@ impl Engine {
                 "threshold_dbfs": snapshot.silence_threshold_dbfs,
             },
             "source": export_source,
+            "data_health": if snapshot.status == "faulted" || snapshot.overflow_samples > 0 {
+                "faulted"
+            } else {
+                "normal"
+            },
+            "risk_warnings": if snapshot.status == "faulted" || snapshot.overflow_samples > 0 {
+                vec!["任务包含采集故障或写盘溢出；请将整轨和时间戳作为恢复材料人工检查。"]
+            } else {
+                Vec::<&str>::new()
+            },
+            "items": &snapshot.items,
             "full_track": "full-track.wav",
             "full_track_container": full_track_container,
             "exported": exported,
             "skipped": skipped,
         });
-        atomic_json(&export_metadata_path, &metadata)?;
-        write_csv(&export_csv_path, &metadata["exported"])?;
-        atomic_json(&legacy_export_metadata_path, &metadata)?;
-        write_csv(&legacy_export_csv_path, &metadata["exported"])?;
-        write_stored_zip(&cuts_archive_path, &sentences_dir, &sentence_plans)?;
+        if export_timestamps {
+            atomic_json(&export_metadata_path, &metadata)?;
+        }
+        if requested_artifact.is_none() {
+            write_csv(&export_csv_path, &metadata["exported"])?;
+            atomic_json(&legacy_export_metadata_path, &metadata)?;
+            write_csv(&legacy_export_csv_path, &metadata["exported"])?;
+        }
+        if export_cuts {
+            write_stored_zip(&cuts_archive_path, &sentences_dir, &sentence_plans)?;
+            if requested_artifact.is_some() {
+                remove_all_sentence_wavs(&sentences_dir)?;
+            }
+        }
         let exported_count = metadata["exported"].as_array().map_or(0, Vec::len);
         let skipped_count = metadata["skipped"].as_array().map_or(0, Vec::len);
         // This small commit marker is always the last published file. Readers
@@ -3514,6 +3811,11 @@ impl Engine {
                 "status": "complete",
                 "export_id": export_id,
                 "session_id": snapshot.session_id,
+                "artifact": requested_artifact.map(|artifact| match artifact {
+                    ExportArtifact::FullTrack => "full_track",
+                    ExportArtifact::CutsZip => "cuts_zip",
+                    ExportArtifact::TimestampsJson => "timestamps_json",
+                }),
                 "source": export_source,
                 "started_at": export_started_at,
                 "completed_at": Utc::now().to_rfc3339(),
@@ -3522,13 +3824,18 @@ impl Engine {
             }),
         )?;
         Ok(json!({
+            "artifact": requested_artifact.map(|artifact| match artifact {
+                ExportArtifact::FullTrack => "full_track",
+                ExportArtifact::CutsZip => "cuts_zip",
+                ExportArtifact::TimestampsJson => "timestamps_json",
+            }),
             "export_dir": export_dir,
-            "master_file": master_output,
+            "master_file": export_full_track.then_some(master_output),
             "master_container": full_track_container,
-            "timestamps_json": export_metadata_path,
-            "timestamps_csv": export_csv_path,
-            "sentences_dir": sentences_dir,
-            "cuts_archive": cuts_archive_path,
+            "timestamps_json": export_timestamps.then_some(export_metadata_path),
+            "timestamps_csv": requested_artifact.is_none().then_some(export_csv_path),
+            "sentences_dir": requested_artifact.is_none().then_some(sentences_dir),
+            "cuts_archive": export_cuts.then_some(cuts_archive_path),
             "exported_count": exported_count,
             "skipped_count": skipped_count,
             "recovery_warnings": recovery_warnings,
@@ -3651,6 +3958,97 @@ fn validate_offline_session_tree(session_dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn persist_offline_snapshot(
+    session_dir: &Path,
+    snapshot: &mut SessionSnapshot,
+    event: &str,
+    payload: Value,
+) -> Result<()> {
+    snapshot.journal_seq = snapshot
+        .journal_seq
+        .checked_add(1)
+        .context("journal sequence overflow")?;
+    snapshot.updated_at = Utc::now().to_rfc3339();
+    let event_value = json!({
+        "journal_seq": snapshot.journal_seq,
+        "event": event,
+        "at": snapshot.updated_at,
+        "payload": payload,
+        "captured_samples": snapshot.captured_samples,
+        "committed_samples": snapshot.committed_samples,
+        "snapshot": &snapshot,
+    });
+    let event_path = session_dir.join("metadata/events.jsonl");
+    append_journal_event(&event_path, &event_value, JournalAppendFault::None)
+        .map_err(|error| anyhow!(error))?;
+    let mut projection_failures = Vec::<String>::new();
+    if let Err(error) = atomic_snapshot_json(
+        &session_dir.join("metadata/items.snapshot.json"),
+        snapshot,
+    ) {
+        projection_failures.push(format!("update items snapshot: {error:#}"));
+    }
+    if let Err(error) = atomic_json(&session_dir.join("script/normalized.json"), &snapshot.items) {
+        projection_failures.push(format!("update normalized script: {error:#}"));
+    }
+    if let Err(error) = atomic_json(&session_dir.join("session.json"), &session_summary_value(snapshot)) {
+        projection_failures.push(format!("update session summary: {error:#}"));
+    }
+    if projection_failures.is_empty()
+        && let Err(error) = atomic_json_line(&event_path, &event_value)
+    {
+        projection_failures.push(format!("compact journal: {error:#}"));
+    }
+    for failure in projection_failures {
+        eprintln!(
+            "offline metadata projection warning after committed event {} seq {}: {failure}",
+            event, snapshot.journal_seq,
+        );
+    }
+    Ok(())
+}
+
+fn render_offline_range(
+    session_dir: &Path,
+    snapshot: &SessionSnapshot,
+    destination: &Path,
+    start_sample: u64,
+    end_sample: u64,
+) -> Result<u64> {
+    let master_relative = Path::new(&snapshot.master_audio);
+    if master_relative.is_absolute()
+        || master_relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("snapshot master_audio must be a safe relative path");
+    }
+    let source = session_dir.join(master_relative);
+    match MasterStorageKind::from_snapshot(snapshot)? {
+        MasterStorageKind::LegacySingleWav => {
+            slice_wav_mono(
+                &source,
+                destination,
+                snapshot.audio_format.sample_rate,
+                snapshot.audio_format.bit_depth,
+                start_sample,
+                end_sample,
+            )?;
+        }
+        MasterStorageKind::SegmentedWav => {
+            let mut segmented = SegmentedWav::resume(
+                &source,
+                snapshot.audio_format.sample_rate,
+                1,
+                snapshot.audio_format.bit_depth,
+                storage_layout_segment_frames(snapshot)?,
+            )?;
+            segmented.export_range(destination, start_sample, end_sample)?;
+        }
+    }
+    Ok(end_sample - start_sample)
 }
 
 /// Loads every mutable recovery projection while holding the same exclusive
@@ -3943,6 +4341,46 @@ fn validate_snapshot_for_export(snapshot: &SessionSnapshot) -> Result<()> {
                 "条目 {} 选中的录音版本异常中断或样本边界越界，无法导出切片。",
                 item.id
             );
+        }
+    }
+    Ok(())
+}
+
+fn validate_snapshot_for_artifact(
+    snapshot: &SessionSnapshot,
+    artifact: Option<ExportArtifact>,
+) -> Result<()> {
+    if artifact.is_none() {
+        return validate_snapshot_for_export(snapshot);
+    }
+    if snapshot.status != "stopped" && snapshot.status != "faulted" {
+        bail!("录制尚未安全结束，请先暂停或修复中断任务后再导出。");
+    }
+    if artifact != Some(ExportArtifact::CutsZip) {
+        // Raw full-track and diagnostic JSON exports remain available for a
+        // faulted task. They preserve suspect metadata instead of pretending
+        // it is safe enough to cut into sentence files.
+        return Ok(());
+    }
+    validate_attempt_boundaries(snapshot, snapshot.committed_samples)?;
+    validate_capture_provenance(snapshot, snapshot.committed_samples, true)?;
+    if snapshot.status == "faulted" || snapshot.overflow_samples > 0 {
+        bail!("异常任务修复并检查前不能导出分段 ZIP；可先导出原始整轨或时间戳 JSON。");
+    }
+    for item in &snapshot.items {
+        let Some(selected_id) = item.selected_attempt_id.as_deref() else {
+            continue;
+        };
+        let attempt = item
+            .attempts
+            .iter()
+            .find(|attempt| attempt.attempt_id == selected_id)
+            .with_context(|| format!("条目 {} 选中的录音版本不存在，无法导出切片。", item.id))?;
+        if attempt.status == "interrupted"
+            || attempt.end_sample <= attempt.start_sample
+            || attempt.end_sample > snapshot.committed_samples
+        {
+            bail!("条目 {} 选中的录音版本不可用，无法导出切片。", item.id);
         }
     }
     Ok(())
@@ -7132,6 +7570,29 @@ fn durable_copy_file(source: &Path, destination: &Path) -> Result<u64> {
     result
 }
 
+fn write_empty_wav_export(destination: &Path, sample_rate: u32, bit_depth: u16) -> Result<()> {
+    let (temporary, file) = create_unique_temporary_file(destination, "empty-wav")?;
+    drop(file);
+    std::fs::remove_file(&temporary)?;
+    let result = (|| -> Result<()> {
+        WavExportWriter::create_new(
+            &temporary,
+            sample_rate,
+            1,
+            bit_depth,
+            0,
+            WavExportMode::AutoRf64,
+        )?
+        .finalize()?;
+        durable_replace(&temporary, destination)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
 fn append_journal_event(
     path: &Path,
     value: &impl Serialize,
@@ -8874,8 +9335,11 @@ mod tests {
         assert_eq!(stopped["attempt"]["required_tail_silence_samples"], 20);
         let session = engine.session.as_ref().unwrap();
         assert!(session.active_attempt.is_none());
-        assert_eq!(session.snapshot.items[0].status, "review");
-        assert!(session.snapshot.items[0].selected_attempt_id.is_none());
+        assert_eq!(stopped["auto_selected"], true);
+        assert_eq!(session.snapshot.items[0].status, "accepted");
+        assert_eq!(session.snapshot.items[0].selected_attempt_id.as_deref(), Some("001-a2"));
+        assert_eq!(session.snapshot.items[0].attempts[0].status, "rejected_by_operator");
+        assert_eq!(session.snapshot.items[0].attempts[1].status, "accepted");
         assert_eq!(session.snapshot.items[0].attempts.len(), 2);
         engine
             .session
@@ -11271,6 +11735,183 @@ mod tests {
 
         snapshot.items[0].selected_attempt_id = None;
         assert!(validate_snapshot_for_export(&snapshot).is_ok());
+    }
+
+    #[test]
+    fn create_and_inspect_session_never_activate_capture() {
+        let root = test_root("create-inspect-offline");
+        // prepare_new_session requires the final task directory not to exist.
+        std::fs::remove_dir_all(&root).unwrap();
+        let engine = Engine::new(Emitter::new());
+        let created = engine
+            .create_session(StartSessionPayload {
+                session_dir: root.to_string_lossy().into_owned(),
+                session_id: "offline-create".to_string(),
+                script_name: "script.csv".to_string(),
+                device_id: Some("device:remembered".to_string()),
+                device_name: Some("Remembered input".to_string()),
+                sample_rate: 48_000,
+                bit_depth: 24,
+                input_channel: 1,
+                silence_duration_ms: 1_000,
+                silence_threshold_dbfs: -42.0,
+                items: vec![ScriptItem {
+                    id: "001".to_string(),
+                    text: "第一句".to_string(),
+                    label: String::new(),
+                }],
+            })
+            .unwrap();
+
+        assert!(engine.session.is_none());
+        assert_eq!(created["mode"], "inspect");
+        assert_eq!(created["snapshot"]["status"], "stopped");
+        assert!(!root.join(SEGMENTED_MASTER_AUDIO).exists());
+
+        let inspected = engine
+            .inspect_session_expected(&root, "offline-create")
+            .unwrap();
+        assert!(engine.session.is_none());
+        assert_eq!(inspected["mode"], "inspect");
+        assert_eq!(inspected["snapshot"]["items"][0]["id"], "001");
+
+        engine
+            .export_session_artifact_expected(
+                &root,
+                "offline-create",
+                ExportArtifact::TimestampsJson,
+            )
+            .unwrap();
+        assert!(root.join("export/timestamps.json").is_file());
+        engine
+            .export_session_artifact_expected(
+                &root,
+                "offline-create",
+                ExportArtifact::CutsZip,
+            )
+            .unwrap();
+        assert!(root.join("export/cuts.zip").is_file());
+        engine
+            .export_session_artifact_expected(
+                &root,
+                "offline-create",
+                ExportArtifact::FullTrack,
+            )
+            .unwrap();
+        assert!(root.join("export/full-track.wav").is_file());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn offline_render_and_explicit_selection_preserve_attempt_history() {
+        let root = test_root("offline-render-select");
+        for directory in ["audio", "metadata", "script", "preview", "export"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        let master = root.join(LEGACY_MASTER_AUDIO);
+        let mut writer = RecoverableWav::create(&master, 48_000, 1, 24).unwrap();
+        writer.write_samples(&[0.1, 0.2, 0.3, 0.4]).unwrap();
+        writer.finalize().unwrap();
+        let mut snapshot = test_snapshot();
+        snapshot.status = "stopped".to_string();
+        snapshot.journal_seq = 1;
+        snapshot.captured_samples = 4;
+        snapshot.committed_samples = 4;
+        snapshot.items[0].status = "accepted".to_string();
+        snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
+        snapshot.items[0].attempts = vec![
+            Attempt {
+                attempt_id: "001-a1".to_string(),
+                start_sample: 0,
+                recording_started_sample: 0,
+                head_silence_armed_sample: 0,
+                head_silence_passed_sample: 0,
+                required_head_silence_samples: 0,
+                content_started_sample: 0,
+                end_sample: 2,
+                forced_without_tail_silence: false,
+                tail_silence_samples: 0,
+                required_tail_silence_samples: 0,
+                status: "accepted".to_string(),
+                created_at: "2026-08-11T00:00:00Z".to_string(),
+            },
+            Attempt {
+                attempt_id: "001-a2".to_string(),
+                start_sample: 2,
+                recording_started_sample: 2,
+                head_silence_armed_sample: 2,
+                head_silence_passed_sample: 2,
+                required_head_silence_samples: 0,
+                content_started_sample: 2,
+                end_sample: 4,
+                forced_without_tail_silence: false,
+                tail_silence_samples: 0,
+                required_tail_silence_samples: 0,
+                status: "rejected_by_operator".to_string(),
+                created_at: "2026-08-11T00:01:00Z".to_string(),
+            },
+        ];
+        write_journal(&root, &[sequenced_event("session_stopped", &snapshot)]);
+        write_snapshot_file(&root.join("metadata/items.snapshot.json"), &snapshot);
+
+        let engine = Engine::new(Emitter::new());
+        let rendered = engine
+            .render_session_attempt_expected(&root, "resume-test", "001", "001-a2")
+            .unwrap();
+        assert!(PathBuf::from(rendered["file_path"].as_str().unwrap()).is_file());
+        let selected = engine
+            .select_session_attempt_expected(&root, "resume-test", "001", "001-a2")
+            .unwrap();
+        assert_eq!(selected["snapshot"]["items"][0]["selected_attempt_id"], "001-a2");
+        assert_eq!(selected["snapshot"]["items"][0]["attempts"].as_array().unwrap().len(), 2);
+        assert_eq!(selected["snapshot"]["items"][0]["status"], "accepted");
+        let journal = read_journal(&root).unwrap();
+        assert_eq!(journal.entries.last().unwrap()["event"], "attempt_selected_offline");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn artifact_exports_are_independent() {
+        let root = test_root("artifact-exports-independent");
+        for directory in ["audio", "metadata", "script", "preview", "export"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        let master = root.join(LEGACY_MASTER_AUDIO);
+        let mut writer = RecoverableWav::create(&master, 48_000, 1, 24).unwrap();
+        writer.write_samples(&[0.1, 0.2, 0.3, 0.4]).unwrap();
+        writer.finalize().unwrap();
+        let mut stopped = test_snapshot();
+        stopped.journal_seq = 1;
+        stopped.status = "stopped".to_string();
+        stopped.captured_samples = 4;
+        stopped.committed_samples = 4;
+        stopped.items[0].status = "skipped".to_string();
+        write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
+        write_snapshot_file(&root.join("metadata/items.snapshot.json"), &stopped);
+        let engine = Engine::new(Emitter::new());
+
+        engine
+            .export_session_artifact_expected(&root, "resume-test", ExportArtifact::FullTrack)
+            .unwrap();
+        assert!(root.join("export/full-track.wav").is_file());
+        assert!(root.join("export/status-full-track.json").is_file());
+        assert!(!root.join("export/timestamps.json").exists());
+        assert!(!root.join("export/cuts.zip").exists());
+
+        engine
+            .export_session_artifact_expected(&root, "resume-test", ExportArtifact::TimestampsJson)
+            .unwrap();
+        assert!(root.join("export/timestamps.json").is_file());
+        assert!(root.join("export/status-timestamps-json.json").is_file());
+        assert!(!root.join("export/cuts.zip").exists());
+
+        engine
+            .export_session_artifact_expected(&root, "resume-test", ExportArtifact::CutsZip)
+            .unwrap();
+        assert!(root.join("export/cuts.zip").is_file());
+        assert!(root.join("export/status-cuts-zip.json").is_file());
+        assert!(!root.join("export/status.json").exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

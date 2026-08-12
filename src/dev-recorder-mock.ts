@@ -26,6 +26,7 @@ export function installDevRecorderMock() {
   let firstAttemptSignalSample = 0;
   let currentSessionDir = '';
   let currentExportExists = false;
+  let captureActive = false;
   let mockSampleRate = 48_000;
   let recordingStartedAt = 0;
   let meterTimer: number | undefined;
@@ -125,6 +126,37 @@ export function installDevRecorderMock() {
     return structuredClone(snapshot);
   }
 
+  function snapshotForRecording(recording: RecordingHistoryEntry, status = recording.status): SessionSnapshot {
+    return {
+      schema_version: 1,
+      session_id: recording.session_id,
+      script_name: recording.script_name,
+      status,
+      device_name: recording.device_name,
+      device_id: mockDevices.find((device) => device.name === recording.device_name)?.id ?? mockDevices[0].id,
+      input_sample_format: 'f32',
+      audio_format: { sample_rate: recording.sample_rate, bit_depth: recording.bit_depth, encoding: recording.encoding, channels: 1, input_channels: 2, input_channel: recording.input_channel },
+      master_audio: 'audio/master.wav', storage_layout_version: 1, segment_frames: recording.sample_rate * 300,
+      captured_samples: recording.captured_samples, committed_samples: recording.captured_samples, overflow_samples: recording.overflow_samples,
+      started_at: recording.started_at, updated_at: recording.updated_at,
+      noise_check: recording.noise_check,
+      silence_duration_ms: 1_000,
+      silence_threshold_dbfs: -42,
+      items: Array.from({ length: recording.total_items }, (_, index) => ({
+        id: String(index + 1).padStart(3, '0'),
+        text: `恢复录制测试文本 ${index + 1}`,
+        label: index === 0 ? '自然语气' : '',
+        status: index < recording.accepted_items
+          ? 'accepted'
+          : index < recording.accepted_items + recording.skipped_items
+            ? 'skipped'
+            : 'pending',
+        attempts: [],
+        selected_attempt_id: null,
+      })),
+    };
+  }
+
   function emitMeter() {
     capturedSamples = Math.max(capturedSamples, Math.floor((performance.now() - recordingStartedAt) / 1_000 * mockSampleRate));
     const newSamples = Math.max(0, capturedSamples - previousCapturedSamples);
@@ -197,7 +229,7 @@ export function installDevRecorderMock() {
     const data = payload as Record<string, unknown>;
     if (command === 'hello') return { engine_version: 'dev-mock', protocol_version: 1 } as T;
     if (command === 'get_state_optional') {
-      if (!snapshot) return { active: false } as T;
+      if (!snapshot || !captureActive) return { active: false } as T;
       return {
         active: true,
         snapshot: snapshotCopy(),
@@ -209,7 +241,7 @@ export function installDevRecorderMock() {
       default_device_id: 'mock:studio-usb-microphone',
       devices: mockDevices,
     } as T;
-    if (command === 'start_session') {
+    if (command === 'start_session' || command === 'create_session') {
       capturedSamples = 0;
       previousCapturedSamples = 0;
       waveformSampleCursor = 0;
@@ -228,7 +260,7 @@ export function installDevRecorderMock() {
         schema_version: 1,
         session_id: String(data.session_id),
         script_name: String(data.script_name ?? ''),
-        status: 'recording',
+        status: command === 'start_session' ? 'recording' : 'stopped',
         device_name: requestedDevice.name,
         device_id: requestedDevice.id,
         input_sample_format: requestedDevice.configurations?.[0]?.sample_format ?? 'f32',
@@ -240,8 +272,23 @@ export function installDevRecorderMock() {
         silence_threshold_dbfs: Number(data.silence_threshold_dbfs ?? -42),
         items: items.map((item) => ({ ...item, status: 'pending', attempts: [], selected_attempt_id: null })),
       };
-      meterTimer = window.setInterval(emitMeter, 100);
+      captureActive = command === 'start_session';
+      if (captureActive) meterTimer = window.setInterval(emitMeter, 100);
       return { snapshot: snapshotCopy(), session_dir: String(data.session_dir) } as T;
+    }
+    if (command === 'inspect_session') {
+      const target = String(data.session_dir ?? '');
+      if (!snapshot || target !== currentSessionDir) {
+        const recording = previewHistory.find((candidate) => candidate.session_dir === target);
+        if (!recording) throw new Error('Mock 中没有该录制任务');
+        snapshot = snapshotForRecording(recording);
+        currentSessionDir = target;
+        capturedSamples = snapshot.captured_samples;
+        currentExportExists = recording.export_exists;
+      }
+      captureActive = false;
+      window.clearInterval(meterTimer);
+      return { snapshot: snapshotCopy(), session_dir: target, mode: 'inspect', faulted: snapshot.status === 'faulted' } as T;
     }
     if (command === 'seal_interrupted_session') {
       const target = String(data.session_dir ?? '');
@@ -289,7 +336,7 @@ export function installDevRecorderMock() {
         warnings: [],
       } as T;
     }
-    if (command === 'resume_session') {
+    if (command === 'resume_session' || command === 'activate_session') {
       const target = String(data.session_dir ?? '');
       if (snapshot && target === currentSessionDir) {
         capturedSamples = snapshot.captured_samples;
@@ -305,6 +352,7 @@ export function installDevRecorderMock() {
         snapshot.updated_at = new Date().toISOString();
         window.clearInterval(meterTimer);
         meterTimer = window.setInterval(emitMeter, 100);
+        captureActive = true;
         return {
           snapshot: snapshotCopy(),
           session_dir: target,
@@ -324,34 +372,15 @@ export function installDevRecorderMock() {
       currentExportExists = recording.export_exists;
       mockSampleRate = recording.sample_rate;
       recordingStartedAt = performance.now() - capturedSamples / mockSampleRate * 1_000;
-      snapshot = {
-        schema_version: 1,
-        session_id: recording.session_id,
-        script_name: recording.script_name,
-        status: 'recording',
-        device_name: recording.device_name,
-        device_id: mockDevices.find((device) => device.name === recording.device_name)?.id ?? mockDevices[0].id,
-        input_sample_format: 'f32',
-        audio_format: { sample_rate: recording.sample_rate, bit_depth: recording.bit_depth, encoding: recording.encoding, channels: 1, input_channels: 2, input_channel: recording.input_channel },
-        master_audio: 'audio/master.wav', storage_layout_version: 1, segment_frames: recording.sample_rate * 300, captured_samples: capturedSamples, committed_samples: capturedSamples, overflow_samples: recording.overflow_samples,
-        started_at: recording.started_at, updated_at: new Date().toISOString(),
-        noise_check: null,
-        silence_duration_ms: 1_000,
-        silence_threshold_dbfs: -42,
-        items: Array.from({ length: recording.total_items }, (_, index) => ({
-          id: String(index + 1).padStart(3, '0'),
-          text: `恢复录制测试文本 ${index + 1}`,
-          label: index === 0 ? '自然语气' : '',
-          status: index < recording.accepted_items ? 'accepted' : 'pending',
-          attempts: [],
-          selected_attempt_id: null,
-        })),
-      };
+      snapshot = snapshotForRecording(recording, 'recording');
+      snapshot.noise_check = null;
+      snapshot.updated_at = new Date().toISOString();
       window.clearInterval(meterTimer);
       meterTimer = window.setInterval(emitMeter, 100);
+      captureActive = true;
       return { snapshot: snapshotCopy(), session_dir: target, active_attempt: null, recovery_warnings: [] } as T;
     }
-    if (command === 'export_session') {
+    if (command === 'export_session' || command === 'export_session_artifact') {
       const target = String(data.session_dir ?? '');
       const source = snapshot && target === currentSessionDir ? snapshot : null;
       if (source) currentExportExists = true;
@@ -366,7 +395,17 @@ export function installDevRecorderMock() {
         ?? previewHistory.find((recording) => recording.session_dir === target)?.total_items
         ?? exportedCount;
       const exportDir = `${target || '/tmp/DataBaker Preview'}/export`;
-      return { export_dir: exportDir, master_file: `${exportDir}/full-track.wav`, timestamps_json: `${exportDir}/timestamps.json`, timestamps_csv: `${exportDir}/timestamps.csv`, sentences_dir: `${exportDir}/sentences`, cuts_archive: `${exportDir}/cuts.zip`, exported_count: exportedCount, skipped_count: total - exportedCount } as T;
+      const artifact = String(data.artifact ?? '');
+      return {
+        artifact: artifact || undefined,
+        export_dir: exportDir,
+        ...(artifact === 'full_track' || !artifact ? { master_file: `${exportDir}/full-track.wav` } : {}),
+        ...(artifact === 'timestamps_json' || !artifact ? { timestamps_json: `${exportDir}/timestamps.json` } : {}),
+        ...(!artifact ? { timestamps_csv: `${exportDir}/timestamps.csv`, sentences_dir: `${exportDir}/sentences` } : {}),
+        ...(artifact === 'cuts_zip' || !artifact ? { cuts_archive: `${exportDir}/cuts.zip` } : {}),
+        exported_count: exportedCount,
+        skipped_count: total - exportedCount,
+      } as T;
     }
     if (!snapshot) throw new Error('Mock 录制尚未启动');
     if (command === 'check_noise') {
@@ -473,13 +512,22 @@ export function installDevRecorderMock() {
       return { item_id: item.id } as T;
     }
     if (command === 'get_state') return { snapshot: snapshotCopy(), session_dir: currentSessionDir, active_attempt: activeAttempt ? { ...activeAttempt } : null } as T;
-    if (command === 'render_attempt') return { file_path: '/tmp/databaker-dev-preview.wav' } as T;
+    if (command === 'render_attempt' || command === 'render_session_attempt') return { file_path: '/tmp/databaker-dev-preview.wav' } as T;
+    if (command === 'select_session_attempt') {
+      const item = snapshot.items.find((candidate) => candidate.id === data.item_id);
+      const attempt = item?.attempts.find((candidate) => candidate.attempt_id === data.attempt_id);
+      if (!item || !attempt) throw new Error('找不到指定录音版本');
+      item.selected_attempt_id = attempt.attempt_id;
+      item.attempts.forEach((candidate) => { candidate.status = candidate === attempt ? 'accepted' : 'rejected_by_operator'; });
+      return { snapshot: snapshotCopy(), item_id: item.id, attempt_id: attempt.attempt_id } as T;
+    }
     if (command === 'stop_session') {
       if (meterTimer) window.clearInterval(meterTimer);
       snapshot.status = 'stopped';
       snapshot.captured_samples = capturedSamples;
       snapshot.committed_samples = capturedSamples;
       snapshot.updated_at = new Date().toISOString();
+      captureActive = false;
       return { snapshot: snapshotCopy(), session_dir: String(data.session_dir ?? '/tmp/DataBaker Preview') } as T;
     }
     throw new Error(`未实现的开发预览命令：${command}`);

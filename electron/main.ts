@@ -83,7 +83,7 @@ const meterBackpressure = new LatestOnlyMeterBackpressure<Electron.WebContents, 
   },
 );
 
-type EnginePhase = 'idle' | 'starting' | 'active' | 'stopping' | 'recovering' | 'sealing' | 'exporting' | 'deleting' | 'quitting';
+type EnginePhase = 'idle' | 'creating' | 'inspecting' | 'starting' | 'active' | 'stopping' | 'recovering' | 'sealing' | 'exporting' | 'deleting' | 'quitting';
 
 type EngineIntent = Readonly<{
   generation: number;
@@ -224,7 +224,10 @@ const ATTEMPT_STATE_QUERY_TIMEOUT_MS = 40_000;
 const allowedCommands = new Set([
   'hello',
   'list_devices',
+  'create_session',
   'start_session',
+  'inspect_session',
+  'activate_session',
   'resume_session',
   'get_state_optional',
   'check_noise',
@@ -233,10 +236,13 @@ const allowedCommands = new Set([
   'accept_attempt',
   'skip_item',
   'render_attempt',
+  'render_session_attempt',
+  'select_session_attempt',
   'get_state',
   'stop_session',
   'seal_interrupted_session',
   'export_session',
+  'export_session_artifact',
 ]);
 
 const SESSION_LIVE_PHASES: readonly EnginePhase[] = [
@@ -421,6 +427,8 @@ function isIntentSession(sessionDir: string): boolean {
 
 function operationBusyMessage(): string {
   switch (engineIntent.phase) {
+    case 'creating': return '正在创建录制任务，请稍候';
+    case 'inspecting': return '正在读取录制任务，请稍候';
     case 'starting': return '录音任务正在启动，请稍候';
     case 'active': return '当前已有录音任务进行中';
     case 'stopping': return '录音任务正在安全停止，请稍候';
@@ -443,14 +451,16 @@ function assertCanStartOrResume(allowPendingCrashSeal = false): void {
 function assertCanMutateActiveSession(command: string): void {
   if (engineIntent.phase === 'exporting') throw new Error(operationBusyMessage());
   if (['hello', 'list_devices', 'get_state_optional'].includes(command)) return;
-  if (engineIntent.phase === 'starting'
+  if (engineIntent.phase === 'creating'
+    || engineIntent.phase === 'inspecting'
+    || engineIntent.phase === 'starting'
     || engineIntent.phase === 'stopping'
     || engineIntent.phase === 'recovering'
     || engineIntent.phase === 'sealing'
     || engineIntent.phase === 'quitting') {
     throw new Error(operationBusyMessage());
   }
-  if (command === 'export_session') return;
+  if (command === 'export_session' || command === 'export_session_artifact') return;
 }
 
 function engineExecutable(): string {
@@ -1152,6 +1162,95 @@ function exportSourceMatchesSnapshot(
     && selection.attempt_id === expectedSelections[index].attempt_id);
 }
 
+type ExportArtifactName = 'full_track' | 'cuts_zip' | 'timestamps_json';
+
+const exportArtifactFiles: Record<ExportArtifactName, { status: string; output: string }> = {
+  full_track: { status: 'status-full-track.json', output: 'full-track.wav' },
+  cuts_zip: { status: 'status-cuts-zip.json', output: 'cuts.zip' },
+  timestamps_json: { status: 'status-timestamps-json.json', output: 'timestamps.json' },
+};
+
+function fullTrackExportSourceMatchesSnapshot(
+  source: unknown,
+  snapshot: Record<string, unknown>,
+): boolean {
+  return isRecord(source)
+    && source.committed_samples === snapshot.committed_samples
+    && JSON.stringify(source.capture_provenance ?? [])
+      === JSON.stringify(snapshot.capture_provenance ?? []);
+}
+
+async function inspectExportArtifact(
+  exportDir: string,
+  snapshot: Record<string, unknown>,
+  artifact: ExportArtifactName,
+): Promise<Record<string, unknown>> {
+  const descriptor = exportArtifactFiles[artifact];
+  const statusSource = await readBoundedRegularFile(
+    path.join(exportDir, descriptor.status),
+    EXPORT_STATUS_MAX_BYTES,
+  );
+  if (!statusSource) return { artifact, state: 'never' };
+  let status: unknown;
+  try {
+    status = JSON.parse(statusSource.bytes.toString('utf8')) as unknown;
+  } catch {
+    return { artifact, state: 'failed', message: '导出状态文件已损坏' };
+  }
+  if (!isRecord(status)
+    || status.schema_version !== 2
+    || status.session_id !== snapshot.session_id
+    || status.artifact !== artifact) {
+    return { artifact, state: 'failed', message: '导出状态与当前任务不匹配' };
+  }
+  if (status.status !== 'complete') {
+    return { artifact, state: 'failed', message: '上次导出未安全完成' };
+  }
+  const sourceMatches = artifact === 'full_track'
+    ? fullTrackExportSourceMatchesSnapshot(status.source, snapshot)
+    : exportSourceMatchesSnapshot(status.source, snapshot);
+  const filePath = path.join(exportDir, descriptor.output);
+  const outputExists = await fs.lstat(filePath)
+    .then((metadata) => metadata.isFile() && !metadata.isSymbolicLink())
+    .catch(() => false);
+  if (!outputExists) {
+    return { artifact, state: 'failed', message: '导出文件缺失' };
+  }
+  return {
+    artifact,
+    state: sourceMatches ? 'current' : 'stale',
+    file_path: filePath,
+    exported_at: typeof status.completed_at === 'string' ? status.completed_at : undefined,
+    exported_count: isNonNegativeSafeInteger(status.exported_count) ? status.exported_count : undefined,
+    skipped_count: isNonNegativeSafeInteger(status.skipped_count) ? status.skipped_count : undefined,
+  };
+}
+
+async function inspectExportArtifacts(
+  exportDir: string,
+  snapshot: Record<string, unknown>,
+): Promise<Record<ExportArtifactName, Record<string, unknown>>> {
+  const entries = await Promise.all((Object.keys(exportArtifactFiles) as ExportArtifactName[])
+    .map(async (artifact) => [artifact, await inspectExportArtifact(exportDir, snapshot, artifact)] as const));
+  const result = Object.fromEntries(entries) as Record<ExportArtifactName, Record<string, unknown>>;
+  if (Object.values(result).some((entry) => entry.state !== 'never')) return result;
+
+  // A legacy bundle remains discoverable. Its source tracked every selection,
+  // so it can only be called current while the legacy commit marker still
+  // matches the snapshot; files are never deleted during this migration.
+  if (await hasCompleteExport(exportDir, snapshot)) {
+    for (const artifact of Object.keys(exportArtifactFiles) as ExportArtifactName[]) {
+      result[artifact] = {
+        artifact,
+        state: 'current',
+        file_path: path.join(exportDir, exportArtifactFiles[artifact].output),
+        message: '由旧版整包导出记录兼容识别',
+      };
+    }
+  }
+  return result;
+}
+
 export async function hasCompleteExport(
   exportDir: string,
   currentSnapshot?: Record<string, unknown>,
@@ -1473,6 +1572,12 @@ async function listRecordings(
         : {};
       const exportDir = path.join(candidate.sessionDir, 'export');
       const exportExists = await hasCompleteExport(exportDir, snapshot);
+      const exportArtifacts = await inspectExportArtifacts(exportDir, snapshot);
+      const faulted = snapshot.audio_fault_marker === true
+        || snapshot.status === 'faulted'
+        || snapshot.status === 'recording'
+        || snapshot.status === 'stopping'
+        || (typeof snapshot.overflow_samples === 'number' && snapshot.overflow_samples > 0);
       rememberKnownSession(candidate.sessionDir, String(snapshot.session_id));
       rows.push({
         session_id: snapshot.session_id,
@@ -1497,7 +1602,10 @@ async function listRecordings(
         review_items: countItems(items, 'review'),
         pending_items: countItems(items, 'pending'),
         noise_check: snapshot.noise_check ?? null,
-        export_exists: exportExists,
+        export_exists: exportExists || Object.values(exportArtifacts)
+          .some((artifact) => artifact.state === 'current'),
+        export_artifacts: exportArtifacts,
+        data_health: faulted ? 'needs_repair' : 'normal',
       });
     } catch (error) {
       rows.push(historyIssueRow(
@@ -1672,6 +1780,8 @@ function effectiveRecordingTrayStatus(requestedStatus?: string): string {
   const fault = currentCaptureFault();
   if (fault) return captureFaultTrayStatus(fault);
   switch (engineIntent.phase) {
+    case 'creating': return '◌ 正在创建录制任务';
+    case 'inspecting': return '◌ 正在读取录制任务';
     case 'starting': return '◌ 录音正在启动，尚未确认写入';
     case 'active': return requestedStatus ?? '● 后台录音正在进行';
     case 'stopping': return '◌ 正在安全停止并封存母轨';
@@ -2104,7 +2214,7 @@ function performSafeStopAndQuit(source: string): Promise<void> {
 }
 
 async function requestSessionWithReconciliation(
-  command: 'start_session' | 'resume_session',
+  command: 'start_session' | 'resume_session' | 'activate_session',
   payload: Record<string, unknown>,
   sessionDir: string,
   timeoutMs: number,
@@ -2480,6 +2590,15 @@ function mainWindowCloseCopy(fault: CaptureFaultNotice | null): MainWindowCloseC
   }
 
   switch (engineIntent.phase) {
+    case 'creating':
+    case 'inspecting':
+      return {
+        title: '正在准备任务',
+        message: '当前没有采集音频，任务元数据仍在处理中。',
+        detail: '请等待当前操作完成后再关闭应用。',
+        backgroundButton: '继续等待',
+        exitButton: '继续等待',
+      };
     case 'starting':
       return {
         title: '录音正在启动',
@@ -2930,13 +3049,17 @@ async function assertEngineIdleForExport(intent: EngineIntent): Promise<void> {
 async function reconciledCompleteExportResult(
   sessionDir: string,
   expectedSessionId: string,
+  artifact?: ExportArtifactName,
 ): Promise<Record<string, unknown> | null> {
   const recovered = await loadHistorySnapshot(sessionDir, path.join(sessionDir, 'metadata'));
   if (!recovered || recovered.snapshot.session_id !== expectedSessionId) return null;
   const exportDir = path.join(sessionDir, 'export');
-  if (!(await hasCompleteExport(exportDir, recovered.snapshot))) return null;
+  if (artifact) {
+    const inspected = await inspectExportArtifact(exportDir, recovered.snapshot, artifact);
+    if (inspected.state !== 'current') return null;
+  } else if (!(await hasCompleteExport(exportDir, recovered.snapshot))) return null;
   const statusSource = await readBoundedRegularFile(
-    path.join(exportDir, 'status.json'),
+    path.join(exportDir, artifact ? exportArtifactFiles[artifact].status : 'status.json'),
     EXPORT_STATUS_MAX_BYTES,
   );
   if (!statusSource) return null;
@@ -2945,16 +3068,27 @@ async function reconciledCompleteExportResult(
     || status.schema_version !== 2
     || status.status !== 'complete'
     || status.session_id !== recovered.snapshot.session_id
-    || !exportSourceMatchesSnapshot(status.source, recovered.snapshot)
+    || (artifact === 'full_track'
+      ? !fullTrackExportSourceMatchesSnapshot(status.source, recovered.snapshot)
+      : !exportSourceMatchesSnapshot(status.source, recovered.snapshot))
     || !isNonNegativeSafeInteger(status.exported_count)
     || !isNonNegativeSafeInteger(status.skipped_count)) return null;
   return {
+    artifact,
     export_dir: exportDir,
-    master_file: path.join(exportDir, 'full-track.wav'),
-    timestamps_json: path.join(exportDir, 'timestamps.json'),
-    timestamps_csv: path.join(exportDir, 'timestamps.csv'),
-    sentences_dir: path.join(exportDir, 'sentences'),
-    cuts_archive: path.join(exportDir, 'cuts.zip'),
+    ...(artifact === 'full_track' || !artifact
+      ? { master_file: path.join(exportDir, 'full-track.wav') }
+      : {}),
+    ...(artifact === 'timestamps_json' || !artifact
+      ? { timestamps_json: path.join(exportDir, 'timestamps.json') }
+      : {}),
+    ...(!artifact ? {
+      timestamps_csv: path.join(exportDir, 'timestamps.csv'),
+      sentences_dir: path.join(exportDir, 'sentences'),
+    } : {}),
+    ...(artifact === 'cuts_zip' || !artifact
+      ? { cuts_archive: path.join(exportDir, 'cuts.zip') }
+      : {}),
     exported_count: status.exported_count,
     skipped_count: status.skipped_count,
     recovery_warnings: ['导出超过界面等待时限，已根据引擎空闲状态和当前快照确认导出文件完整。'],
@@ -2967,6 +3101,7 @@ async function failExportingSession(
   intent: EngineIntent,
   originalError: unknown,
   binding: AuthorizedSessionBinding | null,
+  artifact?: ExportArtifactName,
 ): Promise<unknown> {
   if (originalError instanceof EngineIntentSupersededError || !ownsEngineGeneration(intent)) {
     throw originalError;
@@ -2989,7 +3124,7 @@ async function failExportingSession(
         await assertAuthorizedSessionUnchanged(binding, [binding.canonicalRoot]);
       }
       const reconciled = binding
-        ? await reconciledCompleteExportResult(binding.canonicalPath, binding.sessionId)
+        ? await reconciledCompleteExportResult(binding.canonicalPath, binding.sessionId, artifact)
         : null;
       assertCurrentEngineIntent(intent, ['exporting']);
       transitionEngineIntent(intent, 'idle', null);
@@ -3014,6 +3149,12 @@ async function exportSession(payload: unknown): Promise<unknown> {
   const exportEngine = engine;
   const sessionDir = (payload as { session_dir?: unknown })?.session_dir;
   if (typeof sessionDir !== 'string') throw new Error('录制目录无效');
+  const requestedArtifact = (payload as { artifact?: unknown })?.artifact;
+  const artifact = typeof requestedArtifact === 'string'
+    && Object.hasOwn(exportArtifactFiles, requestedArtifact)
+    ? requestedArtifact as ExportArtifactName
+    : undefined;
+  if (requestedArtifact !== undefined && !artifact) throw new Error('导出项目无效');
   assertCanStartOrResume();
   const exportIntent = beginEngineIntent('exporting', path.resolve(sessionDir));
   let binding: AuthorizedSessionBinding | null = null;
@@ -3036,8 +3177,11 @@ async function exportSession(payload: unknown): Promise<unknown> {
       await assertEngineIdleForExport(exportIntent);
       await assertAuthorizedSessionUnchanged(binding, authorizedRoots);
       assertCurrentEngineIntent(exportIntent, ['exporting']);
+      const exportCommand = artifact
+        ? 'export_session_artifact'
+        : 'export_session';
       const result = await exportEngine.request(
-        'export_session',
+        exportCommand,
         {
           ...(payload as Record<string, unknown>),
           session_dir: canonical,
@@ -3056,7 +3200,7 @@ async function exportSession(payload: unknown): Promise<unknown> {
         const invalidated = binding?.canonicalPath ?? canonicalSessionDir;
         if (invalidated) forgetKnownSession(invalidated);
       }
-      return await failExportingSession(exportIntent, error, binding);
+      return await failExportingSession(exportIntent, error, binding, artifact);
     }
   })();
   activeExportOperation = { intent: exportIntent, completion };
@@ -3367,6 +3511,76 @@ function registerIpc(): void {
     assertMainRenderer(event.sender);
     if (!allowedCommands.has(command)) throw new Error(`不允许的录音引擎命令：${command}`);
     if (!engine) throw new Error('录音引擎不可用');
+    if (command === 'create_session') {
+      const sessionDir = (payload as { session_dir?: unknown })?.session_dir;
+      if (typeof sessionDir !== 'string') throw new Error('录制目录无效');
+      const resolved = path.resolve(sessionDir);
+      if (!isAllowedNewSession(resolved)) throw new Error('新录制必须保存在已授权目录的直接子目录中');
+      assertCanStartOrResume();
+      const createIntent = beginEngineIntent('creating', resolved, { newSessionGeneration: true });
+      try {
+        const canonicalRoot = await resolveAuthorizedOutputRoot(path.dirname(resolved), true);
+        assertCurrentEngineIntent(createIntent, ['creating']);
+        const canonicalTarget = path.join(canonicalRoot, path.basename(resolved));
+        transitionEngineIntent(createIntent, 'creating', canonicalTarget);
+        const existing = await fs.lstat(canonicalTarget).catch((error: NodeJS.ErrnoException) => {
+          if (error.code === 'ENOENT') return null;
+          throw error;
+        });
+        if (existing) throw new Error('同名录制目录已存在，请更换录制名称后重试');
+        await engine.start();
+        const result = await engine.request('create_session', {
+          ...(payload as Record<string, unknown>),
+          session_dir: canonicalTarget,
+        }, 20_000);
+        assertCurrentEngineIntent(createIntent, ['creating']);
+        const canonical = await fs.realpath(canonicalTarget);
+        if (path.dirname(canonical) !== canonicalRoot) throw new Error('新录制目录越过了已授权的保存位置');
+        const requestedSessionId = (payload as { session_id?: unknown }).session_id;
+        if (typeof requestedSessionId !== 'string' || !requestedSessionId.trim()) {
+          throw new Error('新建录制任务身份无效');
+        }
+        const binding = await bindAuthorizedSession(canonical, [canonicalRoot], requestedSessionId);
+        rememberKnownSession(canonical, binding.sessionId);
+        transitionEngineIntent(createIntent, 'idle', null);
+        return result;
+      } catch (error) {
+        if (ownsEngineGeneration(createIntent)) transitionEngineIntent(createIntent, 'idle', null);
+        throw error;
+      }
+    }
+    if (command === 'inspect_session'
+      || command === 'render_session_attempt'
+      || command === 'select_session_attempt') {
+      const sessionDir = (payload as { session_dir?: unknown })?.session_dir;
+      if (typeof sessionDir !== 'string') throw new Error('录制目录无效');
+      assertCanStartOrResume();
+      const inspectIntent = beginEngineIntent('inspecting', path.resolve(sessionDir));
+      try {
+        const canonical = await resolveKnownSession(sessionDir);
+        if (!canonical) throw new Error('只能打开已授权保存位置中的录制任务');
+        transitionEngineIntent(inspectIntent, 'inspecting', canonical);
+        const expectedSessionId = knownSessionId(canonical);
+        if (!expectedSessionId) throw new Error('无法确认录制任务身份，请刷新任务列表后重试');
+        const authorizedRoots = Array.from(canonicalOutputRoots.values());
+        const binding = await bindAuthorizedSession(canonical, authorizedRoots, expectedSessionId);
+        attachAuthorizedBinding(inspectIntent, binding);
+        await engine.start();
+        await assertAuthorizedSessionUnchanged(binding, authorizedRoots);
+        const result = await engine.request(command, {
+          ...(payload as Record<string, unknown>),
+          session_dir: canonical,
+          expected_session_id: binding.sessionId,
+        }, command === 'render_session_attempt' ? 60_000 : 20_000);
+        await assertAuthorizedSessionUnchanged(binding, authorizedRoots);
+        transitionEngineIntent(inspectIntent, 'idle', null);
+        rememberKnownSession(canonical, binding.sessionId);
+        return result;
+      } catch (error) {
+        if (ownsEngineGeneration(inspectIntent)) transitionEngineIntent(inspectIntent, 'idle', null);
+        throw error;
+      }
+    }
     if (command === 'start_session') {
       const sessionDir = (payload as { session_dir?: unknown })?.session_dir;
       if (typeof sessionDir !== 'string') throw new Error('录制目录无效');
@@ -3438,7 +3652,7 @@ function registerIpc(): void {
         return await failStartingSession(startIntent, error);
       }
     }
-    if (command === 'resume_session') {
+    if (command === 'resume_session' || command === 'activate_session') {
       const sessionDir = (payload as { session_dir?: unknown })?.session_dir;
       if (typeof sessionDir !== 'string') throw new Error('录制目录无效');
       // Resuming the exact interrupted task is itself a production recovery
@@ -3466,7 +3680,7 @@ function registerIpc(): void {
         await engine.start();
         assertCurrentEngineIntent(resumeIntent, ['starting']);
         const result = await requestSessionWithReconciliation(
-          'resume_session',
+          command,
           { session_dir: canonical, expected_session_id: binding.sessionId },
           canonical,
           30_000,
@@ -3520,7 +3734,7 @@ function registerIpc(): void {
       assertCanMutateActiveSession(command);
       return await stopActiveSession();
     }
-    if (command === 'export_session') {
+    if (command === 'export_session' || command === 'export_session_artifact') {
       return await exportSession(payload);
     }
     assertCanMutateActiveSession(command);

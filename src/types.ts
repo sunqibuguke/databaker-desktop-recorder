@@ -159,6 +159,7 @@ export type EngineRecoveryFailedPayload = {
 };
 
 export type ExportResult = {
+  artifact?: ExportArtifact;
   export_dir: string;
   master_file?: string;
   master_container?: 'riff' | 'rf64';
@@ -171,12 +172,24 @@ export type ExportResult = {
   recovery_warnings?: string[];
 };
 
+export type ExportArtifact = 'full_track' | 'cuts_zip' | 'timestamps_json';
+
+export type InspectedSessionState = {
+  snapshot: SessionSnapshot;
+  session_dir: string;
+  mode: 'inspect';
+  faulted?: boolean;
+  data_health?: 'normal' | 'needs_repair' | 'readonly';
+  recovery_warnings?: string[];
+};
+
 export type SealInterruptedSessionResult = {
   session_dir: string;
   snapshot: SessionSnapshot;
   durable_frames: number;
   recovered_attempts?: number;
   fault_preserved?: boolean;
+  data_health?: 'normal' | 'needs_repair' | 'readonly';
   no_op: boolean;
   warnings?: string[];
 };
@@ -219,7 +232,19 @@ export type RecordingHistoryEntry = {
   pending_items: number;
   noise_check: NoiseCheckResult | null;
   export_exists: boolean;
+  export_artifacts?: Partial<Record<ExportArtifact, ExportArtifactState>>;
+  data_health?: 'normal' | 'needs_repair' | 'readonly';
   history_issue?: string;
+};
+
+export type ExportArtifactState = {
+  artifact: ExportArtifact;
+  state: 'never' | 'current' | 'stale' | 'failed';
+  file_path?: string;
+  exported_at?: string;
+  exported_count?: number;
+  skipped_count?: number;
+  message?: string;
 };
 
 export type RecordingHistoryPage = {

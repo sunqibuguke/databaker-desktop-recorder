@@ -9,8 +9,8 @@ mod wav;
 #[cfg(feature = "system-test")]
 use crate::engine::SystemTestStartSessionPayload;
 use crate::engine::{
-    Engine, NoiseCheckPayload, ResumeSessionPayload, StartSessionPayload, StopAttemptPayload,
-    is_no_active_session_error,
+    Engine, ExportArtifact, NoiseCheckPayload, ResumeSessionPayload, StartSessionPayload,
+    StopAttemptPayload, is_no_active_session_error,
 };
 use crate::protocol::{CommandEnvelope, Emitter, PROTOCOL_VERSION};
 use anyhow::{Context, Result, anyhow};
@@ -31,9 +31,30 @@ struct AttemptPayload {
 }
 
 #[derive(Deserialize)]
+struct OfflineSessionPayload {
+    session_dir: String,
+    expected_session_id: String,
+}
+
+#[derive(Deserialize)]
+struct OfflineAttemptPayload {
+    session_dir: String,
+    expected_session_id: String,
+    item_id: String,
+    attempt_id: String,
+}
+
+#[derive(Deserialize)]
 struct ExportPayload {
     session_dir: String,
     expected_session_id: String,
+}
+
+#[derive(Deserialize)]
+struct ExportArtifactPayload {
+    session_dir: String,
+    expected_session_id: String,
+    artifact: ExportArtifact,
 }
 
 #[derive(Deserialize)]
@@ -172,6 +193,11 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
                 serde_json::from_value(command.payload).context("invalid start_session payload")?;
             engine.start_session(payload)
         }
+        "create_session" => {
+            let payload: StartSessionPayload = serde_json::from_value(command.payload)
+                .context("invalid create_session payload")?;
+            engine.create_session(payload)
+        }
         #[cfg(feature = "system-test")]
         "test_start_session" => {
             let payload: SystemTestStartSessionPayload = serde_json::from_value(command.payload)
@@ -185,10 +211,35 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
         }
         #[cfg(feature = "system-test")]
         "test_checkpoint" => engine.system_test_checkpoint(),
-        "resume_session" => {
+        "resume_session" | "activate_session" => {
             let payload: ResumeSessionPayload = serde_json::from_value(command.payload)
                 .context("invalid resume_session payload")?;
             engine.resume_session(payload)
+        }
+        "inspect_session" => {
+            let payload: OfflineSessionPayload = parse(command.payload)?;
+            engine.inspect_session_expected(
+                &PathBuf::from(payload.session_dir),
+                &payload.expected_session_id,
+            )
+        }
+        "render_session_attempt" => {
+            let payload: OfflineAttemptPayload = parse(command.payload)?;
+            engine.render_session_attempt_expected(
+                &PathBuf::from(payload.session_dir),
+                &payload.expected_session_id,
+                &payload.item_id,
+                &payload.attempt_id,
+            )
+        }
+        "select_session_attempt" => {
+            let payload: OfflineAttemptPayload = parse(command.payload)?;
+            engine.select_session_attempt_expected(
+                &PathBuf::from(payload.session_dir),
+                &payload.expected_session_id,
+                &payload.item_id,
+                &payload.attempt_id,
+            )
         }
         "check_noise" => {
             let payload: NoiseCheckPayload = parse(command.payload)?;
@@ -236,6 +287,14 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
             engine.export_session_expected(
                 &PathBuf::from(payload.session_dir),
                 &payload.expected_session_id,
+            )
+        }
+        "export_session_artifact" => {
+            let payload: ExportArtifactPayload = parse(command.payload)?;
+            engine.export_session_artifact_expected(
+                &PathBuf::from(payload.session_dir),
+                &payload.expected_session_id,
+                payload.artifact,
             )
         }
         "shutdown" => shutdown_protocol_response(engine.shutdown()),
