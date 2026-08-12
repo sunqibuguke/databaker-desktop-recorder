@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
+const fs = require('node:fs');
 const Module = require('node:module');
 const path = require('node:path');
 
@@ -16,6 +17,11 @@ function loadPreloadWithElectronMock() {
     ipcRenderer,
   };
   const preloadPath = path.join(__dirname, '..', 'dist-electron', 'preload.js');
+  assert.doesNotMatch(
+    fs.readFileSync(preloadPath, 'utf8'),
+    /require\(["']\.\.?\//,
+    'sandboxed preload must not require compiled sibling modules',
+  );
   delete require.cache[require.resolve(preloadPath)];
   const originalLoad = Module._load;
   Module._load = function patchedLoad(request, parent, isMain) {

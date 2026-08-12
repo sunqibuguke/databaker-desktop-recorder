@@ -1,9 +1,11 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import {
-  ENGINE_EVENT_CHANNEL,
-  ENGINE_METER_ACK_CHANNEL,
-  ENGINE_METER_CHANNEL,
-} from './meter-backpressure';
+
+// Keep preload self-contained. Sandboxed Electron preload scripts can load
+// built-in modules such as `electron`, but cannot require our compiled sibling
+// modules from disk.
+const ENGINE_EVENT_CHANNEL = 'engine:event';
+const ENGINE_METER_CHANNEL = 'engine:meter';
+const ENGINE_METER_ACK_CHANNEL = 'engine:meter-ack';
 
 type EngineEventListener = (message: unknown) => void;
 
