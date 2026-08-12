@@ -1,9 +1,9 @@
-use crate::attempt::{
-    HEAD_SILENCE_PASSED, HEAD_SILENCE_SPEECH_STARTED, HEAD_SILENCE_WAITING,
-    HeadSilenceMonitor, annotate_attempt_block, head_silence_phase_name,
-};
 #[cfg(test)]
 use crate::attempt::HEAD_SILENCE_IDLE;
+use crate::attempt::{
+    HEAD_SILENCE_PASSED, HEAD_SILENCE_SPEECH_STARTED, HEAD_SILENCE_WAITING, HeadSilenceMonitor,
+    annotate_attempt_block, head_silence_phase_name,
+};
 use crate::durable_fs::{
     durable_create_directory, durable_create_directory_all, durable_replace, sync_directory,
     sync_parent_directory,
@@ -22,8 +22,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
-    Device, I24, SampleFormat, ShareMode, SizedSample, Stream, StreamConfig,
-    SupportedStreamConfig, U24,
+    Device, I24, SampleFormat, ShareMode, SizedSample, Stream, StreamConfig, SupportedStreamConfig,
+    U24,
 };
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use serde::{Deserialize, Serialize};
@@ -374,17 +374,12 @@ pub struct SetSilenceSettingsPayload {
     pub silence_duration_ms: u32,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureShareMode {
+    #[default]
     Exclusive,
     Shared,
-}
-
-impl Default for CaptureShareMode {
-    fn default() -> Self {
-        Self::Exclusive
-    }
 }
 
 impl CaptureShareMode {

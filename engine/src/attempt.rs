@@ -57,6 +57,7 @@ pub(crate) fn head_silence_phase_name(phase: u32) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn annotate_attempt_block(
     head_silence: &HeadSilenceMonitor,
     silence_samples: &AtomicU64,
