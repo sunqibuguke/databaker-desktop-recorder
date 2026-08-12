@@ -3,7 +3,7 @@ use crate::{
     host::{com::ComString, ErrorCallbackArc},
     BufferSize, Data, DeviceDescription, DeviceDescriptionBuilder, DeviceDirection, DeviceId,
     DeviceType, Error, ErrorKind, FrameCount, InputCallbackInfo, InterfaceType, OutputCallbackInfo,
-    SampleFormat, SampleRate, StreamConfig, SupportedBufferSize, SupportedStreamConfig,
+    SampleFormat, SampleRate, ShareMode, StreamConfig, SupportedBufferSize, SupportedStreamConfig,
     SupportedStreamConfigRange, COMMON_SAMPLE_RATES,
 };
 
@@ -115,6 +115,13 @@ impl DeviceTrait for Device {
         Self::supported_input_configs(self)
     }
 
+    fn supported_input_configs_for(
+        &self,
+        exclusive: bool,
+    ) -> Result<Self::SupportedInputConfigs, Error> {
+        Self::supported_input_configs_for(self, exclusive)
+    }
+
     fn supported_output_configs(&self) -> Result<Self::SupportedOutputConfigs, Error> {
         Self::supported_output_configs(self)
     }
@@ -192,7 +199,18 @@ fn data_flow_matches(result: Result<Audio::EDataFlow, Error>, expected: Audio::E
 pub unsafe fn is_format_supported(
     client: &Audio::IAudioClient,
     waveformatex_ptr: *const Audio::WAVEFORMATEX,
+    exclusive: bool,
 ) -> Result<bool, Error> {
+    if exclusive {
+        // Exclusive IsFormatSupported forbids a closest-match out parameter.
+        let hr = client.IsFormatSupported(
+            Audio::AUDCLNT_SHAREMODE_EXCLUSIVE,
+            waveformatex_ptr,
+            None,
+        );
+        return Ok(hr.0 == 0);
+    }
+
     let mut closest_match: *mut Audio::WAVEFORMATEX = ptr::null_mut();
     let hr = client.IsFormatSupported(
         Audio::AUDCLNT_SHAREMODE_SHARED,
@@ -744,7 +762,7 @@ impl Device {
     // number of channels seems to be supported. Any, more or less returns an invalid
     // parameter error. Thus, we just assume that the default number of channels is the only
     // number supported.
-    fn supported_formats(&self) -> Result<SupportedInputConfigs, Error> {
+    fn supported_formats(&self, exclusive: bool) -> Result<SupportedInputConfigs, Error> {
         // initializing COM because we call `CoTaskMemFree` to release the format.
         com::com_initialized();
 
@@ -762,8 +780,9 @@ impl Device {
                 .map(WaveFormatExPtr)
                 .context("Failed to get mix format")?;
 
-            // If the default format can't succeed we have no hope of finding other formats.
-            if !is_format_supported(client, default_waveformatex_ptr.0)? {
+            // Shared mode needs a usable mix format to probe from. Exclusive
+            // mode must not treat GetMixFormat as a hardware capability cap.
+            if !exclusive && !is_format_supported(client, default_waveformatex_ptr.0, false)? {
                 return Err(Error::with_message(
                     ErrorKind::UnsupportedConfig,
                     "Could not determine support for default audio format",
@@ -778,7 +797,7 @@ impl Device {
             // described by GetMixFormat so that such conversion cannot be
             // reported as additional source precision. Unknown or invalid input
             // precision is rejected rather than promoted by probing.
-            let capture_mix_precision_bits = if is_output {
+            let capture_mix_precision_bits = if is_output || exclusive {
                 None
             } else {
                 Some(
@@ -833,6 +852,15 @@ impl Device {
                 None
             };
 
+            let mut channel_counts = vec![default_channels];
+            if exclusive && !is_output {
+                for extra in [1_u16, 2, 4, 6, 8] {
+                    if !channel_counts.contains(&extra) {
+                        channel_counts.push(extra);
+                    }
+                }
+            }
+
             let mut supported_formats = Vec::new();
             for sample_rate in sample_rates {
                 let buffer_size = match default_buffer_size {
@@ -851,36 +879,44 @@ impl Device {
                     other => other,
                 };
 
-                for sample_format in WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS {
-                    if !is_output
-                        && !capture_candidate_within_mix_precision(
-                            sample_format,
-                            capture_mix_precision_bits,
-                        )
-                    {
-                        continue;
-                    }
-                    if let Some(waveformat) = config_to_waveformatextensible(
-                        StreamConfig {
-                            channels: default_channels,
-                            sample_rate,
-                            buffer_size: BufferSize::Default,
-                        },
-                        sample_format,
-                    ) {
-                        let usable = is_output
-                            || is_format_supported(
-                                client,
-                                &waveformat.Format as *const Audio::WAVEFORMATEX,
-                            )?;
-                        if usable {
-                            supported_formats.push(SupportedStreamConfigRange {
-                                channels: default_channels,
-                                min_sample_rate: sample_rate,
-                                max_sample_rate: sample_rate,
-                                buffer_size,
+                for channels in channel_counts.iter().copied() {
+                    for sample_format in WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS {
+                        if !is_output
+                            && !capture_candidate_within_mix_precision(
                                 sample_format,
-                            });
+                                capture_mix_precision_bits,
+                            )
+                        {
+                            continue;
+                        }
+                        if let Some(waveformat) = config_to_waveformatextensible(
+                            StreamConfig {
+                                channels,
+                                sample_rate,
+                                buffer_size: BufferSize::Default,
+                                share_mode: if exclusive {
+                                    ShareMode::Exclusive
+                                } else {
+                                    ShareMode::Shared
+                                },
+                            },
+                            sample_format,
+                        ) {
+                            let usable = is_output
+                                || is_format_supported(
+                                    client,
+                                    &waveformat.Format as *const Audio::WAVEFORMATEX,
+                                    exclusive,
+                                )?;
+                            if usable {
+                                supported_formats.push(SupportedStreamConfigRange {
+                                    channels,
+                                    min_sample_rate: sample_rate,
+                                    max_sample_rate: sample_rate,
+                                    buffer_size,
+                                    sample_format,
+                                });
+                            }
                         }
                     }
                 }
@@ -890,9 +926,15 @@ impl Device {
     }
 
     pub fn supported_input_configs(&self) -> Result<SupportedInputConfigs, Error> {
+        self.supported_input_configs_for(false)
+    }
+
+    pub fn supported_input_configs_for(
+        &self,
+        exclusive: bool,
+    ) -> Result<SupportedInputConfigs, Error> {
         if self.data_flow()? == Audio::eCapture {
-            self.supported_formats()
-        // If it's an output device, assume no input formats.
+            self.supported_formats(exclusive)
         } else {
             Ok(vec![].into_iter())
         }
@@ -900,7 +942,7 @@ impl Device {
 
     pub fn supported_output_configs(&self) -> Result<SupportedOutputConfigs, Error> {
         if self.data_flow()? == Audio::eRender {
-            self.supported_formats()
+            self.supported_formats(false)
         // If it's an input device, assume no output formats.
         } else {
             Ok(vec![].into_iter())
@@ -1000,58 +1042,61 @@ impl Device {
             com::com_initialized();
 
             // Obtaining a `IAudioClient`.
-            let audio_client = self
+            let mut audio_client = self
                 .build_audioclient(activation_timeout)
                 .context("Failed to build audio client")?;
 
-            // No further range validation: IAudioClient::Initialize accepts any positive duration
-            // in shared mode. The callback period is always GetDevicePeriod() regardless of what
-            // is requested here; the value only affects ring-buffer latency.
-            let buffer_duration = buffer_size_to_duration(&config.buffer_size, config.sample_rate);
-
+            let exclusive = config.share_mode == ShareMode::Exclusive;
             let mut stream_flags = DEFAULT_FLAGS;
 
             if self.data_flow()? == Audio::eRender {
+                if exclusive {
+                    return Err(Error::with_message(
+                        ErrorKind::UnsupportedConfig,
+                        "WASAPI exclusive capture cannot open a render/loopback endpoint",
+                    ));
+                }
                 stream_flags |= Audio::AUDCLNT_STREAMFLAGS_LOOPBACK;
             }
 
-            // Computing the format and initializing the device.
-            let waveformatex = {
-                let format_attempt = config_to_waveformatextensible(config, sample_format)
-                    .ok_or_else(|| {
-                        Error::with_message(
-                            ErrorKind::UnsupportedConfig,
-                            "Stream configuration could not be converted to a compatible format",
-                        )
-                    })?;
-                let share_mode = Audio::AUDCLNT_SHAREMODE_SHARED;
-
-                // Ensure the format is supported.
-                match super::device::is_format_supported(&audio_client, &format_attempt.Format) {
-                    Ok(false) => {
-                        return Err(Error::with_message(
-                            ErrorKind::UnsupportedConfig,
-                            "Stream configuration is not supported in shared mode",
-                        ))
-                    }
-                    Err(e) => return Err(e),
-                    _ => (),
-                }
-
-                // Finally, initializing the audio client
-                audio_client
-                    .Initialize(
-                        share_mode,
-                        stream_flags,
-                        buffer_duration,
-                        0,
-                        &format_attempt.Format,
-                        None,
+            let format_attempt = config_to_waveformatextensible(config, sample_format).ok_or_else(
+                || {
+                    Error::with_message(
+                        ErrorKind::UnsupportedConfig,
+                        "Stream configuration could not be converted to a compatible format",
                     )
-                    .context("Failed to initialize audio client")?;
+                },
+            )?;
 
-                format_attempt.Format
-            };
+            match super::device::is_format_supported(
+                &audio_client,
+                &format_attempt.Format,
+                exclusive,
+            ) {
+                Ok(false) => {
+                    return Err(Error::with_message(
+                        ErrorKind::UnsupportedConfig,
+                        if exclusive {
+                            "Stream configuration is not supported in exclusive mode"
+                        } else {
+                            "Stream configuration is not supported in shared mode"
+                        },
+                    ))
+                }
+                Err(e) => return Err(e),
+                _ => (),
+            }
+
+            audio_client = initialize_capture_client(
+                self,
+                audio_client,
+                exclusive,
+                stream_flags,
+                config,
+                &format_attempt.Format,
+                activation_timeout,
+            )?;
+            let waveformatex = format_attempt.Format;
 
             // obtaining the size of the samples buffer in number of frames
             let max_frames_in_buffer = audio_client
@@ -1138,7 +1183,7 @@ impl Device {
                 let share_mode = Audio::AUDCLNT_SHAREMODE_SHARED;
 
                 // Ensure the format is supported.
-                match super::device::is_format_supported(&audio_client, &format_attempt.Format) {
+                match super::device::is_format_supported(&audio_client, &format_attempt.Format, false) {
                     Ok(false) => {
                         return Err(Error::with_message(
                             ErrorKind::UnsupportedConfig,
@@ -1586,6 +1631,94 @@ fn shared_mode_period_frames(
     } else {
         max_frames_in_buffer
     }
+}
+
+fn exclusive_initialize_error(error: windows::core::Error) -> Error {
+    let code = error.code().0 as u32;
+    const AUDCLNT_E_DEVICE_IN_USE: u32 = 0x8889_000A;
+    const AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED: u32 = 0x8889_000E;
+    const AUDCLNT_E_UNSUPPORTED_FORMAT: u32 = 0x8889_0008;
+    const AUDCLNT_E_ENDPOINT_CREATE_FAILED: u32 = 0x8889_000F;
+    let detail = match code {
+        AUDCLNT_E_DEVICE_IN_USE => {
+            "声卡正被其他程序独占使用，请关闭后重试"
+        }
+        AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED => "系统策略不允许该设备使用独占模式",
+        AUDCLNT_E_UNSUPPORTED_FORMAT => "该设备不支持所选采样率或样本格式的独占开流",
+        AUDCLNT_E_ENDPOINT_CREATE_FAILED => "无法以独占模式创建采集端点",
+        _ => "Failed to initialize exclusive WASAPI client",
+    };
+    Error::with_message(ErrorKind::UnsupportedConfig, format!("{detail} ({error})"))
+}
+
+fn initialize_capture_client(
+    device: &Device,
+    mut audio_client: Audio::IAudioClient,
+    exclusive: bool,
+    stream_flags: u32,
+    config: StreamConfig,
+    format: &Audio::WAVEFORMATEX,
+    activation_timeout: Option<Duration>,
+) -> Result<Audio::IAudioClient, Error> {
+    if !exclusive {
+        let buffer_duration = buffer_size_to_duration(&config.buffer_size, config.sample_rate);
+        unsafe {
+            audio_client
+                .Initialize(
+                    Audio::AUDCLNT_SHAREMODE_SHARED,
+                    stream_flags,
+                    buffer_duration,
+                    0,
+                    format,
+                    None,
+                )
+                .context("Failed to initialize audio client")?;
+        }
+        return Ok(audio_client);
+    }
+
+    let mut default_period = 0i64;
+    let _ = unsafe { audio_client.GetDevicePeriod(Some(&mut default_period), None) };
+    let mut period = match config.buffer_size {
+        BufferSize::Fixed(frames) if frames > 0 => {
+            buffer_size_to_duration(&BufferSize::Fixed(frames), config.sample_rate)
+        }
+        _ if default_period > 0 => default_period,
+        _ => 100_000, // 10 ms in hectonanoseconds
+    };
+
+    for _ in 0..3 {
+        let result = unsafe {
+            audio_client.Initialize(
+                Audio::AUDCLNT_SHAREMODE_EXCLUSIVE,
+                stream_flags,
+                period,
+                period,
+                format,
+                None,
+            )
+        };
+        match result {
+            Ok(()) => return Ok(audio_client),
+            Err(error)
+                if (error.code().0 as u32) == 0x8889_0019 /* AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED */ =>
+            {
+                let frames = unsafe { audio_client.GetBufferSize() }.unwrap_or(0);
+                if frames == 0 {
+                    return Err(exclusive_initialize_error(error));
+                }
+                period = (i64::from(frames) * 10_000_000).div_ceil(i64::from(config.sample_rate));
+                audio_client = device
+                    .build_audioclient(activation_timeout)
+                    .context("Failed to rebuild audio client after exclusive buffer align")?;
+            }
+            Err(error) => return Err(exclusive_initialize_error(error)),
+        }
+    }
+    Err(Error::with_message(
+        ErrorKind::UnsupportedConfig,
+        "独占开流缓冲无法按设备周期对齐",
+    ))
 }
 
 fn buffer_size_to_duration(buffer_size: &BufferSize, sample_rate: SampleRate) -> i64 {

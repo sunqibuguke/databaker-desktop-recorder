@@ -9,7 +9,7 @@ export type Attempt = {
   required_head_silence_samples?: number;
   content_started_sample: number;
   end_sample: number;
-  /** 该版本由操作员在句尾静音未达标时强制封闭，导出前需要重点试听。 */
+  /** 尾静音短于任务设定；仅作记录，不阻止结束本句。 */
   forced_without_tail_silence?: boolean;
   tail_silence_samples?: number;
   required_tail_silence_samples?: number;
@@ -24,6 +24,8 @@ export type ItemState = ScriptItem & {
   attempts: Attempt[];
   selected_attempt_id: string | null;
 };
+
+export type CaptureShareMode = 'exclusive' | 'shared';
 
 export type CaptureProvenanceSpan = {
   start_sample: number;
@@ -44,6 +46,7 @@ export type SessionSnapshot = {
   device_name: string;
   device_id?: string;
   input_sample_format?: string;
+  capture_share_mode?: CaptureShareMode;
   capture_provenance?: CaptureProvenanceSpan[];
   audio_format: {
     sample_rate: number;
@@ -59,6 +62,8 @@ export type SessionSnapshot = {
   captured_samples: number;
   committed_samples: number;
   overflow_samples: number;
+  input_discontinuity_count?: number;
+  input_discontinuity_silence_samples?: number;
   started_at: string;
   updated_at: string;
   noise_check?: NoiseCheckResult | null;
@@ -86,18 +91,26 @@ export type NoiseCheckProgress = {
   threshold_dbfs: number;
 };
 
+export type DeviceStreamConfiguration = {
+  min_sample_rate: number;
+  max_sample_rate: number;
+  channels: number;
+  sample_format: string;
+  share_mode?: CaptureShareMode;
+};
+
 export type AudioDevice = {
   id: string;
   name: string;
   is_default: boolean;
   sample_rates: number[];
   input_channels: number[];
-  configurations?: Array<{
-    min_sample_rate: number;
-    max_sample_rate: number;
-    channels: number;
-    sample_format: string;
-  }>;
+  configurations?: DeviceStreamConfiguration[];
+  exclusive_available?: boolean;
+  exclusive_sample_rates?: number[];
+  exclusive_input_channels?: number[];
+  shared_sample_rates?: number[];
+  shared_input_channels?: number[];
 };
 
 export type CapturePreset = {
@@ -108,6 +121,7 @@ export type CapturePreset = {
   sampleRate: number;
   bitDepth: 16 | 24 | 32;
   inputChannel: number;
+  captureShareMode?: CaptureShareMode;
   silenceDurationMs: number;
   silenceThresholdDbfs: number;
 };
@@ -132,6 +146,9 @@ export type Meter = {
   faulted: boolean;
   fault_kind?: string;
   fault_reason?: string;
+  input_discontinuity_count?: number;
+  input_discontinuity_silence_samples?: number;
+  capture_share_mode?: CaptureShareMode;
   storage_status: 'healthy' | 'warning' | 'critical';
   storage_safe_remaining_seconds: number;
   peak: number;
@@ -195,7 +212,7 @@ export type SealInterruptedSessionResult = {
   warnings?: string[];
 };
 
-export type PrompterCue = 'idle' | 'checking' | 'ready' | 'recording' | 'post-ready' | 'review' | 'complete' | 'fault';
+export type PrompterCue = 'idle' | 'checking' | 'pending' | 'recording' | 'review' | 'complete' | 'fault';
 
 export type PrompterState = {
   sessionName: string;

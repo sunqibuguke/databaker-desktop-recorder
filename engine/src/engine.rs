@@ -1,3 +1,9 @@
+use crate::attempt::{
+    HEAD_SILENCE_PASSED, HEAD_SILENCE_SPEECH_STARTED, HEAD_SILENCE_WAITING,
+    HeadSilenceMonitor, annotate_attempt_block, head_silence_phase_name,
+};
+#[cfg(test)]
+use crate::attempt::HEAD_SILENCE_IDLE;
 use crate::durable_fs::{
     durable_create_directory, durable_create_directory_all, durable_replace, sync_directory,
     sync_parent_directory,
@@ -9,15 +15,15 @@ use crate::storage_guard::{
     AtomicExportStep, StorageReport, StorageStatus, check_storage, evaluate_atomic_export_space,
 };
 use crate::wav::{
-    RecoverableWav, WavEncoding, WavExportMode, WavExportWriter,
-    automatic_wav_container_name, automatic_wav_file_size, slice_wav_mono,
-    standard_wav_file_size, validate_standard_wav_size,
+    RecoverableWav, WavEncoding, WavExportMode, WavExportWriter, automatic_wav_container_name,
+    automatic_wav_file_size, slice_wav_mono, standard_wav_file_size, validate_standard_wav_size,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{
-    Device, I24, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig, U24,
+    Device, I24, SampleFormat, ShareMode, SizedSample, Stream, StreamConfig,
+    SupportedStreamConfig, U24,
 };
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use serde::{Deserialize, Serialize};
@@ -109,6 +115,12 @@ const EXPORT_METADATA_BASE_HEADROOM_BYTES: u64 = 4 * 1024 * 1024;
 const EXPORT_FILE_ALLOCATION_HEADROOM_BYTES: u64 = 64 * 1024;
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[derive(Clone, Default)]
+struct CaptureRecoveryTelemetry {
+    discontinuities: Arc<AtomicU64>,
+    inserted_silence_frames: Arc<AtomicU64>,
+}
+
 #[derive(Debug)]
 pub struct NoActiveSessionError;
 
@@ -166,26 +178,22 @@ pub struct Attempt {
     pub start_sample: u64,
     #[serde(default)]
     pub recording_started_sample: u64,
-    /// Authoritative capture boundary at which the operator clicked start and
-    /// this take's head-silence detector was armed. Kept separate from
-    /// `start_sample`, which may exclude noise before the validated silence
-    /// run, and from the legacy `recording_started_sample` field so downstream
-    /// consumers can migrate without guessing timestamp semantics.
+    /// Capture boundary at which the operator clicked start and the pending
+    /// timer was armed.
     #[serde(default)]
     pub head_silence_armed_sample: u64,
-    /// First sample boundary at which the configured continuous head silence
-    /// had been observed. Zero means unavailable on legacy or interrupted
-    /// metadata; completed takes produced by the current engine always set it.
+    /// First sample at which the configured pending duration had elapsed.
+    /// This is elapsed time from the click, not a VAD gate.
     #[serde(default)]
     pub head_silence_passed_sample: u64,
-    /// Head-silence requirement in force for this take.
+    /// Pending / head-pad requirement in force for this take.
     #[serde(default)]
     pub required_head_silence_samples: u64,
     #[serde(default)]
     pub content_started_sample: u64,
     pub end_sample: u64,
-    /// True only when an operator explicitly completed a spoken take before
-    /// the configured tail-silence duration had elapsed.
+    /// True when the recorded tail is shorter than the configured duration.
+    /// Informational only: stop is not gated on detected silence.
     #[serde(default)]
     pub forced_without_tail_silence: bool,
     /// Silence available at the fixed stop boundary, measured from the end of
@@ -252,6 +260,10 @@ pub struct SessionSnapshot {
     /// independent from the requested WAV delivery bit depth.
     #[serde(default)]
     pub input_sample_format: String,
+    /// WASAPI share mode used to open the input stream. Exclusive bypasses the
+    /// Windows mixer; other hosts keep their native path and ignore the flag.
+    #[serde(default)]
+    pub capture_share_mode: CaptureShareMode,
     /// Durable sample ranges attributed to each actual driver configuration.
     /// Older snapshots have no spans and retain their legacy top-level source
     /// fields; the first resume upgrades them without inventing sample data.
@@ -271,6 +283,12 @@ pub struct SessionSnapshot {
     pub captured_samples: u64,
     pub committed_samples: u64,
     pub overflow_samples: u64,
+    /// Number of bounded WASAPI input gaps recovered without stopping capture.
+    #[serde(default)]
+    pub input_discontinuity_count: u64,
+    /// Equilibrium frames inserted to preserve the master timeline across gaps.
+    #[serde(default)]
+    pub input_discontinuity_silence_samples: u64,
     pub started_at: String,
     pub updated_at: String,
     #[serde(default)]
@@ -311,6 +329,8 @@ pub struct StartSessionPayload {
     pub bit_depth: u16,
     #[serde(default = "default_input_channel")]
     pub input_channel: u16,
+    #[serde(default)]
+    pub capture_share_mode: CaptureShareMode,
     #[serde(default = "default_silence_duration_ms")]
     pub silence_duration_ms: u32,
     #[serde(default)]
@@ -352,6 +372,49 @@ pub struct NoiseCheckPayload {
 pub struct SetSilenceSettingsPayload {
     pub threshold_dbfs: f32,
     pub silence_duration_ms: u32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureShareMode {
+    Exclusive,
+    Shared,
+}
+
+impl Default for CaptureShareMode {
+    fn default() -> Self {
+        Self::Exclusive
+    }
+}
+
+impl CaptureShareMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exclusive => "exclusive",
+            Self::Shared => "shared",
+        }
+    }
+
+    fn is_exclusive(self) -> bool {
+        matches!(self, Self::Exclusive)
+    }
+}
+
+impl From<CaptureShareMode> for ShareMode {
+    fn from(mode: CaptureShareMode) -> Self {
+        match mode {
+            CaptureShareMode::Exclusive => Self::Exclusive,
+            CaptureShareMode::Shared => Self::Shared,
+        }
+    }
+}
+
+fn effective_capture_share_mode(requested: CaptureShareMode) -> CaptureShareMode {
+    if cfg!(target_os = "windows") {
+        requested
+    } else {
+        CaptureShareMode::Shared
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -430,64 +493,7 @@ struct ActiveAttempt {
     attempt_id: String,
     start_sample: u64,
     recording_started_sample: u64,
-}
-
-const HEAD_SILENCE_IDLE: u32 = 0;
-const HEAD_SILENCE_WAITING: u32 = 1;
-const HEAD_SILENCE_PASSED: u32 = 2;
-const HEAD_SILENCE_SPEECH_STARTED: u32 = 3;
-
-#[derive(Clone)]
-struct HeadSilenceMonitor {
-    phase: Arc<AtomicU32>,
-    armed_sample: Arc<AtomicU64>,
-    progress_samples: Arc<AtomicU64>,
-    passed_sample: Arc<AtomicU64>,
-    required_samples: Arc<AtomicU64>,
-}
-
-impl HeadSilenceMonitor {
-    fn new(required_samples: u64) -> Self {
-        Self {
-            phase: Arc::new(AtomicU32::new(HEAD_SILENCE_IDLE)),
-            armed_sample: Arc::new(AtomicU64::new(0)),
-            progress_samples: Arc::new(AtomicU64::new(0)),
-            passed_sample: Arc::new(AtomicU64::new(0)),
-            required_samples: Arc::new(AtomicU64::new(required_samples)),
-        }
-    }
-
-    fn required_samples(&self) -> u64 {
-        self.required_samples.load(Ordering::Acquire)
-    }
-
-    /// Must be called while holding the capture-analysis seqlock.
-    fn arm(&self, armed_sample: u64) {
-        // Publish WAITING last so a callback that observes the armed phase also
-        // observes the fresh boundary and zeroed progress from this take.
-        self.phase.store(HEAD_SILENCE_IDLE, Ordering::Release);
-        self.armed_sample.store(armed_sample, Ordering::Release);
-        self.progress_samples.store(0, Ordering::Release);
-        self.passed_sample.store(0, Ordering::Release);
-        self.phase.store(HEAD_SILENCE_WAITING, Ordering::Release);
-    }
-
-    /// Must be called while holding the capture-analysis seqlock.
-    fn disarm(&self) {
-        self.phase.store(HEAD_SILENCE_IDLE, Ordering::Release);
-        self.armed_sample.store(0, Ordering::Release);
-        self.progress_samples.store(0, Ordering::Release);
-        self.passed_sample.store(0, Ordering::Release);
-    }
-}
-
-fn head_silence_phase_name(phase: u32) -> &'static str {
-    match phase {
-        HEAD_SILENCE_WAITING => "waiting_for_head_silence",
-        HEAD_SILENCE_PASSED => "ready_for_speech",
-        HEAD_SILENCE_SPEECH_STARTED => "speech_started",
-        _ => "idle",
-    }
+    input_discontinuity_count_at_start: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -617,6 +623,7 @@ struct WriterQueueBudget {
 #[derive(Clone)]
 struct CaptureFaultPersistence {
     session_dir: PathBuf,
+    recovery: CaptureRecoveryTelemetry,
 }
 
 impl CaptureFaultPersistence {
@@ -702,6 +709,19 @@ fn input_stream_fault_code(error: &cpal::Error) -> u32 {
         cpal::ErrorKind::Xrun => CAPTURE_FAULT_INPUT_DISCONTINUITY,
         _ => CAPTURE_FAULT_INPUT_STREAM_ERROR,
     }
+}
+
+fn recovered_xrun_missing_frames(error: &cpal::Error) -> Option<u64> {
+    if error.kind() != cpal::ErrorKind::RecoveredXrun {
+        return None;
+    }
+    error.message()?.split(';').find_map(|field| {
+        field
+            .trim()
+            .strip_prefix("missing_frames=")?
+            .parse::<u64>()
+            .ok()
+    })
 }
 
 fn latch_capture_fault_code(capture_fault_code: &AtomicU32, code: u32) {
@@ -1275,6 +1295,7 @@ pub struct RecordingSession {
     captured: Arc<AtomicU64>,
     committed: Arc<AtomicU64>,
     overflow: Arc<AtomicU64>,
+    capture_recovery: CaptureRecoveryTelemetry,
     faulted: Arc<AtomicBool>,
     peak: Arc<AtomicU32>,
     rms: Arc<AtomicU32>,
@@ -1406,32 +1427,21 @@ impl Engine {
                     continue;
                 }
             };
-            let mut rates = Vec::<u32>::new();
-            let mut input_channels = Vec::<u16>::new();
-            let mut configurations = Vec::<Value>::new();
-            if let Ok(configs) = device.supported_input_configs() {
-                for config in configs {
-                    if !is_supported_input_format(config.sample_format()) {
-                        continue;
-                    }
-                    input_channels.push(config.channels());
-                    rates.push(config.min_sample_rate());
-                    rates.push(config.max_sample_rate());
-                    configurations.push(json!({
-                        "min_sample_rate": config.min_sample_rate(),
-                        "max_sample_rate": config.max_sample_rate(),
-                        "channels": config.channels(),
-                        "sample_format": config.sample_format().to_string(),
-                    }));
-                }
-            }
-            rates.sort_unstable();
-            rates.dedup();
-            input_channels.sort_unstable();
-            input_channels.dedup();
-            if configurations.is_empty() {
+            let exclusive = collect_input_format_catalog(&device, true);
+            let shared = collect_input_format_catalog(&device, false);
+            if exclusive.configurations.is_empty() && shared.configurations.is_empty() {
                 continue;
             }
+            let mut rates = exclusive.sample_rates.clone();
+            rates.extend(shared.sample_rates.iter().copied());
+            rates.sort_unstable();
+            rates.dedup();
+            let mut input_channels = exclusive.input_channels.clone();
+            input_channels.extend(shared.input_channels.iter().copied());
+            input_channels.sort_unstable();
+            input_channels.dedup();
+            let mut configurations = exclusive.configurations;
+            configurations.extend(shared.configurations);
             let is_default = default_device_id.as_deref() == Some(id.as_str());
             if is_default {
                 // Derive the display name from the same explicitly enumerated
@@ -1446,6 +1456,11 @@ impl Engine {
                 "sample_rates": rates,
                 "input_channels": input_channels,
                 "configurations": configurations,
+                "exclusive_available": exclusive.available,
+                "exclusive_sample_rates": exclusive.sample_rates,
+                "exclusive_input_channels": exclusive.input_channels,
+                "shared_sample_rates": shared.sample_rates,
+                "shared_input_channels": shared.input_channels,
             }));
         }
         Ok(json!({
@@ -1475,7 +1490,10 @@ impl Engine {
         snapshot.status = "stopped".to_string();
         atomic_snapshot_json(&session_dir.join("metadata/items.snapshot.json"), &snapshot)?;
         atomic_json(&session_dir.join("script/normalized.json"), &snapshot.items)?;
-        atomic_json(&session_dir.join("session.json"), &session_summary_value(&snapshot))?;
+        atomic_json(
+            &session_dir.join("session.json"),
+            &session_summary_value(&snapshot),
+        )?;
         Ok(json!({
             "snapshot": snapshot,
             "session_dir": session_dir,
@@ -1576,6 +1594,7 @@ impl Engine {
             device_name: payload.device_name.unwrap_or_default(),
             device_id: payload.device_id.unwrap_or_default(),
             input_sample_format: String::new(),
+            capture_share_mode: effective_capture_share_mode(payload.capture_share_mode),
             capture_provenance: Vec::new(),
             audio_format: AudioFormat {
                 sample_rate: payload.sample_rate,
@@ -1591,11 +1610,15 @@ impl Engine {
             captured_samples: 0,
             committed_samples: 0,
             overflow_samples: 0,
+            input_discontinuity_count: 0,
+            input_discontinuity_silence_samples: 0,
             started_at: now.clone(),
             updated_at: now,
             noise_check: None,
             noise_threshold_dbfs: Some(
-                payload.noise_threshold_dbfs.unwrap_or(payload.silence_threshold_dbfs),
+                payload
+                    .noise_threshold_dbfs
+                    .unwrap_or(payload.silence_threshold_dbfs),
             ),
             silence_duration_ms: payload.silence_duration_ms,
             silence_threshold_dbfs: payload.silence_threshold_dbfs,
@@ -1763,10 +1786,14 @@ impl Engine {
             .items
             .iter()
             .find(|item| item.id == item_id)
-            .and_then(|item| item.attempts.iter().find(|attempt| attempt.attempt_id == attempt_id))
+            .and_then(|item| {
+                item.attempts
+                    .iter()
+                    .find(|attempt| attempt.attempt_id == attempt_id)
+            })
             .cloned()
             .ok_or_else(|| anyhow!("录音版本不存在"))?;
-        if attempt.status == "interrupted"
+        if matches!(attempt.status.as_str(), "interrupted" | "needs_rerecord")
             || attempt.end_sample <= attempt.start_sample
             || attempt.end_sample > snapshot.committed_samples
         {
@@ -1781,10 +1808,7 @@ impl Engine {
             }
             Err(error) => return Err(error.into()),
         }
-        let destination = preview_dir.join(format!(
-            "{}.wav",
-            bounded_wav_stem(attempt_id, "")?,
-        ));
+        let destination = preview_dir.join(format!("{}.wav", bounded_wav_stem(attempt_id, "")?,));
         render_offline_range(
             session_dir,
             &snapshot,
@@ -1827,7 +1851,7 @@ impl Engine {
             .iter()
             .find(|attempt| attempt.attempt_id == attempt_id)
             .ok_or_else(|| anyhow!("录音版本不存在"))?;
-        if selected.status == "interrupted"
+        if matches!(selected.status.as_str(), "interrupted" | "needs_rerecord")
             || selected.end_sample <= selected.start_sample
             || selected.end_sample > snapshot.committed_samples
         {
@@ -1884,6 +1908,7 @@ impl Engine {
             )?;
         }
         let output_encoding = WavEncoding::for_bit_depth(snapshot.audio_format.bit_depth)?;
+        snapshot.capture_share_mode = effective_capture_share_mode(snapshot.capture_share_mode);
         let previous_capture_source = capture_span_from_snapshot(&snapshot, 0, 0);
         let input_channel_index = usize::from(snapshot.audio_format.input_channel - 1);
         let (device_name, device_id, input_channels, sample_format, stream_setup) =
@@ -1905,6 +1930,7 @@ impl Engine {
                         snapshot.audio_format.sample_rate,
                         input_channel_index,
                         snapshot.audio_format.bit_depth,
+                        snapshot.capture_share_mode,
                     )?;
                     let input_channels = supported.channels();
                     let sample_format = supported.sample_format();
@@ -1912,6 +1938,7 @@ impl Engine {
                         channels: input_channels,
                         sample_rate: snapshot.audio_format.sample_rate,
                         buffer_size: cpal::BufferSize::Default,
+                        share_mode: ShareMode::from(snapshot.capture_share_mode),
                     };
                     (
                         device_name,
@@ -2048,10 +2075,13 @@ impl Engine {
                     "device_name": snapshot.device_name,
                     "device_id": snapshot.device_id,
                     "input_sample_format": snapshot.input_sample_format,
+                    "capture_share_mode": snapshot.capture_share_mode,
                     "capture_provenance": snapshot.capture_provenance,
                     "audio_format": snapshot.audio_format,
                     "storage_layout_version": snapshot.storage_layout_version,
                     "segment_frames": snapshot.segment_frames,
+                    "input_discontinuity_count": snapshot.input_discontinuity_count,
+                    "input_discontinuity_silence_samples": snapshot.input_discontinuity_silence_samples,
                     "noise_threshold_dbfs": snapshot.noise_threshold_dbfs,
                     "silence_duration_ms": snapshot.silence_duration_ms,
                     "silence_threshold_dbfs": snapshot.silence_threshold_dbfs,
@@ -2076,6 +2106,12 @@ impl Engine {
         let overflow = Arc::new(AtomicU64::new(snapshot.overflow_samples));
         let faulted = Arc::new(AtomicBool::new(false));
         let capture_fault_code = Arc::new(AtomicU32::new(CAPTURE_FAULT_NONE));
+        let capture_recovery = CaptureRecoveryTelemetry {
+            discontinuities: Arc::new(AtomicU64::new(snapshot.input_discontinuity_count)),
+            inserted_silence_frames: Arc::new(AtomicU64::new(
+                snapshot.input_discontinuity_silence_samples,
+            )),
+        };
         let storage_status = Arc::new(AtomicU32::new(match storage_report.status {
             StorageStatus::Healthy => 0,
             StorageStatus::Warning => 1,
@@ -2172,6 +2208,7 @@ impl Engine {
             captured,
             committed,
             overflow,
+            capture_recovery: capture_recovery.clone(),
             faulted,
             peak: peak_bits,
             rms: rms_bits,
@@ -2236,6 +2273,7 @@ impl Engine {
                 Arc::clone(&session.faulted),
                 CaptureFaultPersistence {
                     session_dir: session.session_dir.clone(),
+                    recovery: capture_recovery.clone(),
                 },
                 Arc::clone(&capture_fault_code),
                 Arc::clone(&session.peak),
@@ -2256,10 +2294,15 @@ impl Engine {
             ) {
                 Ok(stream) => stream,
                 Err(error) => {
+                    let exclusive_open = session.snapshot.capture_share_mode.is_exclusive();
                     return Err(self.finish_activation_failure(
                         session,
                         "build_input_stream",
-                        error.context("build input stream"),
+                        error.context(if exclusive_open {
+                            "独占开流失败。请确认声卡未被其他程序占用，并检查采样率/位深/通道；可改为「系统混音」，不会自动降级"
+                        } else {
+                            "build input stream"
+                        }),
                     ));
                 }
             };
@@ -2337,6 +2380,7 @@ impl Engine {
         let overflow_thread = Arc::clone(&session.overflow);
         let faulted_thread = Arc::clone(&session.faulted);
         let capture_fault_code_thread = Arc::clone(&capture_fault_code);
+        let capture_recovery_thread = capture_recovery.clone();
         let storage_status_thread = Arc::clone(&storage_status);
         let storage_remaining_thread = Arc::clone(&storage_safe_remaining_seconds);
         let peak_thread = Arc::clone(&session.peak);
@@ -2349,6 +2393,7 @@ impl Engine {
         let head_silence_thread = session.head_silence.clone();
         let silence_duration_ms_thread = Arc::clone(&session.silence_duration_ms);
         let telemetry_session_dir = session.session_dir.clone();
+        let capture_share_mode = session.snapshot.capture_share_mode.as_str();
         let telemetry_join = match thread::Builder::new()
             .name("telemetry".to_string())
             .spawn(move || {
@@ -2407,6 +2452,9 @@ impl Engine {
                             "faulted": capture_faulted,
                             "fault_kind": fault_kind,
                             "fault_reason": fault_reason,
+                            "input_discontinuity_count": capture_recovery_thread.discontinuities.load(Ordering::Acquire),
+                            "input_discontinuity_silence_samples": capture_recovery_thread.inserted_silence_frames.load(Ordering::Acquire),
+                            "capture_share_mode": capture_share_mode,
                             "storage_status": storage_status,
                             "storage_safe_remaining_seconds": storage_remaining_thread.load(Ordering::Acquire),
                             "peak": f32::from_bits(peak_thread.load(Ordering::Relaxed)),
@@ -2457,6 +2505,7 @@ impl Engine {
                 "device_name": device_name,
                 "device_id": device_id,
                 "input_sample_format": sample_format.to_string(),
+                "capture_share_mode": session.snapshot.capture_share_mode,
                 "sample_rate": sample_rate,
                 "bit_depth": bit_depth,
                 "encoding": output_encoding.name(),
@@ -2675,8 +2724,7 @@ impl Engine {
     }
 
     pub fn set_silence_settings(&mut self, payload: SetSilenceSettingsPayload) -> Result<Value> {
-        if !payload.threshold_dbfs.is_finite()
-            || !(-96.0..=-6.0).contains(&payload.threshold_dbfs)
+        if !payload.threshold_dbfs.is_finite() || !(-96.0..=-6.0).contains(&payload.threshold_dbfs)
         {
             bail!("silence threshold must be between -96 and -6 dBFS");
         }
@@ -2689,10 +2737,8 @@ impl Engine {
             bail!("音频写盘异常，请结束并恢复当前录制");
         }
 
-        let (analysis_boundary, reset_kind) = session.apply_silence_settings(
-            payload.threshold_dbfs,
-            payload.silence_duration_ms,
-        );
+        let (analysis_boundary, reset_kind) =
+            session.apply_silence_settings(payload.threshold_dbfs, payload.silence_duration_ms);
         session.snapshot.silence_threshold_dbfs = payload.threshold_dbfs;
         session.snapshot.silence_duration_ms = payload.silence_duration_ms;
         session.persist(
@@ -2742,10 +2788,8 @@ impl Engine {
             }
             sequence += 1;
         };
-        // Clicking start arms a fresh per-take detector. Ambient silence from
-        // before the click intentionally does not count: the operator must be
-        // given an observable, deterministic head-silence interval after the
-        // action, but the action itself must never be rejected.
+        // Clicking start arms a fixed pending timer. Room tone from before the
+        // click does not count; elapsed time after the click always does.
         let recording_started_sample = session.arm_attempt_analysis();
         let start_sample = recording_started_sample;
         session.active_attempt = Some(ActiveAttempt {
@@ -2753,6 +2797,10 @@ impl Engine {
             attempt_id: attempt_id.clone(),
             start_sample,
             recording_started_sample,
+            input_discontinuity_count_at_start: session
+                .capture_recovery
+                .discontinuities
+                .load(Ordering::Acquire),
         });
         session.persist(
             "attempt_started",
@@ -2829,16 +2877,13 @@ impl Engine {
             observed_content_started_sample
         };
         if content_started_sample == 0 {
-            if !force {
-                bail!("未检测到本句有效语音，请朗读后再完成");
-            }
             session.persist(
                 "attempt_discarded",
                 json!({
                     "item_id": &active.item_id,
                     "attempt_id": &active.attempt_id,
                     "reason": if analysis.head_silence_passed_sample == 0 {
-                        "manual_stop_before_head_silence"
+                        "manual_stop_before_pending"
                     } else {
                         "manual_stop_without_signal"
                     },
@@ -2859,31 +2904,13 @@ impl Engine {
                 "forced": true,
             }));
         }
+        let _ = force;
         let head_silence_passed_sample = analysis.head_silence_passed_sample;
-        if head_silence_passed_sample == 0
-            || head_silence_passed_sample > content_started_sample
-            || !matches!(
-                analysis.head_silence_phase,
-                HEAD_SILENCE_PASSED | HEAD_SILENCE_SPEECH_STARTED
-            )
-        {
-            bail!("本句头静音与正文起点的分析边界不一致，请稍后重试完成本句");
-        }
         let required_silence_samples = session.required_silence_samples();
-        let last_signal_sample = analysis.last_signal_sample;
-        if last_signal_sample < content_started_sample {
-            bail!("音频信号分析边界不一致，请稍后重试完成本句");
-        }
+        let last_signal_sample = analysis.last_signal_sample.max(content_started_sample);
         let tail_silence_samples =
             captured_boundary.saturating_sub(last_signal_sample.min(captured_boundary));
-        if tail_silence_samples < required_silence_samples && !force {
-            bail!(
-                "完成本句前需要连续静音 {:.1} 秒；当前 {:.1} 秒",
-                session.snapshot.silence_duration_ms as f64 / 1_000.0,
-                tail_silence_samples as f64 / f64::from(session.snapshot.audio_format.sample_rate)
-            );
-        }
-        let forced_without_tail_silence = force && tail_silence_samples < required_silence_samples;
+        let forced_without_tail_silence = tail_silence_samples < required_silence_samples;
         let end_sample = match session.wait_until_committed(captured_boundary) {
             Ok(_) => captured_boundary,
             Err(error) if session.faulted.load(Ordering::Acquire) => {
@@ -2931,13 +2958,16 @@ impl Engine {
             }
             bail!("attempt contains no audio samples");
         }
+        let recovered_discontinuity = session
+            .capture_recovery
+            .discontinuities
+            .load(Ordering::Acquire)
+            > active.input_discontinuity_count_at_start;
         let attempt = Attempt {
             attempt_id: active.attempt_id.clone(),
-            // Deliver exactly the configured silence immediately preceding
-            // the first content sample. If the speaker waits after the head
-            // gate passes, that extra pause remains in the continuous master
-            // track but does not bloat the sentence bundle.
-            start_sample: content_started_sample.saturating_sub(required_silence_samples),
+            // The take begins at the operator click. The pending timer that
+            // follows is the configured head pad.
+            start_sample: active.recording_started_sample,
             recording_started_sample: active.recording_started_sample,
             head_silence_armed_sample: analysis.head_silence_armed_sample,
             head_silence_passed_sample,
@@ -2947,7 +2977,11 @@ impl Engine {
             forced_without_tail_silence,
             tail_silence_samples,
             required_tail_silence_samples: required_silence_samples,
-            status: "recorded".to_string(),
+            status: if recovered_discontinuity {
+                "needs_rerecord".to_string()
+            } else {
+                "recorded".to_string()
+            },
             created_at: Utc::now().to_rfc3339(),
         };
         let item = session
@@ -2956,9 +2990,13 @@ impl Engine {
             .iter_mut()
             .find(|item| item.id == active.item_id)
             .ok_or_else(|| anyhow!("item disappeared while recording"))?;
-        let replaces_accepted_version = item.status == "accepted"
+        let replaces_accepted_version = !recovered_discontinuity
+            && item.status == "accepted"
             && item.selected_attempt_id.is_some();
-        item.status = if replaces_accepted_version {
+        let preserves_accepted_version = recovered_discontinuity
+            && item.status == "accepted"
+            && item.selected_attempt_id.is_some();
+        item.status = if replaces_accepted_version || preserves_accepted_version {
             "accepted".to_string()
         } else {
             "review".to_string()
@@ -2970,7 +3008,7 @@ impl Engine {
                 }
             }
             item.selected_attempt_id = Some(attempt.attempt_id.clone());
-        } else {
+        } else if !preserves_accepted_version {
             item.selected_attempt_id = None;
         }
         let mut attempt = attempt;
@@ -2996,6 +3034,7 @@ impl Engine {
             "attempt": attempt,
             "forced": forced_without_tail_silence,
             "auto_selected": replaces_accepted_version,
+            "recovered_discontinuity": recovered_discontinuity,
         }))
     }
 
@@ -3016,7 +3055,9 @@ impl Engine {
             .iter()
             .find(|attempt| attempt.attempt_id == attempt_id)
             .ok_or_else(|| anyhow!("unknown attempt id {attempt_id}"))?;
-        if selected.status == "interrupted" || selected.end_sample <= selected.start_sample {
+        if matches!(selected.status.as_str(), "interrupted" | "needs_rerecord")
+            || selected.end_sample <= selected.start_sample
+        {
             bail!("异常中断的录音版本不能被确认或交付");
         }
         for attempt in &mut item.attempts {
@@ -3063,7 +3104,9 @@ impl Engine {
             .and_then(|item| item.attempts.iter().find(|a| a.attempt_id == attempt_id))
             .cloned()
             .ok_or_else(|| anyhow!("attempt not found"))?;
-        if attempt.status == "interrupted" || attempt.end_sample <= attempt.start_sample {
+        if matches!(attempt.status.as_str(), "interrupted" | "needs_rerecord")
+            || attempt.end_sample <= attempt.start_sample
+        {
             bail!("异常中断的录音版本不能试听或交付");
         }
         let destination = session
@@ -3499,13 +3542,20 @@ impl Engine {
         // under the same task lease. Checking the marker first leaves a race
         // where another process can fault/seal the session before this export
         // acquires the lock and then incorrectly publish a normal delivery.
-        let export_full_track = requested_artifact.is_none_or(|artifact| artifact == ExportArtifact::FullTrack);
-        let export_cuts = requested_artifact.is_none_or(|artifact| artifact == ExportArtifact::CutsZip);
-        let export_timestamps = requested_artifact.is_none_or(|artifact| artifact == ExportArtifact::TimestampsJson);
+        let export_full_track =
+            requested_artifact.is_none_or(|artifact| artifact == ExportArtifact::FullTrack);
+        let export_cuts =
+            requested_artifact.is_none_or(|artifact| artifact == ExportArtifact::CutsZip);
+        let export_timestamps =
+            requested_artifact.is_none_or(|artifact| artifact == ExportArtifact::TimestampsJson);
         if export_cuts {
             ensure_no_audio_fault_marker(
                 session_dir,
-                if requested_artifact.is_none() { "导出任务" } else { "导出分段 ZIP" },
+                if requested_artifact.is_none() {
+                    "导出任务"
+                } else {
+                    "导出分段 ZIP"
+                },
             )?;
         }
         let mut journal = read_journal(session_dir)?;
@@ -3542,8 +3592,10 @@ impl Engine {
         let source_metadata = match std::fs::symlink_metadata(&source) {
             Ok(metadata) => Some(metadata),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && pristine_empty => None,
-            Err(error) => return Err(error)
-                .with_context(|| format!("inspect source audio {}", source.display())),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect source audio {}", source.display()));
+            }
         };
         if let Some(source_metadata) = source_metadata.as_ref() {
             let valid_source = match storage_kind {
@@ -3641,7 +3693,7 @@ impl Engine {
                 continue;
             };
             let attempt = &item.attempts[attempt_index];
-            if attempt.status == "interrupted"
+            if matches!(attempt.status.as_str(), "interrupted" | "needs_rerecord")
                 || attempt.end_sample <= attempt.start_sample
                 || attempt.end_sample > snapshot.committed_samples
             {
@@ -3827,6 +3879,19 @@ impl Engine {
                 "required_tail_silence_samples": attempt.required_tail_silence_samples,
             }));
         }
+        let mut risk_warnings = Vec::<String>::new();
+        if snapshot.status == "faulted" || snapshot.overflow_samples > 0 {
+            risk_warnings.push(
+                "任务包含采集故障或写盘溢出；请将整轨和时间戳作为恢复材料人工检查。".to_string(),
+            );
+        }
+        if snapshot.input_discontinuity_count > 0 {
+            risk_warnings.push(format!(
+                "声卡链路发生 {} 次可恢复短暂抖动，已插入 {} 帧静音保持时间轴；请人工复核受影响句子。",
+                snapshot.input_discontinuity_count,
+                snapshot.input_discontinuity_silence_samples,
+            ));
+        }
         let metadata = json!({
             "schema_version": 1,
             "session_id": snapshot.session_id,
@@ -3834,10 +3899,13 @@ impl Engine {
             "device_name": snapshot.device_name,
             "device_id": snapshot.device_id,
             "input_sample_format": snapshot.input_sample_format,
+            "capture_share_mode": snapshot.capture_share_mode,
             "capture_provenance": snapshot.capture_provenance,
             "audio_format": snapshot.audio_format,
             "storage_layout_version": snapshot.storage_layout_version,
             "segment_frames": snapshot.segment_frames,
+            "input_discontinuity_count": snapshot.input_discontinuity_count,
+            "input_discontinuity_silence_samples": snapshot.input_discontinuity_silence_samples,
             "noise_check": snapshot.noise_check,
             "silence_policy": {
                 "duration_ms": snapshot.silence_duration_ms,
@@ -3849,11 +3917,7 @@ impl Engine {
             } else {
                 "normal"
             },
-            "risk_warnings": if snapshot.status == "faulted" || snapshot.overflow_samples > 0 {
-                vec!["任务包含采集故障或写盘溢出；请将整轨和时间戳作为恢复材料人工检查。"]
-            } else {
-                Vec::<&str>::new()
-            },
+            "risk_warnings": risk_warnings,
             "items": &snapshot.items,
             "full_track": "full-track.wav",
             "full_track_container": full_track_container,
@@ -4059,16 +4123,18 @@ fn persist_offline_snapshot(
     append_journal_event(&event_path, &event_value, JournalAppendFault::None)
         .map_err(|error| anyhow!(error))?;
     let mut projection_failures = Vec::<String>::new();
-    if let Err(error) = atomic_snapshot_json(
-        &session_dir.join("metadata/items.snapshot.json"),
-        snapshot,
-    ) {
+    if let Err(error) =
+        atomic_snapshot_json(&session_dir.join("metadata/items.snapshot.json"), snapshot)
+    {
         projection_failures.push(format!("update items snapshot: {error:#}"));
     }
     if let Err(error) = atomic_json(&session_dir.join("script/normalized.json"), &snapshot.items) {
         projection_failures.push(format!("update normalized script: {error:#}"));
     }
-    if let Err(error) = atomic_json(&session_dir.join("session.json"), &session_summary_value(snapshot)) {
+    if let Err(error) = atomic_json(
+        &session_dir.join("session.json"),
+        &session_summary_value(snapshot),
+    ) {
         projection_failures.push(format!("update session summary: {error:#}"));
     }
     if projection_failures.is_empty()
@@ -4190,10 +4256,6 @@ fn validate_attempt_boundaries(snapshot: &SessionSnapshot, durable_frames: u64) 
         .flat_map(|item| item.attempts.iter())
         .any(|attempt| {
             let head_silence_invalid = if attempt.head_silence_passed_sample == 0 {
-                // Legacy attempts omit all three fields. Interrupted attempts
-                // may durably preserve only the click boundary. A deliverable
-                // take that advertises any new head-silence metadata must also
-                // contain the latched pass boundary.
                 attempt.status != "interrupted"
                     && (attempt.head_silence_armed_sample != 0
                         || attempt.required_head_silence_samples != 0)
@@ -4206,11 +4268,7 @@ fn validate_attempt_boundaries(snapshot: &SessionSnapshot, durable_frames: u64) 
                         < attempt.required_head_silence_samples
                     || (attempt.status != "interrupted"
                         && (attempt.recording_started_sample != attempt.head_silence_armed_sample
-                            || attempt.start_sample
-                                != attempt
-                                    .content_started_sample
-                                    .saturating_sub(attempt.required_head_silence_samples)
-                            || attempt.head_silence_passed_sample > attempt.content_started_sample))
+                            || attempt.start_sample != attempt.recording_started_sample))
             };
             attempt.start_sample > durable_frames
                 || attempt.recording_started_sample > durable_frames
@@ -4363,10 +4421,13 @@ fn session_summary_value(snapshot: &SessionSnapshot) -> Value {
         "device_name": snapshot.device_name,
         "device_id": snapshot.device_id,
         "input_sample_format": snapshot.input_sample_format,
+        "capture_share_mode": snapshot.capture_share_mode,
         "capture_provenance": snapshot.capture_provenance,
         "audio_format": snapshot.audio_format,
         "storage_layout_version": snapshot.storage_layout_version,
         "segment_frames": snapshot.segment_frames,
+        "input_discontinuity_count": snapshot.input_discontinuity_count,
+        "input_discontinuity_silence_samples": snapshot.input_discontinuity_silence_samples,
         "silence_duration_ms": snapshot.silence_duration_ms,
         "silence_threshold_dbfs": snapshot.silence_threshold_dbfs,
         "started_at": snapshot.started_at,
@@ -4411,7 +4472,9 @@ fn validate_snapshot_for_export(snapshot: &SessionSnapshot) -> Result<()> {
             || attempt.head_silence_passed_sample > snapshot.committed_samples
             || attempt.content_started_sample > snapshot.committed_samples
             || attempt.end_sample > snapshot.committed_samples;
-        if attempt.status == "interrupted" || outside_durable_audio {
+        if matches!(attempt.status.as_str(), "interrupted" | "needs_rerecord")
+            || outside_durable_audio
+        {
             bail!(
                 "条目 {} 选中的录音版本异常中断或样本边界越界，无法导出切片。",
                 item.id
@@ -4451,7 +4514,7 @@ fn validate_snapshot_for_artifact(
             .iter()
             .find(|attempt| attempt.attempt_id == selected_id)
             .with_context(|| format!("条目 {} 选中的录音版本不存在，无法导出切片。", item.id))?;
-        if attempt.status == "interrupted"
+        if matches!(attempt.status.as_str(), "interrupted" | "needs_rerecord")
             || attempt.end_sample <= attempt.start_sample
             || attempt.end_sample > snapshot.committed_samples
         {
@@ -5343,6 +5406,14 @@ impl RecordingSession {
             active_span.end_sample = committed_samples;
         }
         snapshot.overflow_samples = self.overflow.load(Ordering::Acquire);
+        snapshot.input_discontinuity_count = self
+            .capture_recovery
+            .discontinuities
+            .load(Ordering::Acquire);
+        snapshot.input_discontinuity_silence_samples = self
+            .capture_recovery
+            .inserted_silence_frames
+            .load(Ordering::Acquire);
         snapshot.updated_at = Utc::now().to_rfc3339();
         snapshot
     }
@@ -5661,10 +5732,13 @@ impl RecordingSession {
                 "device_name": self.snapshot.device_name,
                 "device_id": self.snapshot.device_id,
                 "input_sample_format": self.snapshot.input_sample_format,
+                "capture_share_mode": self.snapshot.capture_share_mode,
                 "capture_provenance": self.snapshot.capture_provenance,
                 "audio_format": self.snapshot.audio_format,
                 "storage_layout_version": self.snapshot.storage_layout_version,
                 "segment_frames": self.snapshot.segment_frames,
+                "input_discontinuity_count": self.snapshot.input_discontinuity_count,
+                "input_discontinuity_silence_samples": self.snapshot.input_discontinuity_silence_samples,
                 "noise_threshold_dbfs": self.snapshot.noise_threshold_dbfs,
                 "silence_duration_ms": self.snapshot.silence_duration_ms,
                 "silence_threshold_dbfs": self.snapshot.silence_threshold_dbfs,
@@ -5757,10 +5831,13 @@ impl RecordingSession {
                 "device_name": self.snapshot.device_name,
                 "device_id": self.snapshot.device_id,
                 "input_sample_format": self.snapshot.input_sample_format,
+                "capture_share_mode": self.snapshot.capture_share_mode,
                 "capture_provenance": self.snapshot.capture_provenance,
                 "audio_format": self.snapshot.audio_format,
                 "storage_layout_version": self.snapshot.storage_layout_version,
                 "segment_frames": self.snapshot.segment_frames,
+                "input_discontinuity_count": self.snapshot.input_discontinuity_count,
+                "input_discontinuity_silence_samples": self.snapshot.input_discontinuity_silence_samples,
                 "noise_threshold_dbfs": self.snapshot.noise_threshold_dbfs,
                 "silence_duration_ms": self.snapshot.silence_duration_ms,
                 "silence_threshold_dbfs": self.snapshot.silence_threshold_dbfs,
@@ -6822,20 +6899,67 @@ fn minimum_input_representation_bits(output_bit_depth: u16) -> Result<u16> {
     }
 }
 
+struct InputFormatCatalog {
+    sample_rates: Vec<u32>,
+    input_channels: Vec<u16>,
+    configurations: Vec<Value>,
+    available: bool,
+}
+
+fn collect_input_format_catalog(device: &Device, exclusive: bool) -> InputFormatCatalog {
+    let mut sample_rates = Vec::<u32>::new();
+    let mut input_channels = Vec::<u16>::new();
+    let mut configurations = Vec::<Value>::new();
+    if let Ok(configs) = device.supported_input_configs_for(exclusive) {
+        for config in configs {
+            if !is_supported_input_format(config.sample_format()) {
+                continue;
+            }
+            input_channels.push(config.channels());
+            sample_rates.push(config.min_sample_rate());
+            sample_rates.push(config.max_sample_rate());
+            configurations.push(json!({
+                "min_sample_rate": config.min_sample_rate(),
+                "max_sample_rate": config.max_sample_rate(),
+                "channels": config.channels(),
+                "sample_format": config.sample_format().to_string(),
+                "share_mode": if exclusive { "exclusive" } else { "shared" },
+            }));
+        }
+    }
+    sample_rates.sort_unstable();
+    sample_rates.dedup();
+    input_channels.sort_unstable();
+    input_channels.dedup();
+    let available = !configurations.is_empty();
+    InputFormatCatalog {
+        sample_rates,
+        input_channels,
+        configurations,
+        available,
+    }
+}
+
 fn select_config(
     device: &Device,
     sample_rate: u32,
     input_channel_index: usize,
     output_bit_depth: u16,
+    share_mode: CaptureShareMode,
 ) -> Result<SupportedStreamConfig> {
     let minimum_representation_bits = minimum_input_representation_bits(output_bit_depth)?;
     let mut selected: Option<(u8, SupportedStreamConfig)> = None;
     let mut compatible_rates = Vec::<(u32, u32)>::new();
     let mut formats_at_requested_rate = Vec::<(String, u16)>::new();
     let requested_channel = input_channel_index + 1;
+    let exclusive = share_mode.is_exclusive();
     for range in device
-        .supported_input_configs()
-        .context("query supported input formats")?
+        .supported_input_configs_for(exclusive)
+        .context(if exclusive {
+            "查询独占输入格式失败"
+        } else {
+            "query supported input formats"
+        })?
     {
         if !is_supported_input_format(range.sample_format())
             || usize::from(range.channels()) <= input_channel_index
@@ -6865,6 +6989,11 @@ fn select_config(
         return Ok(config);
     }
     if compatible_rates.is_empty() {
+        if exclusive {
+            bail!(
+                "该输入设备未枚举到独占格式，无法以独占模式开流。请关闭占用该声卡的其他程序，或将采集模式改为「系统混音」。不会自动降级。"
+            );
+        }
         bail!(
             "input channel {requested_channel} is unavailable in every compatible format exposed by this device"
         );
@@ -6883,6 +7012,11 @@ fn select_config(
             })
             .collect::<Vec<_>>()
             .join("、");
+        if exclusive {
+            bail!(
+                "独占模式：所选设备在 {sample_rate} Hz、输入通道 {requested_channel} 仅提供 {offered}，无法满足 {output_bit_depth}-bit 交付的最低 {minimum_representation_bits} 位输入有效数字精度。可改采样率/位深，或改为「系统混音」。不会自动降级。"
+            );
+        }
         bail!(
             "所选设备在 {sample_rate} Hz 、输入通道 {requested_channel} 仅提供 {offered}，无法满足 {output_bit_depth}-bit 交付的最低 {minimum_representation_bits} 位输入有效数字精度要求。这是驱动数字样本精度，不等同于声卡 ADC 的有效位数（ENOB）。"
         );
@@ -6900,6 +7034,11 @@ fn select_config(
         })
         .collect::<Vec<_>>()
         .join(", ");
+    if exclusive {
+        bail!(
+            "独占模式不支持 {sample_rate} Hz（输入通道 {requested_channel}）。该设备独占可用采样率：{offered}。请改采样率，或改为「系统混音」。不会自动降级。"
+        );
+    }
     bail!(
         "requested sample rate {sample_rate} Hz is unsupported on input channel {requested_channel}; compatible ranges: {offered}"
     )
@@ -7220,6 +7359,15 @@ where
             }
         },
         move |error| {
+            if let Some(missing_frames) = recovered_xrun_missing_frames(&error) {
+                saturating_atomic_add(&error_fault_persistence.recovery.discontinuities, 1);
+                saturating_atomic_add(
+                    &error_fault_persistence.recovery.inserted_silence_frames,
+                    missing_frames,
+                );
+                eprintln!("recoverable audio input discontinuity: {error}");
+                return;
+            }
             latch_capture_fault_code(&error_capture_fault_code, input_stream_fault_code(&error));
             let reason = format!("audio input stream failed: {error}");
             error_emitter.store(true, Ordering::Release);
@@ -7517,84 +7665,17 @@ fn publish_leased_block_with_preview(
         apply_digital_silence_block(previous_digital_silence, digital_silence_block),
         Ordering::Release,
     );
-    let threshold_dbfs = f32::from_bits(silence.threshold_bits.load(Ordering::Relaxed));
-    let threshold_linear = 10f32.powf(threshold_dbfs / 20.0);
-    if rms <= threshold_linear {
-        saturating_atomic_add(&silence.silence_samples, frames);
-        if silence.head_silence.phase.load(Ordering::Acquire) == HEAD_SILENCE_WAITING {
-            let armed_sample = silence.head_silence.armed_sample.load(Ordering::Acquire);
-            if block_end > armed_sample {
-                let eligible_start = block_start.max(armed_sample);
-                let eligible_frames = block_end.saturating_sub(eligible_start);
-                let required_samples = silence.head_silence.required_samples();
-                let previous = silence
-                    .head_silence
-                    .progress_samples
-                    .load(Ordering::Acquire)
-                    .min(required_samples);
-                let updated = previous
-                    .saturating_add(eligible_frames)
-                    .min(required_samples);
-                silence
-                    .head_silence
-                    .progress_samples
-                    .store(updated, Ordering::Release);
-                if previous < required_samples
-                    && updated >= required_samples
-                {
-                    let samples_needed = silence
-                        .head_silence
-                        .required_samples()
-                        .saturating_sub(previous);
-                    let passed_sample = eligible_start.saturating_add(samples_needed);
-                    // Publish the exact threshold boundary before the latched
-                    // phase. Later signal blocks can advance to SPEECH_STARTED
-                    // but can never reset this value within the take.
-                    silence
-                        .head_silence
-                        .passed_sample
-                        .store(passed_sample, Ordering::Release);
-                    silence
-                        .head_silence
-                        .phase
-                        .store(HEAD_SILENCE_PASSED, Ordering::Release);
-                }
-            }
-        }
-    } else {
-        silence.silence_samples.store(0, Ordering::Release);
-        match silence.head_silence.phase.load(Ordering::Acquire) {
-            HEAD_SILENCE_WAITING => {
-                // Only post-click samples participate. Any above-threshold
-                // block after arming restarts the continuous head-silence run,
-                // but it is not sentence content yet.
-                if block_end > silence.head_silence.armed_sample.load(Ordering::Acquire) {
-                    silence
-                        .head_silence
-                        .progress_samples
-                        .store(0, Ordering::Release);
-                }
-            }
-            HEAD_SILENCE_PASSED | HEAD_SILENCE_SPEECH_STARTED => {
-                let passed_sample = silence.head_silence.passed_sample.load(Ordering::Acquire);
-                let candidate = block_start.max(passed_sample).max(1);
-                let _ = silence.attempt_signal_start_sample.compare_exchange(
-                    0,
-                    candidate,
-                    Ordering::Release,
-                    Ordering::Relaxed,
-                );
-                silence
-                    .head_silence
-                    .phase
-                    .store(HEAD_SILENCE_SPEECH_STARTED, Ordering::Release);
-                silence
-                    .last_signal_sample
-                    .store(block_end, Ordering::Release);
-            }
-            _ => {}
-        }
-    }
+    annotate_attempt_block(
+        &silence.head_silence,
+        &silence.silence_samples,
+        &silence.last_signal_sample,
+        &silence.attempt_signal_start_sample,
+        &silence.threshold_bits,
+        rms,
+        frames,
+        block_start,
+        block_end,
+    );
     // Publish this only after every signal/silence annotation for the accepted
     // range is visible. `stop_attempt` uses the watermark as the acquire side
     // of that boundary before deciding whether a take contains speech.
@@ -8839,6 +8920,7 @@ mod tests {
             device_name: "test".to_string(),
             device_id: "null:test".to_string(),
             input_sample_format: "f32".to_string(),
+            capture_share_mode: CaptureShareMode::Exclusive,
             capture_provenance: Vec::new(),
             audio_format: AudioFormat {
                 sample_rate: 48_000,
@@ -8854,6 +8936,8 @@ mod tests {
             captured_samples: 0,
             committed_samples: 0,
             overflow_samples: 0,
+            input_discontinuity_count: 0,
+            input_discontinuity_silence_samples: 0,
             started_at: "2026-08-10T11:00:00Z".to_string(),
             updated_at: "2026-08-10T12:00:00Z".to_string(),
             noise_check: None,
@@ -8965,6 +9049,7 @@ mod tests {
             captured: Arc::new(AtomicU64::new(0)),
             committed: Arc::new(AtomicU64::new(0)),
             overflow: Arc::new(AtomicU64::new(0)),
+            capture_recovery: CaptureRecoveryTelemetry::default(),
             faulted: Arc::new(AtomicBool::new(false)),
             peak: Arc::new(AtomicU32::new(0)),
             rms: Arc::new(AtomicU32::new(0)),
@@ -9121,7 +9206,7 @@ mod tests {
     }
 
     #[test]
-    fn noise_before_head_silence_pass_resets_only_the_new_take_progress() {
+    fn noise_during_pending_does_not_reset_the_timer() {
         let harness = AttemptAnalysisHarness::armed_at(100, 4);
         harness.publish(vec![0.0; 3]);
         assert_eq!(
@@ -9141,18 +9226,26 @@ mod tests {
                 .head_silence
                 .progress_samples
                 .load(Ordering::Acquire),
-            0
+            4
         );
         assert_eq!(
             harness.silence.head_silence.phase.load(Ordering::Acquire),
-            HEAD_SILENCE_WAITING
+            HEAD_SILENCE_SPEECH_STARTED
         );
         assert_eq!(
             harness
                 .silence
                 .attempt_signal_start_sample
                 .load(Ordering::Acquire),
-            0
+            103
+        );
+        assert_eq!(
+            harness
+                .silence
+                .head_silence
+                .passed_sample
+                .load(Ordering::Acquire),
+            104
         );
     }
 
@@ -9196,7 +9289,7 @@ mod tests {
     }
 
     #[test]
-    fn sound_before_head_silence_pass_is_not_sentence_content() {
+    fn sound_during_pending_is_content_but_does_not_block_the_timer() {
         let harness = AttemptAnalysisHarness::armed_at(40, 4);
 
         harness.publish(vec![0.2; 3]);
@@ -9206,15 +9299,23 @@ mod tests {
                 .silence
                 .attempt_signal_start_sample
                 .load(Ordering::Acquire),
-            0
+            40
         );
         assert_eq!(
             harness.silence.last_signal_sample.load(Ordering::Acquire),
-            0
+            43
         );
         assert_eq!(
             harness.silence.head_silence.phase.load(Ordering::Acquire),
             HEAD_SILENCE_WAITING
+        );
+        assert_eq!(
+            harness
+                .silence
+                .head_silence
+                .progress_samples
+                .load(Ordering::Acquire),
+            3
         );
     }
 
@@ -9296,6 +9397,7 @@ mod tests {
             attempt_id: "001-a1".to_string(),
             start_sample: 0,
             recording_started_sample: 20,
+            input_discontinuity_count_at_start: 0,
         });
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
@@ -9326,6 +9428,7 @@ mod tests {
             attempt_id: "001-a1".to_string(),
             start_sample: 0,
             recording_started_sample: 0,
+            input_discontinuity_count_at_start: 0,
         });
         let event_path = root.join("metadata/events.jsonl");
         std::fs::remove_file(&event_path).unwrap();
@@ -9394,11 +9497,22 @@ mod tests {
         let session = prepare_metadata_test_session(&root);
         session.analyzed_samples.store(120, Ordering::Release);
         session.silence_samples.store(30, Ordering::Release);
-        session.attempt_signal_start_sample.store(45, Ordering::Release);
+        session
+            .attempt_signal_start_sample
+            .store(45, Ordering::Release);
         session.last_signal_sample.store(90, Ordering::Release);
-        session.head_silence.phase.store(HEAD_SILENCE_WAITING, Ordering::Release);
-        session.head_silence.armed_sample.store(20, Ordering::Release);
-        session.head_silence.progress_samples.store(30, Ordering::Release);
+        session
+            .head_silence
+            .phase
+            .store(HEAD_SILENCE_WAITING, Ordering::Release);
+        session
+            .head_silence
+            .armed_sample
+            .store(20, Ordering::Release);
+        session
+            .head_silence
+            .progress_samples
+            .store(30, Ordering::Release);
 
         let (boundary, reset_kind) = session.apply_silence_settings(-36.0, 800);
 
@@ -9411,15 +9525,32 @@ mod tests {
         assert_eq!(session.silence_samples.load(Ordering::Acquire), 0);
         assert_eq!(session.silence_duration_ms.load(Ordering::Acquire), 800);
         assert_eq!(session.head_silence.required_samples(), 38_400);
-        assert_eq!(session.head_silence.armed_sample.load(Ordering::Acquire), 120);
-        assert_eq!(session.head_silence.progress_samples.load(Ordering::Acquire), 0);
-        assert_eq!(session.attempt_signal_start_sample.load(Ordering::Acquire), 0);
+        assert_eq!(
+            session.head_silence.armed_sample.load(Ordering::Acquire),
+            120
+        );
+        assert_eq!(
+            session
+                .head_silence
+                .progress_samples
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            session.attempt_signal_start_sample.load(Ordering::Acquire),
+            0
+        );
 
         session.analyzed_samples.store(200, Ordering::Release);
         session.silence_samples.store(18, Ordering::Release);
-        session.attempt_signal_start_sample.store(150, Ordering::Release);
+        session
+            .attempt_signal_start_sample
+            .store(150, Ordering::Release);
         session.last_signal_sample.store(185, Ordering::Release);
-        session.head_silence.phase.store(HEAD_SILENCE_SPEECH_STARTED, Ordering::Release);
+        session
+            .head_silence
+            .phase
+            .store(HEAD_SILENCE_SPEECH_STARTED, Ordering::Release);
 
         let (boundary, reset_kind) = session.apply_silence_settings(-48.0, 1_500);
 
@@ -9428,7 +9559,10 @@ mod tests {
         assert_eq!(session.silence_samples.load(Ordering::Acquire), 0);
         assert_eq!(session.silence_duration_ms.load(Ordering::Acquire), 1_500);
         assert_eq!(session.head_silence.required_samples(), 38_400);
-        assert_eq!(session.attempt_signal_start_sample.load(Ordering::Acquire), 150);
+        assert_eq!(
+            session.attempt_signal_start_sample.load(Ordering::Acquire),
+            150
+        );
         assert_eq!(session.last_signal_sample.load(Ordering::Acquire), 200);
         drop(session);
         let _ = std::fs::remove_dir_all(root);
@@ -9493,6 +9627,7 @@ mod tests {
             attempt_id: "001-a2".to_string(),
             start_sample: 0,
             recording_started_sample: 20,
+            input_discontinuity_count_at_start: 0,
         });
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
@@ -9504,7 +9639,7 @@ mod tests {
         assert_eq!(stopped["attempt"]["content_started_sample"], 50);
         assert_eq!(stopped["attempt"]["head_silence_armed_sample"], 20);
         assert_eq!(stopped["attempt"]["head_silence_passed_sample"], 40);
-        assert_eq!(stopped["attempt"]["start_sample"], 30);
+        assert_eq!(stopped["attempt"]["start_sample"], 20);
         assert_eq!(stopped["attempt"]["end_sample"], 100);
         assert_eq!(stopped["attempt"]["forced_without_tail_silence"], true);
         assert_eq!(stopped["attempt"]["tail_silence_samples"], 5);
@@ -9513,10 +9648,174 @@ mod tests {
         assert!(session.active_attempt.is_none());
         assert_eq!(stopped["auto_selected"], true);
         assert_eq!(session.snapshot.items[0].status, "accepted");
-        assert_eq!(session.snapshot.items[0].selected_attempt_id.as_deref(), Some("001-a2"));
-        assert_eq!(session.snapshot.items[0].attempts[0].status, "rejected_by_operator");
+        assert_eq!(
+            session.snapshot.items[0].selected_attempt_id.as_deref(),
+            Some("001-a2")
+        );
+        assert_eq!(
+            session.snapshot.items[0].attempts[0].status,
+            "rejected_by_operator"
+        );
         assert_eq!(session.snapshot.items[0].attempts[1].status, "accepted");
         assert_eq!(session.snapshot.items[0].attempts.len(), 2);
+        engine
+            .session
+            .as_mut()
+            .unwrap()
+            .writer_join
+            .take()
+            .unwrap()
+            .join()
+            .unwrap();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stop_without_force_keeps_speech_when_tail_silence_is_short() {
+        let root = test_root("ungated-stop-short-tail");
+        let mut session = prepare_metadata_test_session(&root);
+        session.snapshot.audio_format.sample_rate = 100;
+        session.snapshot.silence_duration_ms = 200;
+        session.head_silence = HeadSilenceMonitor::new(20);
+        session.captured.store(100, Ordering::Release);
+        session.committed.store(100, Ordering::Release);
+        session.analyzed_samples.store(100, Ordering::Release);
+        session.last_signal_sample.store(95, Ordering::Release);
+        session
+            .attempt_signal_start_sample
+            .store(50, Ordering::Release);
+        session
+            .head_silence
+            .armed_sample
+            .store(20, Ordering::Release);
+        session
+            .head_silence
+            .progress_samples
+            .store(20, Ordering::Release);
+        session
+            .head_silence
+            .passed_sample
+            .store(40, Ordering::Release);
+        session
+            .head_silence
+            .phase
+            .store(HEAD_SILENCE_SPEECH_STARTED, Ordering::Release);
+        session.active_attempt = Some(ActiveAttempt {
+            item_id: "001".to_string(),
+            attempt_id: "001-a1".to_string(),
+            start_sample: 20,
+            recording_started_sample: 20,
+            input_discontinuity_count_at_start: 0,
+        });
+        let (writer_tx, writer_rx) = bounded::<WriterMessage>(1);
+        session.writer_tx = writer_tx;
+        session.writer_join = Some(thread::spawn(move || {
+            if let Ok(WriterMessage::Checkpoint(reply)) = writer_rx.recv() {
+                let _ = reply.send(Ok(100));
+            }
+        }));
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+
+        let stopped = engine.stop_attempt(false).unwrap();
+
+        assert_eq!(stopped["attempt"]["start_sample"], 20);
+        assert_eq!(stopped["attempt"]["forced_without_tail_silence"], true);
+        assert_eq!(stopped["attempt"]["tail_silence_samples"], 5);
+        engine
+            .session
+            .as_mut()
+            .unwrap()
+            .writer_join
+            .take()
+            .unwrap()
+            .join()
+            .unwrap();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovered_discontinuity_rejects_only_the_affected_retake() {
+        let root = test_root("recovered-discontinuity-rejects-retake");
+        let mut session = prepare_metadata_test_session(&root);
+        session.snapshot.audio_format.sample_rate = 100;
+        session.snapshot.silence_duration_ms = 200;
+        session.snapshot.items[0].status = "accepted".to_string();
+        session.snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
+        session.snapshot.items[0].attempts.push(Attempt {
+            attempt_id: "001-a1".to_string(),
+            start_sample: 0,
+            recording_started_sample: 0,
+            head_silence_armed_sample: 0,
+            head_silence_passed_sample: 5,
+            required_head_silence_samples: 5,
+            content_started_sample: 5,
+            end_sample: 10,
+            forced_without_tail_silence: false,
+            tail_silence_samples: 5,
+            required_tail_silence_samples: 5,
+            status: "accepted".to_string(),
+            created_at: "2026-08-11T00:00:00Z".to_string(),
+        });
+        session
+            .capture_recovery
+            .discontinuities
+            .store(1, Ordering::Release);
+        session.head_silence = HeadSilenceMonitor::new(20);
+        session.captured.store(100, Ordering::Release);
+        session.committed.store(100, Ordering::Release);
+        session.analyzed_samples.store(100, Ordering::Release);
+        session.last_signal_sample.store(80, Ordering::Release);
+        session
+            .attempt_signal_start_sample
+            .store(50, Ordering::Release);
+        session
+            .head_silence
+            .armed_sample
+            .store(20, Ordering::Release);
+        session
+            .head_silence
+            .passed_sample
+            .store(40, Ordering::Release);
+        session
+            .head_silence
+            .phase
+            .store(HEAD_SILENCE_SPEECH_STARTED, Ordering::Release);
+        session.active_attempt = Some(ActiveAttempt {
+            item_id: "001".to_string(),
+            attempt_id: "001-a2".to_string(),
+            start_sample: 20,
+            recording_started_sample: 20,
+            input_discontinuity_count_at_start: 0,
+        });
+        let (writer_tx, writer_rx) = bounded::<WriterMessage>(1);
+        session.writer_tx = writer_tx;
+        session.writer_join = Some(thread::spawn(move || {
+            if let Ok(WriterMessage::Checkpoint(reply)) = writer_rx.recv() {
+                let _ = reply.send(Ok(100));
+            }
+        }));
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+
+        let stopped = engine.stop_attempt(false).unwrap();
+
+        assert_eq!(stopped["recovered_discontinuity"], true);
+        assert_eq!(stopped["attempt"]["status"], "needs_rerecord");
+        assert_eq!(stopped["auto_selected"], false);
+        let session = engine.session.as_ref().unwrap();
+        assert_eq!(session.snapshot.items[0].status, "accepted");
+        assert_eq!(
+            session.snapshot.items[0].selected_attempt_id.as_deref(),
+            Some("001-a1")
+        );
+        assert_eq!(session.snapshot.items[0].attempts[0].status, "accepted");
+        assert_eq!(
+            session.snapshot.items[0].attempts[1].status,
+            "needs_rerecord"
+        );
         engine
             .session
             .as_mut()
@@ -9565,6 +9864,7 @@ mod tests {
             attempt_id: "001-a1".to_string(),
             start_sample: 20,
             recording_started_sample: 20,
+            input_discontinuity_count_at_start: 0,
         });
 
         let (writer_tx, writer_rx) = bounded::<WriterMessage>(1);
@@ -9667,6 +9967,7 @@ mod tests {
             captured,
             committed,
             overflow,
+            capture_recovery: CaptureRecoveryTelemetry::default(),
             faulted,
             peak: Arc::new(AtomicU32::new(0)),
             rms: Arc::new(AtomicU32::new(0)),
@@ -10025,6 +10326,29 @@ mod tests {
         assert_eq!(
             code.load(Ordering::Acquire),
             CAPTURE_FAULT_DEVICE_UNAVAILABLE,
+        );
+    }
+
+    #[test]
+    fn recovered_xrun_is_quality_telemetry_not_a_terminal_capture_fault() {
+        let recovered = cpal::Error::with_message(
+            cpal::ErrorKind::RecoveredXrun,
+            "WASAPI input discontinuity recovered; missing_frames=480; driver_reported=true",
+        );
+        assert_eq!(recovered_xrun_missing_frames(&recovered), Some(480));
+        assert_eq!(
+            input_stream_fault_code(&recovered),
+            CAPTURE_FAULT_INPUT_STREAM_ERROR
+        );
+
+        let terminal = cpal::Error::with_message(
+            cpal::ErrorKind::Xrun,
+            "WASAPI capture device position moved backward",
+        );
+        assert_eq!(recovered_xrun_missing_frames(&terminal), None);
+        assert_eq!(
+            input_stream_fault_code(&terminal),
+            CAPTURE_FAULT_INPUT_DISCONTINUITY
         );
     }
 
@@ -11433,6 +11757,7 @@ mod tests {
         let faulted = Arc::new(AtomicBool::new(false));
         let persistence = CaptureFaultPersistence {
             session_dir: root.clone(),
+            recovery: CaptureRecoveryTelemetry::default(),
         };
         let (writer, receiver) = unbounded::<WriterMessage>();
         let queue_for_fault = queue.clone();
@@ -11735,6 +12060,7 @@ mod tests {
             captured,
             committed,
             overflow,
+            capture_recovery: CaptureRecoveryTelemetry::default(),
             faulted,
             peak: Arc::new(AtomicU32::new(0)),
             rms: Arc::new(AtomicU32::new(0)),
@@ -11827,6 +12153,7 @@ mod tests {
             captured,
             committed,
             overflow,
+            capture_recovery: CaptureRecoveryTelemetry::default(),
             faulted,
             peak: Arc::new(AtomicU32::new(0f32.to_bits())),
             rms: Arc::new(AtomicU32::new(0f32.to_bits())),
@@ -11844,6 +12171,7 @@ mod tests {
                 attempt_id: "001-a1".to_string(),
                 start_sample: 0,
                 recording_started_sample: 1,
+                input_discontinuity_count_at_start: 0,
             }),
             metadata_fault: None,
             stop_requested: false,
@@ -11932,6 +12260,7 @@ mod tests {
                 sample_rate: 48_000,
                 bit_depth: 24,
                 input_channel: 1,
+                capture_share_mode: CaptureShareMode::Exclusive,
                 silence_duration_ms: 1_000,
                 noise_threshold_dbfs: Some(-42.0),
                 silence_threshold_dbfs: -42.0,
@@ -11946,6 +12275,14 @@ mod tests {
         assert!(engine.session.is_none());
         assert_eq!(created["mode"], "inspect");
         assert_eq!(created["snapshot"]["status"], "stopped");
+        assert_eq!(
+            created["snapshot"]["capture_share_mode"],
+            if cfg!(target_os = "windows") {
+                "exclusive"
+            } else {
+                "shared"
+            }
+        );
         assert!(!root.join(SEGMENTED_MASTER_AUDIO).exists());
 
         let inspected = engine
@@ -11964,19 +12301,11 @@ mod tests {
             .unwrap();
         assert!(root.join("export/timestamps.json").is_file());
         engine
-            .export_session_artifact_expected(
-                &root,
-                "offline-create",
-                ExportArtifact::CutsZip,
-            )
+            .export_session_artifact_expected(&root, "offline-create", ExportArtifact::CutsZip)
             .unwrap();
         assert!(root.join("export/cuts.zip").is_file());
         engine
-            .export_session_artifact_expected(
-                &root,
-                "offline-create",
-                ExportArtifact::FullTrack,
-            )
+            .export_session_artifact_expected(&root, "offline-create", ExportArtifact::FullTrack)
             .unwrap();
         assert!(root.join("export/full-track.wav").is_file());
         let _ = std::fs::remove_dir_all(root);
@@ -12042,11 +12371,23 @@ mod tests {
         let selected = engine
             .select_session_attempt_expected(&root, "resume-test", "001", "001-a2")
             .unwrap();
-        assert_eq!(selected["snapshot"]["items"][0]["selected_attempt_id"], "001-a2");
-        assert_eq!(selected["snapshot"]["items"][0]["attempts"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            selected["snapshot"]["items"][0]["selected_attempt_id"],
+            "001-a2"
+        );
+        assert_eq!(
+            selected["snapshot"]["items"][0]["attempts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
         assert_eq!(selected["snapshot"]["items"][0]["status"], "accepted");
         let journal = read_journal(&root).unwrap();
-        assert_eq!(journal.entries.last().unwrap()["event"], "attempt_selected_offline");
+        assert_eq!(
+            journal.entries.last().unwrap()["event"],
+            "attempt_selected_offline"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -12358,7 +12699,7 @@ mod tests {
         stopped.items[0].selected_attempt_id = Some("001-a1".to_string());
         stopped.items[0].attempts.push(Attempt {
             attempt_id: "001-a1".to_string(),
-            start_sample: 3,
+            start_sample: 2,
             recording_started_sample: 2,
             head_silence_armed_sample: 2,
             head_silence_passed_sample: 4,
@@ -12409,6 +12750,25 @@ mod tests {
         value.as_object_mut().unwrap().remove("journal_seq");
         let snapshot: SessionSnapshot = serde_json::from_value(value).unwrap();
         assert_eq!(snapshot.journal_seq, 0);
+    }
+
+    #[test]
+    fn start_session_payload_defaults_to_exclusive_capture() {
+        let payload: StartSessionPayload = serde_json::from_value(json!({
+            "session_dir": "/tmp/session",
+            "session_id": "s1",
+            "items": [{ "id": "001", "text": "hello" }]
+        }))
+        .unwrap();
+        assert_eq!(payload.capture_share_mode, CaptureShareMode::Exclusive);
+    }
+
+    #[test]
+    fn snapshot_without_capture_share_mode_defaults_to_exclusive() {
+        let mut value = serde_json::to_value(test_snapshot()).unwrap();
+        value.as_object_mut().unwrap().remove("capture_share_mode");
+        let snapshot: SessionSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(snapshot.capture_share_mode, CaptureShareMode::Exclusive);
     }
 
     #[test]
@@ -12780,6 +13140,7 @@ mod tests {
             attempt_id: "001-a1".to_string(),
             start_sample: 0,
             recording_started_sample: 0,
+            input_discontinuity_count_at_start: 0,
         });
         session.latch_metadata_fault(&failure);
 
@@ -13154,6 +13515,7 @@ mod tests {
             captured,
             committed,
             overflow,
+            capture_recovery: CaptureRecoveryTelemetry::default(),
             faulted,
             peak: Arc::new(AtomicU32::new(0)),
             rms: Arc::new(AtomicU32::new(0)),
@@ -13301,6 +13663,7 @@ mod tests {
             attempt_id: "001-a1".to_string(),
             start_sample: 10,
             recording_started_sample: 20,
+            input_discontinuity_count_at_start: 0,
         });
         session
             .persist(

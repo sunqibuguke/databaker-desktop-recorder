@@ -113,10 +113,14 @@ function testArgs() {
   const short = parseArgs(['--mode', 'short', '--bit-depth', '24', '--device-index', '2']);
   assert.equal(short.sampleRate, 48_000);
   assert.equal(short.bitDepth, 24);
+  assert.equal(short.shareMode, 'exclusive');
   assert.equal(short.minimumInputFormatBits, 24);
   assert.equal(short.deviceIndex, 2);
   assert.equal(short.pollSeconds, 1);
   assert.equal(short.export, true);
+  const shared = parseArgs(['--mode', 'short', '--share-mode', 'shared']);
+  assert.equal(shared.shareMode, 'shared');
+  assert.throws(() => parseArgs(['--mode', 'short', '--share-mode', 'asio']), /share-mode/);
 
   const qualification = parseArgs([
     '--mode', 'inventory',
@@ -343,6 +347,15 @@ function testConfigurations() {
   assert.equal(matchingConfigurations(device, 48_000, 2).length, 1);
   assert.equal(matchingConfigurations(device, 48_000, 3).length, 0);
   assert.equal(matchingConfigurations(device, 96_000, 8).length, 1);
+  const dual = {
+    configurations: [
+      { min_sample_rate: 48_000, max_sample_rate: 48_000, channels: 2, sample_format: 'i24', share_mode: 'exclusive' },
+      { min_sample_rate: 44_100, max_sample_rate: 48_000, channels: 2, sample_format: 'f32', share_mode: 'shared' },
+    ],
+  };
+  assert.equal(matchingConfigurations(dual, 48_000, 2, 'exclusive').length, 1);
+  assert.equal(matchingConfigurations(dual, 44_100, 2, 'exclusive').length, 0);
+  assert.equal(matchingConfigurations(dual, 44_100, 2, 'shared').length, 1);
 }
 
 function testProgressSummary() {
@@ -695,6 +708,8 @@ function testShortProtocolIntegration() {
     });
     assert.equal(report.start.snapshot.device_id, 'mock:usb-interface');
     assert.equal(report.start.snapshot.input_sample_format, 'f32');
+    assert.equal(report.start.snapshot.capture_share_mode, 'exclusive');
+    assert.equal(report.requested.capture_share_mode, 'exclusive');
     assert.equal(report.inspection.segments[0].bits_per_sample, 24);
     assert.equal(report.inspection.full_track.exact_header, true);
     assert.equal(report.inspection.export_metadata.exported.length, 1);
@@ -795,6 +810,7 @@ function writeInterruptedSessionFixture(session, phase1Report) {
     device_name: 'Mock USB Audio Interface',
     device_id: 'mock:usb-interface',
     input_sample_format: 'f32',
+    capture_share_mode: 'exclusive',
     audio_format: {
       sample_rate: 48_000,
       bit_depth: 24,
@@ -867,6 +883,7 @@ function writeInterruptedSessionFixture(session, phase1Report) {
     device_id: snapshot.device_id,
     device_name: snapshot.device_name,
     input_sample_format: snapshot.input_sample_format,
+    capture_share_mode: snapshot.capture_share_mode,
     audio_format: snapshot.audio_format,
     required_duration_seconds: 2,
     production_minimum_seconds: 3_600,

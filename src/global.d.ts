@@ -2,16 +2,21 @@ export {};
 
 declare module '*.css';
 
+import type { DebugLogDraft, DebugLogEntry, DebugLogSnapshot } from './debug-log';
 import type { CapturePresetDraft, CapturePresetLoadResult, CapturePresetStore, DefaultOutputResult, PrompterState, RecordingHistoryPage } from './types';
 
 declare global {
   interface Window {
     recorder: {
       runtime: 'desktop' | 'preview';
+      platform?: string;
       request<T = unknown>(command: string, payload?: unknown): Promise<T>;
       openScript(): Promise<{ filePath: string; name: string; content: string } | null>;
       chooseOutput(): Promise<string | null>;
       defaultOutput(): Promise<DefaultOutputResult>;
+      getLocale?(): Promise<string>;
+      setLocale?(locale: string): Promise<string>;
+      onLocaleChanged?(listener: (locale: string) => void): () => void;
       loadCapturePresets(): Promise<CapturePresetLoadResult>;
       saveCapturePreset(preset: CapturePresetDraft): Promise<CapturePresetStore>;
       deleteCapturePreset(id: string): Promise<CapturePresetStore>;
@@ -31,6 +36,12 @@ declare global {
       onPrompterStatus(listener: (status: { open: boolean; ready: boolean }) => void): () => void;
       onEngineEvent(listener: (message: unknown) => void): () => void;
       onEngineOffline(listener: (message: string) => void): () => void;
+      getDebugLog?(): Promise<DebugLogSnapshot>;
+      appendDebugLog?(entry: DebugLogDraft): Promise<DebugLogEntry>;
+      bindDebugLog?(sessionDir: string, sessionId: string): Promise<DebugLogSnapshot>;
+      unbindDebugLog?(reason?: string): Promise<void>;
+      saveDebugLog?(content: string, defaultName: string): Promise<string | null>;
+      onDebugLog?(listener: (entry: DebugLogEntry) => void): () => void;
     };
   }
 }

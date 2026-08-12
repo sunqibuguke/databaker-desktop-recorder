@@ -1102,6 +1102,7 @@ fn check_config(
         channels,
         sample_rate,
         buffer_size,
+        share_mode: _,
     } = config;
 
     // Validate buffer size if `Fixed` is specified. This is necessary because ASIO's

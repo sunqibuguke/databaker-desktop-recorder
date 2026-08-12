@@ -64,11 +64,24 @@ export function recordRecorderPhase(phase: string, hasActiveRecording: boolean):
   });
 }
 
+type LocalErrorSink = (
+  operation: string,
+  error: unknown,
+  attributes: Record<string, string | number | boolean>,
+) => void;
+
+let localErrorSink: LocalErrorSink | null = null;
+
+export function setOperationalErrorSink(sink: LocalErrorSink | null): void {
+  localErrorSink = sink;
+}
+
 export function reportOperationalError(
   operation: string,
   error: unknown,
   attributes: Record<string, string | number | boolean> = {},
 ): void {
+  localErrorSink?.(operation, error, attributes);
   if (!Sentry) return;
   const detail = error instanceof Error ? error.message : String(error);
   Sentry.logger.error(operation, {

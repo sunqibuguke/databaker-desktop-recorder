@@ -437,6 +437,22 @@ macro_rules! impl_platform_host {
                 }
             }
 
+            fn supported_input_configs_for(
+                &self,
+                exclusive: bool,
+            ) -> Result<Self::SupportedInputConfigs, crate::Error> {
+                match self.0 {
+                    $(
+                        $(#[cfg($feat)])?
+                        DeviceInner::$HostVariant(ref d) => {
+                            d.supported_input_configs_for(exclusive)
+                                .map(SupportedInputConfigsInner::$HostVariant)
+                                .map(SupportedInputConfigs)
+                        }
+                    )*
+                }
+            }
+
             fn supported_output_configs(&self) -> Result<Self::SupportedOutputConfigs, crate::Error> {
                 match self.0 {
                     $(

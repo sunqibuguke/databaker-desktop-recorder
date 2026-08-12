@@ -27,8 +27,11 @@ async function main() {
   } = await import(pathToFileURL(inputQualityModulePath).href);
   const {
     captureFormatsSupportBitDepth,
+    captureShareModeLabel,
+    configurationsForShareMode,
     inputSampleFormatRepresentationBits,
     minimumInputRepresentationBits,
+    normalizeCaptureShareMode,
   } = await import(pathToFileURL(captureConfigurationModulePath).href);
 
   const item = (status) => ({ status });
@@ -104,6 +107,26 @@ async function main() {
   assert.equal(minimumInputRepresentationBits(24), 24);
   assert.equal(minimumInputRepresentationBits(32), 24);
   assert.equal(inputSampleFormatRepresentationBits('F32'), 24);
+  assert.equal(normalizeCaptureShareMode(undefined), 'exclusive');
+  assert.equal(normalizeCaptureShareMode('shared'), 'shared');
+  assert.equal(captureShareModeLabel('exclusive'), '独占');
+  assert.equal(captureShareModeLabel('shared'), '系统混音');
+  const dualModeDevice = {
+    configurations: [
+      { min_sample_rate: 48_000, max_sample_rate: 48_000, channels: 2, sample_format: 'i24', share_mode: 'exclusive' },
+      { min_sample_rate: 44_100, max_sample_rate: 48_000, channels: 2, sample_format: 'f32', share_mode: 'shared' },
+    ],
+  };
+  assert.deepEqual(
+    configurationsForShareMode(dualModeDevice, 'exclusive').map((configuration) => configuration.sample_format),
+    ['i24'],
+  );
+  assert.deepEqual(
+    configurationsForShareMode(dualModeDevice, 'shared').map((configuration) => configuration.min_sample_rate),
+    [44_100],
+  );
+  assert.equal(configurationsForShareMode({ configurations: [{ min_sample_rate: 48_000, max_sample_rate: 48_000, channels: 1, sample_format: 'f32' }] }, 'exclusive').length, 0);
+  assert.equal(configurationsForShareMode({ configurations: [{ min_sample_rate: 48_000, max_sample_rate: 48_000, channels: 1, sample_format: 'f32' }] }, 'shared').length, 1);
   assert.equal(captureFormatsSupportBitDepth(['I16'], 16), true);
   assert.equal(
     captureFormatsSupportBitDepth(['I16'], 24),

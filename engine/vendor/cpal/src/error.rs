@@ -71,6 +71,13 @@ pub enum ErrorKind {
     /// A buffer underrun or overrun occurred, causing a potential audio glitch.
     Xrun,
 
+    /// A capture discontinuity was recovered without stopping the stream.
+    ///
+    /// The backend preserved the stream timeline (for example by inserting
+    /// equilibrium samples for a measurable forward gap), but callers should
+    /// still surface a quality warning and retain diagnostic evidence.
+    RecoveredXrun,
+
     /// The underlying platform audio API returned an error that CPAL cannot map to a more
     /// specific error kind.
     BackendError,
@@ -119,6 +126,9 @@ impl Display for ErrorKind {
             ),
             Self::UnsupportedOperation => f.write_str("The requested operation is not supported."),
             Self::Xrun => f.write_str("A buffer underrun or overrun occurred."),
+            Self::RecoveredXrun => {
+                f.write_str("A buffer underrun or overrun was recovered.")
+            }
             Self::BackendError => f.write_str(
                 "The audio backend returned an unclassified error.",
             ),

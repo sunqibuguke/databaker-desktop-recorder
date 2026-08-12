@@ -94,6 +94,7 @@ function usage() {
   --device-index <n>             界面打印的 1-based 设备序号
   --sample-rate <hz>             默认 48000
   --bit-depth <16|24|32>         交付 WAV 位深，默认 24
+  --share-mode <exclusive|shared> 开流模式，默认 exclusive（绕过 Windows 混音器）
   --minimum-input-format-bits <n> 驱动输入有效数字精度门槛；f32 按 24、f64 按 53；默认 16-bit 交付要求 16，24/32-bit 要求 24
   --channel <n>                  声卡输入通道（1-based），默认 1
   --seconds <n>                  short 录制秒数（默认 20）/ power-cut 最长等待（生产默认 3900）
@@ -170,6 +171,7 @@ function parseArgs(argv) {
     deviceIndex: null,
     sampleRate: 48_000,
     bitDepth: 24,
+    shareMode: 'exclusive',
     minimumInputFormatBits: null,
     channel: 1,
     seconds: 20,
@@ -235,6 +237,10 @@ function parseArgs(argv) {
         break;
       case '--bit-depth':
         options.bitDepth = parseInteger(valueFor(index, flag), flag);
+        index += 1;
+        break;
+      case '--share-mode':
+        options.shareMode = valueFor(index, flag);
         index += 1;
         break;
       case '--minimum-input-format-bits':
@@ -361,6 +367,9 @@ function parseArgs(argv) {
   }
   if (options.mode === 'disk-full') validateDiskFullTarget(options.output);
   if (!BIT_DEPTHS.has(options.bitDepth)) throw new Error('--bit-depth 必须是 16、24 或 32');
+  if (options.shareMode !== 'exclusive' && options.shareMode !== 'shared') {
+    throw new Error('--share-mode 必须是 exclusive 或 shared');
+  }
   if (options.minimumInputFormatBits === null) {
     // 32-bit Float 交付通常来自 24-bit ADC。这里只拒绝明显低于
     // 24-bit 有效数字精度的输入，不把数字表示精度误当成 ADC ENOB 证明。
@@ -634,6 +643,7 @@ function buildPowerCutEvidence(report, options, sessionDirectory, row) {
     device_id: snapshot?.device_id,
     device_name: snapshot?.device_name,
     input_sample_format: snapshot?.input_sample_format,
+    capture_share_mode: snapshot?.capture_share_mode,
     audio_format: snapshot?.audio_format,
     required_duration_seconds: requiredDurationSeconds,
     production_minimum_seconds: PRODUCTION_POWER_CUT_SECONDS,
@@ -962,7 +972,8 @@ function printDevices(inventory) {
     const marker = device.is_default ? ' [默认]' : '';
     process.stdout.write(`  ${index + 1}. ${device.name}${marker}\n     ID: ${device.id}\n`);
     for (const config of device.configurations ?? []) {
-      process.stdout.write(`     ${config.min_sample_rate}–${config.max_sample_rate} Hz / ${config.channels} ch / ${config.sample_format}\n`);
+      const shareMode = config.share_mode === 'exclusive' ? '独占' : config.share_mode === 'shared' ? '共享' : '未标注';
+      process.stdout.write(`     ${shareMode} ${config.min_sample_rate}–${config.max_sample_rate} Hz / ${config.channels} ch / ${config.sample_format}\n`);
     }
   }
   if (devices.length === 0) process.stdout.write('  （没有可用输入设备）\n');
@@ -992,13 +1003,15 @@ async function selectDevice(inventory, options) {
   return selected;
 }
 
-function matchingConfigurations(device, sampleRate, inputChannel) {
-  return (device.configurations ?? []).filter(
-    (config) =>
+function matchingConfigurations(device, sampleRate, inputChannel, shareMode) {
+  return (device.configurations ?? []).filter((config) => {
+    if (shareMode && config.share_mode && config.share_mode !== shareMode) return false;
+    return (
       Number(config.min_sample_rate) <= sampleRate &&
       Number(config.max_sample_rate) >= sampleRate &&
-      Number(config.channels) >= inputChannel,
-  );
+      Number(config.channels) >= inputChannel
+    );
+  });
 }
 
 function replugInventoryEvidence(inventory, selected, options) {
@@ -1007,7 +1020,7 @@ function replugInventoryEvidence(inventory, selected, options) {
   const exact = endpointMatches.length === 1 ? endpointMatches[0] : null;
   const nameMatches = exact?.name === selected?.name;
   const configurationMatches = Boolean(
-    exact && matchingConfigurations(exact, options.sampleRate, options.channel).length > 0,
+    exact && matchingConfigurations(exact, options.sampleRate, options.channel, options.shareMode).length > 0,
   );
   return {
     target_id: selected?.id ?? null,
@@ -1900,6 +1913,7 @@ function evaluatePhase1Evidence(phase1, options, inspection, currentHost) {
       snapshot.session_id === evidence?.session_id &&
       snapshot.device_id === evidence?.device_id &&
       snapshot.input_sample_format === evidence?.input_sample_format &&
+      snapshot.capture_share_mode === evidence?.capture_share_mode &&
       snapshotFormat?.sample_rate === evidenceFormat?.sample_rate &&
       snapshotFormat?.bit_depth === evidenceFormat?.bit_depth &&
       snapshotFormat?.encoding === evidenceFormat?.encoding &&
@@ -2004,8 +2018,14 @@ function evaluateCommon(report, options, inspection) {
     actual: snapshot?.audio_format?.input_channel,
     hardware_input_channels: snapshot?.audio_format?.input_channels,
   });
+  addCheck(checks, 'capture-share-mode-match', '实际开流模式与请求一致', snapshot?.capture_share_mode === options.shareMode, {
+    requested: options.shareMode,
+    actual: snapshot?.capture_share_mode,
+  });
   addCheck(checks, 'input-format-recorded', '引擎记录驱动实际输入样本格式', Boolean(snapshot?.input_sample_format), {
     input_sample_format: snapshot?.input_sample_format,
+    capture_share_mode: snapshot?.capture_share_mode,
+    delivery_encoding: snapshot?.audio_format?.encoding,
   });
   const actualInputFormatBits = inputSampleFormatBits(snapshot?.input_sample_format);
   addCheck(
@@ -2763,6 +2783,7 @@ function replugStartPayload(sessionDirectory, sessionId, selected, options, phas
     sample_rate: options.sampleRate,
     bit_depth: options.bitDepth,
     input_channel: options.channel,
+    capture_share_mode: options.shareMode,
     silence_duration_ms: 1_000,
     silence_threshold_dbfs: options.noiseThresholdDbfs,
     items: [{
@@ -2806,14 +2827,15 @@ async function runReplug(options, runDirectory, report) {
     report.inventory = inventory;
     printDevices(inventory);
     const selected = await selectDevice(inventory, options);
-    const configurations = matchingConfigurations(selected, options.sampleRate, options.channel);
+    const configurations = matchingConfigurations(selected, options.sampleRate, options.channel, options.shareMode);
     if (configurations.length === 0) {
-      throw new Error(`设备 ${selected.name} 不支持 ${options.sampleRate} Hz / 输入 ${options.channel}`);
+      throw new Error(`设备 ${selected.name} 不支持 ${options.shareMode} / ${options.sampleRate} Hz / 输入 ${options.channel}`);
     }
     report.selected_device = selected;
     report.requested = {
       sample_rate: options.sampleRate,
       wav_bit_depth: options.bitDepth,
+      capture_share_mode: options.shareMode,
       minimum_input_format_bits: options.minimumInputFormatBits,
       output_channels: 1,
       input_channel: options.channel,
@@ -3243,13 +3265,14 @@ async function runCapture(options, runDirectory, report) {
     printDevices(inventory);
     const selected = await selectDevice(inventory, options);
     report.selected_device = selected;
-    const configs = matchingConfigurations(selected, options.sampleRate, options.channel);
+    const configs = matchingConfigurations(selected, options.sampleRate, options.channel, options.shareMode);
     if (configs.length === 0) {
-      throw new Error(`设备 ${selected.name} 不支持 ${options.sampleRate} Hz / 输入 ${options.channel}`);
+      throw new Error(`设备 ${selected.name} 不支持 ${options.shareMode} / ${options.sampleRate} Hz / 输入 ${options.channel}`);
     }
     report.requested = {
       sample_rate: options.sampleRate,
       wav_bit_depth: options.bitDepth,
+      capture_share_mode: options.shareMode,
       minimum_input_format_bits: options.minimumInputFormatBits,
       output_channels: 1,
       input_channel: options.channel,
@@ -3268,6 +3291,7 @@ async function runCapture(options, runDirectory, report) {
         sample_rate: options.sampleRate,
         bit_depth: options.bitDepth,
         input_channel: options.channel,
+        capture_share_mode: options.shareMode,
         silence_duration_ms: 1_000,
         silence_threshold_dbfs: options.noiseThresholdDbfs,
         items: [{ id: 'QA-001', text: 'DataBaker Windows external audio interface acceptance', label: options.mode }],
@@ -3299,7 +3323,7 @@ async function runCapture(options, runDirectory, report) {
     }
     writeJsonDurable(path.join(runDirectory, 'acceptance-report.json'), report);
     process.stdout.write(
-      `\n已启动: ${start.snapshot.device_name}\nID: ${start.snapshot.device_id}\n输入: ${start.snapshot.input_sample_format}, ${start.snapshot.audio_format.input_channels} ch\n交付: ${start.snapshot.audio_format.sample_rate} Hz / ${start.snapshot.audio_format.bit_depth}-bit ${start.snapshot.audio_format.encoding} / mono\n\n`,
+      `\n已启动: ${start.snapshot.device_name}\nID: ${start.snapshot.device_id}\n开流: ${start.snapshot.capture_share_mode}\n输入: ${start.snapshot.input_sample_format}, ${start.snapshot.audio_format.input_channels} ch\n交付: ${start.snapshot.audio_format.sample_rate} Hz / ${start.snapshot.audio_format.bit_depth}-bit ${start.snapshot.audio_format.encoding} / mono\n\n`,
     );
 
     if (!options.skipNoiseCheck) {

@@ -5,15 +5,17 @@ unreleased Git revision or direct GitHub access.
 
 The WASAPI input loop includes the upstream capture-xrun changes from
 RustAudio/cpal pull requests #1268 and #1281. It ignores the undefined
-`AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY` flag on the first capture packet, but
-releases every later flagged packet and returns a terminal `ErrorKind::Xrun`.
-The recorder treats that error as a fail-closed recording fault.
+`AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY` flag on the first capture packet.
+Later flagged packets remain in the stream and emit
+`ErrorKind::RecoveredXrun` quality telemetry instead of stopping capture.
 
 The input loop also verifies that each packet's stream-relative
-`device_position` starts exactly after the preceding packet. A jump without
-`DATA_DISCONTINUITY` is returned as a terminal `ErrorKind::Xrun`, after the
-packet has been released. This catches short driver/USB delivery gaps that
-would otherwise resume before the recorder's five-second no-callback watchdog.
+`device_position` starts exactly after the preceding packet. A bounded forward
+jump of at most one second is filled with format-correct equilibrium samples,
+reported as `ErrorKind::RecoveredXrun`, and capture continues. A larger forward
+jump, backward jump, or position overflow remains a terminal `ErrorKind::Xrun`.
+This keeps the master timeline aligned while making the affected range audible
+and visible instead of silently closing over missing hardware data.
 `AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR` means that the time at which a device
 position was recorded is uncertain; it does not suppress frame-position
 continuity checking, so it cannot hide an unflagged gap.
@@ -40,6 +42,13 @@ Because Windows does not AddRef/Release registered notification clients, an
 indeterminate unregister failure deliberately retains one callback reference
 (and its event) for the process lifetime; successful unregister and the
 documented E_NOTFOUND result release it normally.
+
+WASAPI can open event-driven exclusive capture. `StreamConfig.share_mode`
+selects `AUDCLNT_SHAREMODE_EXCLUSIVE` and `supported_input_configs_for(true)`
+probes hardware-accepted exclusive formats without treating `GetMixFormat` as a
+precision upgrade. Exclusive `Initialize` uses equal buffer and periodicity
+durations and retries once after `AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED`. Shared
+enumeration and open paths are unchanged.
 
 Remove this vendor only after a released CPAL version containing both upstream
 fixes, equivalent silent-packet handling, and equivalent explicit-endpoint

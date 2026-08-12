@@ -448,11 +448,23 @@ impl wasm_bindgen::convert::FromWasmAbi for BufferSize {
     ),
     wasm_bindgen
 )]
+/// Whether the host should open a shared or exclusive stream.
+///
+/// Exclusive is only meaningful on WASAPI. Other hosts ignore it and keep
+/// their native open path. Shared remains the CPAL default for API compatibility.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ShareMode {
+    #[default]
+    Shared,
+    Exclusive,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Copy)]
 pub struct StreamConfig {
     pub channels: ChannelCount,
     pub sample_rate: SampleRate,
     pub buffer_size: BufferSize,
+    pub share_mode: ShareMode,
 }
 
 /// Describes the minimum and maximum supported buffer size for the device
@@ -565,6 +577,7 @@ impl SupportedStreamConfig {
             channels: self.channels,
             sample_rate: self.sample_rate,
             buffer_size: BufferSize::Default,
+            share_mode: ShareMode::Shared,
         }
     }
 }
@@ -1048,6 +1061,7 @@ mod tests {
             channels: 0,
             sample_rate: 44100,
             buffer_size: BufferSize::Default,
+            share_mode: ShareMode::Shared,
         })
         .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
@@ -1060,6 +1074,7 @@ mod tests {
             channels: 2,
             sample_rate: 0,
             buffer_size: BufferSize::Default,
+            share_mode: ShareMode::Shared,
         })
         .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
@@ -1072,6 +1087,7 @@ mod tests {
             channels: 2,
             sample_rate: 44100,
             buffer_size: BufferSize::Fixed(0),
+            share_mode: ShareMode::Shared,
         })
         .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
@@ -1084,12 +1100,14 @@ mod tests {
             channels: 2,
             sample_rate: 44100,
             buffer_size: BufferSize::Default,
+            share_mode: ShareMode::Shared,
         })
         .is_ok());
         assert!(validate_stream_config(&StreamConfig {
             channels: 1,
             sample_rate: 1,
             buffer_size: BufferSize::Fixed(1),
+            share_mode: ShareMode::Shared,
         })
         .is_ok());
     }

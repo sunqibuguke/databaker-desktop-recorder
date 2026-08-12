@@ -22,7 +22,8 @@ function mockDevice(id = 'mock:usb-interface', name = 'Mock USB Audio Interface'
     sample_rates: [48_000],
     input_channels: [2],
     configurations: [
-      { min_sample_rate: 48_000, max_sample_rate: 48_000, channels: 2, sample_format: 'f32' },
+      { min_sample_rate: 48_000, max_sample_rate: 48_000, channels: 2, sample_format: 'f32', share_mode: 'exclusive' },
+      { min_sample_rate: 48_000, max_sample_rate: 48_000, channels: 2, sample_format: 'f32', share_mode: 'shared' },
     ],
   };
 }
@@ -252,6 +253,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
             ? 'mock:wrong-interface'
             : 'mock:usb-interface',
         input_sample_format: 'f32',
+        capture_share_mode: payload.capture_share_mode === 'shared' ? 'shared' : 'exclusive',
         audio_format: {
           sample_rate: payload.sample_rate,
           bit_depth: payload.bit_depth,

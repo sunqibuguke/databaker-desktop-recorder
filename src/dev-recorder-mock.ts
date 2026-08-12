@@ -1,3 +1,5 @@
+import type { DebugLogDraft, DebugLogEntry, DebugLogSnapshot } from './debug-log';
+import { formatDebugLogText } from './debug-log';
 import type { Attempt, AudioDevice, CapturePresetDraft, CapturePresetStore, HeadSilencePhase, Meter, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SessionSnapshot } from './types';
 
 type MockActiveAttempt = {
@@ -35,13 +37,74 @@ export function installDevRecorderMock() {
   const meterListeners = new Set<(message: unknown) => void>();
   const prompterListeners = new Set<(state: PrompterState) => void>();
   const prompterStatusListeners = new Set<(status: { open: boolean; ready: boolean }) => void>();
+  const debugLogListeners = new Set<(entry: DebugLogEntry) => void>();
+  const localeListeners = new Set<(locale: string) => void>();
+  const PREVIEW_LOCALE_KEY = 'databaker-preview-locale';
+  let previewLocale = 'zh-CN';
+  try {
+    previewLocale = globalThis.localStorage?.getItem(PREVIEW_LOCALE_KEY) || 'zh-CN';
+  } catch {
+    previewLocale = 'zh-CN';
+  }
+  const mockDebugLogs = new Map<string, DebugLogEntry[]>();
+  let mockDebugSeq = 0;
+  let mockBoundSessionId = '';
+  let mockBoundSessionDir = '';
+  const MOCK_DEBUG_CAPACITY = 2_000;
+
+  function mockDebugKey(sessionDir = mockBoundSessionDir) {
+    return sessionDir || '__app__';
+  }
+
+  function mockDebugSnapshot(): DebugLogSnapshot {
+    const entries = mockDebugLogs.get(mockDebugKey()) ?? [];
+    return {
+      entries: [...entries],
+      dropped: 0,
+      capacity: MOCK_DEBUG_CAPACITY,
+      bound_session_id: mockBoundSessionId,
+      bound_session_dir: mockBoundSessionDir,
+      app_log_path: 'preview://runtime-debug.jsonl',
+      session_log_path: mockBoundSessionDir ? `${mockBoundSessionDir}/debug.log` : '',
+    };
+  }
+
+  function mockAppendDebugLog(draft: DebugLogDraft): DebugLogEntry {
+    const entry: DebugLogEntry = {
+      seq: ++mockDebugSeq,
+      ts: new Date().toISOString(),
+      level: draft.level ?? 'info',
+      source: draft.source ?? 'ui',
+      category: draft.category ?? 'ui',
+      event: draft.event,
+      message: draft.message,
+      session_id: draft.session_id || mockBoundSessionId || undefined,
+      session_dir: draft.session_dir || mockBoundSessionDir || undefined,
+      data: draft.data,
+    };
+    const key = mockDebugKey(entry.session_dir);
+    const current = mockDebugLogs.get(key) ?? [];
+    current.push(entry);
+    if (current.length > MOCK_DEBUG_CAPACITY) current.splice(0, current.length - MOCK_DEBUG_CAPACITY);
+    mockDebugLogs.set(key, current);
+    debugLogListeners.forEach((listener) => listener(entry));
+    return entry;
+  }
+
+  mockAppendDebugLog({
+    source: 'main',
+    category: 'lifecycle',
+    event: 'app.ready',
+    message: '浏览器预览已启动，本地调试日志使用内存队列',
+    data: { runtime: 'preview' },
+  });
   const prompterChannel = typeof BroadcastChannel === 'undefined' ? null : new BroadcastChannel('databaker-prompter');
   prompterChannel?.addEventListener('message', (event: MessageEvent<PrompterState>) => {
     prompterListeners.forEach((listener) => listener(event.data));
   });
   const mockDevices: AudioDevice[] = [
-    { id: 'mock:studio-usb-microphone', name: 'Studio USB Microphone', is_default: true, sample_rates: [44_100, 48_000, 96_000], input_channels: [1, 2], configurations: [{ min_sample_rate: 44_100, max_sample_rate: 96_000, channels: 2, sample_format: 'f32' }] },
-    { id: 'mock:built-in-microphone', name: 'Built-in Microphone', is_default: false, sample_rates: [44_100, 48_000], input_channels: [1], configurations: [{ min_sample_rate: 44_100, max_sample_rate: 48_000, channels: 1, sample_format: 'f32' }] },
+    { id: 'mock:studio-usb-microphone', name: 'Studio USB Microphone', is_default: true, sample_rates: [44_100, 48_000, 96_000], input_channels: [1, 2], configurations: [{ min_sample_rate: 44_100, max_sample_rate: 96_000, channels: 2, sample_format: 'f32', share_mode: 'exclusive' }, { min_sample_rate: 44_100, max_sample_rate: 96_000, channels: 2, sample_format: 'f32', share_mode: 'shared' }] },
+    { id: 'mock:built-in-microphone', name: 'Built-in Microphone', is_default: false, sample_rates: [44_100, 48_000], input_channels: [1], configurations: [{ min_sample_rate: 44_100, max_sample_rate: 48_000, channels: 1, sample_format: 'f32', share_mode: 'exclusive' }, { min_sample_rate: 44_100, max_sample_rate: 48_000, channels: 1, sample_format: 'f32', share_mode: 'shared' }] },
   ];
   const previewHistory: RecordingHistoryEntry[] = [{
     session_id: '朗读采集-20260810-161715',
@@ -137,6 +200,7 @@ export function installDevRecorderMock() {
       device_name: recording.device_name,
       device_id: mockDevices.find((device) => device.name === recording.device_name)?.id ?? mockDevices[0].id,
       input_sample_format: 'f32',
+      capture_share_mode: 'exclusive',
       audio_format: { sample_rate: recording.sample_rate, bit_depth: recording.bit_depth, encoding: recording.encoding, channels: 1, input_channels: 2, input_channel: recording.input_channel },
       master_audio: 'audio/master.wav', storage_layout_version: 1, segment_frames: recording.sample_rate * 300,
       captured_samples: recording.captured_samples, committed_samples: recording.captured_samples, overflow_samples: recording.overflow_samples,
@@ -172,16 +236,18 @@ export function installDevRecorderMock() {
       );
       if (activeAttempt.head_silence_progress_samples >= requiredHeadSilence) {
         activeAttempt.head_silence_passed_sample = activeAttempt.head_silence_armed_sample + requiredHeadSilence;
-        activeAttempt.head_silence_phase = 'ready_for_speech';
+        activeAttempt.head_silence_phase = firstAttemptSignalSample ? 'speech_started' : 'ready_for_speech';
       }
     }
-    const mockReadyPauseSamples = Math.round(mockSampleRate * 0.5);
+    const mockSpeechDelay = Math.round(mockSampleRate * 0.4);
     const mockSpeechSamples = Math.round(mockSampleRate * 1.5);
-    if (activeAttempt?.head_silence_phase === 'ready_for_speech'
-      && capturedSamples >= activeAttempt.head_silence_passed_sample + mockReadyPauseSamples) {
-      activeAttempt.content_started_sample = activeAttempt.head_silence_passed_sample + mockReadyPauseSamples;
+    if (activeAttempt && !activeAttempt.content_started_sample
+      && capturedSamples >= activeAttempt.recording_started_sample + mockSpeechDelay) {
+      activeAttempt.content_started_sample = activeAttempt.recording_started_sample + mockSpeechDelay;
       firstAttemptSignalSample = activeAttempt.content_started_sample;
-      activeAttempt.head_silence_phase = 'speech_started';
+      if (activeAttempt.head_silence_phase !== 'waiting_for_head_silence') {
+        activeAttempt.head_silence_phase = 'speech_started';
+      }
     }
     const speaking = Boolean(activeAttempt?.content_started_sample)
       && capturedSamples < (activeAttempt?.content_started_sample ?? 0) + mockSpeechSamples;
@@ -267,6 +333,7 @@ export function installDevRecorderMock() {
         device_name: requestedDevice.name,
         device_id: requestedDevice.id,
         input_sample_format: requestedDevice.configurations?.[0]?.sample_format ?? 'f32',
+        capture_share_mode: data.capture_share_mode === 'shared' ? 'shared' : 'exclusive',
         audio_format: { sample_rate: Number(data.sample_rate), bit_depth: Number(data.bit_depth ?? 24), encoding: Number(data.bit_depth ?? 24) === 32 ? 'float' : 'pcm', channels: 1, input_channels: 2, input_channel: Number(data.input_channel ?? 1) },
         master_audio: 'audio/master.wav', storage_layout_version: 1, segment_frames: Number(data.sample_rate) * 300, captured_samples: 0, committed_samples: 0, overflow_samples: 0,
         started_at: now, updated_at: now,
@@ -309,6 +376,7 @@ export function installDevRecorderMock() {
         status: recording.status,
         device_name: recording.device_name,
         input_sample_format: 'f32',
+        capture_share_mode: 'exclusive',
         audio_format: { sample_rate: recording.sample_rate, bit_depth: recording.bit_depth, encoding: recording.encoding, channels: 1, input_channels: 2, input_channel: recording.input_channel },
         master_audio: 'audio/master.wav', storage_layout_version: 1, segment_frames: recording.sample_rate * 300,
         captured_samples: recording.captured_samples, committed_samples: recording.captured_samples, overflow_samples: recording.overflow_samples,
@@ -510,19 +578,16 @@ export function installDevRecorderMock() {
     }
     if (command === 'stop_attempt') {
       if (!activeAttempt) throw new Error('没有正在录制的版本');
-      const force = Boolean(data.force);
       if (!firstAttemptSignalSample) {
-        if (!force) throw new Error('未检测到本句有效语音');
         const itemId = activeAttempt.item_id;
         activeAttempt = null;
         return { item_id: itemId, attempt: null, discarded: true, forced: true } as T;
       }
       const requiredSilence = mockSampleRate * snapshot.silence_duration_ms / 1_000;
-      const forcedWithoutTailSilence = force && silenceSamples < requiredSilence;
-      if (!force && silenceSamples < requiredSilence) throw new Error('完成前静音时长不足');
+      const forcedWithoutTailSilence = silenceSamples < requiredSilence;
       const attempt: Attempt = {
         attempt_id: activeAttempt.attempt_id,
-        start_sample: Math.max(0, firstAttemptSignalSample - requiredSilence),
+        start_sample: activeAttempt.recording_started_sample,
         recording_started_sample: activeAttempt.recording_started_sample,
         head_silence_armed_sample: activeAttempt.head_silence_armed_sample,
         head_silence_passed_sample: activeAttempt.head_silence_passed_sample,
@@ -580,10 +645,28 @@ export function installDevRecorderMock() {
     configurable: false,
     value: {
       runtime: 'preview',
+      platform: 'darwin',
       request,
       openScript: async () => null,
       chooseOutput: async () => '/tmp/DataBaker Recordings',
       defaultOutput: async () => ({ outputRoot: '/tmp/DataBaker Recordings' }),
+      getLocale: async () => previewLocale,
+      setLocale: async (locale: string) => {
+        previewLocale = locale;
+        try {
+          globalThis.localStorage?.setItem(PREVIEW_LOCALE_KEY, locale);
+        } catch {
+          // preview storage is best-effort
+        }
+        for (const listener of localeListeners) listener(locale);
+        return locale;
+      },
+      onLocaleChanged: (listener: (locale: string) => void) => {
+        localeListeners.add(listener);
+        return () => {
+          localeListeners.delete(listener);
+        };
+      },
       loadCapturePresets: async () => ({ store: structuredClone(capturePresetStore) }),
       saveCapturePreset: async (draft: CapturePresetDraft) => {
         const preset = { ...draft, id: draft.id || crypto.randomUUID() };
@@ -651,6 +734,17 @@ export function installDevRecorderMock() {
         if (index < 0) throw new Error('Mock 中没有该录制任务');
         if (previewHistory[index].is_active) throw new Error('当前录制任务不能删除');
         previewHistory.splice(index, 1);
+        mockDebugLogs.delete(sessionDir);
+        if (mockBoundSessionDir === sessionDir) {
+          mockBoundSessionDir = '';
+          mockBoundSessionId = '';
+        }
+        mockAppendDebugLog({
+          event: 'debug_log.forget_session',
+          message: '任务已删除，对应调试日志随任务目录一并清理',
+          category: 'history',
+          data: { session_dir: sessionDir, session_id: sessionId },
+        });
         return { session_dir: sessionDir, session_id: sessionId };
       },
       joinPath: async (...parts: string[]) => parts.join('/').replace(/\/+/g, '/'),
@@ -683,6 +777,45 @@ export function installDevRecorderMock() {
       onPrompterStatus: (listener: (status: { open: boolean; ready: boolean }) => void) => { prompterStatusListeners.add(listener); return () => prompterStatusListeners.delete(listener); },
       onEngineEvent: (listener: (message: unknown) => void) => { meterListeners.add(listener); return () => meterListeners.delete(listener); },
       onEngineOffline: () => () => undefined,
+      getDebugLog: async () => mockDebugSnapshot(),
+      appendDebugLog: async (entry: DebugLogDraft) => mockAppendDebugLog(entry),
+      bindDebugLog: async (sessionDir: string, sessionId: string) => {
+        mockBoundSessionDir = sessionDir;
+        mockBoundSessionId = sessionId;
+        mockAppendDebugLog({
+          event: 'debug_log.bind',
+          message: `已绑定任务日志：${sessionId}`,
+          category: 'session',
+          session_id: sessionId,
+          session_dir: sessionDir,
+        });
+        return mockDebugSnapshot();
+      },
+      unbindDebugLog: async (reason = 'leave') => {
+        mockAppendDebugLog({
+          event: 'debug_log.unbind',
+          message: `已解除任务日志绑定（${reason}）`,
+          category: 'session',
+        });
+        mockBoundSessionDir = '';
+        mockBoundSessionId = '';
+      },
+      saveDebugLog: async (content: string, defaultName: string) => {
+        const blob = new Blob([content || formatDebugLogText(mockDebugSnapshot().entries)], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = defaultName;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+        return defaultName;
+      },
+      onDebugLog: (listener: (entry: DebugLogEntry) => void) => {
+        debugLogListeners.add(listener);
+        return () => debugLogListeners.delete(listener);
+      },
     },
   });
 }

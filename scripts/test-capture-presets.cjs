@@ -29,6 +29,7 @@ async function main() {
 
   const created = await repository.save(draft);
   assert.equal(created.presets[0].name, '棚内 48k', '名称必须去除首尾空格');
+  assert.equal(created.presets[0].captureShareMode, 'exclusive', '未指定采集模式时默认独占');
   assert.equal(created.lastSelectedPresetId, created.presets[0].id, '新预设应成为上次选中项');
   assert.equal('scriptFile' in created.presets[0], false, '脚本不得进入预设');
   assert.equal('outputDir' in created.presets[0], false, '保存位置不得进入预设');
@@ -58,6 +59,9 @@ async function main() {
   await assert.rejects(repository.save({ ...draft, inputChannel: 0 }), /输入通道/);
   await assert.rejects(repository.save({ ...draft, bitDepth: '24' }), /位深/,
     '主进程不得隐式接受渲染器传入的字符串数字');
+  await assert.rejects(repository.save({ ...draft, name: 'Bad mode', captureShareMode: 'asio' }), /采集模式/);
+  const sharedPreset = await repository.save({ ...draft, name: 'Shared mixer', captureShareMode: 'shared' });
+  assert.equal(sharedPreset.presets.find((preset) => preset.name === 'Shared mixer').captureShareMode, 'shared');
   const manyChannelDevice = await repository.save({ ...draft, name: 'Dante 128', inputChannel: 128 });
   assert.equal(manyChannelDevice.presets.find((preset) => preset.name === 'Dante 128').inputChannel, 128,
     '预设不得将专业多通道声卡人为限制在 64 通道');

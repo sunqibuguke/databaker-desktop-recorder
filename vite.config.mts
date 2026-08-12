@@ -1,8 +1,14 @@
 import { sentryVitePlugin } from "@sentry/vite-plugin";
+import path from 'node:path';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
 export default defineConfig({
+  resolve: {
+    alias: {
+      '@shared': path.resolve(__dirname, 'shared'),
+    },
+  },
   plugins: [react(), sentryVitePlugin({
     org: "vsoul",
     project: "databaker-record-desktop",

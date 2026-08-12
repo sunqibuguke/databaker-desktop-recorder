@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { useI18n } from './i18n';
 import {
   advanceWaveformPlayhead,
   reconcileWaveformBatch,
@@ -64,6 +65,7 @@ function createProgram(gl: WebGLRenderingContext | WebGL2RenderingContext) {
 }
 
 export function WebGLWaveform({ bins, capturedSamples, waveformEndSample, recording, sampleRate }: Props) {
+  const { t } = useI18n();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const historyRef = useRef<WaveformBin[]>([]);
   const latestWaveformEndSampleRef = useRef<number | null>(null);
@@ -301,7 +303,7 @@ export function WebGLWaveform({ bins, capturedSamples, waveformEndSample, record
   }, []);
 
   return <div className="webgl-waveform" data-renderer={available ? 'webgl' : 'unavailable'}>
-    <canvas ref={canvasRef} role="img" aria-label="实时 PCM 波形（WebGL）" />
-    {!available && <span>WebGL 不可用，无法显示实时波形</span>}
+    <canvas ref={canvasRef} role="img" aria-label={t('waveform.aria')} />
+    {!available && <span>{t('waveform.unavailable')}</span>}
   </div>;
 }

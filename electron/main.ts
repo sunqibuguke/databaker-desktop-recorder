@@ -4,7 +4,14 @@ import {
   recordRecorderPhase,
   reportEngineOffline,
   reportOperationalError,
+  setOperationalErrorSink,
 } from './sentry';
+import {
+  DEBUG_LOG_APP_FILE_NAME,
+  DebugLogStore,
+  SESSION_BIND_COMMANDS,
+  sessionIdentityFromResult,
+} from './debug-log';
 import {
   app,
   BrowserWindow,
@@ -17,7 +24,7 @@ import {
   systemPreferences,
   Tray,
 } from 'electron';
-import { promises as fs } from 'node:fs';
+import { copyFileSync, chmodSync, promises as fs, statSync } from 'node:fs';
 import path from 'node:path';
 import {
   EngineClient,
@@ -36,6 +43,7 @@ import {
   OutputRootPreferenceRepository,
   type OutputRootPreference,
 } from './output-root-preference';
+import { AppLocaleRepository, normalizeAppLocale, type AppLocale } from './app-locale';
 import {
   ENGINE_EVENT_CHANNEL,
   ENGINE_METER_ACK_CHANNEL,
@@ -49,6 +57,8 @@ let prompterWindow: BrowserWindow | null = null;
 let prompterRendererReady = false;
 let latestPrompterState: unknown = null;
 let engine: EngineClient | null = null;
+let debugLog: DebugLogStore | null = null;
+let lastMeterFaultSignature = '';
 let recordingTray: Tray | null = null;
 let closeDecisionPromise: Promise<void> | null = null;
 let safeExitPromise: Promise<void> | null = null;
@@ -366,6 +376,7 @@ function releaseApplicationQuit(): void {
   // app.quit() returns; at this point the engine is safely stopped or the
   // operator explicitly accepted the force/unconfirmed-exit consequence.
   appQuitReleased = true;
+  void debugLog?.flush().catch(() => undefined);
   if (!isSentryEnabled()) {
     app.quit();
     return;
@@ -468,7 +479,33 @@ function assertCanMutateActiveSession(command: string): void {
 function engineExecutable(): string {
   const executable = process.platform === 'win32' ? 'recorder-engine.exe' : 'recorder-engine';
   if (app.isPackaged) return path.join(process.resourcesPath, 'bin', executable);
-  return path.join(app.getAppPath(), 'engine', 'target', 'debug', executable);
+  const built = path.join(app.getAppPath(), 'engine', 'target', 'debug', executable);
+  return stageMacDevSidecar(built, executable) ?? built;
+}
+
+function stageMacDevSidecar(built: string, executable: string): string | null {
+  if (process.platform !== 'darwin') return null;
+  const marker = `${path.sep}Electron.app${path.sep}Contents${path.sep}MacOS${path.sep}`;
+  if (!process.execPath.includes(marker)) return null;
+  const staged = path.join(path.dirname(process.execPath), executable);
+  try {
+    const builtStat = statSync(built);
+    let stale = true;
+    try {
+      const stagedStat = statSync(staged);
+      stale = stagedStat.mtimeMs < builtStat.mtimeMs || stagedStat.size !== builtStat.size;
+    } catch {
+      stale = true;
+    }
+    if (stale) {
+      copyFileSync(built, staged);
+      chmodSync(staged, 0o755);
+    }
+    return staged;
+  } catch (error) {
+    console.warn('未能把开发态录音引擎放进 Electron.app，麦克风权限可能无法继承：', error);
+    return null;
+  }
 }
 
 function defaultOutputRoot(): string {
@@ -731,6 +768,9 @@ function parseValidSnapshot(value: unknown): Record<string, unknown> | null {
     || typeof value.device_name !== 'string'
     || (value.device_id !== undefined && typeof value.device_id !== 'string')
     || (value.input_sample_format !== undefined && typeof value.input_sample_format !== 'string')
+    || (value.capture_share_mode !== undefined
+      && value.capture_share_mode !== 'exclusive'
+      && value.capture_share_mode !== 'shared')
     || !isValidAudioFormat(value.audio_format)
     || typeof value.master_audio !== 'string'
     || !isValidStorageLayout(value)
@@ -1675,9 +1715,21 @@ async function deleteRecording(payload: unknown): Promise<Record<string, string>
     assertCurrentEngineIntent(deleteIntent, ['deleting']);
     forgetKnownSession(canonicalSession);
     clearCrashSealObligation(canonicalSession);
+    await debugLog?.forgetSession(canonicalSession);
     return { session_dir: canonicalSession, session_id: payload.session_id };
   } finally {
     transitionEngineIntent(deleteIntent, 'idle', null);
+  }
+}
+
+function sendToRendererWindows(channel: string, ...args: unknown[]): void {
+  sendToMain(channel, ...args);
+  if (
+    prompterWindow
+    && !prompterWindow.isDestroyed()
+    && !prompterWindow.webContents.isDestroyed()
+  ) {
+    prompterWindow.webContents.send(channel, ...args);
   }
 }
 
@@ -2359,24 +2411,36 @@ async function requestAttemptWithReconciliation(
   }
 }
 
+function shouldSkipMicrophonePreflight(): boolean {
+  return process.env.DATABAKER_SKIP_MIC_PREFLIGHT === '1' && !app.isPackaged;
+}
+
+async function requestMicrophoneAccessQuietly(): Promise<boolean> {
+  if (process.platform !== 'darwin') return true;
+  const status = systemPreferences.getMediaAccessStatus('microphone');
+  if (status === 'granted') return true;
+  if (status !== 'not-determined') return false;
+  try {
+    return await systemPreferences.askForMediaAccess('microphone');
+  } catch (error) {
+    console.warn('macOS microphone prompt failed:', error);
+    return false;
+  }
+}
+
 async function ensureMicrophoneAccess(): Promise<void> {
   if (process.platform !== 'darwin') return;
-  const status = systemPreferences.getMediaAccessStatus('microphone');
-  if (status === 'granted') return;
-  if (status === 'not-determined') {
-    let granted = false;
-    try {
-      granted = await systemPreferences.askForMediaAccess('microphone');
-    } catch (error) {
-      throw new Error(
-        `macOS 无法请求麦克风权限：${error instanceof Error ? error.message : String(error)}`,
-      );
-    }
-    if (granted) return;
+  const granted = await requestMicrophoneAccessQuietly();
+  if (granted) return;
+  if (shouldSkipMicrophonePreflight()) {
+    console.warn(
+      'macOS 开发态未获得麦克风权限。系统设置里找「Electron」，不是 DataBaker。开流前已等待系统弹窗，避免未授权就打开声卡得到全零静音。',
+    );
+    return;
   }
-  const applicationName = app.isPackaged ? 'DataBaker 音频采集' : 'Electron（开发模式）';
+  const applicationName = app.isPackaged ? 'DataBaker 音频采集' : 'Electron';
   throw new Error(
-    `麦克风权限未开启。请在“系统设置 → 隐私与安全性 → 麦克风”中允许 ${applicationName}，然后重启应用。`,
+    `麦克风权限未开启。开发态请在“系统设置 → 隐私与安全性 → 麦克风”中找「${applicationName}」，不是 DataBaker。找不到时在终端执行 tccutil reset Microphone com.github.Electron 后重启。只测界面可设 DATABAKER_SKIP_MIC_PREFLIGHT=1。`,
   );
 }
 
@@ -3487,6 +3551,37 @@ function assertExpectedActiveSession(payload: unknown): void {
   }
 }
 
+async function bindDebugLogFromCommand(command: string, result: unknown): Promise<void> {
+  if (!debugLog || !SESSION_BIND_COMMANDS.has(command)) return;
+  const identity = sessionIdentityFromResult(result);
+  if (!identity) return;
+  await debugLog.bindSession(identity.sessionDir, identity.sessionId);
+}
+
+async function withDebugLoggedCommand<T>(
+  command: string,
+  payload: unknown,
+  action: () => Promise<T>,
+): Promise<T> {
+  const startedAt = Date.now();
+  try {
+    const result = await action();
+    debugLog?.recordCommand(command, payload, result, Date.now() - startedAt, null);
+    if (command === 'stop_session') await debugLog?.unbindSession('stop_session');
+    else await bindDebugLogFromCommand(command, result);
+    await debugLog?.flush();
+    return result;
+  } catch (error) {
+    debugLog?.recordCommand(command, payload, null, Date.now() - startedAt, error);
+    await debugLog?.flush();
+    throw error;
+  }
+}
+
+function publishDebugLogEntry(entry: unknown): void {
+  sendToMain('debug-log:entry', entry);
+}
+
 function registerIpc(): void {
   allowedOutputRoots.add(path.resolve(defaultOutputRoot()));
   const capturePresets = new CapturePresetRepository(
@@ -3495,6 +3590,13 @@ function registerIpc(): void {
   const outputRootPreference = new OutputRootPreferenceRepository(
     path.join(app.getPath('userData'), 'output-root.json'),
   );
+  const appLocalePreference = new AppLocaleRepository(
+    path.join(app.getPath('userData'), 'app-locale.json'),
+  );
+  let currentAppLocale: AppLocale = normalizeAppLocale(process.env.DATABAKER_LOCALE);
+  void appLocalePreference.load().then((stored) => {
+    if (!process.env.DATABAKER_LOCALE) currentAppLocale = stored;
+  });
   let outputRootRecoveryWarning: string | null = null;
   const bindAndRememberOutputRoot = async (
     candidate: string,
@@ -3527,6 +3629,8 @@ function registerIpc(): void {
     assertMainRenderer(event.sender);
     if (!allowedCommands.has(command)) throw new Error(`不允许的录音引擎命令：${command}`);
     if (!engine) throw new Error('录音引擎不可用');
+    const activeEngine = engine;
+    return withDebugLoggedCommand(command, payload, async () => {
     if (command === 'create_session') {
       const sessionDir = (payload as { session_dir?: unknown })?.session_dir;
       if (typeof sessionDir !== 'string') throw new Error('录制目录无效');
@@ -3544,8 +3648,8 @@ function registerIpc(): void {
           throw error;
         });
         if (existing) throw new Error('同名录制目录已存在，请更换录制名称后重试');
-        await engine.start();
-        const result = await engine.request('create_session', {
+        await activeEngine.start();
+        const result = await activeEngine.request('create_session', {
           ...(payload as Record<string, unknown>),
           session_dir: canonicalTarget,
         }, 20_000);
@@ -3581,9 +3685,9 @@ function registerIpc(): void {
         const authorizedRoots = Array.from(canonicalOutputRoots.values());
         const binding = await bindAuthorizedSession(canonical, authorizedRoots, expectedSessionId);
         attachAuthorizedBinding(inspectIntent, binding);
-        await engine.start();
+        await activeEngine.start();
         await assertAuthorizedSessionUnchanged(binding, authorizedRoots);
-        const result = await engine.request(command, {
+        const result = await activeEngine.request(command, {
           ...(payload as Record<string, unknown>),
           session_dir: canonical,
           expected_session_id: binding.sessionId,
@@ -3617,7 +3721,7 @@ function registerIpc(): void {
         });
         assertCurrentEngineIntent(startIntent, ['starting']);
         if (existing) throw new Error('同名录制目录已存在，请更换录制名称后重试');
-        await engine.start();
+        await activeEngine.start();
         assertCurrentEngineIntent(startIntent, ['starting']);
         const safePayload = { ...(payload as Record<string, unknown>), session_dir: canonicalTarget };
         const result = await requestSessionWithReconciliation(
@@ -3693,7 +3797,7 @@ function registerIpc(): void {
         );
         assertCurrentEngineIntent(resumeIntent, ['starting']);
         attachAuthorizedBinding(resumeIntent, binding);
-        await engine.start();
+        await activeEngine.start();
         assertCurrentEngineIntent(resumeIntent, ['starting']);
         const result = await requestSessionWithReconciliation(
           command,
@@ -3760,7 +3864,7 @@ function registerIpc(): void {
     const timeout = 20_000;
     const commandIntent = engineIntent;
     try {
-      const result = await engine.request(command, payload, timeout);
+      const result = await activeEngine.request(command, payload, timeout);
       if (command === 'get_state_optional'
         && ownsEngineGeneration(commandIntent)
         && !isQuitting()) {
@@ -3788,6 +3892,7 @@ function registerIpc(): void {
       }
       throw error;
     }
+    });
   });
 
   ipcMain.handle('dialog:open-script', async () => {
@@ -3821,6 +3926,20 @@ function registerIpc(): void {
       return bindAndRememberOutputRoot(selected, false);
     }
     return null;
+  });
+
+  ipcMain.handle('app:get-locale', async () => {
+    if (process.env.DATABAKER_LOCALE) return normalizeAppLocale(process.env.DATABAKER_LOCALE);
+    currentAppLocale = await appLocalePreference.load();
+    return currentAppLocale;
+  });
+
+  ipcMain.handle('app:set-locale', async (_event, locale: unknown) => {
+    currentAppLocale = process.env.DATABAKER_LOCALE
+      ? normalizeAppLocale(process.env.DATABAKER_LOCALE)
+      : await appLocalePreference.save(locale);
+    sendToRendererWindows('locale:changed', currentAppLocale);
+    return currentAppLocale;
   });
 
   ipcMain.handle('app:default-output', async (event) => {
@@ -3957,6 +4076,67 @@ function registerIpc(): void {
     const error = await shell.openPath(target);
     if (error) throw new Error(error);
   });
+  ipcMain.handle('debug-log:snapshot', (event) => {
+    assertMainRenderer(event.sender);
+    return debugLog?.snapshot() ?? {
+      entries: [],
+      dropped: 0,
+      capacity: 2_000,
+      bound_session_id: '',
+      bound_session_dir: '',
+      app_log_path: '',
+      session_log_path: '',
+    };
+  });
+  ipcMain.handle('debug-log:append', (event, entry: unknown) => {
+    assertMainRenderer(event.sender);
+    if (!debugLog) throw new Error('调试日志尚未就绪');
+    return debugLog.appendFromRenderer(entry);
+  });
+  ipcMain.handle('debug-log:bind', async (event, payload: unknown) => {
+    assertMainRenderer(event.sender);
+    if (!debugLog) throw new Error('调试日志尚未就绪');
+    if (!isRecord(payload)
+      || typeof payload.session_dir !== 'string'
+      || typeof payload.session_id !== 'string'
+      || !payload.session_dir.trim()
+      || !payload.session_id.trim()) {
+      throw new Error('绑定调试日志的任务身份无效');
+    }
+    return debugLog.bindSession(payload.session_dir, payload.session_id);
+  });
+  ipcMain.handle('debug-log:unbind', async (event, reason: unknown) => {
+    assertMainRenderer(event.sender);
+    await debugLog?.unbindSession(typeof reason === 'string' && reason.trim() ? reason : 'leave');
+  });
+  ipcMain.handle('debug-log:save', async (event, payload: unknown) => {
+    assertMainRenderer(event.sender);
+    if (!isRecord(payload) || typeof payload.content !== 'string') {
+      throw new Error('导出日志内容无效');
+    }
+    const defaultName = typeof payload.defaultName === 'string' && payload.defaultName.trim()
+      ? path.basename(payload.defaultName.trim())
+      : `databaker-debug-${new Date().toISOString().replace(/[:.]/g, '-')}.log`;
+    const result = await dialog.showSaveDialog(mainWindow!, {
+      title: '导出运行日志',
+      defaultPath: defaultName,
+      filters: [
+        { name: '日志文件', extensions: ['log', 'txt'] },
+        { name: '所有文件', extensions: ['*'] },
+      ],
+    });
+    if (result.canceled || !result.filePath) return null;
+    await fs.writeFile(result.filePath, payload.content, 'utf8');
+    debugLog?.append({
+      level: 'info',
+      source: 'main',
+      category: 'ui',
+      event: 'debug_log.export',
+      message: `已导出运行日志：${path.basename(result.filePath)}`,
+      data: { bytes: payload.content.length },
+    });
+    return result.filePath;
+  });
 }
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
@@ -3974,11 +4154,99 @@ if (!hasSingleInstanceLock) {
 
 app.whenReady().then(async () => {
   if (!hasSingleInstanceLock) return;
+  debugLog = new DebugLogStore(path.join(app.getPath('userData'), DEBUG_LOG_APP_FILE_NAME));
+  await debugLog.loadAppLog().catch(() => undefined);
+  debugLog.onEntry(publishDebugLogEntry);
+  setOperationalErrorSink((operation, error, attributes) => {
+    debugLog?.append({
+      level: 'error',
+      source: 'main',
+      category: 'error',
+      event: 'main.error',
+      message: `${operation}：${error instanceof Error ? error.message : String(error)}`,
+      data: {
+        operation,
+        error_type: error instanceof Error ? error.name : typeof error,
+        stack: error instanceof Error ? error.stack : undefined,
+        ...attributes,
+      },
+    });
+  });
+  debugLog.append({
+    level: 'info',
+    source: 'main',
+    category: 'lifecycle',
+    event: 'app.ready',
+    message: '应用已启动，本地调试日志已就绪',
+    data: {
+      version: typeof app.getVersion === 'function' ? app.getVersion() : '',
+      name: typeof app.getName === 'function' ? app.getName() : '',
+      electron: process.versions.electron,
+      chrome: process.versions.chrome,
+      node: process.versions.node,
+      platform: process.platform,
+      arch: process.arch,
+      os_release: typeof process.getSystemVersion === 'function' ? process.getSystemVersion() : '',
+      locale: typeof app.getLocale === 'function' ? app.getLocale() : '',
+      sentry: isSentryEnabled(),
+      user_data: typeof app.getPath === 'function' ? app.getPath('userData') : '',
+    },
+  });
   registerIpc();
   engine = new EngineClient(engineExecutable());
   engine.on('event', (message) => {
     sendToMain('engine:event', message);
     handleCaptureFaultEvent(message);
+    if (!isMeterEngineEvent(message) && isRecord(message)) {
+      const eventName = typeof message.event === 'string' ? message.event : 'engine.event';
+      const payload = isRecord(message.payload) ? message.payload : {};
+      const isError = /fail|fault|offline|error|crash/i.test(eventName);
+      debugLog?.append({
+        level: isError ? 'error' : 'info',
+        source: 'engine',
+        category: 'engine',
+        event: eventName,
+        message: isError ? `引擎事件 ${eventName}` : `引擎事件 ${eventName}`,
+        session_dir: typeof payload.session_dir === 'string' ? payload.session_dir : undefined,
+        data: payload,
+      });
+    } else if (isMeterEngineEvent(message) && isRecord(message.payload)) {
+      const meter = message.payload;
+      const faulted = meter.faulted === true
+        || meter.storage_status === 'critical'
+        || (typeof meter.overflow_samples === 'number' && meter.overflow_samples > 0);
+      const signature = faulted
+        ? [
+          String(meter.fault_kind ?? ''),
+          String(meter.fault_reason ?? ''),
+          String(meter.storage_status ?? ''),
+          String(meter.overflow_samples ?? 0),
+        ].join('|')
+        : '';
+      if (faulted && signature !== lastMeterFaultSignature) {
+        lastMeterFaultSignature = signature;
+        debugLog?.append({
+          level: 'error',
+          source: 'engine',
+          category: 'capture',
+          event: 'meter.fault',
+          message: meter.fault_reason
+            ? String(meter.fault_reason)
+            : `采集异常：faulted=${String(meter.faulted)} overflow=${String(meter.overflow_samples)} storage=${String(meter.storage_status)}`,
+          data: {
+            fault_kind: meter.fault_kind,
+            fault_reason: meter.fault_reason,
+            overflow_samples: meter.overflow_samples,
+            storage_status: meter.storage_status,
+            captured_samples: meter.captured_samples,
+            committed_samples: meter.committed_samples,
+            input_discontinuity_count: meter.input_discontinuity_count,
+          },
+        });
+      } else if (!faulted) {
+        lastMeterFaultSignature = '';
+      }
+    }
   });
   engine.on('offline', (message) => {
     const interruptedIntent = engineIntent;
@@ -4098,14 +4366,49 @@ app.whenReady().then(async () => {
       void requestSafeStopAndQuit('延迟的音频封存已完成');
     }
   });
-  engine.on('log', (message) => console.error(`[engine] ${message}`));
+  engine.on('log', (message) => {
+    console.error(`[engine] ${message}`);
+    debugLog?.append({
+      level: 'warn',
+      source: 'engine',
+      category: 'engine',
+      event: 'engine.stderr',
+      message,
+    });
+  });
+  engine.on('offline', (message) => {
+    debugLog?.append({
+      level: 'error',
+      source: 'engine',
+      category: 'lifecycle',
+      event: 'engine.offline',
+      message,
+      data: { phase: engineIntent.phase, session_dir: engineIntent.sessionDir },
+    });
+  });
   try {
     await engine.start();
+    debugLog?.append({
+      level: 'info',
+      source: 'main',
+      category: 'lifecycle',
+      event: 'engine.start',
+      message: '录音引擎已启动',
+    });
     if (isQuitting()) return;
   } catch (error) {
     console.error('Unable to start recorder engine:', error);
+    debugLog?.append({
+      level: 'error',
+      source: 'main',
+      category: 'lifecycle',
+      event: 'engine.start_failed',
+      message: `录音引擎启动失败：${error instanceof Error ? error.message : String(error)}`,
+      data: { error_type: error instanceof Error ? error.name : typeof error },
+    });
   }
   if (!isQuitting()) await createWindow();
+  if (!isQuitting()) void requestMicrophoneAccessQuietly();
 });
 
 app.on('activate', () => {

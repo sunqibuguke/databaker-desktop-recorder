@@ -10,16 +10,16 @@
 
 - Windows 版本、CPU 和工具/引擎版本。
 - WASAPI 输入设备显示名、稳定设备 ID、是否系统默认设备。
-- 驱动暴露的采样率范围、输入通道数和样本格式。
-- 请求值：采样率、交付 WAV 位深、输入通道。
-- 实际值：引擎选中的设备 ID、输入样本格式、输入通道数、WAV 编码。
+- 驱动暴露的采样率范围、输入通道数、样本格式，以及每条配置的 `share_mode`（独占 / 系统混音）。
+- 请求值：开流模式、采样率、交付 WAV 位深、输入通道。
+- 实际值：引擎选中的设备 ID、开流模式、输入样本格式、输入通道数、WAV 编码。
 - `captured_samples` / `committed_samples` / `overflow_samples`、提交延迟、Peak / RMS、磁盘状态。
 - 活动分段的文件增长；停止后的 RIFF/RF64 WAVE 属性、物理完整帧和头部/EOF 一致性。
 - `audio-fault.json`、故障检测时间、时间轴是否停止、故障数据是否被禁止常规导出。
 
 > `input_sample_format` 是最终交给引擎的数字样本表示，例如 `i16` / `i24` / `i32` / `f32`。`--bit-depth` 是交付 WAV 编码。验收门槛按有效数字精度计算：整数 `n` bit 按 `n`，IEEE-754 `f32` 按 24 bit 有效数字，`f64` 按 53 bit，不会把 `f32` 容器误认为 32 bit 有效精度。Windows shared mode 下，可枚举的客户端格式不得超过 `GetMixFormat` 声明的有效精度；`IsFormatSupported` 只能证明 Windows 音频引擎接受该客户端格式，不能用来把已知的低位深源判成高精度。把低精度硬件输入写成 24-bit 或 32-bit 不会凭空增加有效精度，因此报告会同时保留输入格式与交付编码。验收工具默认要求 16-bit 交付至少 16 bit 有效数字精度，24/32-bit 交付至少 24 bit；可用 `--minimum-input-format-bits` 按项目提高。这仍不能证明声卡 ADC 的 ENOB，声卡型号、驱动版本与厂商规格必须人工归档。
 
-> 同样，`sample_rate` 是 WASAPI shared 客户端的交付采样率。生成 96 kHz WAV 只能证明 Windows 音频引擎向应用交付了 96 kHz 样本，不能单凭元数据证明 ADC/驱动原生 96 kHz，因为 shared mode 可以重采样。项目若要求原生采样率或 bit-perfect，必须单独走 RAW/独占 WASAPI 或 ASIO 路线，并用硬件回环、频谱和时钟测试验收。
+> 默认开流是 WASAPI exclusive。`capture_share_mode` 记录实际路径；`sample_rate` 在独占模式下才更接近驱动接受的硬件格式。生成 96 kHz WAV 在系统混音（shared）下只能证明 Windows 音频引擎向应用交付了 96 kHz 样本，不能单凭元数据证明 ADC/驱动原生 96 kHz。独占失败必须可见，禁止静默降级成共享还显示独占。真机仍需用硬件回环、频谱和时钟测试验收原生时钟。
 
 > 音频 PCM 仍持续写入活动分段；为避免每秒 `FlushFileBuffers` 对长录音造成抖动，引擎默认约每 10 秒执行一次昂贵的“音频落盘 → WAV 头落盘” checkpoint。磁盘余量查询与 checkpoint 独立，仍每秒执行，频繁完成短句不会推迟安全余量保护。`committed_samples` 表示这个可恢复水位，因此正常验收允许最多 15 秒 committed 延迟；真实断电的默认尾差也是 15 秒，项目可用 `--max-tail-loss-seconds` 放宽，但生产工具不允许超过 30 秒。
 
@@ -104,7 +104,8 @@ recording/               本次验收的原始录制目录
 
 - 外置声卡出现在列表中。
 - 设备 ID 非空且与同一台机器上其他输入端点不重复。
-- 需要的采样率和输入通道在 `configurations` 内。
+- 需要的采样率和输入通道在 `configurations` 内，并带 `share_mode=exclusive` / `shared`。
+- 工位默认验独占格式；独占列表为空时不得假装可用，应改 `--share-mode shared` 后单独归档。
 - 声卡驱动版本、USB 端口和设备序列号（如有）由验收人补充到工单，因为 WASAPI 协议不保证提供厂商驱动版本。
 
 ## 5. 短录与 16/24/32-bit 矩阵
@@ -116,14 +117,18 @@ $device = "<inventory 返回的完整设备 ID>"
 .\run-windows-audio-acceptance.cmd --mode short --device-id $device --sample-rate 48000 --bit-depth 16 --channel 1 --seconds 30
 .\run-windows-audio-acceptance.cmd --mode short --device-id $device --sample-rate 48000 --bit-depth 24 --channel 1 --seconds 30
 .\run-windows-audio-acceptance.cmd --mode short --device-id $device --sample-rate 48000 --bit-depth 32 --channel 1 --seconds 30
+.\run-windows-audio-acceptance.cmd --mode short --device-id $device --share-mode exclusive --sample-rate 48000 --bit-depth 24 --channel 1 --seconds 30
+.\run-windows-audio-acceptance.cmd --mode short --device-id $device --share-mode exclusive --sample-rate 48000 --bit-depth 24 --channel 2 --seconds 30
 ```
+
+默认 `--share-mode exclusive`。独占开流失败时报告应可复现（设备占用、不支持的采样率/位深/通道），再显式用 `--share-mode shared` 做对照，不得把共享会话标成独占。
 
 执行噪声检测的前 3 秒保持安静，之后持续朗读或播放稳定测试音。如果是多输入声卡，对生产会使用的每一个 `--channel` 分别执行。完整生产资格必须在 44.1/48/96 kHz 下各重复 16/24/32-bit 矩阵；单次项目验证不能代替该资格矩阵。
 
 强制通过标准：
 
-- 请求设备 ID、采样率、输入通道和交付位深与会话快照一致。
-- 引擎记录非空 `input_sample_format`，且通过 `minimum_input_format_bits` 有效数字精度门槛（整数按位宽，`f32=24`、`f64=53`；默认 24/32-bit 交付不接受 `i16/u16`）。
+- 请求设备 ID、开流模式、采样率、输入通道和交付位深与会话快照一致。
+- 引擎记录非空 `input_sample_format` 与 `capture_share_mode`，且通过 `minimum_input_format_bits` 有效数字精度门槛（整数按位宽，`f32=24`、`f64=53`；默认 24/32-bit 交付不接受 `i16/u16`）。
 - `captured` / `committed` 单调，最大提交延迟 ≤ 15 秒，无 overflow/fault marker。
 - 所有分段 WAV 为请求采样率、请求位深、Mono；物理帧数等于最终 `committed_samples`。
 - 安全停止后 WAV 头与物理 EOF 一致，整轨导出可解析；文件较大时能正确识别 RF64 的 `ds64` 计数和哨兵字段。
@@ -407,7 +412,7 @@ $installerSha256 = "<SHA256SUMS.txt 中的 64 位哈希>"
 
 ## 11. 已知边界
 
-- 当前 Windows 基线是 WASAPI shared mode，不是 ASIO 或独占 bit-perfect 链路。需要 ASIO-only 的声卡不属于本门禁覆盖范围。
+- 当前 Windows 基线是 WASAPI exclusive 开流，失败后才允许显式改用系统混音；不是 ASIO。需要 ASIO-only 的声卡不属于本门禁覆盖范围。独占成功仍不能单凭元数据宣称 bit-perfect，时钟与 ENOB 仍需硬件测量。
 - 工具可证明驱动交给应用的样本格式和最终 WAV 编码，不能仅凭 WASAPI 元数据证明声卡 ADC 的真实 ENOB。模拟前端、噪声底和失真仍需专业测量。
 - 标准 RIFF/WAV 容器有约 4 GiB 上限；整轨超过该边界时会自动切换为 RF64，五分钟分段、单句和预览仍保持普通 RIFF。RF64 的目标文件系统及播放器、标注、上传等下游兼容性必须按实际交付链路验收，FAT32 不能保存大于 4 GiB 的单文件。
 - 进程强杀/恢复的无硬件回归由 `npm run test:crash-recovery` 执行；真实断电必须按第 9 节在可丢弃的 Windows 测试机上执行并归档，不能用无硬件回归代替。

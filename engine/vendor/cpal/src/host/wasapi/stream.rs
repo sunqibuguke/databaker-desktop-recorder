@@ -864,6 +864,7 @@ fn run_input(
             &run_ctxt.stream,
             capture_client,
             data_callback,
+            error_callback,
             &mut silent_buffer,
             &mut first_packet_seen,
             &mut previous_capture_packet,
@@ -992,6 +993,7 @@ fn process_input(
     stream: &StreamInner,
     capture_client: Audio::IAudioCaptureClient,
     data_callback: &mut dyn FnMut(&Data, &InputCallbackInfo),
+    error_callback: &ErrorCallbackArc,
     silent_buffer: &mut Vec<u64>,
     first_packet_seen: &mut bool,
     previous_capture_packet: &mut Option<(u64, FrameCount)>,
@@ -1038,35 +1040,98 @@ fn process_input(
             // be silently accepted when a driver omits that flag. The first
             // packet has no predecessor, and therefore establishes the
             // baseline regardless of its initial device position.
-            let unflagged_position_discontinuity =
-                capture_packet_has_unflagged_position_discontinuity(
-                    previous_capture_packet,
-                    flags,
-                    device_position,
-                    frames_available,
-                );
-            if driver_discontinuity || unflagged_position_discontinuity {
+            let position_discontinuity = capture_packet_position_discontinuity(
+                previous_capture_packet,
+                device_position,
+                frames_available,
+            );
+            let maximum_recoverable_gap = u64::from(stream.config.sample_rate);
+            let recoverable_gap = match position_discontinuity {
+                CapturePacketDiscontinuity::ForwardGap(frames)
+                    if frames <= maximum_recoverable_gap =>
+                {
+                    Some(frames)
+                }
+                _ => None,
+            };
+            let fatal_position_discontinuity = matches!(
+                position_discontinuity,
+                CapturePacketDiscontinuity::ForwardGap(frames)
+                    if frames > maximum_recoverable_gap
+            ) || matches!(
+                position_discontinuity,
+                CapturePacketDiscontinuity::BackwardJumpOrOverflow
+            );
+            if fatal_position_discontinuity {
                 // A successful GetBuffer must be paired with ReleaseBuffer
                 // before leaving this iteration. This error is returned to
                 // the run loop (rather than best-effort emitted here), which
                 // guarantees delivery through the stream error callback and
                 // ends this WASAPI input worker.
-                let message = if driver_discontinuity {
-                    "WASAPI capture packet has DATA_DISCONTINUITY"
-                } else {
-                    "WASAPI capture device position jumped without DATA_DISCONTINUITY"
+                let message = match position_discontinuity {
+                    CapturePacketDiscontinuity::ForwardGap(frames) => format!(
+                        "WASAPI capture device position jumped forward by {frames} frames, exceeding the recoverable limit of {maximum_recoverable_gap} frames"
+                    ),
+                    CapturePacketDiscontinuity::BackwardJumpOrOverflow =>
+                        "WASAPI capture device position moved backward or overflowed".to_string(),
+                    CapturePacketDiscontinuity::Continuous => unreachable!(),
                 };
                 capture_client
                     .ReleaseBuffer(frames_available)
                     .map_err(|release_error| {
                         Error::with_message(
                             ErrorKind::Xrun,
-                            format!(
-                                "{message}; additionally failed to release capture buffer: {release_error}"
-                            ),
+                            format!("{message}; additionally failed to release capture buffer: {release_error}"),
                         )
                     })?;
                 return Err(Error::with_message(ErrorKind::Xrun, message));
+            }
+
+            // A bounded forward jump has an exact frame count. Preserve the
+            // continuous master timeline by inserting format-correct
+            // equilibrium samples before delivering the current packet. A
+            // driver-only flag with continuous positions needs no insertion,
+            // but remains visible as recovered quality telemetry.
+            if driver_discontinuity || recoverable_gap.is_some() {
+                let missing_frames = recoverable_gap.unwrap_or(0);
+                emit_error(
+                    error_callback,
+                    Error::with_message(
+                        ErrorKind::RecoveredXrun,
+                        format!(
+                            "WASAPI input discontinuity recovered; missing_frames={missing_frames}; driver_reported={driver_discontinuity}"
+                        ),
+                    ),
+                );
+                if missing_frames > 0 {
+                    let missing_frames = usize::try_from(missing_frames).map_err(|_| {
+                        Error::with_message(
+                            ErrorKind::Xrun,
+                            "recoverable WASAPI gap does not fit in memory address space",
+                        )
+                    })?;
+                    let byte_count = missing_frames
+                        .checked_mul(stream.bytes_per_frame as usize)
+                        .ok_or_else(|| {
+                            Error::with_message(
+                                ErrorKind::Xrun,
+                                "recoverable WASAPI gap byte count overflowed",
+                            )
+                        })?;
+                    let sample_size = stream.sample_format.sample_size();
+                    let len = byte_count / sample_size;
+                    let data = Data::from_parts(
+                        prepare_silent_capture_buffer(
+                            silent_buffer,
+                            byte_count,
+                            stream.sample_format,
+                        ),
+                        len,
+                        stream.sample_format,
+                    );
+                    let timestamp = input_timestamp(stream, qpc_position)?;
+                    data_callback(&data, &InputCallbackInfo { timestamp });
+                }
             }
 
             let byte_count = frames_available as usize * stream.bytes_per_frame as usize;
@@ -1122,31 +1187,34 @@ fn capture_packet_has_data_discontinuity(flags: u32) -> bool {
 /// of the first frame in each packet. Consecutive packets must therefore begin
 /// exactly after the previous packet's frame count. Treat a checked-add overflow
 /// as discontinuous too: losing the baseline would make the check fail-open.
-fn capture_packet_has_position_discontinuity(
-    previous_packet: &mut Option<(u64, FrameCount)>,
-    device_position: u64,
-    frames_available: FrameCount,
-) -> bool {
-    let discontinuity = previous_packet.is_some_and(|(previous_position, previous_frames)| {
-        previous_position.checked_add(previous_frames as u64) != Some(device_position)
-    });
-    *previous_packet = Some((device_position, frames_available));
-    discontinuity
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapturePacketDiscontinuity {
+    Continuous,
+    ForwardGap(u64),
+    BackwardJumpOrOverflow,
 }
 
-/// A driver-reported discontinuity is handled as its own terminal error. A
-/// timestamp error only says that the instant at which the device position was
-/// recorded is uncertain; it does not make the stream-relative frame position
-/// unusable for this adjacency check. Keep checking it so that flag cannot
-/// mask an unreported capture gap.
-fn capture_packet_has_unflagged_position_discontinuity(
+fn capture_packet_position_discontinuity(
     previous_packet: &mut Option<(u64, FrameCount)>,
-    flags: u32,
     device_position: u64,
     frames_available: FrameCount,
-) -> bool {
-    capture_packet_has_position_discontinuity(previous_packet, device_position, frames_available)
-        && !capture_packet_has_data_discontinuity(flags)
+) -> CapturePacketDiscontinuity {
+    let discontinuity = match *previous_packet {
+        None => CapturePacketDiscontinuity::Continuous,
+        Some((previous_position, previous_frames)) => {
+            match previous_position.checked_add(u64::from(previous_frames)) {
+                Some(expected_position) if device_position == expected_position => {
+                    CapturePacketDiscontinuity::Continuous
+                }
+                Some(expected_position) if device_position > expected_position => {
+                    CapturePacketDiscontinuity::ForwardGap(device_position - expected_position)
+                }
+                _ => CapturePacketDiscontinuity::BackwardJumpOrOverflow,
+            }
+        }
+    };
+    *previous_packet = Some((device_position, frames_available));
+    discontinuity
 }
 
 // The loop for writing output data.
@@ -1391,60 +1459,50 @@ mod tests {
         let mut previous_packet = None;
 
         // A stream may begin at a non-zero device position.
-        assert!(!capture_packet_has_position_discontinuity(
-            &mut previous_packet,
-            4_096,
-            480,
-        ));
-        assert!(!capture_packet_has_position_discontinuity(
-            &mut previous_packet,
-            4_576,
-            480,
-        ));
+        assert_eq!(
+            capture_packet_position_discontinuity(&mut previous_packet, 4_096, 480,),
+            CapturePacketDiscontinuity::Continuous,
+        );
+        assert_eq!(
+            capture_packet_position_discontinuity(&mut previous_packet, 4_576, 480,),
+            CapturePacketDiscontinuity::Continuous,
+        );
 
         // At 48 kHz this is a 10 ms gap: much shorter than the engine's
-        // five-second stalled-input watchdog, but still an unrecoverable gap.
-        assert!(capture_packet_has_position_discontinuity(
-            &mut previous_packet,
-            5_536,
-            480,
-        ));
+        // five-second stalled-input watchdog, and can be recovered exactly.
+        assert_eq!(
+            capture_packet_position_discontinuity(&mut previous_packet, 5_536, 480,),
+            CapturePacketDiscontinuity::ForwardGap(480),
+        );
     }
 
     #[test]
     fn capture_position_discontinuity_detects_backward_jump_and_overflow() {
         let mut previous_packet = Some((1_000, 480));
-        assert!(capture_packet_has_position_discontinuity(
-            &mut previous_packet,
-            999,
-            480,
-        ));
+        assert_eq!(
+            capture_packet_position_discontinuity(&mut previous_packet, 999, 480,),
+            CapturePacketDiscontinuity::BackwardJumpOrOverflow,
+        );
 
         let mut previous_packet = Some((u64::MAX - 10, 11));
-        assert!(capture_packet_has_position_discontinuity(
-            &mut previous_packet,
-            0,
-            480,
-        ));
+        assert_eq!(
+            capture_packet_position_discontinuity(&mut previous_packet, 0, 480,),
+            CapturePacketDiscontinuity::BackwardJumpOrOverflow,
+        );
     }
 
     #[test]
     fn timestamp_error_does_not_mask_an_unflagged_position_gap() {
-        let timestamp_error = Audio::AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR.0 as u32;
         let mut previous_packet = None;
 
-        assert!(!capture_packet_has_unflagged_position_discontinuity(
-            &mut previous_packet,
-            timestamp_error,
-            2_000,
-            480,
-        ));
-        assert!(capture_packet_has_unflagged_position_discontinuity(
-            &mut previous_packet,
-            timestamp_error,
-            2_960,
-            480,
-        ));
+        assert_eq!(
+            capture_packet_position_discontinuity(&mut previous_packet, 2_000, 480,),
+            CapturePacketDiscontinuity::Continuous,
+        );
+        assert_eq!(
+            capture_packet_position_discontinuity(&mut previous_packet, 2_960, 480,),
+            CapturePacketDiscontinuity::ForwardGap(480),
+        );
     }
 
     #[test]
@@ -1452,12 +1510,10 @@ mod tests {
         let data_discontinuity = Audio::AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY.0 as u32;
         let mut previous_packet = Some((1_000, 480));
 
-        assert!(!capture_packet_has_unflagged_position_discontinuity(
-            &mut previous_packet,
-            data_discontinuity,
-            1_960,
-            480,
-        ));
+        assert_eq!(
+            capture_packet_position_discontinuity(&mut previous_packet, 1_960, 480,),
+            CapturePacketDiscontinuity::ForwardGap(480),
+        );
 
         let mut first_packet_seen = true;
         assert!(capture_packet_has_reportable_discontinuity(

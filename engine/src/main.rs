@@ -1,3 +1,4 @@
+mod attempt;
 mod durable_fs;
 mod engine;
 mod protocol;
@@ -9,8 +10,8 @@ mod wav;
 #[cfg(feature = "system-test")]
 use crate::engine::SystemTestStartSessionPayload;
 use crate::engine::{
-    Engine, ExportArtifact, NoiseCheckPayload, ResumeSessionPayload, StartSessionPayload,
-    SetSilenceSettingsPayload, StopAttemptPayload, is_no_active_session_error,
+    Engine, ExportArtifact, NoiseCheckPayload, ResumeSessionPayload, SetSilenceSettingsPayload,
+    StartSessionPayload, StopAttemptPayload, is_no_active_session_error,
 };
 use crate::protocol::{CommandEnvelope, Emitter, PROTOCOL_VERSION};
 use anyhow::{Context, Result, anyhow};
@@ -409,6 +410,7 @@ mod tests {
             device_name: "disconnected interface".to_string(),
             device_id: "missing:device".to_string(),
             input_sample_format: "f32".to_string(),
+            capture_share_mode: crate::engine::CaptureShareMode::Exclusive,
             capture_provenance: Vec::new(),
             audio_format: AudioFormat {
                 sample_rate: 48_000,
@@ -424,6 +426,8 @@ mod tests {
             captured_samples: 2,
             committed_samples: 2,
             overflow_samples: 0,
+            input_discontinuity_count: 0,
+            input_discontinuity_silence_samples: 0,
             started_at: "2026-08-10T11:00:00Z".to_string(),
             updated_at: "2026-08-10T12:00:00Z".to_string(),
             noise_check: None,

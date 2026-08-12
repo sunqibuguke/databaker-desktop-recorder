@@ -615,6 +615,7 @@ mod tests {
             channels: 2,
             sample_rate: SampleRate(48000),
             buffer_size: BufferSize::Fixed(512),
+            share_mode: crate::ShareMode::Shared,
         };
 
         let result = device.build_output_stream(

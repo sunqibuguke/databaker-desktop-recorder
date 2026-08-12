@@ -36,10 +36,18 @@ ipcRenderer.on(
 
 contextBridge.exposeInMainWorld('recorder', {
   runtime: 'desktop',
+  platform: process.platform,
   request: (command: string, payload: unknown = {}) => ipcRenderer.invoke('engine:request', command, payload),
   openScript: () => ipcRenderer.invoke('dialog:open-script'),
   chooseOutput: () => ipcRenderer.invoke('dialog:choose-output'),
   defaultOutput: () => ipcRenderer.invoke('app:default-output'),
+  getLocale: () => ipcRenderer.invoke('app:get-locale'),
+  setLocale: (locale: string) => ipcRenderer.invoke('app:set-locale', locale),
+  onLocaleChanged: (listener: (locale: string) => void) => {
+    const wrapped = (_event: Electron.IpcRendererEvent, locale: string) => listener(locale);
+    ipcRenderer.on('locale:changed', wrapped);
+    return () => ipcRenderer.removeListener('locale:changed', wrapped);
+  },
   loadCapturePresets: () => ipcRenderer.invoke('capture-presets:load'),
   saveCapturePreset: (preset: unknown) => ipcRenderer.invoke('capture-presets:save', preset),
   deleteCapturePreset: (id: string) => ipcRenderer.invoke('capture-presets:delete', id),
@@ -77,5 +85,19 @@ contextBridge.exposeInMainWorld('recorder', {
     const wrapped = (_event: Electron.IpcRendererEvent, message: string) => listener(message);
     ipcRenderer.on('engine:offline', wrapped);
     return () => ipcRenderer.removeListener('engine:offline', wrapped);
+  },
+  getDebugLog: () => ipcRenderer.invoke('debug-log:snapshot'),
+  appendDebugLog: (entry: unknown) => ipcRenderer.invoke('debug-log:append', entry),
+  bindDebugLog: (sessionDir: string, sessionId: string) => (
+    ipcRenderer.invoke('debug-log:bind', { session_dir: sessionDir, session_id: sessionId })
+  ),
+  unbindDebugLog: (reason?: string) => ipcRenderer.invoke('debug-log:unbind', reason ?? 'leave'),
+  saveDebugLog: (content: string, defaultName: string) => (
+    ipcRenderer.invoke('debug-log:save', { content, defaultName })
+  ),
+  onDebugLog: (listener: (entry: unknown) => void) => {
+    const wrapped = (_event: Electron.IpcRendererEvent, entry: unknown) => listener(entry);
+    ipcRenderer.on('debug-log:entry', wrapped);
+    return () => ipcRenderer.removeListener('debug-log:entry', wrapped);
   },
 });

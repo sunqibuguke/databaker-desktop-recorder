@@ -171,6 +171,18 @@ pub trait DeviceTrait: PartialEq + Eq + Hash + Debug + Display {
     /// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
     fn supported_input_configs(&self) -> Result<Self::SupportedInputConfigs, Error>;
 
+    /// Input configurations for a specific share mode.
+    ///
+    /// Exclusive is only meaningful on WASAPI. Other hosts ignore the flag and
+    /// return the same iterator as [`supported_input_configs`].
+    fn supported_input_configs_for(
+        &self,
+        exclusive: bool,
+    ) -> Result<Self::SupportedInputConfigs, Error> {
+        let _ = exclusive;
+        self.supported_input_configs()
+    }
+
     /// An iterator yielding output stream configurations that are supported by the device.
     ///
     /// # Errors

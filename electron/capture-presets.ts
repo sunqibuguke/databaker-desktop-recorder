@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
+export type CaptureShareMode = 'exclusive' | 'shared';
+
 export type CapturePreset = {
   id: string;
   name: string;
@@ -10,6 +12,7 @@ export type CapturePreset = {
   sampleRate: number;
   bitDepth: 16 | 24 | 32;
   inputChannel: number;
+  captureShareMode: CaptureShareMode;
   silenceDurationMs: number;
   silenceThresholdDbfs: number;
 };
@@ -77,6 +80,12 @@ function validatePreset(value: unknown): CapturePreset {
     || value.silenceThresholdDbfs > -6) {
     throw new Error('预设静音阈值无效');
   }
+  const captureShareMode = value.captureShareMode === undefined
+    ? 'exclusive'
+    : value.captureShareMode;
+  if (captureShareMode !== 'exclusive' && captureShareMode !== 'shared') {
+    throw new Error('预设采集模式无效');
+  }
   return {
     id,
     name,
@@ -85,6 +94,7 @@ function validatePreset(value: unknown): CapturePreset {
     sampleRate: Number(value.sampleRate),
     bitDepth: Number(value.bitDepth) as 16 | 24 | 32,
     inputChannel: Number(value.inputChannel),
+    captureShareMode,
     silenceDurationMs: Number(value.silenceDurationMs),
     silenceThresholdDbfs: value.silenceThresholdDbfs,
   };
