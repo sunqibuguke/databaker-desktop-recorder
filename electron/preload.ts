@@ -33,6 +33,7 @@ ipcRenderer.on(
 );
 
 contextBridge.exposeInMainWorld('recorder', {
+  runtime: 'desktop',
   request: (command: string, payload: unknown = {}) => ipcRenderer.invoke('engine:request', command, payload),
   openScript: () => ipcRenderer.invoke('dialog:open-script'),
   chooseOutput: () => ipcRenderer.invoke('dialog:choose-output'),
@@ -43,6 +44,9 @@ contextBridge.exposeInMainWorld('recorder', {
   setLastCapturePreset: (id: string | null) => ipcRenderer.invoke('capture-presets:select', id),
   listRecordings: (root: string, options?: { offset?: number; limit?: number }) => (
     ipcRenderer.invoke('recordings:list', root, options)
+  ),
+  deleteRecording: (root: string, sessionDir: string, sessionId: string) => (
+    ipcRenderer.invoke('recordings:delete', { root, session_dir: sessionDir, session_id: sessionId })
   ),
   joinPath: (...parts: string[]) => ipcRenderer.invoke('path:join', ...parts),
   readAudio: (filePath: string) => ipcRenderer.invoke('audio:read', filePath),

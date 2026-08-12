@@ -378,7 +378,19 @@ async function main() {
       1,
       'a damaged session.json must not block a resume backed by consistent snapshots',
     );
-    await handlers.get('engine:request')(event, 'stop_session', {});
+    await assert.rejects(
+      handlers.get('engine:request')(event, 'stop_session', {
+        expected_session_id: 'another-task',
+        expected_session_dir: resumeSessionDir,
+      }),
+      /\u4e0e\u6240\u9009\u5217\u8868\u9879\u4e0d\u4e00\u81f4/,
+      'a history action must not stop a different active task',
+    );
+    assert.equal(engine.active, true, 'identity mismatch must leave capture active');
+    await handlers.get('engine:request')(event, 'stop_session', {
+      expected_session_id: resumeSessionId,
+      expected_session_dir: resumeSessionDir,
+    });
 
     await fs.writeFile(
       path.join(resumeSessionDir, 'session.json'),

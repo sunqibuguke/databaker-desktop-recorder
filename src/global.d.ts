@@ -7,6 +7,7 @@ import type { CapturePresetDraft, CapturePresetLoadResult, CapturePresetStore, D
 declare global {
   interface Window {
     recorder: {
+      runtime: 'desktop' | 'preview';
       request<T = unknown>(command: string, payload?: unknown): Promise<T>;
       openScript(): Promise<{ filePath: string; name: string; content: string } | null>;
       chooseOutput(): Promise<string | null>;
@@ -16,6 +17,7 @@ declare global {
       deleteCapturePreset(id: string): Promise<CapturePresetStore>;
       setLastCapturePreset(id: string | null): Promise<CapturePresetStore>;
       listRecordings(root: string, options?: { offset?: number; limit?: number }): Promise<RecordingHistoryPage>;
+      deleteRecording(root: string, sessionDir: string, sessionId: string): Promise<{ session_dir: string; session_id: string }>;
       joinPath(...parts: string[]): Promise<string>;
       readAudio(filePath: string): Promise<ArrayBuffer>;
       openPath(target: string): Promise<void>;

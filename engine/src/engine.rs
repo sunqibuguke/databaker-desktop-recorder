@@ -3890,6 +3890,30 @@ fn validate_snapshot_for_export(snapshot: &SessionSnapshot) -> Result<()> {
     validate_attempt_boundaries(snapshot, snapshot.committed_samples)?;
     validate_capture_provenance(snapshot, snapshot.committed_samples, true)?;
     for item in &snapshot.items {
+        match item.status.as_str() {
+            "accepted" => {
+                if item.selected_attempt_id.is_none() {
+                    bail!(
+                        "条目 {} 已标记为确认，但没有选中的录音版本，禁止生成交付。",
+                        item.id
+                    );
+                }
+            }
+            "skipped" => {
+                if item.selected_attempt_id.is_some() {
+                    bail!(
+                        "条目 {} 已标记为跳过，但仍保留选中的录音版本，禁止生成交付。",
+                        item.id
+                    );
+                }
+            }
+            _ => {
+                bail!(
+                    "条目 {} 尚未确认或跳过，录制任务未完成，禁止生成交付。",
+                    item.id
+                );
+            }
+        }
         let Some(selected_id) = item.selected_attempt_id.as_deref() else {
             continue;
         };
@@ -11101,6 +11125,15 @@ mod tests {
         assert!(validate_snapshot_for_export(&snapshot).is_err());
 
         snapshot.overflow_samples = 0;
+        let unfinished_error = validate_snapshot_for_export(&snapshot).unwrap_err();
+        assert!(format!("{unfinished_error:#}").contains("未完成"));
+
+        snapshot.items[0].status = "review".to_string();
+        assert!(validate_snapshot_for_export(&snapshot).is_err());
+
+        snapshot.items[0].status = "accepted".to_string();
+        assert!(validate_snapshot_for_export(&snapshot).is_err());
+
         snapshot.committed_samples = 100;
         snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
         snapshot.items[0].attempts.push(Attempt {
@@ -11126,6 +11159,12 @@ mod tests {
 
         snapshot.items[0].attempts[0].end_sample = 100;
         assert!(validate_snapshot_for_export(&snapshot).is_ok());
+
+        snapshot.items[0].status = "skipped".to_string();
+        assert!(validate_snapshot_for_export(&snapshot).is_err());
+
+        snapshot.items[0].selected_attempt_id = None;
+        assert!(validate_snapshot_for_export(&snapshot).is_ok());
     }
 
     #[test]
@@ -11146,6 +11185,7 @@ mod tests {
         stopped.status = "stopped".to_string();
         stopped.captured_samples = 4;
         stopped.committed_samples = 4;
+        stopped.items[0].status = "skipped".to_string();
         write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
         std::fs::write(
             root.join("metadata/items.snapshot.json"),
@@ -11248,6 +11288,7 @@ mod tests {
         stopped.status = "stopped".to_string();
         stopped.captured_samples = 4;
         stopped.committed_samples = 4;
+        stopped.items[0].status = "skipped".to_string();
         write_snapshot_file(&root.join("metadata/items.snapshot.json"), &stopped);
         write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
 
@@ -11280,6 +11321,7 @@ mod tests {
         stopped.status = "stopped".to_string();
         stopped.captured_samples = 4;
         stopped.committed_samples = 4;
+        stopped.items[0].status = "skipped".to_string();
         write_snapshot_file(&root.join("metadata/items.snapshot.json"), &stopped);
         write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
 

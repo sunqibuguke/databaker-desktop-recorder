@@ -488,6 +488,7 @@ export function installDevRecorderMock() {
   Object.defineProperty(window, 'recorder', {
     configurable: false,
     value: {
+      runtime: 'preview',
       request,
       openScript: async () => null,
       chooseOutput: async () => '/tmp/DataBaker Recordings',
@@ -552,9 +553,20 @@ export function installDevRecorderMock() {
           scanned_directories: end - offset,
         };
       },
+      deleteRecording: async (_root: string, sessionDir: string, sessionId: string) => {
+        const index = previewHistory.findIndex((recording) => (
+          recording.session_dir === sessionDir && recording.session_id === sessionId
+        ));
+        if (index < 0) throw new Error('Mock 中没有该录制任务');
+        if (previewHistory[index].is_active) throw new Error('当前录制任务不能删除');
+        previewHistory.splice(index, 1);
+        return { session_dir: sessionDir, session_id: sessionId };
+      },
       joinPath: async (...parts: string[]) => parts.join('/').replace(/\/+/g, '/'),
       readAudio: async () => new ArrayBuffer(44),
-      openPath: async () => undefined,
+      openPath: async (target: string) => {
+        throw new Error(`浏览器界面预览无法打开本机文件夹：${target}。请在 DataBaker 桌面应用中使用此按钮。`);
+      },
       openPrompter: async () => {
         window.open(`${window.location.pathname}?view=prompter`, 'databaker-prompter', 'popup=yes,width=720,height=500');
         return true;

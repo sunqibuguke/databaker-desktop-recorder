@@ -119,6 +119,7 @@ async function main() {
 
   const validDir = path.join(recordingRoot, 'valid-session');
   await fs.mkdir(path.join(validDir, 'metadata'), { recursive: true });
+  await fs.mkdir(path.join(validDir, 'export'));
   await writeJson(path.join(validDir, 'session.json'), { schema_version: 1, session_id: 'valid-session' });
   await writeJson(path.join(validDir, 'metadata', 'items.snapshot.json'), snapshot('valid-session'));
 
@@ -168,6 +169,7 @@ async function main() {
   const handlers = new Map();
   const appEvents = new Map();
   const openedPaths = [];
+  const trashedPaths = [];
   let outputSelection = null;
   const electronStub = {
     app: {
@@ -198,7 +200,15 @@ async function main() {
     Menu: { buildFromTemplate: (template) => template },
     nativeImage: { createFromDataURL: () => ({ setTemplateImage: () => undefined }) },
     screen: { getPrimaryDisplay: () => ({ id: 1, workArea: {} }), getAllDisplays: () => [] },
-    shell: { openPath: async (target) => { openedPaths.push(target); return ''; } },
+    shell: {
+      openPath: async (target) => { openedPaths.push(target); return ''; },
+      trashItem: async (target) => {
+        trashedPaths.push(target);
+        const trashDir = path.join(root, 'system-trash');
+        await fs.mkdir(trashDir, { recursive: true });
+        await fs.rename(target, path.join(trashDir, path.basename(target)));
+      },
+    },
     Tray: class extends EventEmitter {},
   };
 
@@ -258,8 +268,39 @@ async function main() {
     assert.equal(rows.some((row) => row.session_id === 'unrelated-folder'), false,
       'ordinary folders in a broad selected root must not become fake tasks');
 
+    await handlers.get('shell:open-path')(event, validDir);
+    await handlers.get('shell:open-path')(event, path.join(validDir, 'export'));
+    assert.deepEqual(openedPaths, [validDir, path.join(validDir, 'export')],
+      'task and delivery actions must open their exact directories in the OS file manager');
+
+    const deleteRecording = handlers.get('recordings:delete');
+    await assert.rejects(
+      deleteRecording(event, {
+        root: selected,
+        session_dir: validDir,
+        session_id: 'wrong-session-id',
+      }),
+      /身份.*不一致/,
+      'deletion must bind the exact task identity shown in history',
+    );
+    assert.deepEqual(trashedPaths, [], 'an identity mismatch must not reach the OS trash');
+    await deleteRecording(event, {
+      root: selected,
+      session_dir: validDir,
+      session_id: 'valid-session',
+    });
+    assert.deepEqual(trashedPaths, [path.join(recordingRootCanonical, 'valid-session')],
+      'a confirmed historical task moves its canonical directory to OS trash');
+    await assert.rejects(fs.lstat(validDir), { code: 'ENOENT' });
+    assert.equal(
+      (await listRecordings(event, selected, { offset: 0, limit: 100 })).recordings
+        .some((row) => row.session_id === 'valid-session'),
+      false,
+      'a trashed task must disappear from refreshed history',
+    );
+
     await handlers.get('shell:open-path')(event, partialDir);
-    assert.deepEqual(openedPaths, [partialDir],
+    assert.deepEqual(openedPaths, [validDir, path.join(validDir, 'export'), partialDir],
       'an inspection-only damaged task must still allow opening its real directory');
     await assert.rejects(
       handlers.get('engine:request')(event, 'export_session', { session_dir: partialDir }),

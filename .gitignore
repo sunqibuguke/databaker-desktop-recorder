@@ -12,3 +12,6 @@ recordings/
 # Historical mobile source is local reference material only. It contains
 # generated dependencies, binaries and environment-specific configuration.
 /移动app 参考/
+
+# Sentry Config File
+.env.sentry-build-plugin

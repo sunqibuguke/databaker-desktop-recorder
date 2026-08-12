@@ -11,7 +11,7 @@
     "build:engine:system-test": "cross-env CARGO_TARGET_DIR=engine/target/system-test node scripts/run-cargo.cjs build --manifest-path engine/Cargo.toml --features system-test",
     "build:renderer": "vite build",
     "build:electron": "tsc -p electron/tsconfig.json",
-    "build": "npm run build:engine:release && npm run build:renderer && npm run build:electron && node scripts/stage-engine.cjs",
+    "build": "npm run build:engine:release && npm run build:renderer && npm run build:electron && node scripts/stage-engine.cjs && node scripts/upload-sentry-electron-sourcemaps.cjs",
     "dev:renderer": "vite --host 127.0.0.1",
     "dev:electron": "npm run build:electron && wait-on http://127.0.0.1:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .",
     "dev": "npm run build:engine && concurrently -k -n renderer,electron -c cyan,magenta \"npm:dev:renderer\" \"npm:dev:electron\"",
@@ -36,7 +36,17 @@
     "asar": true,
     "files": [
       "dist/**/*",
+      "!dist/**/*.map",
+      "!dist/mac*/**/*",
+      "!dist/win*/**/*",
+      "!dist/*.dmg",
+      "!dist/*.zip",
+      "!dist/*.exe",
+      "!dist/*.blockmap",
+      "!dist/latest*.yml",
+      "!dist/SHA256SUMS.txt",
       "dist-electron/**/*",
+      "!dist-electron/**/*.map",
       "package.json"
     ],
     "extraResources": [
@@ -114,11 +124,14 @@
     "node": ">=22.12"
   },
   "dependencies": {
+    "@sentry/electron": "^7.16.0",
     "ajv": "^8.20.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },
   "devDependencies": {
+    "@sentry/cli": "^2.58.6",
+    "@sentry/vite-plugin": "^5.4.0",
     "@types/node": "^26.2.0",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.4",

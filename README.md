@@ -50,6 +50,16 @@ npm run package:dir
 
 Windows 安装包应在 Windows x64 构建机上执行 `npm run package`。Rust sidecar 必须在目标平台编译，不能把 macOS 二进制直接打入 Windows 安装包。
 
+### Sentry 错误与日志
+
+主进程和所有 renderer 都会初始化 `@sentry/electron`。生产包默认上报未捕获异常、原生崩溃、renderer 退出、录音引擎离线，以及 `warn` / `error` 和关键录制生命周期日志；不会采集截图或默认个人信息。发送前会过滤本地路径、录制任务 ID、脚本内容和常见密钥字段。
+
+- `SENTRY_DSN`：可覆盖内置的公开 DSN；设置为空字符串可关闭上报。
+- `DATABAKER_SENTRY_DISABLED=1`：在本地运行时临时关闭 Sentry。
+- `SENTRY_ENVIRONMENT`：可覆盖默认的 `development` / `production` 环境名。
+- `.env.sentry-build-plugin`：Wizard 创建的本地 source map 上传 token 文件，已加入 `.gitignore`，不能提交。
+- GitHub Actions：在仓库 secret 中配置 `SENTRY_AUTH_TOKEN`，Windows 打包时会上传 renderer、main 和 preload 的 source map；安装包不会包含应用自身的 `.map` 文件。没有 token 时，本地构建仍会成功，但会跳过上传。
+
 ### Windows 外置声卡生产验收
 
 源码环境可直接枚举引擎识别的声卡：

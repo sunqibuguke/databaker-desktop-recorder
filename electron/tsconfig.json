@@ -5,6 +5,8 @@
     "moduleResolution": "Node16",
     "rootDir": ".",
     "outDir": "../dist-electron",
+    "sourceMap": true,
+    "inlineSources": true,
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,

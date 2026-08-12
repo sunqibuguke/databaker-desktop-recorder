@@ -29,6 +29,7 @@ import { createLatestFrameCommitter } from './latest-frame';
 import type { LatestFrameCommitter } from './latest-frame';
 import type { SessionNoiseCheckOperation } from './recording-workflow';
 import type { Attempt, AudioDevice, CapturePreset, CapturePresetDraft, CapturePresetStore, EngineEvent, ExportResult, HeadSilencePhase, ItemState, Meter, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SealInterruptedSessionResult, SessionSnapshot } from './types';
+import { reportRendererError } from './sentry';
 
 type Phase = 'home' | 'setup' | 'running';
 type EngineStatus = 'connecting' | 'ready' | 'offline';
@@ -59,7 +60,7 @@ type StoppedSessionState = {
 };
 type CaptureExitMode = 'pause' | 'finish' | 'fault';
 type OptionalRunningSessionState = ({ active: true } & RunningSessionState) | { active: false };
-type IconName = 'check' | 'chevron-left' | 'chevron-right' | 'export' | 'file' | 'folder' | 'history' | 'home' | 'headphones' | 'meter' | 'microphone' | 'play' | 'plus' | 'record' | 'refresh' | 'retake' | 'skip' | 'sliders' | 'stop';
+type IconName = 'check' | 'chevron-left' | 'chevron-right' | 'export' | 'file' | 'folder' | 'history' | 'home' | 'headphones' | 'meter' | 'microphone' | 'more' | 'play' | 'plus' | 'record' | 'refresh' | 'retake' | 'skip' | 'sliders' | 'stop' | 'trash';
 
 const NOISE_CHECK_PROGRESS_STEPS = 15;
 const NOISE_CHECK_PROGRESS_INTERVAL_MS = 200;
@@ -241,10 +242,12 @@ function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
     case 'file': return <svg {...common}><path d="M6 3h8l4 4v14H6z" /><path d="M14 3v5h5M9 13h6M9 17h6" /></svg>;
     case 'folder': return <svg {...common}><path d="M3 6h7l2 2h9v11H3z" /></svg>;
     case 'history': return <svg {...common}><path d="M4 5v5h5" /><path d="M5.2 16a8 8 0 1 0 .1-8.2L4 10" /><path d="M12 7v5l3 2" /></svg>;
+    case 'trash': return <svg {...common}><path d="M4 7h16" /><path d="M9 7V4h6v3" /><path d="m6 7 1 13h10l1-13" /><path d="M10 11v5M14 11v5" /></svg>;
     case 'home': return <svg {...common}><path d="m3 11 9-8 9 8" /><path d="M5 10v10h14V10M9 20v-6h6v6" /></svg>;
     case 'headphones': return <svg {...common}><path d="M4 15v-3a8 8 0 0 1 16 0v3" /><path d="M4 14h4v7H5a1 1 0 0 1-1-1zm16 0h-4v7h3a1 1 0 0 0 1-1z" /></svg>;
     case 'meter': return <svg {...common}><path d="M4 18V9m5 9V5m6 13v-7m5 7V3" /></svg>;
     case 'microphone': return <svg {...common}><rect x="8" y="3" width="8" height="12" rx="4" /><path d="M5 11a7 7 0 0 0 14 0M12 18v3M9 21h6" /></svg>;
+    case 'more': return <svg {...common}><circle cx="5" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="19" cy="12" r="1" fill="currentColor" stroke="none" /></svg>;
     case 'play': return <svg {...common}><path d="m8 5 11 7-11 7z" /></svg>;
     case 'plus': return <svg {...common}><path d="M12 5v14M5 12h14" /></svg>;
     case 'record': return <svg {...common}><circle cx="12" cy="12" r="6" fill="currentColor" stroke="none" /></svg>;
@@ -271,14 +274,15 @@ function StudioStatus({ engineStatus, message, isError = false, right }: { engin
   </footer>;
 }
 
-function HomeHeader({ engineStatus }: { engineStatus: EngineStatus }) {
+function HomeHeader({ engineStatus, preview }: { engineStatus: EngineStatus; preview: boolean }) {
   return <header className="home-header">
-    <div className="home-brand"><span className="home-brand-mark"><img src={appLogo} alt="DataBaker" /></span><div><strong>DataBaker Recorder</strong><small>桌面音频采集</small></div></div>
+    <div className="home-brand"><span className="home-brand-mark"><img src={appLogo} alt="DataBaker" /></span><div><strong>DataBaker Recorder</strong><small>桌面音频采集</small></div>{preview && <em className="preview-badge">浏览器界面预览</em>}</div>
     <div className={`home-engine ${engineStatus}`}><i /><span>{engineStatus === 'ready' ? '录音引擎已就绪' : engineStatus === 'connecting' ? '正在连接录音引擎' : '录音引擎离线'}</span></div>
   </header>;
 }
 
 function RecorderApp() {
+  const isBrowserPreview = window.recorder.runtime === 'preview';
   const [phase, setPhase] = useState<Phase>('home');
   const [engineStatus, setEngineStatus] = useState<EngineStatus>('connecting');
   const [devices, setDevices] = useState<AudioDevice[]>([]);
@@ -319,6 +323,7 @@ function RecorderApp() {
   const [presetManagerOpen, setPresetManagerOpen] = useState(false);
   const [presetName, setPresetName] = useState('');
   const [presetWarning, setPresetWarning] = useState('');
+  const [presetBusy, setPresetBusy] = useState(false);
   const [recordings, setRecordings] = useState<RecordingHistoryEntry[]>([]);
   const [historyFilter, setHistoryFilter] = useState<HistoryFilter>('all');
   const [historyLoading, setHistoryLoading] = useState(true);
@@ -327,11 +332,15 @@ function RecorderApp() {
   const [resumingSessionDir, setResumingSessionDir] = useState('');
   const [sealingSessionDir, setSealingSessionDir] = useState('');
   const [sealConfirmRecording, setSealConfirmRecording] = useState<RecordingHistoryEntry | null>(null);
+  const [deleteConfirmRecording, setDeleteConfirmRecording] = useState<RecordingHistoryEntry | null>(null);
+  const [deletingSessionDir, setDeletingSessionDir] = useState('');
+  const [openActionsSessionDir, setOpenActionsSessionDir] = useState('');
   const [resumeError, setResumeError] = useState<{ sessionDir: string; message: string } | null>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const resumeOperationRef = useRef(false);
   const sealOperationRef = useRef(false);
   const pauseOperationRef = useRef(false);
+  const presetOperationRef = useRef(false);
   const noiseCheckActivationRef = useRef(0);
   const noiseCheckRequestSequenceRef = useRef(0);
   const noiseCheckOperationRef = useRef<SessionNoiseCheckOperation | null>(null);
@@ -546,6 +555,7 @@ function RecorderApp() {
     try {
       return await action();
     } catch (caught) {
+      reportRendererError(label, caught);
       setError(errorMessage(caught));
       return null;
     } finally {
@@ -729,6 +739,9 @@ function RecorderApp() {
   }
 
   async function selectCapturePreset(id: string) {
+    if (presetOperationRef.current) return;
+    presetOperationRef.current = true;
+    setPresetBusy(true);
     try {
       const selected = capturePresetStore.presets.find((preset) => preset.id === id) ?? null;
       const store = await window.recorder.setLastCapturePreset(selected?.id ?? null);
@@ -739,13 +752,19 @@ function RecorderApp() {
       setPresetWarning('');
     } catch (caught) {
       setError(`无法选择采集预设：${errorMessage(caught)}`);
+    } finally {
+      presetOperationRef.current = false;
+      setPresetBusy(false);
     }
   }
 
   async function saveCapturePreset(mode: 'new' | 'update') {
+    if (presetOperationRef.current) return;
     const name = presetName.trim();
     const draft = currentCapturePresetDraft(name, mode === 'update' ? selectedCapturePreset?.id : undefined);
     if (!draft) return;
+    presetOperationRef.current = true;
+    setPresetBusy(true);
     try {
       const store = await window.recorder.saveCapturePreset(draft);
       setCapturePresetStore(store);
@@ -757,11 +776,16 @@ function RecorderApp() {
       setNotice(mode === 'update' ? `已更新采集预设“${name}”` : `已保存采集预设“${name}”`);
     } catch (caught) {
       setError(`无法保存采集预设：${errorMessage(caught)}`);
+    } finally {
+      presetOperationRef.current = false;
+      setPresetBusy(false);
     }
   }
 
   async function deleteCapturePreset() {
-    if (!selectedCapturePreset) return;
+    if (!selectedCapturePreset || presetOperationRef.current) return;
+    presetOperationRef.current = true;
+    setPresetBusy(true);
     try {
       const removedName = selectedCapturePreset.name;
       const store = await window.recorder.deleteCapturePreset(selectedCapturePreset.id);
@@ -773,6 +797,9 @@ function RecorderApp() {
       setNotice(`已删除采集预设“${removedName}”；当前参数仍保留为未保存配置。`);
     } catch (caught) {
       setError(`无法删除采集预设：${errorMessage(caught)}`);
+    } finally {
+      presetOperationRef.current = false;
+      setPresetBusy(false);
     }
   }
 
@@ -827,6 +854,31 @@ function RecorderApp() {
       }
     } finally {
       if (sequence === historyLoadSequenceRef.current) setHistoryLoadingMore(false);
+    }
+  }
+
+  async function deleteHistoricalRecording(recording: RecordingHistoryEntry) {
+    if (!outputDir || recording.is_active || deletingSessionDir) return;
+    setDeletingSessionDir(recording.session_dir);
+    setBusy('正在将录制任务移到回收站…');
+    setError('');
+    try {
+      await window.recorder.deleteRecording(
+        outputDir,
+        recording.session_dir,
+        recording.session_id,
+      );
+      setRecordings((current) => current.filter((candidate) => (
+        candidate.session_dir !== recording.session_dir
+      )));
+      setResumeError((current) => current?.sessionDir === recording.session_dir ? null : current);
+      setNotice(`已将录制任务“${recording.session_id}”移到系统回收站。`);
+      await refreshRecordings();
+    } catch (caught) {
+      setError(`无法删除录制任务：${errorMessage(caught)}`);
+    } finally {
+      setDeletingSessionDir('');
+      setBusy('');
     }
   }
 
@@ -934,15 +986,15 @@ function RecorderApp() {
         clearSessionNoiseCheck();
         setBusy('');
         setDataSafetyAlert('');
-        setError(`录音引擎连续三次自动恢复失败：${terminalRecoveryFailure.error}。已返回任务列表，已落盘母音频仍保留；请使用“修复并封存”。`);
-        setNotice('已返回任务列表。已落盘母音频仍保留，请使用“修复并封存”。');
+        setError(`录音引擎连续三次自动恢复失败：${terminalRecoveryFailure.error}。已返回任务列表，已落盘母音频仍保留；请使用“修复中断任务”。`);
+        setNotice('已返回任务列表。已落盘母音频仍保留，请使用“修复中断任务”。');
         void refreshRecordings(outputDirRef.current);
       } else if (message.event === 'offline_seal_cleanup_finished') {
         setEngineStatus('ready');
         setNotice('离线封存的后台清理已完成，可以刷新任务或重试。');
       } else if (message.event === 'engine_idle_after_stopping_crash') {
         setEngineStatus('ready');
-        setNotice('录音引擎已重启；中断任务的已落盘母音频仍保留，请使用“修复并封存”。');
+        setNotice('录音引擎已重启；中断任务的已落盘母音频仍保留，请使用“修复中断任务”。');
       }
     });
     const unsubscribeOffline = window.recorder.onEngineOffline((message) => {
@@ -1338,7 +1390,7 @@ function RecorderApp() {
     if (sealOperationRef.current || resumeOperationRef.current) return;
     sealOperationRef.current = true;
     setSealingSessionDir(recording.session_dir);
-    setBusy('正在修复并封存已落盘的母音频…');
+    setBusy('正在修复中断任务并安全收尾母音频…');
     setError('');
     setDataSafetyAlert('');
     let sealed: SealInterruptedSessionResult;
@@ -1348,7 +1400,7 @@ function RecorderApp() {
         { session_dir: recording.session_dir, session_id: recording.session_id },
       );
     } catch (caught) {
-      const message = `无法封存“${recording.session_id}”：${errorMessage(caught)}`;
+      const message = `无法修复中断任务“${recording.session_id}”：${errorMessage(caught)}`;
       setError(message);
       setResumeError({ sessionDir: recording.session_dir, message });
       return;
@@ -1378,9 +1430,16 @@ function RecorderApp() {
       : `“${recording.session_id}”已封存 ${durableDuration} 母音频${recovered}${canExportNow ? '，现在可以生成交付' : ''}`);
   }
 
-  async function returnToActiveRecording() {
+  async function returnToActiveRecording(recording: RecordingHistoryEntry) {
     const current = await run('正在返回当前录制…', () => window.recorder.request<RunningSessionState>('get_state'));
     if (!current) return;
+    if (current.snapshot.session_id !== recording.session_id
+      || !current.session_dir
+      || current.session_dir !== recording.session_dir) {
+      setError('当前录音引擎处理的任务与所选列表项不一致，已取消进入；请刷新任务列表。');
+      await refreshRecordings();
+      return;
+    }
     if (current.snapshot.status !== 'recording') {
       setError('当前任务仍在安全收尾，不能进入录制界面。');
       await refreshRecordings();
@@ -1391,7 +1450,10 @@ function RecorderApp() {
 
   async function continuePendingStop(recording: RecordingHistoryEntry) {
     const stopped = await run('正在继续安全封存…', () => (
-      window.recorder.request<StoppedSessionState>('stop_session')
+      window.recorder.request<StoppedSessionState>('stop_session', {
+        expected_session_id: recording.session_id,
+        expected_session_dir: recording.session_dir,
+      })
     ));
     await refreshRecordings();
     if (!stopped) return;
@@ -1401,7 +1463,19 @@ function RecorderApp() {
 
   async function openRecordingExport(recording: RecordingHistoryEntry) {
     const target = await window.recorder.joinPath(recording.session_dir, 'export');
-    await run('正在打开交付目录…', () => window.recorder.openPath(target));
+    const opened = await run('正在打开交付目录…', async () => {
+      await window.recorder.openPath(target);
+      return true;
+    });
+    if (opened) setNotice(`已在系统文件管理器中打开“${recording.session_id}”的交付目录。`);
+  }
+
+  async function openRecordingDirectory(recording: RecordingHistoryEntry) {
+    const opened = await run('正在打开录制目录…', async () => {
+      await window.recorder.openPath(recording.session_dir);
+      return true;
+    });
+    if (opened) setNotice(`已在系统文件管理器中打开录制任务“${recording.session_id}”。`);
   }
 
   function finishSession() {
@@ -1428,11 +1502,18 @@ function RecorderApp() {
     }
   }
 
-  async function stopSessionWithReconciliation(label: string): Promise<StoppedSessionState | null> {
+  async function stopSessionWithReconciliation(
+    label: string,
+    expectedSessionId: string,
+    expectedSessionDir: string,
+  ): Promise<StoppedSessionState | null> {
     setBusy(label);
     setError('');
     try {
-      return await window.recorder.request<StoppedSessionState>('stop_session');
+      return await window.recorder.request<StoppedSessionState>('stop_session', {
+        expected_session_id: expectedSessionId,
+        expected_session_dir: expectedSessionDir,
+      });
     } catch (caught) {
       const stopError = errorMessage(caught);
       setError(stopError);
@@ -1457,7 +1538,7 @@ function RecorderApp() {
             overflow_samples: Math.max(snapshot.overflow_samples, meter.overflow_samples),
             updated_at: new Date().toISOString(),
           },
-          warnings: ['已确认录音引擎不再采集，但最终元数据未证明完整封存；请从任务列表执行“修复并封存”。'],
+          warnings: ['已确认录音引擎不再采集，但最终元数据未证明完整封存；请从任务列表执行“修复中断任务”。'],
           reconciled_inactive_after_error: true,
         };
       } catch (reconciliationError) {
@@ -1470,7 +1551,7 @@ function RecorderApp() {
   }
 
   async function safeStopAndReturn(mode: CaptureExitMode) {
-    if (pauseOperationRef.current || phase !== 'running' || !sessionDir) return;
+    if (pauseOperationRef.current || phase !== 'running' || !sessionDir || !snapshot) return;
     pauseOperationRef.current = true;
     setPauseConfirmOpen(false);
     setFinishConfirmOpen(false);
@@ -1483,6 +1564,8 @@ function RecorderApp() {
         closeActiveAttempt: () => stopAttempt(true),
         stopSession: () => stopSessionWithReconciliation(
           mode === 'pause' ? '正在封存母轨并返回任务列表…' : '正在安全结束持续录音…',
+          snapshot.session_id,
+          sessionDir,
         ),
         closePrompter: () => window.recorder.closePrompter(),
       });
@@ -1511,8 +1594,8 @@ function RecorderApp() {
       setFinishConfirmOpen(false);
       setPauseConfirmOpen(false);
       if (stopped.reconciled_inactive_after_error) {
-        setDataSafetyAlert('已确认录音引擎不再采集，但本任务未证明完整封存；请立即执行“修复并封存”，不要将其当作可继续或可交付任务。');
-        setNotice('已返回任务列表，当前任务需要修复并封存。');
+        setDataSafetyAlert('已确认录音引擎不再采集，但本任务尚未安全收尾；请立即执行“修复中断任务”，不要将其当作可继续或可交付任务。');
+        setNotice('已返回任务列表，当前任务需要修复。');
       } else if (stoppedWithFault) {
         setDataSafetyAlert('采集故障已结束：原始母轨和故障证据已保留，禁止直接续录或常规交付，请在任务列表检查或修复封存。');
         setNotice('故障任务已返回列表，已落盘母轨仍保留。');
@@ -1546,6 +1629,8 @@ function RecorderApp() {
     setResumeError(null);
     setResumingSessionDir('');
     setSealConfirmRecording(null);
+    setDeleteConfirmRecording(null);
+    setOpenActionsSessionDir('');
     setPhase('setup');
     clearSessionNoiseCheck();
     setSnapshot(null);
@@ -1577,6 +1662,8 @@ function RecorderApp() {
     setResumingSessionDir('');
     setResumeError(null);
     setSealConfirmRecording(null);
+    setDeleteConfirmRecording(null);
+    setOpenActionsSessionDir('');
     setPhase('home');
     clearSessionNoiseCheck();
     setSnapshot(null);
@@ -1595,6 +1682,10 @@ function RecorderApp() {
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
+      if (deleteConfirmRecording) {
+        if (event.key === 'Escape' && !deletingSessionDir) setDeleteConfirmRecording(null);
+        return;
+      }
       if (sealConfirmRecording) {
         if (event.key === 'Escape' && !sealingSessionDir) setSealConfirmRecording(null);
         return;
@@ -1605,6 +1696,10 @@ function RecorderApp() {
       }
       if (pauseConfirmOpen) {
         if (event.key === 'Escape' && !pauseOperationRef.current) setPauseConfirmOpen(false);
+        return;
+      }
+      if (openActionsSessionDir && event.key === 'Escape') {
+        setOpenActionsSessionDir('');
         return;
       }
       if (phase !== 'running' || busy) return;
@@ -1647,6 +1742,16 @@ function RecorderApp() {
     return () => window.removeEventListener('keydown', onKeyDown);
   });
 
+  useEffect(() => {
+    if (!openActionsSessionDir) return undefined;
+    function closeActionsMenu(event: PointerEvent) {
+      const target = event.target as HTMLElement | null;
+      if (!target?.closest('.home-actions-menu-wrap')) setOpenActionsSessionDir('');
+    }
+    window.addEventListener('pointerdown', closeActionsMenu);
+    return () => window.removeEventListener('pointerdown', closeActionsMenu);
+  }, [openActionsSessionDir]);
+
   if (phase === 'home') {
     const filters: Array<{ id: HistoryFilter; label: string }> = [
       { id: 'all', label: '全部' },
@@ -1654,10 +1759,10 @@ function RecorderApp() {
       { id: 'unfinished', label: '未完成' },
     ];
     return <div className="home-shell">
-      <HomeHeader engineStatus={engineStatus} />
+      <HomeHeader engineStatus={engineStatus} preview={isBrowserPreview} />
       <main className="home-main" data-testid="recordings-workspace">
         <header className="home-titlebar">
-          <div><h1>录制任务</h1><p>从脚本开始一次采集，或查看本机已有任务。</p></div>
+          <div><h1>录制任务</h1><p>{isBrowserPreview ? '当前是浏览器界面预览；打开本机文件夹、真实录音等系统功能请使用桌面应用。' : '从脚本开始一次采集，或查看本机已有任务。'}</p></div>
           <button data-testid="new-recording" className="home-primary" onClick={beginNewRecording} disabled={Boolean(busy)}><Icon name="plus" size={16} />新建录制</button>
         </header>
 
@@ -1671,7 +1776,7 @@ function RecorderApp() {
         </section>
 
         <section className="home-list" aria-label="录制任务列表">
-          <div className="home-list-header"><span>任务</span><span>进度</span><span>更新时间</span><span>状态</span><span /></div>
+          <div className="home-list-header"><span>任务</span><span>进度</span><span>更新时间</span><span>状态</span><span className="home-actions-heading">操作</span></div>
           {historyLoading && <div className="home-empty"><Icon name="refresh" size={20} /><strong>正在读取录制任务</strong></div>}
           {!historyLoading && !filteredRecordings.length && <div className="home-empty"><span className="home-empty-icon"><Icon name="microphone" size={24} /></span><strong>{recordings.length ? '这里还没有任务' : '开始第一条录制任务'}</strong><p>{recordings.length ? '切换到其他状态查看已有任务。' : '导入三列 CSV 或 TXT，配置设备后即可开始采集。'}</p>{!recordings.length && <button className="home-primary" onClick={beginNewRecording} disabled={Boolean(busy)}><Icon name="plus" size={15} />新建录制</button>}</div>}
           {!historyLoading && filteredRecordings.map((recording) => {
@@ -1680,30 +1785,39 @@ function RecorderApp() {
             const progress = recording.total_items ? handled / recording.total_items * 100 : 0;
             const isResuming = resumingSessionDir === recording.session_dir;
             const isSealing = sealingSessionDir === recording.session_dir;
+            const isDeleting = deletingSessionDir === recording.session_dir;
+            const actionsOpen = openActionsSessionDir === recording.session_dir;
             const rowResumeError = resumeError?.sessionDir === recording.session_dir ? resumeError.message : '';
             const recoveryPlan = planHistoryRecovery(recording);
-            return <article key={recording.session_dir} className={`home-recording-row ${rowResumeError ? 'has-error' : ''}`}>
+            return <article key={recording.session_dir} className={`home-recording-row ${rowResumeError ? 'has-error' : ''} ${actionsOpen ? 'menu-open' : ''}`}>
               <div className="home-recording-name"><i className={`recording-dot ${state.kind}`} /><div><strong>{recording.session_id}</strong><small title={recording.history_issue}>{recording.history_issue || <>{recording.script_name || '未记录源文件'} · {recording.sample_rate ? `${recording.sample_rate.toLocaleString()} Hz / ${recording.bit_depth}-bit` : '格式未知'}</>}</small></div></div>
               <div className="home-recording-progress"><span><b>{handled}</b><small> / {recording.total_items}</small></span><i><em style={{ width: `${progress}%` }} /></i></div>
               <time>{formatDateTime(recording.updated_at)}</time>
               <span><em className={`recording-status ${state.kind}`}>{state.label}</em></span>
               <div className="home-row-actions">
-                <button title="打开任务目录" aria-label={`打开 ${recording.session_id} 的任务目录`} onClick={() => void run('正在打开录制目录…', () => window.recorder.openPath(recording.session_dir))}><Icon name="folder" size={15} /></button>
                 {recording.is_active
                   ? recording.status === 'stopping'
                     ? <button className="row-primary" onClick={() => void continuePendingStop(recording)} disabled={Boolean(busy)}>继续安全停止</button>
-                    : <button className="row-primary" onClick={() => void returnToActiveRecording()} disabled={Boolean(busy)}>返回录制</button>
+                    : <button className="row-primary" onClick={() => void returnToActiveRecording(recording)} disabled={Boolean(busy)}>返回录制</button>
                   : recoveryPlan.primary === 'resume'
-                    ? <><button data-testid="resume-recording" className={`row-primary resume ${isResuming ? 'working' : ''}`} aria-busy={isResuming} onClick={() => void resumeHistoricalRecording(recording)} disabled={Boolean(busy) || Boolean(resumingSessionDir) || Boolean(sealingSessionDir)}>{isResuming ? <><i />恢复中…</> : recording.status === 'recording' ? '恢复录制' : '继续录制'}</button>{recoveryPlan.secondary === 'seal' && <button data-testid="seal-recording" className="row-secondary-seal" aria-busy={isSealing} onClick={() => setSealConfirmRecording(recording)} disabled={Boolean(busy) || Boolean(resumingSessionDir) || Boolean(sealingSessionDir)}>{isSealing ? '封存中…' : '修复并封存'}</button>}</>
+                    ? <button data-testid="resume-recording" className={`row-primary resume ${isResuming ? 'working' : ''}`} aria-busy={isResuming} onClick={() => void resumeHistoricalRecording(recording)} disabled={Boolean(busy) || Boolean(resumingSessionDir) || Boolean(sealingSessionDir)}>{isResuming ? <><i />恢复中…</> : recording.status === 'recording' ? '恢复录制' : '继续录制'}</button>
                     : recoveryPlan.primary === 'seal'
-                      ? <button data-testid="seal-recording" className="row-primary seal" aria-busy={isSealing} onClick={() => setSealConfirmRecording(recording)} disabled={Boolean(busy) || Boolean(resumingSessionDir) || Boolean(sealingSessionDir)}>{isSealing ? '封存中…' : '修复并封存'}</button>
+                      ? <button data-testid="seal-recording" className="row-primary seal" aria-busy={isSealing} onClick={() => setSealConfirmRecording(recording)} disabled={Boolean(busy) || Boolean(resumingSessionDir) || Boolean(sealingSessionDir)}>{isSealing ? '修复中…' : '修复中断任务'}</button>
                     : recording.export_exists
                   ? <button className="row-primary" onClick={() => void openRecordingExport(recording)}>查看交付</button>
                   : recording.status === 'stopped'
                     ? <button className="row-primary" onClick={() => void exportHistoricalRecording(recording)} disabled={Boolean(busy)}>生成交付</button>
-                    : <button className="row-primary" onClick={() => void run('正在打开录制目录…', () => window.recorder.openPath(recording.session_dir))}>检查文件</button>}
+                    : <button className="row-primary" onClick={() => void openRecordingDirectory(recording)}>检查文件</button>}
+                <div className="home-actions-menu-wrap">
+                  <button data-testid="recording-actions-menu" className="row-more" title="更多操作" aria-label={`${recording.session_id} 的更多操作`} aria-haspopup="menu" aria-expanded={actionsOpen} onClick={() => setOpenActionsSessionDir(actionsOpen ? '' : recording.session_dir)} disabled={Boolean(busy) || Boolean(deletingSessionDir)}><Icon name="more" size={16} /></button>
+                  {actionsOpen && <div className="home-actions-menu" role="menu" aria-label={`${recording.session_id} 的操作`}>
+                    <button role="menuitem" onClick={() => { setOpenActionsSessionDir(''); void openRecordingDirectory(recording); }}><Icon name="folder" size={14} /><span>打开任务目录</span></button>
+                    {!recording.is_active && recoveryPlan.secondary === 'seal' && <button data-testid="seal-recording" role="menuitem" onClick={() => { setOpenActionsSessionDir(''); setSealConfirmRecording(recording); }} disabled={Boolean(busy) || Boolean(resumingSessionDir) || Boolean(sealingSessionDir)}><Icon name="history" size={14} /><span>{isSealing ? '修复中…' : '修复中断任务'}</span></button>}
+                    {!recording.is_active && <><i className="home-actions-divider" /><button data-testid="delete-recording" className="danger" role="menuitem" aria-busy={isDeleting} onClick={() => { setOpenActionsSessionDir(''); setDeleteConfirmRecording(recording); }} disabled={Boolean(busy) || Boolean(resumingSessionDir) || Boolean(sealingSessionDir) || Boolean(deletingSessionDir)}><Icon name="trash" size={14} /><span>删除录制任务</span></button></>}
+                  </div>}
+                </div>
               </div>
-              {rowResumeError && <div className="home-row-error" role="alert"><strong>恢复未完成</strong><span title={rowResumeError}>{rowResumeError}</span><div className="home-row-error-actions"><button data-testid="seal-recording" className="seal" aria-busy={isSealing} onClick={() => setSealConfirmRecording(recording)} disabled={Boolean(busy) || Boolean(resumingSessionDir) || Boolean(sealingSessionDir)}>{isSealing ? '封存中…' : '修复并封存'}</button><button onClick={() => setResumeError(null)} disabled={Boolean(busy)}>关闭</button></div></div>}
+              {rowResumeError && <div className="home-row-error" role="alert"><strong>恢复未完成</strong><span title={rowResumeError}>{rowResumeError}</span><div className="home-row-error-actions"><button data-testid="seal-recording" className="seal" aria-busy={isSealing} onClick={() => setSealConfirmRecording(recording)} disabled={Boolean(busy) || Boolean(resumingSessionDir) || Boolean(sealingSessionDir)}>{isSealing ? '修复中…' : '修复中断任务'}</button><button onClick={() => setResumeError(null)} disabled={Boolean(busy)}>关闭</button></div></div>}
             </article>;
           })}
           {!historyLoading && historyNextOffset !== null && <div className="home-load-more"><button onClick={() => void loadMoreRecordings()} disabled={historyLoadingMore}>{historyLoadingMore ? '正在加载…' : '加载更多任务'}</button></div>}
@@ -1713,17 +1827,25 @@ function RecorderApp() {
       </main>
       {sealConfirmRecording && <div className="dialog-backdrop" role="presentation">
         <section className="studio-dialog seal-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="seal-confirm-title">
-          <header><span className="dialog-icon"><Icon name="history" size={19} /></span><div><small>OFFLINE RECOVERY</small><h2 id="seal-confirm-title">修复并封存中断任务？</h2></div></header>
-          <p>系统会先确认当前没有活跃录音，再修复已落盘 WAV 头和未闭合版本，并把任务写成可恢复的安全状态。</p>
+          <header><span className="dialog-icon"><Icon name="history" size={19} /></span><div><small>INTERRUPTED TASK RECOVERY</small><h2 id="seal-confirm-title">修复这个中断任务？</h2></div></header>
+          <p>系统会先确认当前没有活跃录音，再修复已落盘 WAV 头和未正常结束的录音版本，安全收尾母音频和任务进度。</p>
           <div className="dialog-warning">任务：{sealConfirmRecording.session_id}<br />此操作不会覆盖母音频，也不会自动生成交付。{sealConfirmRecording.status === 'faulted' || sealConfirmRecording.overflow_samples > 0 ? '封存后仍保留采集故障标记，禁止继续录制和常规交付，请人工检查原始分段。' : '封存后，已完成任务可直接生成交付；未完成任务仍可继续录制。'}</div>
-          <footer><button className="button" onClick={() => setSealConfirmRecording(null)} disabled={Boolean(busy)}>取消</button><button data-testid="confirm-seal-recording" className="button primary" onClick={() => { const recording = sealConfirmRecording; setSealConfirmRecording(null); void sealHistoricalRecording(recording); }} disabled={Boolean(busy)}>确认修复并封存</button></footer>
+          <footer><button className="button" onClick={() => setSealConfirmRecording(null)} disabled={Boolean(busy)}>取消</button><button data-testid="confirm-seal-recording" className="button primary" onClick={() => { const recording = sealConfirmRecording; setSealConfirmRecording(null); void sealHistoricalRecording(recording); }} disabled={Boolean(busy)}>确认修复</button></footer>
+        </section>
+      </div>}
+      {deleteConfirmRecording && <div className="dialog-backdrop" role="presentation">
+        <section className="studio-dialog delete-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-confirm-title">
+          <header><span className="dialog-icon danger"><Icon name="trash" size={19} /></span><div><small>MOVE TO TRASH</small><h2 id="delete-confirm-title">删除这条录制任务？</h2></div></header>
+          <p>整条任务目录将移到系统回收站，包括母音频、已录版本、元数据和交付文件。</p>
+          <div className="dialog-warning danger">任务：{deleteConfirmRecording.session_id}<br />删除后不能在应用内继续录制或生成交付；如果误删，请尽快从系统回收站恢复。</div>
+          <footer><button className="button" onClick={() => setDeleteConfirmRecording(null)} disabled={Boolean(deletingSessionDir)}>取消</button><button data-testid="confirm-delete-recording" className="button danger" onClick={() => { const recording = deleteConfirmRecording; setDeleteConfirmRecording(null); void deleteHistoricalRecording(recording); }} disabled={Boolean(deletingSessionDir)}>移到回收站</button></footer>
         </section>
       </div>}
     </div>;
   }
 
   if (phase === 'setup') {
-    const readyToStart = engineStatus === 'ready' && scriptItems.length > 0 && !scriptErrors.length && Boolean(outputDir) && captureConfigurationValid && !busy;
+    const readyToStart = engineStatus === 'ready' && scriptItems.length > 0 && !scriptErrors.length && Boolean(outputDir) && captureConfigurationValid && !busy && !presetBusy;
     return <div className="studio-shell">
       <StudioChrome phase={phase} title="新建录制" engineStatus={engineStatus} onBack={returnToRecordings} />
       <div className="studio-workspace setup-workspace" data-testid="setup-workspace">
@@ -1750,13 +1872,13 @@ function RecorderApp() {
               <div className="property-heading"><span>02</span><div><h2>音频输入</h2><p>选择硬件设备与本次录制格式</p></div></div>
               <div className="capture-preset-stack">
                 <div className="capture-preset-bar">
-                  <label><span>采集预设</span><select data-testid="capture-preset-select" value={capturePresetStore.lastSelectedPresetId ?? ''} onChange={(event) => void selectCapturePreset(event.target.value)} disabled={Boolean(busy)}><option value="">未保存配置</option>{capturePresetStore.presets.map((preset) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}</select></label>
+                  <label><span>采集预设</span><select data-testid="capture-preset-select" value={capturePresetStore.lastSelectedPresetId ?? ''} onChange={(event) => void selectCapturePreset(event.target.value)} disabled={Boolean(busy) || presetBusy}><option value="">未保存配置</option>{capturePresetStore.presets.map((preset) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}</select></label>
                   <span className={`preset-state ${presetDirty ? 'dirty' : ''}`}>{selectedCapturePreset ? presetDirty ? '已调整，未保存' : `已应用“${selectedCapturePreset.name}”` : '当前参数未保存'}</span>
-                  <button className="button subtle" onClick={() => { setPresetName(selectedCapturePreset?.name ?? ''); setPresetManagerOpen((open) => !open); }} disabled={Boolean(busy)}>{presetManagerOpen ? '收起' : '管理预设'}</button>
+                  <button className="button subtle" onClick={() => { setPresetName(selectedCapturePreset?.name ?? ''); setPresetManagerOpen((open) => !open); }} disabled={Boolean(busy) || presetBusy}>{presetManagerOpen ? '收起' : '管理预设'}</button>
                 </div>
                 {presetManagerOpen && <div className="capture-preset-editor">
-                  <label className="field"><span>预设名称</span><input data-testid="capture-preset-name" maxLength={40} value={presetName} placeholder="例如：棚内 48k" onChange={(event) => setPresetName(event.target.value)} /></label>
-                  <div><button className="button" onClick={() => void saveCapturePreset('new')} disabled={!presetName.trim() || Boolean(busy)}>{selectedCapturePreset ? '另存为新预设' : '保存为预设'}</button>{selectedCapturePreset && <><button className="button primary" onClick={() => void saveCapturePreset('update')} disabled={!presetName.trim() || Boolean(busy)}>更新当前预设</button><button className="button danger-button" onClick={() => void deleteCapturePreset()} disabled={Boolean(busy)}>删除</button></>}</div>
+                  <label className="field"><span>预设名称</span><input data-testid="capture-preset-name" maxLength={40} value={presetName} placeholder="例如：棚内 48k" onChange={(event) => setPresetName(event.target.value)} disabled={Boolean(busy) || presetBusy} /></label>
+                  <div><button className="button" onClick={() => void saveCapturePreset('new')} disabled={!presetName.trim() || Boolean(busy) || presetBusy}>{selectedCapturePreset ? '另存为新预设' : '保存为预设'}</button>{selectedCapturePreset && <><button className="button primary" onClick={() => void saveCapturePreset('update')} disabled={!presetName.trim() || Boolean(busy) || presetBusy}>更新当前预设</button><button className="button danger-button" onClick={() => void deleteCapturePreset()} disabled={Boolean(busy) || presetBusy}>删除</button></>}</div>
                 </div>}
               </div>
               <div className="form-grid audio-form"><label className="field span-2"><span>输入设备（Windows 系统驱动 / 声卡）</span><div className="field-row"><select value={deviceId} onChange={(event) => { const device = devices.find((candidate) => candidate.id === event.target.value); setDeviceId(event.target.value); setDeviceName(device?.name ?? ''); }} disabled={Boolean(busy)}>{!devices.length && <option value="">未发现输入设备</option>}{deviceId && !selectedDevice && <option value={deviceId}>{deviceName || deviceId}（不可用）</option>}{devices.map((device) => <option value={device.id} key={device.id}>{device.name}{device.is_default ? '（系统默认）' : ''}</option>)}</select><button className="square-button" title="刷新设备" onClick={() => void loadDevices()}><Icon name="refresh" /></button></div></label><label className={`field ${selectedDevice && !rateOptions.includes(sampleRate) ? 'invalid' : ''}`}><span>采样率</span><select value={sampleRate} onChange={(event) => setSampleRate(Number(event.target.value))}>{!rateOptions.includes(sampleRate) && <option value={sampleRate}>{sampleRate.toLocaleString()} Hz（不兼容）</option>}{rateOptions.map((rate) => <option value={rate} key={rate}>{rate.toLocaleString()} Hz</option>)}</select></label><label className="field"><span>交付位深</span><select value={bitDepth} onChange={(event) => setBitDepth(Number(event.target.value))}><option value={16}>16-bit PCM</option><option value={24}>24-bit PCM（推荐）</option><option value={32}>32-bit Float</option></select></label><label className={`field ${selectedDevice && inputChannel > activeInputChannels ? 'invalid' : ''}`}><span>输入通道</span><select value={inputChannel} onChange={(event) => setInputChannel(Number(event.target.value))}>{inputChannel > activeInputChannels && <option value={inputChannel}>输入 {inputChannel}（不兼容）</option>}{Array.from({ length: activeInputChannels }, (_, index) => <option value={index + 1} key={index + 1}>输入 {index + 1}</option>)}</select></label><label className="field"><span>环境 / 静音上限（RMS dBFS）</span><input type="number" min="-72" max="-12" step="1" value={noiseThresholdDbfs} onChange={(event) => setNoiseThresholdDbfs(Math.min(-12, Math.max(-72, Number(event.target.value) || -42)))} /></label><label className="field"><span>前后静音时长（秒）</span><input type="number" min="0.2" max="5" step="0.1" value={silenceDurationMs / 1_000} onChange={(event) => setSilenceDurationMs(Math.round(Math.min(5, Math.max(.2, Number(event.target.value) || 1)) * 1_000))} /></label></div>
@@ -1813,7 +1935,7 @@ function RecorderApp() {
                 : recording
                   ? <button data-testid="main-transport" className={`main-transport ${!headSilencePassed ? 'waiting' : !hasSpoken ? 'record' : postSilenceReady ? 'post-ready' : 'stop'}`} onClick={() => void stopAttempt()} disabled={Boolean(busy)}><span><Icon name="stop" /></span><strong>{!headSilencePassed ? '正在检测头静音 · 点击取消' : !hasSpoken ? '头静音达标 · 请开始朗读' : postSilenceReady ? '尾静音达标 · 完成本句' : '录制中 · 强制完成'}</strong><kbd>SPACE</kbd></button>
                 : primaryAction === 'accept'
-                  ? <button data-testid="main-transport" className="main-transport accept" onClick={() => void acceptAttempt()} disabled={Boolean(busy)}><span><Icon name="check" /></span><strong>{finalReview ? '确认本句并完成任务' : '确认并转到下一句'}</strong><kbd>SPACE</kbd></button>
+                  ? <button data-testid="main-transport" className="main-transport accept" onClick={() => void acceptAttempt()} disabled={Boolean(busy)}><span><Icon name="check" /></span><strong>{finalReview ? '确认本句' : '确认并转到下一句'}</strong><kbd>SPACE</kbd></button>
                   : primaryAction === 'finish'
                     ? <button data-testid="main-transport" className="main-transport complete" onClick={finishSession} disabled={Boolean(busy)}><span><Icon name="check" /></span><strong>全部完成 · 完成采集</strong><kbd>SPACE</kbd></button>
                     : primaryAction === 'start'
@@ -1853,7 +1975,7 @@ function RecorderApp() {
     {finishConfirmOpen && <div className="dialog-backdrop" role="presentation">
       <section className="studio-dialog" role="dialog" aria-modal="true" aria-labelledby="finish-dialog-title">
         <header><span className="dialog-icon"><Icon name="stop" size={19} /></span><div><small>CAPTURE CONTROL</small><h2 id="finish-dialog-title">{captureFault ? '故障保护：安全结束？' : '完成本次采集？'}</h2></div></header>
-        <p>{captureFault ? '将尝试停止采集并确认引擎不再写入。已落盘母轨会保留；若最终元数据无法证明完整封存，返回列表后只能“修复并封存”，不会当作可续录或可交付任务。' : '录音引擎将停止持续写盘，封存整轨母音频与进度快照并返回任务列表。本次不生成交付，可以稍后处理。'}</p>
+        <p>{captureFault ? '将尝试停止采集并确认引擎不再写入。已落盘母轨会保留；若任务未能安全收尾，返回列表后需执行“修复中断任务”，不会当作可续录或可交付任务。' : '录音引擎将停止持续写盘，封存整轨母音频与进度快照并返回任务列表。本次不生成交付，可以稍后处理。'}</p>
         <dl className="dialog-summary"><div><dt>已确认</dt><dd>{counts.accepted ?? 0}</dd></div><div><dt>已跳过</dt><dd>{counts.skipped ?? 0}</dd></div><div><dt>待处理</dt><dd className={(counts.pending ?? 0) + (counts.review ?? 0) ? 'warning' : ''}>{(counts.pending ?? 0) + (counts.review ?? 0)}</dd></div></dl>
         <footer><button data-testid="finish-cancel" className="button" onClick={() => setFinishConfirmOpen(false)}>{captureFault ? '保持在故障页' : '取消'}</button><button data-testid="finish-confirm" className="button primary" onClick={() => void confirmFinishSession()} disabled={Boolean(busy)}><Icon name="stop" size={14} />{captureFault ? '安全结束并保留母轨' : '完成采集'}</button></footer>
       </section>
@@ -1864,25 +1986,34 @@ function RecorderApp() {
 
 function PrompterView() {
   const [state, setState] = useState<PrompterState | null>(null);
+  const copyRef = useRef<HTMLParagraphElement>(null);
+  const labelRef = useRef<HTMLElement>(null);
   useEffect(() => {
     const unsubscribe = window.recorder.onPrompterState(setState);
     void window.recorder.getPrompterState().then(setState).catch(() => undefined);
     return unsubscribe;
   }, []);
+  useEffect(() => {
+    copyRef.current?.scrollTo({ top: 0 });
+    labelRef.current?.scrollTo({ top: 0 });
+  }, [state?.id, state?.text, state?.label]);
   const cue = state?.cue ?? 'idle';
   const qualityWarning = cue === 'fault' ? '' : state?.qualityWarning ?? '';
+  const copyLength = Array.from(state?.text ?? '').length;
+  const copyDensity = copyLength > 180 ? 'dense' : copyLength > 90 ? 'long' : '';
   return <main className={`prompter-shell ${cue} ${qualityWarning ? 'has-quality-warning' : ''}`} aria-label={state?.cueLabel ?? '领读面板'}>
     <header className="prompter-header">
       <span className="prompter-sequence">
-        第 <strong>{state?.sequence || '—'}</strong> 条
+        ID <strong>{state?.id || '—'}</strong>
+        <i>· 第 {state?.sequence || '—'} 条</i>
         <i>/ 共 {state?.total ?? 0} 条</i>
       </span>
-      <span className="prompter-cue"><i />{state?.cueLabel ?? '等待任务'}</span>
+      <span className="prompter-cue" role={cue === 'fault' ? 'alert' : 'status'} aria-live={cue === 'fault' ? 'assertive' : 'polite'}><i />{state?.cueLabel ?? '等待任务'}</span>
     </header>
     {qualityWarning && <div className="prompter-quality-warning" role="alert"><i />{qualityWarning}</div>}
     <article className="prompter-content">
-      <p>{state?.text || '当前没有可朗读的文本'}</p>
-      <aside className={`prompter-label ${state?.label ? '' : 'empty'}`}><span>标签备注</span><strong>{state?.label || '无'}</strong></aside>
+      <p ref={copyRef} className={copyDensity}>{state?.text || '当前没有可朗读的文本'}</p>
+      <aside ref={labelRef} className={`prompter-label ${state?.label ? '' : 'empty'}`}><span>标签备注</span><strong>{state?.label || '无'}</strong></aside>
     </article>
   </main>;
 }

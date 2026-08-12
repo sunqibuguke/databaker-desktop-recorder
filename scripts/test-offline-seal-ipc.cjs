@@ -316,7 +316,7 @@ async function runScenario() {
       await sealStarted;
       appEvents.get('window-all-closed')();
       const tray = activeTray();
-      assert.match(tray.menu[0].label, /修复并封存/);
+      assert.match(tray.menu[0].label, /修复中断任务/);
       assert.doesNotMatch(tray.menu[0].label, /后台录音正在进行/,
         'offline sealing must never be advertised as capture');
       sealGateResolve();
