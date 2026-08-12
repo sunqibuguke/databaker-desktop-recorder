@@ -1707,7 +1707,7 @@ fn initialize_capture_client(
                 if frames == 0 {
                     return Err(exclusive_initialize_error(error));
                 }
-                period = (i64::from(frames) * 10_000_000).div_ceil(i64::from(config.sample_rate));
+                period = buffer_size_to_duration(&BufferSize::Fixed(frames), config.sample_rate);
                 audio_client = device
                     .build_audioclient(activation_timeout)
                     .context("Failed to rebuild audio client after exclusive buffer align")?;
