@@ -3215,7 +3215,7 @@ impl Engine {
         // under the same task lease. Checking the marker first leaves a race
         // where another process can fault/seal the session before this export
         // acquires the lock and then incorrectly publish a normal delivery.
-        ensure_no_audio_fault_marker(session_dir, "生成常规交付")?;
+        ensure_no_audio_fault_marker(session_dir, "导出任务")?;
         let mut journal = read_journal(session_dir)?;
         let snapshot =
             load_recovery_snapshot_for_session(session_dir, &mut journal, expected_session_id)?;
@@ -3277,7 +3277,7 @@ impl Engine {
             .frames_written(),
         };
         if physical_frames != snapshot.committed_samples {
-            bail!("母轨物理帧数与已提交水位不一致，必须先恢复并安全结束录制后再交付。");
+            bail!("母轨物理帧数与已提交水位不一致，必须先恢复并安全结束录制后再导出。");
         }
         let full_track_container = match storage_kind {
             MasterStorageKind::LegacySingleWav => "riff",
@@ -3344,8 +3344,11 @@ impl Engine {
 
         let master_output = export_dir.join("full-track.wav");
         let export_status_path = export_dir.join("status.json");
-        let export_metadata_path = export_dir.join("metadata.json");
-        let export_csv_path = export_dir.join("metadata.csv");
+        let export_metadata_path = export_dir.join("timestamps.json");
+        let export_csv_path = export_dir.join("timestamps.csv");
+        let legacy_export_metadata_path = export_dir.join("metadata.json");
+        let legacy_export_csv_path = export_dir.join("metadata.csv");
+        let cuts_archive_path = export_dir.join("cuts.zip");
         let planned_master_bytes =
             automatic_wav_file_size(physical_frames, 1, snapshot.audio_format.bit_depth)?
                 .max(source_metadata.len());
@@ -3382,10 +3385,22 @@ impl Engine {
                 replaced_bytes: 0,
             });
         }
+        let planned_archive_bytes = stored_zip_size(&sentence_plans)?;
+        storage_steps.push(AtomicExportStep {
+            new_bytes: planned_export_allocation(planned_archive_bytes)?,
+            replaced_bytes: existing_export_allocation(existing_export_file_size(
+                &cuts_archive_path,
+                "已有切片压缩包",
+            )?),
+        });
         existing_export_file_size(&export_metadata_path, "已有导出元数据")?;
         existing_export_file_size(&export_csv_path, "已有 CSV 元数据")?;
+        existing_export_file_size(&legacy_export_metadata_path, "已有兼容导出元数据")?;
+        existing_export_file_size(&legacy_export_csv_path, "已有兼容 CSV 元数据")?;
         storage_steps.push(AtomicExportStep {
-            new_bytes: export_metadata_headroom(&snapshot)?,
+            new_bytes: export_metadata_headroom(&snapshot)?
+                .checked_mul(2)
+                .context("导出元数据空间估算溢出")?,
             replaced_bytes: 0,
         });
         let storage = check_storage(
@@ -3484,6 +3499,9 @@ impl Engine {
         });
         atomic_json(&export_metadata_path, &metadata)?;
         write_csv(&export_csv_path, &metadata["exported"])?;
+        atomic_json(&legacy_export_metadata_path, &metadata)?;
+        write_csv(&legacy_export_csv_path, &metadata["exported"])?;
+        write_stored_zip(&cuts_archive_path, &sentences_dir, &sentence_plans)?;
         let exported_count = metadata["exported"].as_array().map_or(0, Vec::len);
         let skipped_count = metadata["skipped"].as_array().map_or(0, Vec::len);
         // This small commit marker is always the last published file. Readers
@@ -3507,7 +3525,10 @@ impl Engine {
             "export_dir": export_dir,
             "master_file": master_output,
             "master_container": full_track_container,
+            "timestamps_json": export_metadata_path,
+            "timestamps_csv": export_csv_path,
             "sentences_dir": sentences_dir,
+            "cuts_archive": cuts_archive_path,
             "exported_count": exported_count,
             "skipped_count": skipped_count,
             "recovery_warnings": recovery_warnings,
@@ -3882,37 +3903,25 @@ fn session_summary_value(snapshot: &SessionSnapshot) -> Value {
 
 fn validate_snapshot_for_export(snapshot: &SessionSnapshot) -> Result<()> {
     if snapshot.status == "faulted" || snapshot.overflow_samples > 0 {
-        bail!("录制存在写盘故障或音频队列溢出，禁止生成常规交付；仅可保留并检查原始母轨。");
+        bail!("录制存在写盘故障或音频队列溢出，请先检查原始母轨并修复中断任务。");
     }
     if snapshot.status != "stopped" {
-        bail!("录制尚未安全结束，禁止生成常规交付；请先封存母轨。")
+        bail!("录制尚未安全结束，请先暂停或修复中断任务后再导出。")
     }
     validate_attempt_boundaries(snapshot, snapshot.committed_samples)?;
     validate_capture_provenance(snapshot, snapshot.committed_samples, true)?;
     for item in &snapshot.items {
-        match item.status.as_str() {
-            "accepted" => {
-                if item.selected_attempt_id.is_none() {
-                    bail!(
-                        "条目 {} 已标记为确认，但没有选中的录音版本，禁止生成交付。",
-                        item.id
-                    );
-                }
-            }
-            "skipped" => {
-                if item.selected_attempt_id.is_some() {
-                    bail!(
-                        "条目 {} 已标记为跳过，但仍保留选中的录音版本，禁止生成交付。",
-                        item.id
-                    );
-                }
-            }
-            _ => {
-                bail!(
-                    "条目 {} 尚未确认或跳过，录制任务未完成，禁止生成交付。",
-                    item.id
-                );
-            }
+        if item.status == "accepted" && item.selected_attempt_id.is_none() {
+            bail!(
+                "条目 {} 已标记为确认，但没有选中的录音版本，无法导出切片。",
+                item.id
+            );
+        }
+        if item.status == "skipped" && item.selected_attempt_id.is_some() {
+            bail!(
+                "条目 {} 已标记为跳过，但仍保留选中的录音版本，无法导出切片。",
+                item.id
+            );
         }
         let Some(selected_id) = item.selected_attempt_id.as_deref() else {
             continue;
@@ -3921,12 +3930,7 @@ fn validate_snapshot_for_export(snapshot: &SessionSnapshot) -> Result<()> {
             .attempts
             .iter()
             .find(|attempt| attempt.attempt_id == selected_id)
-            .with_context(|| {
-                format!(
-                    "条目 {} 选中的录音版本不存在，禁止常规交付；仅可保留原始母轨。",
-                    item.id
-                )
-            })?;
+            .with_context(|| format!("条目 {} 选中的录音版本不存在，无法导出切片。", item.id))?;
         let outside_durable_audio = attempt.end_sample <= attempt.start_sample
             || attempt.start_sample > snapshot.committed_samples
             || attempt.recording_started_sample > snapshot.committed_samples
@@ -3936,7 +3940,7 @@ fn validate_snapshot_for_export(snapshot: &SessionSnapshot) -> Result<()> {
             || attempt.end_sample > snapshot.committed_samples;
         if attempt.status == "interrupted" || outside_durable_audio {
             bail!(
-                "条目 {} 选中的录音版本异常中断或样本边界越界，禁止常规交付；仅可保留并检查原始母轨。",
+                "条目 {} 选中的录音版本异常中断或样本边界越界，无法导出切片。",
                 item.id
             );
         }
@@ -7717,6 +7721,109 @@ fn write_csv(path: &Path, exported: &Value) -> Result<()> {
     result
 }
 
+fn stored_zip_size(plans: &[SentenceExportPlan]) -> Result<u64> {
+    let mut total = 22u64;
+    for plan in plans {
+        let name_len = u64::try_from("cuts/".len() + plan.file_name.len())
+            .context("ZIP file name too long")?;
+        total = total
+            .checked_add(30 + name_len + plan.file_bytes)
+            .and_then(|value| value.checked_add(46 + name_len))
+            .context("ZIP archive size overflow")?;
+    }
+    Ok(total)
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320u32 & (0u32.wrapping_sub(crc & 1)));
+        }
+    }
+    !crc
+}
+
+fn write_stored_zip(path: &Path, sentences_dir: &Path, plans: &[SentenceExportPlan]) -> Result<()> {
+    let (temporary, mut file) = create_unique_temporary_file(path, "zip")?;
+    let result = (|| -> Result<()> {
+        let mut central_entries = Vec::<(String, u32, u32, u32)>::new();
+        for plan in plans {
+            let source = sentences_dir.join(&plan.file_name);
+            let bytes = std::fs::read(&source)
+                .with_context(|| format!("read exported cut {}", source.display()))?;
+            let size = u32::try_from(bytes.len()).context("WAV cut is too large for ZIP32")?;
+            let name = format!("cuts/{}", plan.file_name);
+            let name_bytes = name.as_bytes();
+            let name_len = u16::try_from(name_bytes.len()).context("ZIP file name too long")?;
+            let checksum = crc32(&bytes);
+            let offset = u32::try_from(file.stream_position()?)
+                .context("ZIP archive exceeds ZIP32 limit")?;
+            file.write_all(&0x04034b50u32.to_le_bytes())?;
+            file.write_all(&20u16.to_le_bytes())?;
+            file.write_all(&0u16.to_le_bytes())?;
+            file.write_all(&0u16.to_le_bytes())?;
+            file.write_all(&0u16.to_le_bytes())?;
+            file.write_all(&0u16.to_le_bytes())?;
+            file.write_all(&checksum.to_le_bytes())?;
+            file.write_all(&size.to_le_bytes())?;
+            file.write_all(&size.to_le_bytes())?;
+            file.write_all(&name_len.to_le_bytes())?;
+            file.write_all(&0u16.to_le_bytes())?;
+            file.write_all(name_bytes)?;
+            file.write_all(&bytes)?;
+            central_entries.push((name, checksum, size, offset));
+        }
+        let central_offset =
+            u32::try_from(file.stream_position()?).context("ZIP archive exceeds ZIP32 limit")?;
+        for (name, checksum, size, offset) in &central_entries {
+            let name_bytes = name.as_bytes();
+            let name_len = u16::try_from(name_bytes.len()).context("ZIP file name too long")?;
+            file.write_all(&0x02014b50u32.to_le_bytes())?;
+            file.write_all(&20u16.to_le_bytes())?;
+            file.write_all(&20u16.to_le_bytes())?;
+            file.write_all(&0u16.to_le_bytes())?;
+            file.write_all(&0u16.to_le_bytes())?;
+            file.write_all(&0u16.to_le_bytes())?;
+            file.write_all(&0u16.to_le_bytes())?;
+            file.write_all(&checksum.to_le_bytes())?;
+            file.write_all(&size.to_le_bytes())?;
+            file.write_all(&size.to_le_bytes())?;
+            file.write_all(&name_len.to_le_bytes())?;
+            file.write_all(&0u16.to_le_bytes())?;
+            file.write_all(&0u16.to_le_bytes())?;
+            file.write_all(&0u16.to_le_bytes())?;
+            file.write_all(&0u16.to_le_bytes())?;
+            file.write_all(&0u32.to_le_bytes())?;
+            file.write_all(&offset.to_le_bytes())?;
+            file.write_all(name_bytes)?;
+        }
+        let central_end =
+            u32::try_from(file.stream_position()?).context("ZIP archive exceeds ZIP32 limit")?;
+        let central_size = central_end
+            .checked_sub(central_offset)
+            .context("ZIP central directory underflow")?;
+        let count =
+            u16::try_from(central_entries.len()).context("too many files for ZIP32 archive")?;
+        file.write_all(&0x06054b50u32.to_le_bytes())?;
+        file.write_all(&0u16.to_le_bytes())?;
+        file.write_all(&0u16.to_le_bytes())?;
+        file.write_all(&count.to_le_bytes())?;
+        file.write_all(&count.to_le_bytes())?;
+        file.write_all(&central_size.to_le_bytes())?;
+        file.write_all(&central_offset.to_le_bytes())?;
+        file.write_all(&0u16.to_le_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        durable_replace(&temporary, path)?;
+        Ok(())
+    })();
+    remove_failed_temporary(&temporary, result.is_err());
+    result
+}
+
 fn csv_cell(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
@@ -9763,7 +9870,7 @@ mod tests {
         assert!(format!("{resume_error:#}").contains("禁止继续录制"));
 
         let export_error = engine.export_session(&root).unwrap_err();
-        assert!(format!("{export_error:#}").contains("禁止生成常规交付"));
+        assert!(format!("{export_error:#}").contains("导出任务"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -9789,7 +9896,7 @@ mod tests {
         let fault_error = engine
             .export_session_expected(&root, "export-lock-before-fault-marker")
             .unwrap_err();
-        assert!(format!("{fault_error:#}").contains("禁止生成常规交付"));
+        assert!(format!("{fault_error:#}").contains("导出任务"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -9833,7 +9940,7 @@ mod tests {
             .unwrap_err();
         assert!(format!("{resume_error:#}").contains("禁止继续录制"));
         let export_error = engine.export_session(&root).unwrap_err();
-        assert!(format!("{export_error:#}").contains("禁止生成常规交付"));
+        assert!(format!("{export_error:#}").contains("导出任务"));
 
         // Re-reporting a later fault must not replace the first evidence or
         // allocate an unrecognized unique temporary name.
@@ -11114,7 +11221,7 @@ mod tests {
     }
 
     #[test]
-    fn export_rejects_faults_overflow_and_invalid_selected_attempts() {
+    fn export_accepts_incomplete_tasks_but_rejects_faults_and_invalid_selected_attempts() {
         let mut snapshot = test_snapshot();
         snapshot.status = "faulted".to_string();
         let error = validate_snapshot_for_export(&snapshot).unwrap_err();
@@ -11125,11 +11232,10 @@ mod tests {
         assert!(validate_snapshot_for_export(&snapshot).is_err());
 
         snapshot.overflow_samples = 0;
-        let unfinished_error = validate_snapshot_for_export(&snapshot).unwrap_err();
-        assert!(format!("{unfinished_error:#}").contains("未完成"));
+        assert!(validate_snapshot_for_export(&snapshot).is_ok());
 
         snapshot.items[0].status = "review".to_string();
-        assert!(validate_snapshot_for_export(&snapshot).is_err());
+        assert!(validate_snapshot_for_export(&snapshot).is_ok());
 
         snapshot.items[0].status = "accepted".to_string();
         assert!(validate_snapshot_for_export(&snapshot).is_err());
@@ -11197,6 +11303,13 @@ mod tests {
 
         assert!(root.join("export/full-track.wav").is_file());
         assert_eq!(result["master_container"], "riff");
+        assert!(root.join("export/timestamps.json").is_file());
+        assert!(root.join("export/timestamps.csv").is_file());
+        assert!(root.join("export/cuts.zip").is_file());
+        assert_eq!(
+            &std::fs::read(root.join("export/cuts.zip")).unwrap()[..4],
+            b"PK\x05\x06"
+        );
         assert!(root.join("export/metadata.csv").is_file());
         assert!(!root.join("export/sentences/stale.wav").exists());
         let status: Value =
@@ -11443,6 +11556,18 @@ mod tests {
 
         assert_eq!(result["exported_count"].as_u64(), Some(1));
         assert!(root.join("export/full-track.wav").is_file());
+        let cuts_archive = std::fs::read(root.join("export/cuts.zip")).unwrap();
+        assert!(cuts_archive.starts_with(b"PK\x03\x04"));
+        assert!(
+            cuts_archive
+                .windows(b"cuts/000001-001.wav".len())
+                .any(|window| window == b"cuts/000001-001.wav")
+        );
+        assert!(
+            cuts_archive
+                .windows(4)
+                .any(|window| window == b"PK\x05\x06")
+        );
         let metadata: Value =
             serde_json::from_slice(&std::fs::read(root.join("export/metadata.json")).unwrap())
                 .unwrap();

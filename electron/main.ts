@@ -426,7 +426,7 @@ function operationBusyMessage(): string {
     case 'stopping': return '录音任务正在安全停止，请稍候';
     case 'recovering': return '录音引擎正在恢复，请稍候';
     case 'sealing': return '正在修复中断任务，请稍候';
-    case 'exporting': return '录音交付正在导出，请等待完成';
+    case 'exporting': return '录制任务正在导出，请等待完成';
     case 'deleting': return '录制任务正在移到回收站，请稍候';
     case 'quitting': return '应用正在安全退出';
     default: return '录音操作暂时不可用';
@@ -1189,12 +1189,12 @@ export async function hasCompleteExport(
       } catch {
         return false;
       }
-      const requiredFiles = ['full-track.wav', 'metadata.json', 'metadata.csv'];
-      const filesComplete = await Promise.all(requiredFiles.map(async (fileName) => {
+      const legacyRequiredFiles = ['full-track.wav', 'metadata.json', 'metadata.csv'];
+      const legacyFilesComplete = await Promise.all(legacyRequiredFiles.map(async (fileName) => {
         const metadata = await fs.lstat(path.join(exportDir, fileName));
         return metadata.isFile() && !metadata.isSymbolicLink();
       })).then((results) => results.every(Boolean)).catch(() => false);
-      if (!filesComplete) return false;
+      if (!legacyFilesComplete) return false;
       const sentencesDir = path.join(exportDir, 'sentences');
       const sentencesComplete = await fs.lstat(sentencesDir)
         .then(async (metadata) => metadata.isDirectory()
@@ -1842,7 +1842,7 @@ function requestQuitAfterExport(source: string): Promise<void> {
     if (!alreadyConfirmed) {
       const options: Electron.MessageBoxOptions = {
         type: 'info',
-        title: '录音交付正在导出',
+        title: '录制任务正在导出',
         message: '导出尚未完成，现在不能直接结束引擎',
         detail: '请等待整轨和分句文件全部落盘后再安全退出。取消退出不会取消当前导出。',
         buttons: ['取消退出', '等待导出完成后退出'],
@@ -1874,7 +1874,7 @@ function requestQuitAfterExport(source: string): Promise<void> {
         type: 'warning',
         title: '导出状态无法确认',
         message: '软件已阻止自动退出',
-        detail: '录音引擎可能仍在写入交付文件。请保留应用运行并检查导出目录。',
+        detail: '录音引擎可能仍在写入导出文件。请保留应用运行并检查导出目录。',
         buttons: ['保留应用'],
         defaultId: 0,
         noLink: true,
@@ -2278,7 +2278,7 @@ async function notifyEngineRecovered(
       type: 'warning',
       title: '录音引擎已自动恢复',
       message: '母轨已从最后一个持久化采样点继续录制',
-      detail: '异常时正在录制的句子已标记为不可交付的中断版本。请确认实时输入电平，并等待句首静音达标后再开始新的句子。',
+      detail: '异常时正在录制的句子已标记为不可用的中断版本。请确认实时输入电平，并等待句首静音达标后再开始新的句子。',
       buttons: ['知道了'],
     });
   } catch (uiError) {
@@ -2514,9 +2514,9 @@ function mainWindowCloseCopy(fault: CaptureFaultNotice | null): MainWindowCloseC
       };
     case 'exporting':
       return {
-        title: '录音交付正在导出',
-        message: '整轨和分句文件仍在写入交付目录，不会采集新音频。',
-        detail: '暂留后台会继续导出；导出完成后退出会等待交付状态持久化，再安全结束引擎。',
+        title: '录制任务正在导出',
+        message: '整轨、时间戳和切片文件仍在写入导出目录，不会采集新音频。',
+        detail: '暂留后台会继续导出；导出完成后退出会等待导出状态持久化，再安全结束引擎。',
         backgroundButton: '暂留后台等待导出',
         exitButton: '导出完成后退出',
       };
@@ -2951,10 +2951,13 @@ async function reconciledCompleteExportResult(
   return {
     export_dir: exportDir,
     master_file: path.join(exportDir, 'full-track.wav'),
+    timestamps_json: path.join(exportDir, 'timestamps.json'),
+    timestamps_csv: path.join(exportDir, 'timestamps.csv'),
     sentences_dir: path.join(exportDir, 'sentences'),
+    cuts_archive: path.join(exportDir, 'cuts.zip'),
     exported_count: status.exported_count,
     skipped_count: status.skipped_count,
-    recovery_warnings: ['导出超过界面等待时限，已根据引擎空闲状态和当前快照确认交付完整。'],
+    recovery_warnings: ['导出超过界面等待时限，已根据引擎空闲状态和当前快照确认导出文件完整。'],
     reconciled_after_timeout: true,
     export_confirmed_complete: true,
   };

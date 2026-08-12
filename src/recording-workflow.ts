@@ -8,6 +8,11 @@ export type WorkflowShortcutAction = 'finish' | 'accept' | 'start' | 'retake' | 
 export type CaptureExitAction = 'pause' | 'complete' | 'fault';
 export type CaptureExitDialog = 'pause' | 'finish';
 export type SessionNoiseGate = 'pending' | 'checking' | 'failed' | 'ready';
+export type AcceptContinuation =
+  | { kind: 'start'; nextIndex: number }
+  | { kind: 'review'; nextIndex: number }
+  | { kind: 'finish' }
+  | { kind: 'blocked' };
 export type SessionNoiseCheckOperation = Readonly<{
   activation: number;
   request: number;
@@ -65,6 +70,19 @@ export function isFinalReview(items: readonly WorkflowItem[], currentIndex: numb
     && items.every((item, index) => (
       index === currentIndex || item.status === 'accepted' || item.status === 'skipped'
     ));
+}
+
+export function continuationAfterAccept(
+  items: readonly WorkflowItem[],
+  currentIndex: number,
+): AcceptContinuation {
+  const nextIndex = findNextActionableItemIndex(items, currentIndex);
+  if (nextIndex >= 0) {
+    return items[nextIndex]?.status === 'pending'
+      ? { kind: 'start', nextIndex }
+      : { kind: 'review', nextIndex };
+  }
+  return areAllItemsHandled(items) ? { kind: 'finish' } : { kind: 'blocked' };
 }
 
 export function idlePrimaryAction(

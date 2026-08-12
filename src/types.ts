@@ -9,7 +9,7 @@ export type Attempt = {
   required_head_silence_samples?: number;
   content_started_sample: number;
   end_sample: number;
-  /** 该版本由操作员在句尾静音未达标时强制封闭，交付前需要重点试听。 */
+  /** 该版本由操作员在句尾静音未达标时强制封闭，导出前需要重点试听。 */
   forced_without_tail_silence?: boolean;
   tail_silence_samples?: number;
   required_tail_silence_samples?: number;
@@ -160,9 +160,12 @@ export type EngineRecoveryFailedPayload = {
 
 export type ExportResult = {
   export_dir: string;
-  master_file: string;
+  master_file?: string;
   master_container?: 'riff' | 'rf64';
-  sentences_dir: string;
+  timestamps_json?: string;
+  timestamps_csv?: string;
+  sentences_dir?: string;
+  cuts_archive?: string;
   exported_count: number;
   skipped_count: number;
   recovery_warnings?: string[];

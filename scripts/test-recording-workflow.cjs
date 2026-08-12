@@ -10,6 +10,7 @@ async function main() {
     areAllItemsHandled,
     captureExitAction,
     captureExitDialog,
+    continuationAfterAccept,
     executeSafePause,
     findNextActionableItemIndex,
     idlePrimaryAction,
@@ -162,6 +163,26 @@ async function main() {
     isFinalReview([item('review'), item('interrupted')], 0),
     false,
     'an unknown or interrupted row must not be silently counted as handled',
+  );
+  assert.deepEqual(
+    continuationAfterAccept([item('accepted'), item('pending'), item('accepted')], 0),
+    { kind: 'start', nextIndex: 1 },
+    'accepting a sentence must immediately start the next pending sentence',
+  );
+  assert.deepEqual(
+    continuationAfterAccept([item('accepted'), item('review'), item('pending')], 0),
+    { kind: 'review', nextIndex: 1 },
+    'an existing review must be shown instead of being silently re-recorded',
+  );
+  assert.deepEqual(
+    continuationAfterAccept(threeComplete, 2),
+    { kind: 'finish' },
+    'the final accepted sentence must enter the existing finish state',
+  );
+  assert.deepEqual(
+    continuationAfterAccept([item('accepted'), item('interrupted')], 0),
+    { kind: 'blocked' },
+    'an unexpected item state must not be skipped or started',
   );
 
   const acceptedBeforePending = [item('accepted'), item('pending'), item('skipped')];

@@ -366,7 +366,7 @@ export function installDevRecorderMock() {
         ?? previewHistory.find((recording) => recording.session_dir === target)?.total_items
         ?? exportedCount;
       const exportDir = `${target || '/tmp/DataBaker Preview'}/export`;
-      return { export_dir: exportDir, master_file: `${exportDir}/full-track.wav`, sentences_dir: `${exportDir}/sentences`, exported_count: exportedCount, skipped_count: total - exportedCount } as T;
+      return { export_dir: exportDir, master_file: `${exportDir}/full-track.wav`, timestamps_json: `${exportDir}/timestamps.json`, timestamps_csv: `${exportDir}/timestamps.csv`, sentences_dir: `${exportDir}/sentences`, cuts_archive: `${exportDir}/cuts.zip`, exported_count: exportedCount, skipped_count: total - exportedCount } as T;
     }
     if (!snapshot) throw new Error('Mock 录制尚未启动');
     if (command === 'check_noise') {

@@ -346,7 +346,7 @@ async function main() {
     appEvents.get('before-quit')({ preventDefault: () => { quitPrevented = true; } });
     assert.equal(quitPrevented, true);
     await waitFor(() => dialogCalls.length === 1, 'export-aware quit prompt');
-    assert.equal(dialogCalls[0].options.title, '录音交付正在导出');
+    assert.equal(dialogCalls[0].options.title, '录制任务正在导出');
     dialogCalls[0].resolve({ response: 1 });
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(engine.stopCalls, 0, 'quit must not send shutdown while export is writing');
