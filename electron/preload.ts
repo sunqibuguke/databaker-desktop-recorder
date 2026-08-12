@@ -57,11 +57,17 @@ contextBridge.exposeInMainWorld('recorder', {
   closePrompter: () => ipcRenderer.invoke('prompter:close'),
   togglePrompterFullscreen: () => ipcRenderer.invoke('prompter:toggle-fullscreen'),
   getPrompterState: () => ipcRenderer.invoke('prompter:get-state'),
+  getPrompterStatus: () => ipcRenderer.invoke('prompter:get-status'),
   sendPrompterState: (state: unknown) => ipcRenderer.send('prompter:update', state),
   onPrompterState: (listener: (state: unknown) => void) => {
     const wrapped = (_event: Electron.IpcRendererEvent, state: unknown) => listener(state);
     ipcRenderer.on('prompter:state', wrapped);
     return () => ipcRenderer.removeListener('prompter:state', wrapped);
+  },
+  onPrompterStatus: (listener: (status: unknown) => void) => {
+    const wrapped = (_event: Electron.IpcRendererEvent, status: unknown) => listener(status);
+    ipcRenderer.on('prompter:status', wrapped);
+    return () => ipcRenderer.removeListener('prompter:status', wrapped);
   },
   onEngineEvent: (listener: (message: unknown) => void) => {
     engineEventListeners.add(listener);

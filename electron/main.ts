@@ -46,6 +46,7 @@ import {
 
 let mainWindow: BrowserWindow | null = null;
 let prompterWindow: BrowserWindow | null = null;
+let prompterRendererReady = false;
 let latestPrompterState: unknown = null;
 let engine: EngineClient | null = null;
 let recordingTray: Tray | null = null;
@@ -231,6 +232,7 @@ const allowedCommands = new Set([
   'resume_session',
   'get_state_optional',
   'check_noise',
+  'set_silence_settings',
   'start_attempt',
   'stop_attempt',
   'accept_attempt',
@@ -747,6 +749,8 @@ function parseValidSnapshot(value: unknown): Record<string, unknown> | null {
       && !isNonNegativeSafeInteger(value.silence_duration_ms))
     || (value.silence_threshold_dbfs !== undefined
       && !isFiniteNumber(value.silence_threshold_dbfs))
+    || (value.noise_threshold_dbfs !== undefined
+      && !isFiniteNumber(value.noise_threshold_dbfs))
     || !Array.isArray(value.items)
     || !value.items.every(isValidSnapshotItem)) {
     return null;
@@ -2388,7 +2392,7 @@ async function notifyEngineRecovered(
       type: 'warning',
       title: '录音引擎已自动恢复',
       message: '母轨已从最后一个持久化采样点继续录制',
-      detail: '异常时正在录制的句子已标记为不可用的中断版本。请确认实时输入电平，并等待句首静音达标后再开始新的句子。',
+      detail: '异常时正在录制的句子已标记为不可用录音。请确认实时输入电平，并等待句首静音达标后再开始新的句子。',
       buttons: ['知道了'],
     });
   } catch (uiError) {
@@ -2810,6 +2814,10 @@ async function createWindow(): Promise<BrowserWindow> {
       },
     });
     mainWindow = window;
+    // BrowserWindow.webContents throws once the native window has been
+    // destroyed. Keep the renderer object captured while the window is alive
+    // so teardown/recovery callbacks can invalidate its meter lane safely.
+    const renderer = window.webContents;
     window.removeMenu();
     let unresponsiveTimer: NodeJS.Timeout | null = null;
     window.on('close', (event) => {
@@ -2833,7 +2841,7 @@ async function createWindow(): Promise<BrowserWindow> {
     }
     window.on('closed', () => {
       if (unresponsiveTimer) clearTimeout(unresponsiveTimer);
-      meterBackpressure.reset(window.webContents);
+      meterBackpressure.reset(renderer);
       if (mainWindow === window) mainWindow = null;
       prompterWindow?.close();
     });
@@ -2849,13 +2857,13 @@ async function createWindow(): Promise<BrowserWindow> {
       clearTimeout(unresponsiveTimer);
       unresponsiveTimer = null;
     });
-    window.webContents.on('did-start-loading', () => {
-      meterBackpressure.reset(window.webContents);
+    renderer.on('did-start-loading', () => {
+      meterBackpressure.reset(renderer);
     });
-    window.webContents.on('render-process-gone', (_event, details) => {
+    renderer.on('render-process-gone', (_event, details) => {
       if (unresponsiveTimer) clearTimeout(unresponsiveTimer);
       unresponsiveTimer = null;
-      meterBackpressure.reset(window.webContents);
+      meterBackpressure.reset(renderer);
       reportOperationalError('Main renderer process exited', new Error(details.reason), {
         reason: details.reason,
         exit_code: details.exitCode,
@@ -2896,7 +2904,7 @@ async function createPrompterWindow(): Promise<BrowserWindow> {
   const height = Math.min(500, targetDisplay.workArea.height);
   const x = Math.round(targetDisplay.workArea.x + (targetDisplay.workArea.width - width) / 2);
   const y = Math.round(targetDisplay.workArea.y + (targetDisplay.workArea.height - height) / 2);
-  prompterWindow = new BrowserWindow({
+  const window = new BrowserWindow({
     width,
     height,
     x,
@@ -2916,26 +2924,34 @@ async function createPrompterWindow(): Promise<BrowserWindow> {
       backgroundThrottling: false,
     },
   });
-  prompterWindow.removeMenu();
-  prompterWindow.on('closed', () => {
-    prompterWindow = null;
+  prompterWindow = window;
+  prompterRendererReady = false;
+  window.removeMenu();
+  window.on('closed', () => {
+    prompterRendererReady = false;
+    if (prompterWindow === window) prompterWindow = null;
+    sendToMain('prompter:status', { open: false, ready: false });
   });
-  prompterWindow.webContents.on('did-finish-load', () => {
+  const renderer = window.webContents;
+  renderer.on('did-finish-load', () => {
+    if (window.isDestroyed() || renderer.isDestroyed() || prompterWindow !== window) return;
+    prompterRendererReady = true;
     if (latestPrompterState !== null) {
-      prompterWindow?.webContents.send('prompter:state', latestPrompterState);
+      renderer.send('prompter:state', latestPrompterState);
     }
+    sendToMain('prompter:status', { open: true, ready: true });
   });
   const developmentUrl = process.env.VITE_DEV_SERVER_URL;
   if (developmentUrl) {
     const url = new URL(developmentUrl);
     url.searchParams.set('view', 'prompter');
-    await prompterWindow.loadURL(url.toString());
+    await window.loadURL(url.toString());
   } else {
-    await prompterWindow.loadFile(path.join(app.getAppPath(), 'dist', 'index.html'), {
+    await window.loadFile(path.join(app.getAppPath(), 'dist', 'index.html'), {
       query: { view: 'prompter' },
     });
   }
-  return prompterWindow;
+  return window;
 }
 
 function assertMainRenderer(sender: Electron.WebContents): void {
@@ -3875,6 +3891,11 @@ function registerIpc(): void {
     await createPrompterWindow();
     return true;
   });
+  ipcMain.handle('prompter:get-status', (event) => {
+    assertMainRenderer(event.sender);
+    const open = Boolean(prompterWindow && !prompterWindow.isDestroyed());
+    return { open, ready: open && prompterRendererReady };
+  });
   ipcMain.handle('prompter:close', (event) => {
     const fromMain = mainWindow && !mainWindow.isDestroyed() && event.sender === mainWindow.webContents;
     const fromPrompter = prompterWindow && !prompterWindow.isDestroyed() && event.sender === prompterWindow.webContents;
@@ -3897,7 +3918,13 @@ function registerIpc(): void {
   ipcMain.on('prompter:update', (event, state: unknown) => {
     if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return;
     latestPrompterState = state;
-    prompterWindow?.webContents.send('prompter:state', state);
+    const window = prompterWindow;
+    if (!window || window.isDestroyed() || window.webContents.isDestroyed()) return;
+    try {
+      window.webContents.send('prompter:state', state);
+    } catch (error) {
+      console.error('无法向领读面板发送状态：', error);
+    }
   });
   ipcMain.handle(
     'recordings:list',

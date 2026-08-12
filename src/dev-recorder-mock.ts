@@ -30,9 +30,11 @@ export function installDevRecorderMock() {
   let mockSampleRate = 48_000;
   let recordingStartedAt = 0;
   let meterTimer: number | undefined;
+  let mockPrompterOpen = false;
   let capturePresetStore: CapturePresetStore = { schemaVersion: 1, lastSelectedPresetId: null, presets: [] };
   const meterListeners = new Set<(message: unknown) => void>();
   const prompterListeners = new Set<(state: PrompterState) => void>();
+  const prompterStatusListeners = new Set<(status: { open: boolean; ready: boolean }) => void>();
   const prompterChannel = typeof BroadcastChannel === 'undefined' ? null : new BroadcastChannel('databaker-prompter');
   prompterChannel?.addEventListener('message', (event: MessageEvent<PrompterState>) => {
     prompterListeners.forEach((listener) => listener(event.data));
@@ -140,6 +142,7 @@ export function installDevRecorderMock() {
       captured_samples: recording.captured_samples, committed_samples: recording.captured_samples, overflow_samples: recording.overflow_samples,
       started_at: recording.started_at, updated_at: recording.updated_at,
       noise_check: recording.noise_check,
+      noise_threshold_dbfs: recording.noise_check?.threshold_dbfs ?? -42,
       silence_duration_ms: 1_000,
       silence_threshold_dbfs: -42,
       items: Array.from({ length: recording.total_items }, (_, index) => ({
@@ -441,9 +444,49 @@ export function installDevRecorderMock() {
         completed_at: new Date().toISOString(),
       };
       snapshot.noise_check = result;
-      snapshot.silence_threshold_dbfs = thresholdDbfs;
+      snapshot.noise_threshold_dbfs = thresholdDbfs;
       emitEvent('noise_check_completed', result);
       return result as T;
+    }
+    if (command === 'set_silence_settings') {
+      const thresholdDbfs = Number(data.threshold_dbfs);
+      const silenceDurationMs = Number(data.silence_duration_ms);
+      if (!Number.isFinite(thresholdDbfs) || thresholdDbfs < -96 || thresholdDbfs > -6) {
+        throw new Error('静音阈值必须在 -96 到 -6 dBFS 之间');
+      }
+      if (!Number.isSafeInteger(silenceDurationMs) || silenceDurationMs < 200 || silenceDurationMs > 5_000) {
+        throw new Error('静音时长必须在 0.2 到 5 秒之间');
+      }
+      const phase = activeAttempt?.head_silence_phase ?? 'idle';
+      let resetKind = 'idle';
+      if (phase === 'waiting_for_head_silence' || phase === 'ready_for_speech') {
+        resetKind = 'head_silence';
+        if (activeAttempt) {
+          activeAttempt.head_silence_phase = 'waiting_for_head_silence';
+          activeAttempt.head_silence_armed_sample = capturedSamples;
+          activeAttempt.head_silence_progress_samples = 0;
+          activeAttempt.head_silence_passed_sample = 0;
+          activeAttempt.content_started_sample = 0;
+          activeAttempt.required_head_silence_samples = mockSampleRate * silenceDurationMs / 1_000;
+        }
+        firstAttemptSignalSample = 0;
+        lastSignalSample = 0;
+      } else if (phase === 'speech_started') {
+        resetKind = 'tail_silence';
+        lastSignalSample = capturedSamples;
+      }
+      silenceSamples = 0;
+      snapshot.silence_threshold_dbfs = thresholdDbfs;
+      snapshot.silence_duration_ms = silenceDurationMs;
+      snapshot.updated_at = new Date().toISOString();
+      return {
+        threshold_dbfs: thresholdDbfs,
+        silence_duration_ms: silenceDurationMs,
+        analysis_boundary: capturedSamples,
+        active_attempt: Boolean(activeAttempt),
+        reset_kind: resetKind,
+        snapshot: snapshotCopy(),
+      } as T;
     }
     if (command === 'start_attempt') {
       const required = mockSampleRate * snapshot.silence_duration_ms / 1_000;
@@ -617,19 +660,27 @@ export function installDevRecorderMock() {
       },
       openPrompter: async () => {
         window.open(`${window.location.pathname}?view=prompter`, 'databaker-prompter', 'popup=yes,width=720,height=500');
+        mockPrompterOpen = true;
+        prompterStatusListeners.forEach((listener) => listener({ open: true, ready: true }));
         return true;
       },
-      closePrompter: async () => window.close(),
+      closePrompter: async () => {
+        mockPrompterOpen = false;
+        prompterStatusListeners.forEach((listener) => listener({ open: false, ready: false }));
+        window.close();
+      },
       togglePrompterFullscreen: async () => false,
       getPrompterState: async () => {
         const serialized = window.localStorage.getItem('databaker-prompter-state');
         return serialized ? JSON.parse(serialized) as PrompterState : null;
       },
+      getPrompterStatus: async () => ({ open: mockPrompterOpen, ready: mockPrompterOpen }),
       sendPrompterState: (state: PrompterState) => {
         window.localStorage.setItem('databaker-prompter-state', JSON.stringify(state));
         prompterChannel?.postMessage(state);
       },
       onPrompterState: (listener: (state: PrompterState) => void) => { prompterListeners.add(listener); return () => prompterListeners.delete(listener); },
+      onPrompterStatus: (listener: (status: { open: boolean; ready: boolean }) => void) => { prompterStatusListeners.add(listener); return () => prompterStatusListeners.delete(listener); },
       onEngineEvent: (listener: (message: unknown) => void) => { meterListeners.add(listener); return () => meterListeners.delete(listener); },
       onEngineOffline: () => () => undefined,
     },

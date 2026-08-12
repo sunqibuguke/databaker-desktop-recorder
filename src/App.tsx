@@ -60,8 +60,9 @@ type StoppedSessionState = {
   reconciled_inactive_after_error?: boolean;
 };
 type CaptureExitMode = 'pause' | 'finish' | 'fault';
+type MonitorPanelTab = 'monitor' | 'detection' | 'task' | 'export' | 'issues';
 type OptionalRunningSessionState = ({ active: true } & RunningSessionState) | { active: false };
-type IconName = 'check' | 'chevron-left' | 'chevron-right' | 'export' | 'file' | 'folder' | 'history' | 'home' | 'headphones' | 'meter' | 'microphone' | 'more' | 'play' | 'plus' | 'record' | 'refresh' | 'retake' | 'skip' | 'sliders' | 'stop' | 'trash';
+type IconName = 'check' | 'chevron-left' | 'chevron-right' | 'export' | 'file' | 'folder' | 'history' | 'home' | 'headphones' | 'meter' | 'microphone' | 'more' | 'play' | 'plus' | 'record' | 'refresh' | 'retake' | 'settings' | 'skip' | 'sliders' | 'stop' | 'trash';
 
 const NOISE_CHECK_PROGRESS_STEPS = 15;
 const NOISE_CHECK_PROGRESS_INTERVAL_MS = 200;
@@ -262,16 +263,17 @@ function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
     case 'record': return <svg {...common}><circle cx="12" cy="12" r="6" fill="currentColor" stroke="none" /></svg>;
     case 'refresh': return <svg {...common}><path d="M20 6v5h-5" /><path d="M18.5 15a7 7 0 1 1-.4-6.5L20 11" /></svg>;
     case 'retake': return <svg {...common}><path d="M3 7v5h5" /><path d="M5.5 16a8 8 0 1 0 .4-8.5L3 12" /></svg>;
+    case 'settings': return <svg {...common}><circle cx="12" cy="12" r="3" /><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z" /></svg>;
     case 'skip': return <svg {...common}><path d="m5 5 10 7L5 19zM19 5v14" /></svg>;
     case 'sliders': return <svg {...common}><path d="M4 6h7m4 0h5M11 3v6M4 18h5m4 0h7M9 15v6M4 12h11m4 0h1M15 9v6" /></svg>;
     case 'stop': return <svg {...common}><rect x="6" y="6" width="12" height="12" rx="1" fill="currentColor" stroke="none" /></svg>;
   }
 }
 
-function StudioChrome({ phase, title, engineStatus, onBack, backTitle = '返回录制任务', activityLabel }: { phase: Exclude<Phase, 'home'>; title: string; engineStatus: EngineStatus; onBack?: () => void; backTitle?: string; activityLabel?: string }) {
+function StudioChrome({ phase, title, onBack, onOpenSettings, backTitle = '返回录制任务', activityLabel }: { phase: Exclude<Phase, 'home'>; title: string; onBack?: () => void; onOpenSettings: () => void; backTitle?: string; activityLabel?: string }) {
   return <header className="workflow-header">
     <div className="workflow-identity"><span><img src={appLogo} alt="DataBaker" /></span>{onBack && <button title={backTitle} aria-label={backTitle} onClick={onBack}><Icon name="chevron-left" size={16} /></button>}<div><small>{activityLabel ?? (phase === 'setup' ? '新建任务' : '正在采集')}</small><strong title={title}>{title}</strong></div></div>
-    <div className={`workflow-engine ${engineStatus}`}><i /><span>{engineStatus === 'ready' ? '引擎就绪' : engineStatus === 'connecting' ? '正在连接' : '引擎离线'}</span></div>
+    <button className="global-settings-button" title="应用设置" aria-label="打开应用设置" onClick={onOpenSettings}><Icon name="settings" size={17} /></button>
   </header>;
 }
 
@@ -283,10 +285,10 @@ function StudioStatus({ engineStatus, message, isError = false, right }: { engin
   </footer>;
 }
 
-function HomeHeader({ engineStatus, preview }: { engineStatus: EngineStatus; preview: boolean }) {
+function HomeHeader({ preview, onOpenSettings }: { preview: boolean; onOpenSettings: () => void }) {
   return <header className="home-header">
     <div className="home-brand"><span className="home-brand-mark"><img src={appLogo} alt="DataBaker" /></span><div><strong>DataBaker Recorder</strong><small>桌面音频采集</small></div>{preview && <em className="preview-badge">浏览器界面预览</em>}</div>
-    <div className={`home-engine ${engineStatus}`}><i /><span>{engineStatus === 'ready' ? '录音引擎已就绪' : engineStatus === 'connecting' ? '正在连接录音引擎' : '录音引擎离线'}</span></div>
+    <button className="global-settings-button" title="应用设置" aria-label="打开应用设置" onClick={onOpenSettings}><Icon name="settings" size={17} /></button>
   </header>;
 }
 
@@ -308,7 +310,8 @@ function RecorderApp() {
   const [snapshot, setSnapshot] = useState<SessionSnapshot | null>(null);
   const [captureActive, setCaptureActive] = useState(false);
   const [workspaceFaulted, setWorkspaceFaulted] = useState(false);
-  const [workspaceExportOpen, setWorkspaceExportOpen] = useState(false);
+  const [monitorPanelTab, setMonitorPanelTab] = useState<MonitorPanelTab>('monitor');
+  const [prompterStatus, setPrompterStatus] = useState({ open: false, ready: false });
   const [sessionDir, setSessionDir] = useState('');
   const [waveformGeneration, setWaveformGeneration] = useState(0);
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -318,6 +321,12 @@ function RecorderApp() {
   const [reviewAttemptId, setReviewAttemptId] = useState<string | null>(null);
   const [meter, setMeter] = useState<Meter>(emptyMeter);
   const [noiseThresholdDbfs, setNoiseThresholdDbfs] = useState(-42);
+  const [taskInitialSilenceThresholdDbfs, setTaskInitialSilenceThresholdDbfs] = useState(-42);
+  const [taskInitialSilenceDurationMs, setTaskInitialSilenceDurationMs] = useState(1_000);
+  const [silenceThresholdDraftDbfs, setSilenceThresholdDraftDbfs] = useState(-42);
+  const [silenceDurationDraftMs, setSilenceDurationDraftMs] = useState(1_000);
+  const [silenceSettingsSaving, setSilenceSettingsSaving] = useState(false);
+  const [silenceSettingsError, setSilenceSettingsError] = useState('');
   const [silenceDurationMs, setSilenceDurationMs] = useState(1_000);
   const [noiseCheckRunning, setNoiseCheckRunning] = useState(false);
   const [noiseCheckProgress, setNoiseCheckProgress] = useState(0);
@@ -329,6 +338,7 @@ function RecorderApp() {
   const [audioUrl, setAudioUrl] = useState('');
   const [finishConfirmOpen, setFinishConfirmOpen] = useState(false);
   const [pauseConfirmOpen, setPauseConfirmOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [capturePresetStore, setCapturePresetStore] = useState<CapturePresetStore>({ schemaVersion: 1, lastSelectedPresetId: null, presets: [] });
   const [capturePresetsLoaded, setCapturePresetsLoaded] = useState(false);
   const [devicesLoaded, setDevicesLoaded] = useState(false);
@@ -355,6 +365,8 @@ function RecorderApp() {
   const noiseCheckActivationRef = useRef(0);
   const noiseCheckRequestSequenceRef = useRef(0);
   const noiseCheckOperationRef = useRef<SessionNoiseCheckOperation | null>(null);
+  const silenceSettingsSaveSequenceRef = useRef(0);
+  const hadMonitorIssuesRef = useRef(false);
   const activeSessionDirRef = useRef('');
   const initialPresetAppliedRef = useRef(false);
   const outputDirRef = useRef('');
@@ -457,6 +469,10 @@ function RecorderApp() {
   const attemptDuration = recording ? formatDuration(meter.captured_samples - attemptStartSample, sampleRateForDisplay) : '00:00:00';
   const peakPercent = Math.min(100, Math.max(0, meter.peak * 100));
   const rmsPercent = Math.min(100, Math.max(0, meter.rms * 100));
+  const liveRmsDbfs = meter.rms <= 0.00001
+    ? -96
+    : Math.max(-96, Math.min(0, 20 * Math.log10(meter.rms)));
+  const liveRmsOnThresholdScale = Math.min(100, Math.max(0, (liveRmsDbfs + 72) / 60 * 100));
   const effectiveSilenceDurationMs = snapshot?.silence_duration_ms ?? silenceDurationMs;
   const requiredSilenceSamples = sampleRateForDisplay * effectiveSilenceDurationMs / 1_000;
   const silenceProgress = Math.min(1, meter.silence_samples / Math.max(1, requiredSilenceSamples));
@@ -502,6 +518,7 @@ function RecorderApp() {
     captureFault,
     meter.digital_silence_suspected,
   );
+  const hasMonitorIssues = Boolean(captureFault || workspaceFaulted || qualityWarning || meter.overflow_samples > 0 || meter.storage_status !== 'healthy');
   const currentNoiseGate = sessionNoiseGate(snapshot?.noise_check, noiseCheckRunning);
   const noiseCheckBlocksAttempt = phase === 'running' && captureActive && !recording && currentNoiseGate !== 'ready';
   const noiseCheckProgressRatio = noiseCheckProgress / NOISE_CHECK_PROGRESS_STEPS;
@@ -536,8 +553,8 @@ function RecorderApp() {
     idle: phase === 'running' && currentItem ? '点击开始录音' : '等待任务',
     checking: `头静音检测中 ${(headSilenceProgressSamples / Math.max(sampleRateForDisplay, 1)).toFixed(1)} / ${(effectiveSilenceDurationMs / 1_000).toFixed(1)}s`,
     ready: '头静音达标 · 请开始朗读',
-    recording: '录制中 · 等待尾部静音',
-    'post-ready': '尾部静音达标 · 可完成',
+    recording: '正在录音 · 朗读结束后请保持安静',
+    'post-ready': '本句录制完成 · 请等待',
     review: '本句已录制 · 等待监听确认',
     complete: '全部句子已处理 · 可完成采集',
       } as const)[normalCue];
@@ -561,7 +578,9 @@ function RecorderApp() {
     cueLabel,
     silenceProgress: displayedSilenceProgress,
     silenceDurationMs: effectiveSilenceDurationMs,
-    qualityWarning: noiseCheckBlocksAttempt && currentNoiseGate !== 'checking' ? noiseCheckMessage : qualityWarning,
+    qualityWarning: noiseCheckBlocksAttempt && currentNoiseGate !== 'checking'
+      ? '请等待监听人员完成环境检查'
+      : qualityWarning ? '请停止朗读，等待监听人员检查设备' : '',
   }), [captureFault, captureFaultCopy.detail, captureFaultCopy.title, cue, cueLabel, currentIndex, currentItem?.id, currentItem?.label, currentItem?.text, currentNoiseGate, displayedSilenceProgress, effectiveSilenceDurationMs, items.length, noiseCheckBlocksAttempt, noiseCheckMessage, qualityWarning, sessionName, snapshot?.session_id, workflowComplete]);
 
   async function run<T>(label: string, action: () => Promise<T>): Promise<T | null> {
@@ -616,7 +635,9 @@ function RecorderApp() {
     }, NOISE_CHECK_PROGRESS_INTERVAL_MS);
     try {
       const result = await window.recorder.request<NoiseCheckResult>('check_noise', {
-        threshold_dbfs: currentSnapshot.silence_threshold_dbfs ?? noiseThresholdDbfs,
+        threshold_dbfs: currentSnapshot.noise_threshold_dbfs
+          ?? currentSnapshot.noise_check?.threshold_dbfs
+          ?? noiseThresholdDbfs,
       });
       if (!isCurrentSessionNoiseCheckOperation(
         noiseCheckOperationRef.current,
@@ -627,9 +648,8 @@ function RecorderApp() {
       setSnapshot((previous) => previous ? {
         ...previous,
         noise_check: result,
-        silence_threshold_dbfs: result.threshold_dbfs,
+        noise_threshold_dbfs: result.threshold_dbfs,
       } : previous);
-      setNoiseThresholdDbfs(result.threshold_dbfs);
       setNotice(result.passed
         ? '环境噪声检测已通过；本次录制的后续句子和重录不再重复检测。'
         : '环境噪声未通过，请处理噪声后手动重新检测。');
@@ -1014,6 +1034,10 @@ function RecorderApp() {
       setEngineStatus('offline');
       setError(message);
     });
+    const unsubscribePrompterStatus = window.recorder.onPrompterStatus(setPrompterStatus);
+    void window.recorder.getPrompterStatus().then((status) => {
+      if (active) setPrompterStatus(status);
+    }).catch(() => undefined);
     return () => {
       active = false;
       meterFrameCommitter.dispose();
@@ -1022,6 +1046,7 @@ function RecorderApp() {
       }
       unsubscribeEvent();
       unsubscribeOffline();
+      unsubscribePrompterStatus();
     };
     // Initial engine discovery only runs when the renderer mounts.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1047,6 +1072,13 @@ function RecorderApp() {
     setPauseConfirmOpen(false);
     setFinishConfirmOpen(true);
   }, [captureFault, pauseConfirmOpen]);
+
+  useEffect(() => {
+    const issueJustAppeared = hasMonitorIssues && !hadMonitorIssuesRef.current;
+    hadMonitorIssuesRef.current = hasMonitorIssues;
+    if (issueJustAppeared && phase === 'running') setMonitorPanelTab('issues');
+    else if (!hasMonitorIssues) setMonitorPanelTab((current) => current === 'issues' ? 'monitor' : current);
+  }, [hasMonitorIssues, phase]);
 
   useEffect(() => {
     if (selectedCapturePreset) return;
@@ -1089,6 +1121,11 @@ function RecorderApp() {
     setInputChannel(nextSnapshot.audio_format.input_channel ?? 1);
     setSilenceDurationMs(nextSnapshot.silence_duration_ms ?? 1_000);
     setNoiseThresholdDbfs(threshold);
+    setTaskInitialSilenceThresholdDbfs(threshold);
+    setTaskInitialSilenceDurationMs(nextSnapshot.silence_duration_ms ?? 1_000);
+    setSilenceThresholdDraftDbfs(threshold);
+    setSilenceDurationDraftMs(nextSnapshot.silence_duration_ms ?? 1_000);
+    setSilenceSettingsError('');
     setCurrentIndex(restoredIndex);
     setRecording(Boolean(current.active_attempt));
     setAttemptStartSample(current.active_attempt?.start_sample ?? 0);
@@ -1137,7 +1174,13 @@ function RecorderApp() {
     setBitDepth(nextSnapshot.audio_format.bit_depth);
     setInputChannel(nextSnapshot.audio_format.input_channel ?? 1);
     setSilenceDurationMs(nextSnapshot.silence_duration_ms ?? 1_000);
-    setNoiseThresholdDbfs(nextSnapshot.silence_threshold_dbfs ?? -42);
+    const taskThreshold = nextSnapshot.silence_threshold_dbfs ?? -42;
+    setNoiseThresholdDbfs(taskThreshold);
+    setTaskInitialSilenceThresholdDbfs(taskThreshold);
+    setTaskInitialSilenceDurationMs(nextSnapshot.silence_duration_ms ?? 1_000);
+    setSilenceThresholdDraftDbfs(taskThreshold);
+    setSilenceDurationDraftMs(nextSnapshot.silence_duration_ms ?? 1_000);
+    setSilenceSettingsError('');
     setCurrentIndex(0);
     setRecording(false);
     setCaptureActive(false);
@@ -1203,7 +1246,64 @@ function RecorderApp() {
   async function openPrompterPanel() {
     window.recorder.sendPrompterState(prompterState);
     const opened = await run('正在打开领读面板…', () => window.recorder.openPrompter());
-    if (opened) setNotice('领读面板已打开；如有外接显示器，已优先放置到外接屏。');
+    if (opened) {
+      setPrompterStatus({ open: true, ready: true });
+      setNotice('领读面板已打开；如有外接显示器，已优先放置到外接屏。');
+    }
+  }
+
+  async function applyTaskSilenceSettings(thresholdValue: number, durationValue: number) {
+    const threshold = Math.min(-12, Math.max(-72, Math.round(thresholdValue)));
+    const durationMs = Math.min(5_000, Math.max(200, Math.round(durationValue / 100) * 100));
+    setSilenceThresholdDraftDbfs(threshold);
+    setSilenceDurationDraftMs(durationMs);
+    if (!snapshot || !captureActive || workspaceFaulted || captureFault
+      || (threshold === noiseThresholdDbfs && durationMs === silenceDurationMs)) return;
+    const request = ++silenceSettingsSaveSequenceRef.current;
+    setSilenceSettingsSaving(true);
+    setSilenceSettingsError('');
+    try {
+      const result = await window.recorder.request<{
+        threshold_dbfs: number;
+        silence_duration_ms: number;
+        reset_kind: 'idle' | 'head_silence' | 'tail_silence';
+        snapshot: SessionSnapshot;
+      }>('set_silence_settings', { threshold_dbfs: threshold, silence_duration_ms: durationMs });
+      if (request !== silenceSettingsSaveSequenceRef.current) return;
+      setSnapshot(result.snapshot);
+      setNoiseThresholdDbfs(result.threshold_dbfs);
+      setSilenceDurationMs(result.silence_duration_ms);
+      setSilenceThresholdDraftDbfs(result.threshold_dbfs);
+      setSilenceDurationDraftMs(result.silence_duration_ms);
+      setMeter((previous) => ({
+        ...previous,
+        silence_threshold_dbfs: result.threshold_dbfs,
+        silence_duration_ms: result.silence_duration_ms,
+        silence_samples: 0,
+        ...(result.reset_kind === 'head_silence' ? {
+          head_silence_phase: 'waiting_for_head_silence' as HeadSilencePhase,
+          head_silence_progress_samples: 0,
+          head_silence_passed_sample: 0,
+          content_started_sample: 0,
+          last_signal_sample: 0,
+        } : result.reset_kind === 'tail_silence' ? {
+          last_signal_sample: previous.captured_samples,
+        } : {}),
+      }));
+      setNotice(result.reset_kind === 'head_silence'
+        ? `任务静音设置已全局更新，当前句正在重新累计句首静音。`
+        : result.reset_kind === 'tail_silence'
+          ? `任务静音设置已全局更新，当前句正在重新累计句尾静音。`
+          : `任务静音设置已全局更新为 ${result.threshold_dbfs} dBFS / ${(result.silence_duration_ms / 1_000).toFixed(1)} 秒。`);
+    } catch (caught) {
+      if (request !== silenceSettingsSaveSequenceRef.current) return;
+      setSilenceThresholdDraftDbfs(noiseThresholdDbfs);
+      setSilenceDurationDraftMs(silenceDurationMs);
+      setSilenceSettingsError(`应用失败：${errorMessage(caught)}`);
+      reportRendererError('更新任务静音设置', caught);
+    } finally {
+      if (request === silenceSettingsSaveSequenceRef.current) setSilenceSettingsSaving(false);
+    }
   }
 
   async function startSession() {
@@ -1223,6 +1323,7 @@ function RecorderApp() {
       bit_depth: bitDepth,
       input_channel: inputChannel,
       silence_duration_ms: silenceDurationMs,
+      noise_threshold_dbfs: noiseThresholdDbfs,
       silence_threshold_dbfs: noiseThresholdDbfs,
       items: scriptItems,
     }));
@@ -1310,7 +1411,7 @@ function RecorderApp() {
         return true;
       }
       if (result.discarded && !result.interrupted) {
-        setNotice('未检测到有效语音，本句已取消，没有生成可用的录音版本。');
+        setNotice('未检测到有效语音，本句已取消，没有生成可用录音。');
         return true;
       }
       setNotice('写盘异常，本句没有可用音频；请安全结束并检查原始母轨。');
@@ -1321,7 +1422,7 @@ function RecorderApp() {
       try {
         await refreshState();
       } catch (caught) {
-        setError(`异常版本已封闭，但无法刷新任务状态：${errorMessage(caught)}`);
+        setError(`异常录音已封闭，但无法刷新任务状态：${errorMessage(caught)}`);
         return true;
       }
       setDataSafetyAlert('音频采集故障已触发保护；当前句已标记为异常中断，不会进入切片导出。');
@@ -1336,7 +1437,7 @@ function RecorderApp() {
       return true;
     }
     setNotice(result.auto_selected
-      ? '重录完成，新版本已设为当前版本；旧版本仍保留。'
+      ? '重录完成，已使用最新录音；之前的数据仍安全保留。'
       : (result.forced ?? result.attempt.forced_without_tail_silence)
         ? '已强制完成本句，尾部静音不足；请试听后确认或重录。'
         : '录制完成：请试听、确认，或按 R 重录。');
@@ -1424,19 +1525,6 @@ function RecorderApp() {
     setNotice(`正在试听 ${attemptId}`);
   }
 
-  async function selectAttemptVersion(attemptId: string) {
-    if (!currentItem || captureActive || workspaceFaulted || recording) return;
-    const result = await run('正在设置当前版本…', () => window.recorder.request<{ snapshot: SessionSnapshot }>('select_session_attempt', {
-      session_dir: sessionDir,
-      item_id: currentItem.id,
-      attempt_id: attemptId,
-    }));
-    if (!result) return;
-    setSnapshot(result.snapshot);
-    setReviewAttemptId(attemptId);
-    setNotice(`已将 ${attemptId} 设为当前版本；分段 ZIP 和时间戳 JSON 需要重新导出。`);
-  }
-
   async function openHistoricalRecording(recording: RecordingHistoryEntry) {
     if (recording.is_active) {
       await returnToActiveRecording(recording);
@@ -1520,7 +1608,7 @@ function RecorderApp() {
     }
     if (warning) setDataSafetyAlert(`${warning}。已落盘的母音频仍已封存，请抽检。`);
     const recovered = sealed.recovered_attempts
-      ? `，${sealed.recovered_attempts} 个未闭合录音版本已标记为异常中断`
+      ? `，${sealed.recovered_attempts} 段未闭合录音已标记为异常中断`
       : '';
     const canExportNow = recording.pending_items + recording.review_items === 0;
     setNotice(sealed.no_op
@@ -1615,14 +1703,14 @@ function RecorderApp() {
     setSessionDir('');
     setCaptureActive(false);
     setWorkspaceFaulted(false);
-    setWorkspaceExportOpen(false);
+    setMonitorPanelTab('monitor');
     setRecording(false);
     setCurrentIndex(0);
     setReviewAttemptId(null);
     setAudioUrl('');
     setMeter(emptyMeter);
     clearSessionNoiseCheck();
-    setNotice('已返回任务列表。');
+    setNotice('已退出任务。');
     void refreshRecordings();
   }
 
@@ -1807,6 +1895,10 @@ function RecorderApp() {
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
+      if (settingsOpen) {
+        if (event.key === 'Escape') setSettingsOpen(false);
+        return;
+      }
       if (deleteConfirmRecording) {
         if (event.key === 'Escape' && !deletingSessionDir) setDeleteConfirmRecording(null);
         return;
@@ -1877,6 +1969,25 @@ function RecorderApp() {
     return () => window.removeEventListener('pointerdown', closeActionsMenu);
   }, [openActionsSessionDir]);
 
+  const settingsDialog = settingsOpen && <div className="dialog-backdrop" role="presentation">
+    <section className="studio-dialog settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-dialog-title">
+      <header><span className="dialog-icon"><Icon name="settings" size={19} /></span><div><small>APPLICATION SETTINGS</small><h2 id="settings-dialog-title">应用设置</h2></div></header>
+      <div className="settings-content">
+        <section>
+          <div><strong>默认保存位置</strong><small>新建录制和历史任务默认从这里读取</small></div>
+          <code title={outputDir}>{outputDir || '尚未选择'}</code>
+          <button className="button" onClick={() => void chooseOutput()} disabled={Boolean(busy) || phase === 'running'}><Icon name="folder" size={14} />更改位置</button>
+          {phase === 'running' && <p>当前任务打开期间不能更改，请退出任务后再设置。</p>}
+        </section>
+        <section>
+          <div><strong>录音引擎</strong><small>连接信息改为按需查看；异常仍会在工作区告警</small></div>
+          <span className={`settings-engine ${engineStatus}`}><i />{engineStatus === 'ready' ? '已连接' : engineStatus === 'connecting' ? '正在连接…' : '已离线'}</span>
+        </section>
+      </div>
+      <footer><button className="button primary" onClick={() => setSettingsOpen(false)}>完成</button></footer>
+    </section>
+  </div>;
+
   if (phase === 'home') {
     const filters: Array<{ id: HistoryFilter; label: string }> = [
       { id: 'all', label: '全部' },
@@ -1884,7 +1995,7 @@ function RecorderApp() {
       { id: 'unfinished', label: '未完成' },
     ];
     return <div className="home-shell">
-      <HomeHeader engineStatus={engineStatus} preview={isBrowserPreview} />
+      <HomeHeader preview={isBrowserPreview} onOpenSettings={() => setSettingsOpen(true)} />
       <main className="home-main" data-testid="recordings-workspace">
         <header className="home-titlebar">
           <div><h1>录制任务</h1><p>{isBrowserPreview ? '当前是浏览器界面预览；打开本机文件夹、真实录音等系统功能请使用桌面应用。' : '进入任务查看进度，或随时导出当前已有内容。'}</p></div>
@@ -1952,14 +2063,14 @@ function RecorderApp() {
             <button onClick={() => { const task = exportRecording; setExportRecording(null); void exportRecordingArtifact(task, 'timestamps_json'); }} disabled={Boolean(busy)}><span><Icon name="file" size={16} /></span><div><strong>导出时间戳 JSON</strong><small>timestamps.json · {artifactStatusCopy(exportRecording, 'timestamps_json')}</small></div></button>
             <button onClick={() => { const task = exportRecording; setExportRecording(null); void exportRecordingArtifact(task, 'cuts_zip'); }} disabled={Boolean(busy) || recordingState(exportRecording).kind === 'attention'}><span><Icon name="export" size={16} /></span><div><strong>导出分段 ZIP</strong><small>{recordingState(exportRecording).kind === 'attention' ? '任务需要修复后才能导出分段' : `cuts.zip · ${artifactStatusCopy(exportRecording, 'cuts_zip')}`}</small></div></button>
           </div>
-          <div className="dialog-warning">任务：{exportRecording.session_id}<br />待录、待确认或未选中录音版本的句子不会出现在切片包中，但不影响整轨和时间戳导出。</div>
+          <div className="dialog-warning">任务：{exportRecording.session_id}<br />待录、待确认或没有可用录音的句子不会出现在切片包中，但不影响整轨和时间戳导出。</div>
           <footer><button className="button" onClick={() => setExportRecording(null)} disabled={Boolean(busy)}>关闭</button></footer>
         </section>
       </div>}
       {sealConfirmRecording && <div className="dialog-backdrop" role="presentation">
         <section className="studio-dialog seal-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="seal-confirm-title">
           <header><span className="dialog-icon"><Icon name="history" size={19} /></span><div><small>INTERRUPTED TASK RECOVERY</small><h2 id="seal-confirm-title">修复这个中断任务？</h2></div></header>
-          <p>系统会先确认当前没有活跃录音，再修复已落盘 WAV 头和未正常结束的录音版本，安全收尾母音频和任务进度。</p>
+          <p>系统会先确认当前没有活跃录音，再修复已落盘 WAV 头和未正常结束的录音，安全收尾母音频和任务进度。</p>
           <div className="dialog-warning">任务：{sealConfirmRecording.session_id}<br />此操作不会覆盖母音频，也不会自动导出。{sealConfirmRecording.status === 'faulted' || sealConfirmRecording.overflow_samples > 0 ? '安全收尾后仍保留采集故障标记，请人工检查原始分段。' : '修复后，可以继续录制，也可导出当前已有内容。'}</div>
           <footer><button className="button" onClick={() => setSealConfirmRecording(null)} disabled={Boolean(busy)}>取消</button><button data-testid="confirm-seal-recording" className="button primary" onClick={() => { const recording = sealConfirmRecording; setSealConfirmRecording(null); void sealHistoricalRecording(recording); }} disabled={Boolean(busy)}>确认修复</button></footer>
         </section>
@@ -1967,18 +2078,19 @@ function RecorderApp() {
       {deleteConfirmRecording && <div className="dialog-backdrop" role="presentation">
         <section className="studio-dialog delete-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-confirm-title">
           <header><span className="dialog-icon danger"><Icon name="trash" size={19} /></span><div><small>MOVE TO TRASH</small><h2 id="delete-confirm-title">删除这条录制任务？</h2></div></header>
-          <p>整条任务目录将移到系统回收站，包括母音频、已录版本、元数据和导出文件。</p>
+          <p>整条任务目录将移到系统回收站，包括母音频、各次重录数据、元数据和导出文件。</p>
           <div className="dialog-warning danger">任务：{deleteConfirmRecording.session_id}<br />删除后不能在应用内继续录制或导出；如果误删，请尽快从系统回收站恢复。</div>
           <footer><button className="button" onClick={() => setDeleteConfirmRecording(null)} disabled={Boolean(deletingSessionDir)}>取消</button><button data-testid="confirm-delete-recording" className="button danger" onClick={() => { const recording = deleteConfirmRecording; setDeleteConfirmRecording(null); void deleteHistoricalRecording(recording); }} disabled={Boolean(deletingSessionDir)}>移到回收站</button></footer>
         </section>
       </div>}
+      {settingsDialog}
     </div>;
   }
 
   if (phase === 'setup') {
     const readyToStart = engineStatus === 'ready' && scriptItems.length > 0 && !scriptErrors.length && Boolean(outputDir) && captureConfigurationValid && !busy && !presetBusy;
     return <div className="studio-shell">
-      <StudioChrome phase={phase} title="新建录制" engineStatus={engineStatus} onBack={returnToRecordings} />
+      <StudioChrome phase={phase} title="新建录制" onBack={returnToRecordings} onOpenSettings={() => setSettingsOpen(true)} />
       <div className="studio-workspace setup-workspace" data-testid="setup-workspace">
         <aside className="tool-rail" aria-label="工具"><button className="active" title="新建录制"><Icon name="file" /></button><button title="音频设备"><Icon name="microphone" /></button><button title="参数"><Icon name="sliders" /></button><span /><button title="返回历史录制" onClick={returnToRecordings}><Icon name="history" /></button></aside>
         <aside className="panel setup-outline">
@@ -2012,7 +2124,7 @@ function RecorderApp() {
                   <div><button className="button" onClick={() => void saveCapturePreset('new')} disabled={!presetName.trim() || Boolean(busy) || presetBusy}>{selectedCapturePreset ? '另存为新预设' : '保存为预设'}</button>{selectedCapturePreset && <><button className="button primary" onClick={() => void saveCapturePreset('update')} disabled={!presetName.trim() || Boolean(busy) || presetBusy}>更新当前预设</button><button className="button danger-button" onClick={() => void deleteCapturePreset()} disabled={Boolean(busy) || presetBusy}>删除</button></>}</div>
                 </div>}
               </div>
-              <div className="form-grid audio-form"><label className="field span-2"><span>输入设备（Windows 系统驱动 / 声卡）</span><div className="field-row"><select value={deviceId} onChange={(event) => { const device = devices.find((candidate) => candidate.id === event.target.value); setDeviceId(event.target.value); setDeviceName(device?.name ?? ''); }} disabled={Boolean(busy)}>{!devices.length && <option value="">未发现输入设备</option>}{deviceId && !selectedDevice && <option value={deviceId}>{deviceName || deviceId}（不可用）</option>}{devices.map((device) => <option value={device.id} key={device.id}>{device.name}{device.is_default ? '（系统默认）' : ''}</option>)}</select><button className="square-button" title="刷新设备" onClick={() => void loadDevices()}><Icon name="refresh" /></button></div></label><label className={`field ${selectedDevice && !rateOptions.includes(sampleRate) ? 'invalid' : ''}`}><span>采样率</span><select value={sampleRate} onChange={(event) => setSampleRate(Number(event.target.value))}>{!rateOptions.includes(sampleRate) && <option value={sampleRate}>{sampleRate.toLocaleString()} Hz（不兼容）</option>}{rateOptions.map((rate) => <option value={rate} key={rate}>{rate.toLocaleString()} Hz</option>)}</select></label><label className="field"><span>导出位深</span><select value={bitDepth} onChange={(event) => setBitDepth(Number(event.target.value))}><option value={16}>16-bit PCM</option><option value={24}>24-bit PCM（推荐）</option><option value={32}>32-bit Float</option></select></label><label className={`field ${selectedDevice && inputChannel > activeInputChannels ? 'invalid' : ''}`}><span>输入通道</span><select value={inputChannel} onChange={(event) => setInputChannel(Number(event.target.value))}>{inputChannel > activeInputChannels && <option value={inputChannel}>输入 {inputChannel}（不兼容）</option>}{Array.from({ length: activeInputChannels }, (_, index) => <option value={index + 1} key={index + 1}>输入 {index + 1}</option>)}</select></label><label className="field"><span>环境 / 静音上限（RMS dBFS）</span><input type="number" min="-72" max="-12" step="1" value={noiseThresholdDbfs} onChange={(event) => setNoiseThresholdDbfs(Math.min(-12, Math.max(-72, Number(event.target.value) || -42)))} /></label><label className="field"><span>前后静音时长（秒）</span><input type="number" min="0.2" max="5" step="0.1" value={silenceDurationMs / 1_000} onChange={(event) => setSilenceDurationMs(Math.round(Math.min(5, Math.max(.2, Number(event.target.value) || 1)) * 1_000))} /></label></div>
+              <div className="form-grid audio-form"><label className="field span-2"><span>输入设备（Windows 系统驱动 / 声卡）</span><div className="field-row"><select value={deviceId} onChange={(event) => { const device = devices.find((candidate) => candidate.id === event.target.value); setDeviceId(event.target.value); setDeviceName(device?.name ?? ''); }} disabled={Boolean(busy)}>{!devices.length && <option value="">未发现输入设备</option>}{deviceId && !selectedDevice && <option value={deviceId}>{deviceName || deviceId}（不可用）</option>}{devices.map((device) => <option value={device.id} key={device.id}>{device.name}{device.is_default ? '（系统默认）' : ''}</option>)}</select><button className="square-button" title="刷新设备" onClick={() => void loadDevices()}><Icon name="refresh" /></button></div></label><label className={`field ${selectedDevice && !rateOptions.includes(sampleRate) ? 'invalid' : ''}`}><span>采样率</span><select value={sampleRate} onChange={(event) => setSampleRate(Number(event.target.value))}>{!rateOptions.includes(sampleRate) && <option value={sampleRate}>{sampleRate.toLocaleString()} Hz（不兼容）</option>}{rateOptions.map((rate) => <option value={rate} key={rate}>{rate.toLocaleString()} Hz</option>)}</select></label><label className="field"><span>导出位深</span><select value={bitDepth} onChange={(event) => setBitDepth(Number(event.target.value))}><option value={16}>16-bit PCM</option><option value={24}>24-bit PCM（推荐）</option><option value={32}>32-bit Float</option></select></label><label className={`field ${selectedDevice && inputChannel > activeInputChannels ? 'invalid' : ''}`}><span>输入通道</span><select value={inputChannel} onChange={(event) => setInputChannel(Number(event.target.value))}>{inputChannel > activeInputChannels && <option value={inputChannel}>输入 {inputChannel}（不兼容）</option>}{Array.from({ length: activeInputChannels }, (_, index) => <option value={index + 1} key={index + 1}>输入 {index + 1}</option>)}</select></label><label className="field"><span>任务静音阈值（RMS dBFS）</span><input type="number" min="-72" max="-12" step="1" value={noiseThresholdDbfs} onChange={(event) => setNoiseThresholdDbfs(Math.min(-12, Math.max(-72, Number(event.target.value) || -42)))} /></label><label className="field"><span>前后静音时长（秒）</span><input type="number" min="0.2" max="5" step="0.1" value={silenceDurationMs / 1_000} onChange={(event) => setSilenceDurationMs(Math.round(Math.min(5, Math.max(.2, Number(event.target.value) || 1)) * 1_000))} /></label></div>
               <div className={`hardware-line ${captureConfigurationIssue ? 'invalid' : ''}`}><span className={captureConfigurationValid ? 'ok' : ''}><i />{captureConfigurationIssue || '设备与参数可用'}</span><em>输入通道 {inputChannel} / {activeInputChannels}</em><em>驱动格式 {captureFormats.join(' / ') || '不兼容'}</em><em>{bitDepth === 32 ? 'Float' : 'PCM'} {bitDepth}-bit / Mono</em></div>
             </section>
             <section className="property-group">
@@ -2026,17 +2138,18 @@ function RecorderApp() {
           <div className="panel-tabs"><button className="active">检查器</button></div>
           <div className="inspector-section"><h3>录制摘要</h3><dl className="property-list"><div><dt>脚本条目</dt><dd>{scriptItems.length || '—'}</dd></div><div><dt>采样率</dt><dd>{sampleRate.toLocaleString()} Hz</dd></div><div><dt>位深</dt><dd>{bitDepth === 32 ? '32-bit Float' : `${bitDepth}-bit PCM`}</dd></div><div><dt>输入通道</dt><dd>{inputChannel}</dd></div><div><dt>声道</dt><dd>Mono</dd></div><div><dt>噪声上限</dt><dd>{noiseThresholdDbfs} dBFS</dd></div><div><dt>前后静音</dt><dd>{(silenceDurationMs / 1_000).toFixed(1)} s</dd></div></dl></div>
           <div className="inspector-section"><h3>输入设备</h3><div className="device-summary"><span><Icon name="microphone" /></span><div><strong>{deviceName || '未选择设备'}</strong><small>{selectedDevice?.is_default ? '系统默认输入' : '外部输入设备'}</small></div></div></div>
-          <div className="inspector-section"><h3>数据策略</h3><ul className="feature-list"><li><Icon name="check" />持续母音频</li><li><Icon name="check" />整数样本边界</li><li><Icon name="check" />不可变重录版本</li><li><Icon name="check" />原子状态快照</li></ul></div>
+          <div className="inspector-section"><h3>数据策略</h3><ul className="feature-list"><li><Icon name="check" />持续母音频</li><li><Icon name="check" />整数样本边界</li><li><Icon name="check" />重录保留原始数据</li><li><Icon name="check" />原子状态快照</li></ul></div>
         </aside>
       </div>
       <StudioStatus engineStatus={engineStatus} message={error || dataSafetyAlert || presetWarning || busy || notice} isError={Boolean(error || dataSafetyAlert)} right="READY · PCM · LOCAL" />
+      {settingsDialog}
     </div>;
   }
 
   return <div className="studio-shell">
-    <StudioChrome phase={phase} title={snapshot?.session_id ?? '当前录制'} engineStatus={engineStatus} onBack={requestSafePause} backTitle={captureActive ? '安全暂停并返回任务列表' : '返回任务列表'} activityLabel={workspaceFaulted ? '只读检查' : captureActive ? '正在采集' : '检查任务'} />
+    <StudioChrome phase={phase} title={snapshot?.session_id ?? '当前录制'} onBack={requestSafePause} onOpenSettings={() => setSettingsOpen(true)} backTitle="退出任务" activityLabel={workspaceFaulted ? '只读检查' : captureActive ? '监听控制台 · 正在采集' : '监听控制台 · 检查任务'} />
     <div className="studio-workspace recording-workspace" data-testid="recording-workspace">
-      <aside className="tool-rail" aria-label="录音工具"><button title="选择"><Icon name="file" /></button><button className="active" title="录音"><Icon name="microphone" /></button><button title="电平"><Icon name="meter" /></button><span /><button className={workspaceExportOpen ? 'active' : ''} title="导出" onClick={() => setWorkspaceExportOpen((open) => !open)}><Icon name="export" /></button></aside>
+      <aside className="tool-rail" aria-label="录音工具" />
       <aside className="panel item-browser">
         <div className="panel-tabs"><button className="active">脚本</button><button>标记</button></div>
         <div className="browser-summary"><span><strong>{completed}</strong> / {items.length} 完成</span><div className="mini-progress"><i style={{ width: `${items.length ? completed / items.length * 100 : 0}%` }} /></div></div>
@@ -2045,8 +2158,7 @@ function RecorderApp() {
       </aside>
       <main className="editor-document">
         <div className="document-tabs"><span className="active"><Icon name="microphone" size={13} /> {workflowComplete ? '任务完成' : currentItem?.id ?? 'Item'} <i>×</i></span></div>
-        <div className="editor-toolbar"><div className="editor-nav"><button title="上一句" disabled={recording || currentIndex === 0} onClick={() => setCurrentIndex((index) => Math.max(0, index - 1))}><Icon name="chevron-left" /></button><span>{currentIndex + 1} / {items.length}</span><button title="下一句" disabled={recording || currentIndex >= items.length - 1} onClick={() => setCurrentIndex((index) => Math.min(items.length - 1, index + 1))}><Icon name="chevron-right" /></button></div><div className="editor-time"><small>{recording ? 'TAKE' : 'TOTAL'}</small><strong className={recording ? 'recording' : ''}>{recording ? attemptDuration : sessionDuration}</strong></div><div className="editor-toolbar-actions"><button className={`workspace-export-toggle ${workspaceExportOpen ? 'active' : ''}`} onClick={() => setWorkspaceExportOpen((open) => !open)}><Icon name="export" size={13} />导出</button><button className="prompter-launch" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />领读面板</button></div><div className={`save-health ${workspaceFaulted || captureFault ? 'fault' : meter.storage_status === 'warning' ? 'warning' : ''}`}><i />{workspaceFaulted ? '只读保护 · 需要检查' : !captureActive ? '检查模式 · 声卡未启用' : captureFault ? `${captureFaultCopy.title} · 立即停止朗读` : meter.storage_status === 'warning' ? `磁盘余量预警 · 约 ${Math.max(0, Math.floor(meter.storage_safe_remaining_seconds / 60))} 分钟安全窗口` : '采集中 · 声卡持续开启'}</div></div>
-        {workspaceExportOpen && snapshot && <section className="workspace-export-panel"><header><div><strong>导出当前任务</strong><small>三个产物独立生成，不要求任务已完成</small></div><button onClick={() => setWorkspaceExportOpen(false)}>关闭</button></header><div><button onClick={() => void exportRecordingArtifact({ session_id: snapshot.session_id, session_dir: sessionDir }, 'full_track')} disabled={Boolean(busy)}><Icon name="meter" /><span><strong>整轨 WAV</strong><small>full-track.wav · {artifactStatusCopy(workspaceRecording, 'full_track')}</small></span></button><button onClick={() => void exportRecordingArtifact({ session_id: snapshot.session_id, session_dir: sessionDir }, 'timestamps_json')} disabled={Boolean(busy)}><Icon name="file" /><span><strong>时间戳 JSON</strong><small>timestamps.json · {artifactStatusCopy(workspaceRecording, 'timestamps_json')}</small></span></button><button onClick={() => void exportRecordingArtifact({ session_id: snapshot.session_id, session_dir: sessionDir }, 'cuts_zip')} disabled={Boolean(busy) || workspaceFaulted}><Icon name="export" /><span><strong>分段 ZIP</strong><small>{workspaceFaulted ? '修复后可用' : `cuts.zip · ${artifactStatusCopy(workspaceRecording, 'cuts_zip')}`}</small></span></button></div></section>}
+        <div className="editor-toolbar"><div className="editor-nav"><button title="上一句" disabled={recording || currentIndex === 0} onClick={() => setCurrentIndex((index) => Math.max(0, index - 1))}><Icon name="chevron-left" /></button><span>{currentIndex + 1} / {items.length}</span><button title="下一句" disabled={recording || currentIndex >= items.length - 1} onClick={() => setCurrentIndex((index) => Math.min(items.length - 1, index + 1))}><Icon name="chevron-right" /></button></div><div className="editor-time"><small>{recording ? 'TAKE' : 'TOTAL'}</small><strong className={recording ? 'recording' : ''}>{recording ? attemptDuration : sessionDuration}</strong></div><div className="editor-toolbar-actions"><button className="prompter-launch" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? '定位领读面板' : '打开领读面板'}</button></div><div className={`save-health ${workspaceFaulted || captureFault ? 'fault' : meter.storage_status === 'warning' ? 'warning' : ''}`}><i />{workspaceFaulted ? '只读保护 · 需要检查' : !captureActive ? '检查模式 · 声卡未启用' : captureFault ? `${captureFaultCopy.title} · 立即停止朗读` : meter.storage_status === 'warning' ? `磁盘余量预警 · 约 ${Math.max(0, Math.floor(meter.storage_safe_remaining_seconds / 60))} 分钟安全窗口` : '采集中 · 声卡持续开启'}</div></div>
         {captureFault && <div className="capture-fault-banner" role="alert"><Icon name="stop" size={16} /><div><strong>{captureFaultCopy.title}</strong><span>{captureFaultCopy.detail}{snapshot?.device_name ? ` 当前设备：${snapshot.device_name}。` : ' '}请停止朗读，然后安全结束任务。</span></div></div>}
         {noiseCheckBlocksAttempt && <div className={`session-noise-banner ${currentNoiseGate}`} role="status"><Icon name="meter" size={16} /><div><strong>{currentNoiseGate === 'checking' ? '环境噪声检测中' : currentNoiseGate === 'failed' ? '环境噪声未通过' : '需要环境噪声检测'}</strong><span>{noiseCheckMessage}。通过后，本次录制期间不再重复检测。</span></div><button className="button" onClick={() => snapshot && void runSessionNoiseCheck(sessionDir, snapshot)} disabled={noiseCheckRunning || Boolean(busy)}>{noiseCheckRunning ? '检测中…' : currentNoiseGate === 'failed' || noiseCheckError ? '重新检测' : '开始检测'}</button></div>}
         {qualityWarning && <div className="input-quality-banner" role="alert"><Icon name="meter" size={16} /><div><strong>输入质量强提醒</strong><span>{qualityWarning}。录音仍在持续写入，请确认输入恢复后再继续朗读。</span></div></div>}
@@ -2081,29 +2193,48 @@ function RecorderApp() {
         </div>
       </main>
       <aside className="panel inspector recording-inspector">
-        <div className="panel-tabs"><button className="active">属性</button><button>历史</button></div>
-        <div className="inspector-section compact"><h3>当前条目</h3><dl className="property-list"><div><dt>文本 ID</dt><dd>{currentItem?.id}</dd></div><div><dt>状态</dt><dd className={`status-value ${captureFault ? 'fault' : recording ? cue : currentItem?.status}`}>{captureFault ? cueLabel : recording ? cueLabel : statusLabel(currentItem?.status ?? '')}</dd></div><div><dt>版本数</dt><dd>{currentItem?.attempts.length ?? 0}</dd></div></dl></div>
-        <div className="inspector-section input-inspector"><h3>输入电平</h3><div className="vertical-meter-wrap"><div className="vertical-meter"><i className="safe-zone" /><i className="vertical-fill" style={{ height: `${peakPercent}%` }} /></div><div className="vertical-scale"><span>0</span><span>−6</span><span>−12</span><span>−24</span><span>−48</span></div><div className="level-readout"><strong className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</strong><small>PEAK</small><strong>{db(meter.rms)}</strong><small>RMS</small></div></div><p className={`level-hint ${captureFault || meter.peak > .92 ? 'danger' : meter.peak > .04 ? 'good' : ''}`}><i />{!captureActive ? '检查模式 · 声卡未启用' : captureFault ? '输入已停止 · 请检查声卡' : meter.peak > .92 ? '输入过载，请降低增益' : meter.peak > .04 ? '输入电平正常' : '等待输入信号'}</p></div>
-        <div className="inspector-section takes-section"><h3>录音版本</h3>{currentItem?.attempts.length ? <div className="take-list">{[...currentItem.attempts].reverse().map((attempt) => {
-          const interrupted = attempt.status === 'interrupted' || attempt.end_sample <= attempt.start_sample;
-          const forcedTail = Boolean(attempt.forced_without_tail_silence);
-          return <div key={attempt.attempt_id} className="take-version-row"><button className={`${attempt.attempt_id === (reviewAttemptId ?? currentItem.selected_attempt_id) ? 'selected' : ''} ${interrupted ? 'interrupted' : ''} ${forcedTail ? 'quality-warning' : ''}`} disabled={interrupted} onClick={() => setReviewAttemptId(attempt.attempt_id)}><span><i />{attempt.attempt_id}</span><small>{interrupted ? '异常中断 · 不可用' : forcedTail ? '尾静音不足 · 需试听' : formatDuration(attempt.end_sample - attempt.start_sample, sampleRateForDisplay)}</small></button>{!captureActive && !workspaceFaulted && !interrupted && attempt.attempt_id === reviewAttemptId && attempt.attempt_id !== currentItem.selected_attempt_id && <button className="set-current-version" onClick={() => void selectAttemptVersion(attempt.attempt_id)} disabled={Boolean(busy)}>设为当前版本</button>}</div>;
-        })}</div> : <p className="empty-panel">尚无录音版本</p>}</div>
-        <div className="inspector-section compact"><h3>本次录制</h3><dl className="property-list"><div><dt>导出格式</dt><dd>{sampleRateForDisplay / 1000}k / {snapshot?.audio_format.bit_depth}-bit</dd></div><div><dt>客户端输入格式</dt><dd title="Windows WASAPI shared 模式下的应用输入格式，不等同于声卡 ADC 原生精度。">{snapshot?.input_sample_format?.toUpperCase() ?? '—'}</dd></div><div><dt>静音规则</dt><dd>{(effectiveSilenceDurationMs / 1_000).toFixed(1)} s / {snapshot?.silence_threshold_dbfs ?? noiseThresholdDbfs} dBFS</dd></div><div><dt>当前门控</dt><dd className={`cue-value ${cue}`}>{cueLabel}</dd></div><div><dt>队列溢出</dt><dd className={meter.overflow_samples ? 'danger' : ''}>{meter.overflow_samples}</dd></div><div><dt>已确认</dt><dd>{counts.accepted ?? 0} / {items.length}</dd></div></dl></div>
-        <button data-testid="finish-session" className="button finish-session" onClick={() => void finishSession()} disabled={Boolean(busy)}><Icon name={captureActive ? 'stop' : 'chevron-left'} size={14} />{!captureActive ? '返回任务列表' : exitAction === 'fault' ? '安全结束并保留母轨' : recording ? '安全暂停' : '暂停录制'}</button>
+        <div className={`monitor-status-strip ${captureFault || workspaceFaulted ? 'fault' : meter.storage_status === 'warning' ? 'warning' : ''}`}>
+          <span><i />{captureFault ? captureFaultCopy.title : workspaceFaulted ? '只读保护' : captureActive ? '采集正常' : '检查模式'}</span>
+          <span className={prompterStatus.ready ? 'ready' : ''}><i />{prompterStatus.ready ? '领读面板已连接' : '领读面板未连接'}</span>
+        </div>
+        <div className="monitor-panel-body">
+          <div className="monitor-tab-content">
+            {monitorPanelTab === 'monitor' && <>
+              <section className="monitor-section input-inspector"><h3>监听输入</h3><div className="vertical-meter-wrap"><div className="vertical-meter"><i className="safe-zone" /><i className="vertical-fill" style={{ height: `${peakPercent}%` }} /></div><div className="vertical-scale"><span>0</span><span>−6</span><span>−12</span><span>−24</span><span>−48</span></div><div className="level-readout"><strong className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</strong><small>PEAK</small><strong>{db(meter.rms)}</strong><small>RMS</small></div></div><p className={`level-hint ${captureFault || meter.peak > .92 ? 'danger' : meter.peak > .04 ? 'good' : ''}`}><i />{!captureActive ? '声卡未启用' : captureFault ? '输入已停止，请检查声卡' : meter.peak > .92 ? '输入过载，请降低增益' : meter.peak > .04 ? '输入电平正常' : '等待输入信号'}</p></section>
+              <section className="monitor-section"><h3>当前协作状态</h3><dl className="property-list"><div><dt>领读人员</dt><dd className={`cue-value ${cue}`}>{cueLabel}</dd></div><div><dt>监听人员</dt><dd>{currentItem?.status === 'review' ? '请试听并确认' : recording ? '请监听当前句' : '等待操作'}</dd></div><div><dt>磁盘</dt><dd>{meter.storage_status === 'healthy' ? '正常' : meter.storage_status === 'warning' ? '余量预警' : '紧急'}</dd></div></dl></section>
+              <button className="detection-summary" onClick={() => setMonitorPanelTab('detection')}><span><strong>静音判定</strong><small>{noiseThresholdDbfs} dBFS / {(effectiveSilenceDurationMs / 1_000).toFixed(1)} 秒</small></span><em>调整</em></button>
+            </>}
+            {monitorPanelTab === 'detection' && <section className="monitor-section detection-settings"><h3>任务静音检测</h3><p>修改会覆盖本任务原设置，并统一作用于当前句和后续句，不修改采集预设。</p><div className="detection-setting"><header><span><strong>静音阈值</strong><small>当前 RMS {liveRmsDbfs <= -96 ? '−∞' : `${liveRmsDbfs.toFixed(1)} dBFS`}</small></span><output>{silenceThresholdDraftDbfs} <small>dBFS</small></output></header><div className="threshold-track"><i style={{ left: `${liveRmsOnThresholdScale}%` }} title={`当前 RMS ${liveRmsDbfs.toFixed(1)} dBFS`} /><input data-testid="task-silence-threshold" aria-label="任务静音阈值" aria-valuetext={`${silenceThresholdDraftDbfs} dBFS`} type="range" min="-72" max="-12" step="1" value={silenceThresholdDraftDbfs} onChange={(event) => setSilenceThresholdDraftDbfs(Number(event.target.value))} onPointerUp={(event) => void applyTaskSilenceSettings(Number(event.currentTarget.value), silenceDurationDraftMs)} onKeyUp={(event) => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) void applyTaskSilenceSettings(Number(event.currentTarget.value), silenceDurationDraftMs); }} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving} /></div><div className="threshold-labels"><span>更敏感 · −72</span><span>更抗噪 · −12</span></div></div><div className="detection-setting"><header><span><strong>静音时长</strong><small>句首和句尾使用同一时长</small></span><output>{(silenceDurationDraftMs / 1_000).toFixed(1)} <small>秒</small></output></header><input data-testid="task-silence-duration" aria-label="任务静音时长" aria-valuetext={`${(silenceDurationDraftMs / 1_000).toFixed(1)} 秒`} type="range" min="200" max="5000" step="100" value={silenceDurationDraftMs} onChange={(event) => setSilenceDurationDraftMs(Number(event.target.value))} onPointerUp={(event) => void applyTaskSilenceSettings(silenceThresholdDraftDbfs, Number(event.currentTarget.value))} onKeyUp={(event) => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) void applyTaskSilenceSettings(silenceThresholdDraftDbfs, Number(event.currentTarget.value)); }} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving} /><div className="threshold-labels"><span>0.2 秒</span><span>5.0 秒</span></div></div><p className={`settings-apply-state ${silenceSettingsError ? 'error' : ''}`}>{silenceSettingsSaving ? '正在覆盖任务设置…' : silenceSettingsError || `全任务已应用 ${noiseThresholdDbfs} dBFS / ${(effectiveSilenceDurationMs / 1_000).toFixed(1)} 秒`}</p><button className="restore-settings" onClick={() => void applyTaskSilenceSettings(taskInitialSilenceThresholdDbfs, taskInitialSilenceDurationMs)} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving || (noiseThresholdDbfs === taskInitialSilenceThresholdDbfs && silenceDurationMs === taskInitialSilenceDurationMs)}>恢复进入任务时的值</button></section>}
+            {monitorPanelTab === 'task' && <section className="monitor-section"><h3>任务与采集参数</h3><dl className="property-list"><div><dt>输入设备</dt><dd title={snapshot?.device_name}>{snapshot?.device_name || '—'}</dd></div><div><dt>输入通道</dt><dd>{snapshot?.audio_format.input_channel ?? 1}</dd></div><div><dt>导出格式</dt><dd>{sampleRateForDisplay / 1000}k / {snapshot?.audio_format.bit_depth}-bit</dd></div><div><dt>驱动输入格式</dt><dd>{snapshot?.input_sample_format?.toUpperCase() ?? '—'}</dd></div><div><dt>环境检测上限</dt><dd>{snapshot?.noise_threshold_dbfs ?? snapshot?.noise_check?.threshold_dbfs ?? '—'} dBFS</dd></div><div><dt>已确认</dt><dd>{counts.accepted ?? 0} / {items.length}</dd></div><div><dt>已跳过</dt><dd>{counts.skipped ?? 0}</dd></div></dl><button className="button panel-action" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? '定位领读面板' : '打开领读面板'}</button></section>}
+            {monitorPanelTab === 'export' && snapshot && <section className="monitor-section monitor-export"><h3>导出当前任务</h3><p>{captureActive ? recording ? '请先完成或取消当前句，再安全暂停并导出。' : '导出前会先安全暂停声卡和持续母轨。' : '三个产物可独立生成。'}</p><div>
+              <button onClick={() => void exportRecordingArtifact({ session_id: snapshot.session_id, session_dir: sessionDir }, 'full_track')} disabled={Boolean(busy) || recording}><Icon name="meter" /><span><strong>整轨 WAV</strong><small>{artifactStatusCopy(workspaceRecording, 'full_track')}</small></span></button>
+              <button onClick={() => void exportRecordingArtifact({ session_id: snapshot.session_id, session_dir: sessionDir }, 'timestamps_json')} disabled={Boolean(busy) || recording}><Icon name="file" /><span><strong>时间戳 JSON</strong><small>{artifactStatusCopy(workspaceRecording, 'timestamps_json')}</small></span></button>
+              <button onClick={() => void exportRecordingArtifact({ session_id: snapshot.session_id, session_dir: sessionDir }, 'cuts_zip')} disabled={Boolean(busy) || recording || workspaceFaulted}><Icon name="export" /><span><strong>分段 ZIP</strong><small>{workspaceFaulted ? '修复后可用' : artifactStatusCopy(workspaceRecording, 'cuts_zip')}</small></span></button>
+            </div></section>}
+            {monitorPanelTab === 'issues' && <section className="monitor-section monitor-issues"><h3>需要监听人员处理</h3>{captureFault && <p><strong>{captureFaultCopy.title}</strong><span>{captureFaultCopy.detail}</span></p>}{workspaceFaulted && <p><strong>任务已进入只读保护</strong><span>请退出任务后使用“检查并修复”。</span></p>}{qualityWarning && <p><strong>输入质量强提醒</strong><span>{qualityWarning}</span></p>}{meter.storage_status !== 'healthy' && <p><strong>存储状态异常</strong><span>{meter.storage_status === 'warning' ? `剩余约 ${Math.max(0, Math.floor(meter.storage_safe_remaining_seconds / 60))} 分钟安全时间` : '请立即安全结束录制'}</span></p>}</section>}
+          </div>
+          <nav className="monitor-tabs" aria-label="监听工具">
+            <button className={monitorPanelTab === 'monitor' ? 'active' : ''} onClick={() => setMonitorPanelTab('monitor')} title="监听"><Icon name="headphones" /><span>监听</span></button>
+            <button className={monitorPanelTab === 'detection' ? 'active' : ''} onClick={() => setMonitorPanelTab('detection')} title="检测设置"><Icon name="sliders" /><span>检测</span></button>
+            <button className={monitorPanelTab === 'task' ? 'active' : ''} onClick={() => setMonitorPanelTab('task')} title="任务"><Icon name="file" /><span>任务</span></button>
+            <button className={monitorPanelTab === 'export' ? 'active' : ''} onClick={() => setMonitorPanelTab('export')} title="导出"><Icon name="export" /><span>导出</span></button>
+            {hasMonitorIssues && <button className={monitorPanelTab === 'issues' ? 'active issue' : 'issue'} onClick={() => setMonitorPanelTab('issues')} title="问题"><Icon name="stop" /><span>问题</span></button>}
+          </nav>
+        </div>
+        <button data-testid="finish-session" className="button finish-session" onClick={() => void finishSession()} disabled={Boolean(busy)}><Icon name={captureActive ? 'stop' : 'chevron-left'} size={14} />{!captureActive ? '退出任务' : exitAction === 'fault' ? '安全结束并退出任务' : '暂停并退出任务'}</button>
       </aside>
     </div>
     {pauseConfirmOpen && !captureFault && <div className="dialog-backdrop" role="presentation">
       <section className="studio-dialog" role="dialog" aria-modal="true" aria-labelledby="pause-dialog-title">
-        <header><span className="dialog-icon"><Icon name="chevron-left" size={19} /></span><div><small>SAFE PAUSE</small><h2 id="pause-dialog-title">{recording ? '先结束当前句，再返回任务列表？' : '安全暂停并返回任务列表？'}</h2></div></header>
+        <header><span className="dialog-icon"><Icon name="chevron-left" size={19} /></span><div><small>SAFE PAUSE</small><h2 id="pause-dialog-title">{recording ? '先结束当前句，再退出任务？' : '暂停录制并退出任务？'}</h2></div></header>
         <p>{recording
           ? hasSpoken
-            ? '当前句已检测到语音。继续后会先封闭本句并保留为待确认版本，再停止持续采集、封存母音频并返回列表。'
+            ? '当前句已检测到语音。继续后会先封闭本句并保留为待确认录音，再停止持续采集、封存母音频并返回列表。'
             : '当前句还没有检测到有效语音。继续后会先取消这次空录音，再停止持续采集、封存母音频并返回列表。'
           : '录音引擎会停止接收新音频，排空已接收数据并安全保存母音频和进度。返回任务列表后可以继续录制或导出。'}</p>
         <dl className="dialog-summary"><div><dt>已确认</dt><dd>{counts.accepted ?? 0}</dd></div><div><dt>已跳过</dt><dd>{counts.skipped ?? 0}</dd></div><div><dt>待处理</dt><dd className={(counts.pending ?? 0) + (counts.review ?? 0) ? 'warning' : ''}>{(counts.pending ?? 0) + (counts.review ?? 0)}</dd></div></dl>
         <div className="dialog-warning">安全暂停后可以从任务列表继续录制；已落盘母音频不会被删除。</div>
-        <footer><button data-testid="pause-cancel" className="button" onClick={() => setPauseConfirmOpen(false)} disabled={Boolean(busy)}>继续录制</button><button data-testid="pause-confirm" className="button primary" onClick={() => void safePauseAndReturn()} disabled={Boolean(busy)}><Icon name="stop" size={14} />{recording ? '结束当前句并安全暂停' : '安全暂停并返回'}</button></footer>
+        <footer><button data-testid="pause-cancel" className="button" onClick={() => setPauseConfirmOpen(false)} disabled={Boolean(busy)}>继续录制</button><button data-testid="pause-confirm" className="button primary" onClick={() => void safePauseAndReturn()} disabled={Boolean(busy)}><Icon name="stop" size={14} />{recording ? '结束当前句并退出任务' : '暂停并退出任务'}</button></footer>
       </section>
     </div>}
     {finishConfirmOpen && <div className="dialog-backdrop" role="presentation">
@@ -2115,6 +2246,7 @@ function RecorderApp() {
       </section>
     </div>}
     <StudioStatus engineStatus={engineStatus} message={error || dataSafetyAlert || busy || notice} isError={Boolean(error || dataSafetyAlert)} right={`${sampleRateForDisplay.toLocaleString()} HZ · ${bitDepthForDisplay}-BIT · MONO`} />
+    {settingsDialog}
   </div>;
 }
 

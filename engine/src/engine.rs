@@ -275,6 +275,10 @@ pub struct SessionSnapshot {
     pub updated_at: String,
     #[serde(default)]
     pub noise_check: Option<NoiseCheckResult>,
+    /// Ambient-room acceptance limit. This remains stable when the operator
+    /// changes the task-wide silence threshold during capture.
+    #[serde(default)]
+    pub noise_threshold_dbfs: Option<f32>,
     #[serde(default = "default_silence_duration_ms")]
     pub silence_duration_ms: u32,
     #[serde(default = "default_noise_threshold_dbfs")]
@@ -309,6 +313,8 @@ pub struct StartSessionPayload {
     pub input_channel: u16,
     #[serde(default = "default_silence_duration_ms")]
     pub silence_duration_ms: u32,
+    #[serde(default)]
+    pub noise_threshold_dbfs: Option<f32>,
     #[serde(default = "default_noise_threshold_dbfs")]
     pub silence_threshold_dbfs: f32,
     pub items: Vec<ScriptItem>,
@@ -340,6 +346,12 @@ pub enum ExportArtifact {
 pub struct NoiseCheckPayload {
     #[serde(default = "default_noise_threshold_dbfs")]
     pub threshold_dbfs: f32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetSilenceSettingsPayload {
+    pub threshold_dbfs: f32,
+    pub silence_duration_ms: u32,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -431,7 +443,7 @@ struct HeadSilenceMonitor {
     armed_sample: Arc<AtomicU64>,
     progress_samples: Arc<AtomicU64>,
     passed_sample: Arc<AtomicU64>,
-    required_samples: u64,
+    required_samples: Arc<AtomicU64>,
 }
 
 impl HeadSilenceMonitor {
@@ -441,8 +453,12 @@ impl HeadSilenceMonitor {
             armed_sample: Arc::new(AtomicU64::new(0)),
             progress_samples: Arc::new(AtomicU64::new(0)),
             passed_sample: Arc::new(AtomicU64::new(0)),
-            required_samples,
+            required_samples: Arc::new(AtomicU64::new(required_samples)),
         }
+    }
+
+    fn required_samples(&self) -> u64 {
+        self.required_samples.load(Ordering::Acquire)
     }
 
     /// Must be called while holding the capture-analysis seqlock.
@@ -1269,6 +1285,7 @@ pub struct RecordingSession {
     analyzed_samples: Arc<AtomicU64>,
     analysis_epoch: Arc<AtomicU64>,
     silence_threshold_bits: Arc<AtomicU32>,
+    silence_duration_ms: Arc<AtomicU32>,
     head_silence: HeadSilenceMonitor,
     active_attempt: Option<ActiveAttempt>,
     metadata_fault: Option<String>,
@@ -1528,6 +1545,11 @@ impl Engine {
         {
             bail!("silence threshold must be between -96 and -6 dBFS");
         }
+        if let Some(threshold) = payload.noise_threshold_dbfs
+            && (!threshold.is_finite() || !(-96.0..=-6.0).contains(&threshold))
+        {
+            bail!("noise threshold must be between -96 and -6 dBFS");
+        }
         let session_dir = PathBuf::from(&payload.session_dir);
         if let Some(parent) = session_dir.parent()
             && !parent.as_os_str().is_empty()
@@ -1572,6 +1594,9 @@ impl Engine {
             started_at: now.clone(),
             updated_at: now,
             noise_check: None,
+            noise_threshold_dbfs: Some(
+                payload.noise_threshold_dbfs.unwrap_or(payload.silence_threshold_dbfs),
+            ),
             silence_duration_ms: payload.silence_duration_ms,
             silence_threshold_dbfs: payload.silence_threshold_dbfs,
             items: payload
@@ -1646,6 +1671,15 @@ impl Engine {
             || !(-96.0..=-6.0).contains(&snapshot.silence_threshold_dbfs)
         {
             bail!("录制任务的静音检测参数无效");
+        }
+        if snapshot.noise_threshold_dbfs.is_none() {
+            snapshot.noise_threshold_dbfs = Some(
+                snapshot
+                    .noise_check
+                    .as_ref()
+                    .map(|check| check.threshold_dbfs)
+                    .unwrap_or(snapshot.silence_threshold_dbfs),
+            );
         }
         let previous_status = snapshot.status.clone();
         snapshot.status = "recording".to_string();
@@ -2018,6 +2052,7 @@ impl Engine {
                     "audio_format": snapshot.audio_format,
                     "storage_layout_version": snapshot.storage_layout_version,
                     "segment_frames": snapshot.segment_frames,
+                    "noise_threshold_dbfs": snapshot.noise_threshold_dbfs,
                     "silence_duration_ms": snapshot.silence_duration_ms,
                     "silence_threshold_dbfs": snapshot.silence_threshold_dbfs,
                     "started_at": snapshot.started_at,
@@ -2061,6 +2096,7 @@ impl Engine {
         let analysis_epoch = Arc::new(AtomicU64::new(0));
         let silence_threshold_bits =
             Arc::new(AtomicU32::new(snapshot.silence_threshold_dbfs.to_bits()));
+        let silence_duration_ms = Arc::new(AtomicU32::new(snapshot.silence_duration_ms));
         let required_head_silence_samples = u64::from(snapshot.audio_format.sample_rate)
             .saturating_mul(u64::from(snapshot.silence_duration_ms))
             / 1_000;
@@ -2146,6 +2182,7 @@ impl Engine {
             analyzed_samples,
             analysis_epoch,
             silence_threshold_bits,
+            silence_duration_ms,
             head_silence,
             active_attempt: None,
             metadata_fault: None,
@@ -2310,7 +2347,7 @@ impl Engine {
         let content_started_sample_thread = Arc::clone(&session.attempt_signal_start_sample);
         let silence_threshold_thread = Arc::clone(&session.silence_threshold_bits);
         let head_silence_thread = session.head_silence.clone();
-        let silence_duration_ms = session.snapshot.silence_duration_ms;
+        let silence_duration_ms_thread = Arc::clone(&session.silence_duration_ms);
         let telemetry_session_dir = session.session_dir.clone();
         let telemetry_join = match thread::Builder::new()
             .name("telemetry".to_string())
@@ -2382,7 +2419,7 @@ impl Engine {
                             ),
                             "last_signal_sample": last_signal_sample_thread.load(Ordering::Acquire),
                             "silence_threshold_dbfs": f32::from_bits(silence_threshold_thread.load(Ordering::Relaxed)),
-                            "silence_duration_ms": silence_duration_ms,
+                            "silence_duration_ms": silence_duration_ms_thread.load(Ordering::Acquire),
                             "head_silence_phase": head_silence_phase_name(
                                 head_silence_thread.phase.load(Ordering::Acquire)
                             ),
@@ -2390,8 +2427,8 @@ impl Engine {
                                 .armed_sample.load(Ordering::Acquire),
                             "head_silence_progress_samples": head_silence_thread
                                 .progress_samples.load(Ordering::Acquire)
-                                .min(head_silence_thread.required_samples),
-                            "required_head_silence_samples": head_silence_thread.required_samples,
+                                .min(head_silence_thread.required_samples()),
+                            "required_head_silence_samples": head_silence_thread.required_samples(),
                             "head_silence_passed_sample": head_silence_thread
                                 .passed_sample.load(Ordering::Acquire),
                             "content_started_sample": content_started_sample_thread
@@ -2590,12 +2627,9 @@ impl Engine {
         if session.faulted.load(Ordering::Acquire) {
             bail!("音频写盘异常，请结束并恢复当前录制");
         }
+        session.snapshot.noise_threshold_dbfs = Some(payload.threshold_dbfs);
         let rms = Arc::clone(&session.rms);
         let peak = Arc::clone(&session.peak);
-        session
-            .silence_threshold_bits
-            .store(payload.threshold_dbfs.to_bits(), Ordering::Relaxed);
-        session.snapshot.silence_threshold_dbfs = payload.threshold_dbfs;
         let mut samples = Vec::with_capacity(SAMPLE_COUNT);
         emitter.event(
             "noise_check_started",
@@ -2638,6 +2672,47 @@ impl Engine {
         session.persist("noise_check_completed", json!(&result))?;
         emitter.event("noise_check_completed", json!(&result));
         Ok(json!(result))
+    }
+
+    pub fn set_silence_settings(&mut self, payload: SetSilenceSettingsPayload) -> Result<Value> {
+        if !payload.threshold_dbfs.is_finite()
+            || !(-96.0..=-6.0).contains(&payload.threshold_dbfs)
+        {
+            bail!("silence threshold must be between -96 and -6 dBFS");
+        }
+        if !(200..=5_000).contains(&payload.silence_duration_ms) {
+            bail!("silence duration must be between 200 and 5000 ms");
+        }
+        let session = self.active_session_mut()?;
+        session.ensure_metadata_mutation_allowed()?;
+        if session.faulted.load(Ordering::Acquire) {
+            bail!("音频写盘异常，请结束并恢复当前录制");
+        }
+
+        let (analysis_boundary, reset_kind) = session.apply_silence_settings(
+            payload.threshold_dbfs,
+            payload.silence_duration_ms,
+        );
+        session.snapshot.silence_threshold_dbfs = payload.threshold_dbfs;
+        session.snapshot.silence_duration_ms = payload.silence_duration_ms;
+        session.persist(
+            "silence_settings_changed",
+            json!({
+                "threshold_dbfs": payload.threshold_dbfs,
+                "silence_duration_ms": payload.silence_duration_ms,
+                "analysis_boundary": analysis_boundary,
+                "active_attempt": session.active_attempt.is_some(),
+                "reset_kind": reset_kind,
+            }),
+        )?;
+        Ok(json!({
+            "threshold_dbfs": payload.threshold_dbfs,
+            "silence_duration_ms": payload.silence_duration_ms,
+            "analysis_boundary": analysis_boundary,
+            "active_attempt": session.active_attempt.is_some(),
+            "reset_kind": reset_kind,
+            "snapshot": session.live_snapshot(),
+        }))
     }
 
     pub fn start_attempt(&mut self, item_id: &str) -> Result<Value> {
@@ -2687,7 +2762,7 @@ impl Engine {
                 "start_sample": start_sample,
                 "recording_started_sample": recording_started_sample,
                 "head_silence_armed_sample": recording_started_sample,
-                "required_head_silence_samples": session.head_silence.required_samples,
+                "required_head_silence_samples": session.head_silence.required_samples(),
                 // Legacy field retained for journal readers. At arm time no
                 // post-click silence has been accepted yet.
                 "pre_silence_samples": 0,
@@ -2702,8 +2777,8 @@ impl Engine {
             "head_silence_phase": head_silence_phase_name(phase),
             "head_silence_progress_samples": session.head_silence
                 .progress_samples.load(Ordering::Acquire)
-                .min(session.head_silence.required_samples),
-            "required_head_silence_samples": session.head_silence.required_samples,
+                .min(session.head_silence.required_samples()),
+            "required_head_silence_samples": session.head_silence.required_samples(),
             "head_silence_passed_sample": session.head_silence
                 .passed_sample.load(Ordering::Acquire),
             "content_started_sample": session.attempt_signal_start_sample.load(Ordering::Acquire),
@@ -2726,7 +2801,7 @@ impl Engine {
                 &active,
                 durable_end,
                 session.head_silence.passed_sample.load(Ordering::Acquire),
-                session.head_silence.required_samples,
+                session.head_silence.required_samples(),
                 session.attempt_signal_start_sample.load(Ordering::Acquire),
                 "audio_writer_fault",
             )?;
@@ -2770,7 +2845,7 @@ impl Engine {
                     "head_silence_armed_sample": analysis.head_silence_armed_sample,
                     "head_silence_passed_sample": analysis.head_silence_passed_sample,
                     "head_silence_progress_samples": analysis.head_silence_progress_samples,
-                    "required_head_silence_samples": session.head_silence.required_samples,
+                    "required_head_silence_samples": session.head_silence.required_samples(),
                 }),
             )?;
             // Retain the active attempt if the authoritative journal append
@@ -2825,7 +2900,7 @@ impl Engine {
                     &active,
                     durable_end,
                     analysis.head_silence_passed_sample,
-                    session.head_silence.required_samples,
+                    session.head_silence.required_samples(),
                     analysis.content_started_sample,
                     &format!("audio_writer_fault_while_finishing: {error:#}"),
                 )?;
@@ -3014,8 +3089,8 @@ impl Engine {
                 "head_silence_armed_sample": session.head_silence.armed_sample.load(Ordering::Acquire),
                 "head_silence_passed_sample": session.head_silence.passed_sample.load(Ordering::Acquire),
                 "head_silence_progress_samples": session.head_silence.progress_samples
-                    .load(Ordering::Acquire).min(session.head_silence.required_samples),
-                "required_head_silence_samples": session.head_silence.required_samples,
+                    .load(Ordering::Acquire).min(session.head_silence.required_samples()),
+                "required_head_silence_samples": session.head_silence.required_samples(),
                 "head_silence_phase": head_silence_phase_name(
                     session.head_silence.phase.load(Ordering::Acquire)
                 ),
@@ -3042,8 +3117,8 @@ impl Engine {
                 "head_silence_armed_sample": session.head_silence.armed_sample.load(Ordering::Acquire),
                 "head_silence_passed_sample": session.head_silence.passed_sample.load(Ordering::Acquire),
                 "head_silence_progress_samples": session.head_silence.progress_samples
-                    .load(Ordering::Acquire).min(session.head_silence.required_samples),
-                "required_head_silence_samples": session.head_silence.required_samples,
+                    .load(Ordering::Acquire).min(session.head_silence.required_samples()),
+                "required_head_silence_samples": session.head_silence.required_samples(),
                 "head_silence_phase": head_silence_phase_name(
                     session.head_silence.phase.load(Ordering::Acquire)
                 ),
@@ -5048,11 +5123,61 @@ impl RecordingSession {
         // silence can never satisfy the newly armed take.
         let analysis_write = begin_analysis_write(&self.analysis_epoch);
         let armed_sample = self.captured.load(Ordering::Acquire);
+        self.head_silence
+            .required_samples
+            .store(self.required_silence_samples(), Ordering::Release);
         self.attempt_signal_start_sample.store(0, Ordering::Release);
         self.last_signal_sample.store(0, Ordering::Release);
         self.head_silence.arm(armed_sample);
         drop(analysis_write);
         armed_sample
+    }
+
+    fn apply_silence_settings(
+        &self,
+        threshold_dbfs: f32,
+        silence_duration_ms: u32,
+    ) -> (u64, &'static str) {
+        // Serialize the new threshold and the affected silence accumulators
+        // with callback analysis. This makes the operator-visible application
+        // boundary deterministic without touching any audio already written.
+        let analysis_write = begin_analysis_write(&self.analysis_epoch);
+        let boundary = self.analyzed_samples.load(Ordering::Acquire);
+        self.silence_threshold_bits
+            .store(threshold_dbfs.to_bits(), Ordering::Release);
+        self.silence_duration_ms
+            .store(silence_duration_ms, Ordering::Release);
+        let required_samples = u64::from(self.snapshot.audio_format.sample_rate)
+            .saturating_mul(u64::from(silence_duration_ms))
+            / 1_000;
+        self.silence_samples.store(0, Ordering::Release);
+        let phase = self.head_silence.phase.load(Ordering::Acquire);
+        let reset_kind = match phase {
+            HEAD_SILENCE_WAITING | HEAD_SILENCE_PASSED => {
+                self.head_silence
+                    .required_samples
+                    .store(required_samples, Ordering::Release);
+                self.attempt_signal_start_sample.store(0, Ordering::Release);
+                self.last_signal_sample.store(0, Ordering::Release);
+                self.head_silence.arm(boundary);
+                "head_silence"
+            }
+            HEAD_SILENCE_SPEECH_STARTED => {
+                // Preserve the established speech boundary, but require a full
+                // new tail-silence interval under the adjusted settings. Keep
+                // the already-proven head-silence requirement as history.
+                self.last_signal_sample.store(boundary, Ordering::Release);
+                "tail_silence"
+            }
+            _ => {
+                self.head_silence
+                    .required_samples
+                    .store(required_samples, Ordering::Release);
+                "idle"
+            }
+        };
+        drop(analysis_write);
+        (boundary, reset_kind)
     }
 
     fn disarm_attempt_analysis(&self) {
@@ -5103,8 +5228,8 @@ impl RecordingSession {
             "head_silence_armed_sample": self.head_silence.armed_sample.load(Ordering::Acquire),
             "head_silence_progress_samples": self.head_silence
                 .progress_samples.load(Ordering::Acquire)
-                .min(self.head_silence.required_samples),
-            "required_head_silence_samples": self.head_silence.required_samples,
+                .min(self.head_silence.required_samples()),
+            "required_head_silence_samples": self.head_silence.required_samples(),
             "head_silence_passed_sample": self.head_silence.passed_sample.load(Ordering::Acquire),
             "content_started_sample": self.attempt_signal_start_sample.load(Ordering::Acquire),
         })
@@ -5540,6 +5665,7 @@ impl RecordingSession {
                 "audio_format": self.snapshot.audio_format,
                 "storage_layout_version": self.snapshot.storage_layout_version,
                 "segment_frames": self.snapshot.segment_frames,
+                "noise_threshold_dbfs": self.snapshot.noise_threshold_dbfs,
                 "silence_duration_ms": self.snapshot.silence_duration_ms,
                 "silence_threshold_dbfs": self.snapshot.silence_threshold_dbfs,
                 "started_at": self.snapshot.started_at,
@@ -5588,7 +5714,7 @@ impl RecordingSession {
                 &active,
                 committed,
                 self.head_silence.passed_sample.load(Ordering::Acquire),
-                self.head_silence.required_samples,
+                self.head_silence.required_samples(),
                 self.attempt_signal_start_sample.load(Ordering::Acquire),
             )
         {
@@ -5635,6 +5761,7 @@ impl RecordingSession {
                 "audio_format": self.snapshot.audio_format,
                 "storage_layout_version": self.snapshot.storage_layout_version,
                 "segment_frames": self.snapshot.segment_frames,
+                "noise_threshold_dbfs": self.snapshot.noise_threshold_dbfs,
                 "silence_duration_ms": self.snapshot.silence_duration_ms,
                 "silence_threshold_dbfs": self.snapshot.silence_threshold_dbfs,
                 "started_at": self.snapshot.started_at,
@@ -5703,7 +5830,7 @@ impl RecordingSession {
                 &active,
                 committed,
                 self.head_silence.passed_sample.load(Ordering::Acquire),
-                self.head_silence.required_samples,
+                self.head_silence.required_samples(),
                 self.attempt_signal_start_sample.load(Ordering::Acquire),
             )?;
             if let Err(error) = self.persist(
@@ -7399,24 +7526,25 @@ fn publish_leased_block_with_preview(
             if block_end > armed_sample {
                 let eligible_start = block_start.max(armed_sample);
                 let eligible_frames = block_end.saturating_sub(eligible_start);
+                let required_samples = silence.head_silence.required_samples();
                 let previous = silence
                     .head_silence
                     .progress_samples
                     .load(Ordering::Acquire)
-                    .min(silence.head_silence.required_samples);
+                    .min(required_samples);
                 let updated = previous
                     .saturating_add(eligible_frames)
-                    .min(silence.head_silence.required_samples);
+                    .min(required_samples);
                 silence
                     .head_silence
                     .progress_samples
                     .store(updated, Ordering::Release);
-                if previous < silence.head_silence.required_samples
-                    && updated >= silence.head_silence.required_samples
+                if previous < required_samples
+                    && updated >= required_samples
                 {
                     let samples_needed = silence
                         .head_silence
-                        .required_samples
+                        .required_samples()
                         .saturating_sub(previous);
                     let passed_sample = eligible_start.saturating_add(samples_needed);
                     // Publish the exact threshold boundary before the latched
@@ -8729,6 +8857,7 @@ mod tests {
             started_at: "2026-08-10T11:00:00Z".to_string(),
             updated_at: "2026-08-10T12:00:00Z".to_string(),
             noise_check: None,
+            noise_threshold_dbfs: Some(-42.0),
             silence_duration_ms: 1_000,
             silence_threshold_dbfs: -42.0,
             items: vec![ItemState {
@@ -8846,6 +8975,7 @@ mod tests {
             analyzed_samples: Arc::new(AtomicU64::new(0)),
             analysis_epoch: Arc::new(AtomicU64::new(0)),
             silence_threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+            silence_duration_ms: Arc::new(AtomicU32::new(1_000)),
             head_silence: test_head_silence_monitor(),
             active_attempt: None,
             metadata_fault: None,
@@ -9259,6 +9389,52 @@ mod tests {
     }
 
     #[test]
+    fn task_silence_settings_change_rearms_only_the_active_detection_phase() {
+        let root = test_root("task-silence-threshold-change");
+        let session = prepare_metadata_test_session(&root);
+        session.analyzed_samples.store(120, Ordering::Release);
+        session.silence_samples.store(30, Ordering::Release);
+        session.attempt_signal_start_sample.store(45, Ordering::Release);
+        session.last_signal_sample.store(90, Ordering::Release);
+        session.head_silence.phase.store(HEAD_SILENCE_WAITING, Ordering::Release);
+        session.head_silence.armed_sample.store(20, Ordering::Release);
+        session.head_silence.progress_samples.store(30, Ordering::Release);
+
+        let (boundary, reset_kind) = session.apply_silence_settings(-36.0, 800);
+
+        assert_eq!(boundary, 120);
+        assert_eq!(reset_kind, "head_silence");
+        assert_eq!(
+            f32::from_bits(session.silence_threshold_bits.load(Ordering::Acquire)),
+            -36.0,
+        );
+        assert_eq!(session.silence_samples.load(Ordering::Acquire), 0);
+        assert_eq!(session.silence_duration_ms.load(Ordering::Acquire), 800);
+        assert_eq!(session.head_silence.required_samples(), 38_400);
+        assert_eq!(session.head_silence.armed_sample.load(Ordering::Acquire), 120);
+        assert_eq!(session.head_silence.progress_samples.load(Ordering::Acquire), 0);
+        assert_eq!(session.attempt_signal_start_sample.load(Ordering::Acquire), 0);
+
+        session.analyzed_samples.store(200, Ordering::Release);
+        session.silence_samples.store(18, Ordering::Release);
+        session.attempt_signal_start_sample.store(150, Ordering::Release);
+        session.last_signal_sample.store(185, Ordering::Release);
+        session.head_silence.phase.store(HEAD_SILENCE_SPEECH_STARTED, Ordering::Release);
+
+        let (boundary, reset_kind) = session.apply_silence_settings(-48.0, 1_500);
+
+        assert_eq!(boundary, 200);
+        assert_eq!(reset_kind, "tail_silence");
+        assert_eq!(session.silence_samples.load(Ordering::Acquire), 0);
+        assert_eq!(session.silence_duration_ms.load(Ordering::Acquire), 1_500);
+        assert_eq!(session.head_silence.required_samples(), 38_400);
+        assert_eq!(session.attempt_signal_start_sample.load(Ordering::Acquire), 150);
+        assert_eq!(session.last_signal_sample.load(Ordering::Acquire), 200);
+        drop(session);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn forced_stop_keeps_detected_speech_when_tail_silence_is_short() {
         let root = test_root("forced-stop-short-tail");
         let mut session = prepare_metadata_test_session(&root);
@@ -9501,6 +9677,7 @@ mod tests {
             analyzed_samples: Arc::new(AtomicU64::new(0)),
             analysis_epoch: Arc::new(AtomicU64::new(0)),
             silence_threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+            silence_duration_ms: Arc::new(AtomicU32::new(1_000)),
             head_silence: test_head_silence_monitor(),
             active_attempt: None,
             metadata_fault: None,
@@ -11568,6 +11745,7 @@ mod tests {
             analyzed_samples: Arc::new(AtomicU64::new(0)),
             analysis_epoch: Arc::new(AtomicU64::new(0)),
             silence_threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+            silence_duration_ms: Arc::new(AtomicU32::new(1_000)),
             head_silence: test_head_silence_monitor(),
             active_attempt: None,
             metadata_fault: None,
@@ -11659,6 +11837,7 @@ mod tests {
             analyzed_samples: Arc::new(AtomicU64::new(0)),
             analysis_epoch: Arc::new(AtomicU64::new(0)),
             silence_threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+            silence_duration_ms: Arc::new(AtomicU32::new(1_000)),
             head_silence: test_head_silence_monitor(),
             active_attempt: Some(ActiveAttempt {
                 item_id: "001".to_string(),
@@ -11754,6 +11933,7 @@ mod tests {
                 bit_depth: 24,
                 input_channel: 1,
                 silence_duration_ms: 1_000,
+                noise_threshold_dbfs: Some(-42.0),
                 silence_threshold_dbfs: -42.0,
                 items: vec![ScriptItem {
                     id: "001".to_string(),
@@ -12984,6 +13164,7 @@ mod tests {
             analyzed_samples: Arc::new(AtomicU64::new(0)),
             analysis_epoch: Arc::new(AtomicU64::new(0)),
             silence_threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+            silence_duration_ms: Arc::new(AtomicU32::new(1_000)),
             head_silence: test_head_silence_monitor(),
             active_attempt: None,
             metadata_fault: Some("injected initial persist failure".to_string()),

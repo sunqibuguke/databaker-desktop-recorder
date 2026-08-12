@@ -65,8 +65,13 @@ class FakeBrowserWindow extends EventEmitter {
     super();
     this.options = options;
     this.destroyed = false;
-    this.webContents = new FakeWebContents();
+    this.renderer = new FakeWebContents();
     FakeBrowserWindow.instances.push(this);
+  }
+
+  get webContents() {
+    if (this.destroyed) throw new TypeError('Object has been destroyed');
+    return this.renderer;
   }
 
   isDestroyed() { return this.destroyed; }
@@ -87,8 +92,8 @@ class FakeBrowserWindow extends EventEmitter {
 
   destroy() {
     if (this.destroyed) return;
+    this.renderer.destroyed = true;
     this.destroyed = true;
-    this.webContents.destroyed = true;
     this.emit('closed');
   }
 }

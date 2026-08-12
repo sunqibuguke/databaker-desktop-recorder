@@ -62,6 +62,7 @@ export type SessionSnapshot = {
   started_at: string;
   updated_at: string;
   noise_check?: NoiseCheckResult | null;
+  noise_threshold_dbfs?: number;
   silence_duration_ms: number;
   silence_threshold_dbfs: number;
   items: ItemState[];

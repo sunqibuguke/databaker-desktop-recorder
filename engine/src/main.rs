@@ -10,7 +10,7 @@ mod wav;
 use crate::engine::SystemTestStartSessionPayload;
 use crate::engine::{
     Engine, ExportArtifact, NoiseCheckPayload, ResumeSessionPayload, StartSessionPayload,
-    StopAttemptPayload, is_no_active_session_error,
+    SetSilenceSettingsPayload, StopAttemptPayload, is_no_active_session_error,
 };
 use crate::protocol::{CommandEnvelope, Emitter, PROTOCOL_VERSION};
 use anyhow::{Context, Result, anyhow};
@@ -245,6 +245,10 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
             let payload: NoiseCheckPayload = parse(command.payload)?;
             engine.check_noise(payload)
         }
+        "set_silence_settings" => {
+            let payload: SetSilenceSettingsPayload = parse(command.payload)?;
+            engine.set_silence_settings(payload)
+        }
         "start_attempt" => {
             let payload: ItemPayload = parse(command.payload)?;
             engine.start_attempt(&payload.item_id)
@@ -423,6 +427,7 @@ mod tests {
             started_at: "2026-08-10T11:00:00Z".to_string(),
             updated_at: "2026-08-10T12:00:00Z".to_string(),
             noise_check: None,
+            noise_threshold_dbfs: Some(-42.0),
             silence_duration_ms: 1_000,
             silence_threshold_dbfs: -42.0,
             items: vec![ItemState {

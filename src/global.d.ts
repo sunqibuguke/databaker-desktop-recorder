@@ -25,8 +25,10 @@ declare global {
       closePrompter(): Promise<void>;
       togglePrompterFullscreen(): Promise<boolean>;
       getPrompterState(): Promise<PrompterState | null>;
+      getPrompterStatus(): Promise<{ open: boolean; ready: boolean }>;
       sendPrompterState(state: PrompterState): void;
       onPrompterState(listener: (state: PrompterState) => void): () => void;
+      onPrompterStatus(listener: (status: { open: boolean; ready: boolean }) => void): () => void;
       onEngineEvent(listener: (message: unknown) => void): () => void;
       onEngineOffline(listener: (message: string) => void): () => void;
     };
