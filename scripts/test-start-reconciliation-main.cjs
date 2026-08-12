@@ -458,7 +458,7 @@ async function main() {
       handlers.get('engine:request')(event, 'resume_session', {
         session_dir: unauthorizedSessionDir,
       }),
-      /\u5c1a\u672a\u786e\u8ba4\u5c01\u5b58/,
+      /\u5c1a\u672a\u5b89\u5168\u6536\u5c3e/,
       'pre-dispatch cancellation must preserve the older crash-seal obligation',
     );
 
@@ -499,7 +499,7 @@ async function main() {
       handlers.get('engine:request')(event, 'resume_session', {
         session_dir: unauthorizedSessionDir,
       }),
-      /\u5c1a\u672a\u786e\u8ba4\u5c01\u5b58/,
+      /\u5c1a\u672a\u5b89\u5168\u6536\u5c3e/,
       'binding rejection must retain the original crash-seal obligation',
     );
     await fs.rm(resumeSessionDir, { recursive: true, force: true });
@@ -551,7 +551,7 @@ async function main() {
       handlers.get('engine:request')(event, 'resume_session', {
         session_dir: unauthorizedSessionDir,
       }),
-      /\u5c1a\u672a\u786e\u8ba4\u5c01\u5b58/,
+      /\u5c1a\u672a\u5b89\u5168\u6536\u5c3e/,
       'the unbound start crash must retain its crash-seal obligation',
     );
     assert.equal(
