@@ -196,6 +196,81 @@ async function main() {
     'a dropped preview packet resets only the disposable visualization',
   );
 
+  {
+    const sampleRate = 48_000;
+    const playhead = sampleRate * 10;
+    assert.equal(
+      waveform.waveformWindowStartSample(playhead, sampleRate),
+      playhead + sampleRate * waveform.WAVEFORM_LIVE_EDGE_GUTTER_SECONDS
+        - waveform.waveformWindowSampleCount(sampleRate),
+      'the visible window starts at the left-edge sample of the scrolling viewport',
+    );
+
+    let takes = waveform.reconcileWaveformTakeSpans([], true, 96_000, 96_400);
+    assert.deepEqual(takes, [{ startSample: 96_000, endSample: null }]);
+    takes = waveform.reconcileWaveformTakeSpans(takes, true, 96_000, 192_000);
+    assert.deepEqual(
+      takes,
+      [{ startSample: 96_000, endSample: null }],
+      'an open take must stay open while recording continues',
+    );
+    takes = waveform.reconcileWaveformTakeSpans(takes, true, 95_872, 192_000);
+    assert.deepEqual(
+      takes,
+      [{ startSample: 95_872, endSample: null }],
+      'a late authoritative start sample must snap the open take onto the PCM clock',
+    );
+    takes = waveform.reconcileWaveformTakeSpans(takes, false, undefined, 240_000);
+    assert.deepEqual(takes, [{ startSample: 95_872, endSample: 240_000 }]);
+
+    takes = waveform.reconcileWaveformTakeSpans(takes, true, undefined, 288_000);
+    assert.deepEqual(
+      takes,
+      [
+        { startSample: 95_872, endSample: 240_000 },
+        { startSample: 288_000, endSample: null },
+      ],
+      'a later take must keep earlier start/end markers on the scrolling timeline',
+    );
+    takes = waveform.reconcileWaveformTakeSpans(takes, false, undefined, 336_000);
+    assert.deepEqual(takes, [
+      { startSample: 95_872, endSample: 240_000 },
+      { startSample: 288_000, endSample: 336_000 },
+    ]);
+
+    const reconnected = waveform.reconcileWaveformTakeSpans([], true, 48_000, 72_000);
+    assert.deepEqual(
+      reconnected,
+      [{ startSample: 48_000, endSample: null }],
+      'reconnecting mid-take must paint from the engine start sample, not wait for a rising edge',
+    );
+
+    assert.equal(waveform.sampleIsRecordedTake(95_871, takes), false);
+    assert.equal(waveform.sampleIsRecordedTake(95_872, takes), true);
+    assert.equal(waveform.sampleIsRecordedTake(239_999, takes), true);
+    assert.equal(waveform.sampleIsRecordedTake(240_000, takes), false);
+    assert.equal(waveform.sampleIsRecordedTake(300_000, takes), true);
+    assert.equal(
+      waveform.sampleIsRecordedTake(400_000, [{ startSample: 288_000, endSample: null }]),
+      true,
+      'samples after an open start marker stay in the recorded color until an end marker arrives',
+    );
+
+    const windowStart = waveform.waveformWindowStartSample(sampleRate * 12, sampleRate);
+    assert.deepEqual(
+      waveform.pruneWaveformTakeSpans([
+        { startSample: 0, endSample: windowStart - 1 },
+        { startSample: windowStart - sampleRate, endSample: windowStart + sampleRate },
+        { startSample: windowStart + sampleRate, endSample: null },
+      ], windowStart),
+      [
+        { startSample: windowStart - sampleRate, endSample: windowStart + sampleRate },
+        { startSample: windowStart + sampleRate, endSample: null },
+      ],
+      'markers that have fully scrolled off the left edge must be discarded',
+    );
+  }
+
   console.log('waveform buffer tests passed');
 }
 

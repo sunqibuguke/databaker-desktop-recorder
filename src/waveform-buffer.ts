@@ -81,6 +81,71 @@ export function waveformSampleHorizontalPosition(
   );
 }
 
+export function waveformWindowStartSample(playheadSample: number, sampleRate: number): number {
+  return playheadSample
+    + Math.max(1, sampleRate) * WAVEFORM_LIVE_EDGE_GUTTER_SECONDS
+    - waveformWindowSampleCount(sampleRate);
+}
+
+export type WaveformTakeSpan = {
+  startSample: number;
+  endSample: number | null;
+};
+
+/**
+ * Recorded-take spans ride the same PCM clock as the scrolling waveform.
+ * A rising recording edge opens a span; a falling edge closes it at the
+ * live capture cursor so start/end markers keep their historical place.
+ */
+export function reconcileWaveformTakeSpans(
+  spans: readonly WaveformTakeSpan[],
+  recording: boolean,
+  takeStartSample: number | undefined,
+  cursorSample: number,
+): WaveformTakeSpan[] {
+  const cursor = Math.max(0, Number.isFinite(cursorSample) ? cursorSample : 0);
+  const resolvedStart = Number.isSafeInteger(takeStartSample) && (takeStartSample ?? -1) >= 0
+    ? Number(takeStartSample)
+    : cursor;
+  const last = spans[spans.length - 1];
+  const open = last !== undefined && last.endSample === null;
+
+  if (recording) {
+    if (!open) {
+      return [...spans, { startSample: resolvedStart, endSample: null }];
+    }
+    if (Number.isSafeInteger(takeStartSample) && last.startSample !== resolvedStart) {
+      return [...spans.slice(0, -1), { startSample: resolvedStart, endSample: null }];
+    }
+    return spans as WaveformTakeSpan[];
+  }
+
+  if (open) {
+    return [...spans.slice(0, -1), {
+      startSample: last.startSample,
+      endSample: Math.max(last.startSample, cursor),
+    }];
+  }
+  return spans as WaveformTakeSpan[];
+}
+
+export function pruneWaveformTakeSpans(
+  spans: readonly WaveformTakeSpan[],
+  windowStartSample: number,
+): WaveformTakeSpan[] {
+  return spans.filter((span) => (span.endSample ?? Number.POSITIVE_INFINITY) > windowStartSample);
+}
+
+export function sampleIsRecordedTake(
+  sample: number,
+  spans: readonly WaveformTakeSpan[],
+): boolean {
+  return spans.some((span) => (
+    sample >= span.startSample
+    && (span.endSample === null || sample < span.endSample)
+  ));
+}
+
 /**
  * Uses Rust's authoritative sample endpoint to reject stale packets and detect
  * a dropped preview packet. Audio capture remains authoritative; a gap merely

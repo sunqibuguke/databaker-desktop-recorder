@@ -2,11 +2,16 @@ import { useEffect, useRef, useState } from 'react';
 import { useI18n } from './i18n';
 import {
   advanceWaveformPlayhead,
+  pruneWaveformTakeSpans,
   reconcileWaveformBatch,
+  reconcileWaveformTakeSpans,
   reconcileWaveformTimelineSample,
+  sampleIsRecordedTake,
   WAVEFORM_BIN_SAMPLES,
   waveformSampleHorizontalPosition,
   waveformWindowBinCount,
+  waveformWindowStartSample,
+  type WaveformTakeSpan,
 } from './waveform-buffer';
 
 export type WaveformBin = [minimum: number, maximum: number];
@@ -16,8 +21,14 @@ type Props = {
   capturedSamples: number;
   waveformEndSample?: number;
   recording: boolean;
+  takeStartSample?: number;
   sampleRate: number;
 };
+
+const IDLE_WAVE_COLOR: [number, number, number, number] = [0.35, 0.72, 0.70, 0.78];
+const RECORDED_WAVE_COLOR: [number, number, number, number] = [0.88, 0.36, 0.40, 0.82];
+const RECORDED_BAND_COLOR: [number, number, number, number] = [0.88, 0.36, 0.40, 0.12];
+const TAKE_MARKER_COLOR: [number, number, number, number] = [0.98, 0.90, 0.90, 0.95];
 
 const vertexShaderSource = `
   attribute vec2 a_position;
@@ -64,7 +75,14 @@ function createProgram(gl: WebGLRenderingContext | WebGL2RenderingContext) {
   return program;
 }
 
-export function WebGLWaveform({ bins, capturedSamples, waveformEndSample, recording, sampleRate }: Props) {
+export function WebGLWaveform({
+  bins,
+  capturedSamples,
+  waveformEndSample,
+  recording,
+  takeStartSample,
+  sampleRate,
+}: Props) {
   const { t } = useI18n();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const historyRef = useRef<WaveformBin[]>([]);
@@ -72,7 +90,7 @@ export function WebGLWaveform({ bins, capturedSamples, waveformEndSample, record
   const latestTimelineSampleRef = useRef<number | null>(null);
   const historyEndSampleRef = useRef<number | null>(null);
   const playheadSampleRef = useRef<number | null>(null);
-  const recordingRef = useRef(recording);
+  const takesRef = useRef<WaveformTakeSpan[]>([]);
   const sampleRateRef = useRef(sampleRate);
   const [available, setAvailable] = useState(true);
 
@@ -117,8 +135,14 @@ export function WebGLWaveform({ bins, capturedSamples, waveformEndSample, record
   }, [bins, capturedSamples, waveformEndSample]);
 
   useEffect(() => {
-    recordingRef.current = recording;
-  }, [recording]);
+    const cursor = latestTimelineSampleRef.current ?? capturedSamples;
+    takesRef.current = reconcileWaveformTakeSpans(
+      takesRef.current,
+      recording,
+      takeStartSample,
+      cursor,
+    );
+  }, [recording, takeStartSample, capturedSamples]);
 
   useEffect(() => {
     if (sampleRateRef.current !== sampleRate) {
@@ -127,6 +151,7 @@ export function WebGLWaveform({ bins, capturedSamples, waveformEndSample, record
       latestTimelineSampleRef.current = null;
       historyEndSampleRef.current = null;
       playheadSampleRef.current = null;
+      takesRef.current = [];
     }
     sampleRateRef.current = sampleRate;
   }, [sampleRate]);
@@ -203,7 +228,46 @@ export function WebGLWaveform({ bins, capturedSamples, waveformEndSample, record
       uploadAndDraw(new Float32Array(vertices), gl.LINES, [0.12, 0.19, 0.18, 0.72]);
     };
 
-    const drawWaveform = (playheadSample: number) => {
+    const drawQuad = (
+      left: number,
+      right: number,
+      color: [number, number, number, number],
+    ) => {
+      if (right <= left) return;
+      uploadAndDraw(new Float32Array([
+        left, -1, right, -1, left, 1,
+        left, 1, right, -1, right, 1,
+      ]), gl.TRIANGLES, color);
+    };
+
+    const drawTakeBands = (playheadSample: number, takes: WaveformTakeSpan[]) => {
+      const rate = sampleRateRef.current;
+      for (const take of takes) {
+        const startX = waveformSampleHorizontalPosition(take.startSample, playheadSample, rate);
+        const endX = take.endSample === null
+          ? 1
+          : waveformSampleHorizontalPosition(take.endSample, playheadSample, rate);
+        drawQuad(Math.max(-1, startX), Math.min(1, endX), RECORDED_BAND_COLOR);
+      }
+    };
+
+    const drawTakeMarkers = (playheadSample: number, takes: WaveformTakeSpan[]) => {
+      const rate = sampleRateRef.current;
+      const halfWidth = Math.max(1.5, width / 900) / Math.max(1, width) * 2;
+      for (const take of takes) {
+        const startX = waveformSampleHorizontalPosition(take.startSample, playheadSample, rate);
+        if (startX >= -1 && startX <= 1) {
+          drawQuad(startX - halfWidth, startX + halfWidth, TAKE_MARKER_COLOR);
+        }
+        if (take.endSample === null) continue;
+        const endX = waveformSampleHorizontalPosition(take.endSample, playheadSample, rate);
+        if (endX >= -1 && endX <= 1) {
+          drawQuad(endX - halfWidth, endX + halfWidth, TAKE_MARKER_COLOR);
+        }
+      }
+    };
+
+    const drawWaveform = (playheadSample: number, takes: WaveformTakeSpan[]) => {
       const history = historyRef.current;
       const historyEndSample = historyEndSampleRef.current;
       if (!history.length || historyEndSample === null) return;
@@ -211,20 +275,26 @@ export function WebGLWaveform({ bins, capturedSamples, waveformEndSample, record
       // 192 kHz, while the canvas has only about 1.5k physical columns. Merge
       // bins that land on the same column so high sample rates do not allocate
       // and upload tens of megabytes of visually redundant vertices per second.
-      const vertices = new Float32Array(Math.max(1, width) * 4);
-      let vertexLines = 0;
+      const columnCapacity = Math.max(1, width) * 4;
+      const idleVertices = new Float32Array(columnCapacity);
+      const recordedVertices = new Float32Array(columnCapacity);
+      let idleLines = 0;
+      let recordedLines = 0;
       let currentColumn = -1;
       let columnMinimum = 1;
       let columnMaximum = -1;
+      let columnRecorded = false;
       const flushColumn = () => {
         if (currentColumn < 0 || columnMaximum < columnMinimum) return;
         const x = -1 + (currentColumn + 0.5) / width * 2;
-        const cursor = vertexLines * 4;
+        const vertices = columnRecorded ? recordedVertices : idleVertices;
+        const cursor = (columnRecorded ? recordedLines : idleLines) * 4;
         vertices[cursor] = x;
         vertices[cursor + 1] = Math.max(-1, Math.min(1, columnMinimum * 0.92));
         vertices[cursor + 2] = x;
         vertices[cursor + 3] = Math.max(-1, Math.min(1, columnMaximum * 0.92));
-        vertexLines += 1;
+        if (columnRecorded) recordedLines += 1;
+        else idleLines += 1;
       };
       for (let index = 0; index < history.length; index += 1) {
         const binCenterSample = historyEndSample
@@ -236,10 +306,12 @@ export function WebGLWaveform({ bins, capturedSamples, waveformEndSample, record
         );
         if (x < -1 || x > 1) continue;
         const column = Math.max(0, Math.min(width - 1, Math.floor((x + 1) * width / 2)));
+        const recorded = sampleIsRecordedTake(binCenterSample, takes);
         const [minimum, maximum] = history[index];
-        if (column !== currentColumn) {
+        if (column !== currentColumn || recorded !== columnRecorded) {
           flushColumn();
           currentColumn = column;
+          columnRecorded = recorded;
           columnMinimum = minimum;
           columnMaximum = maximum;
         } else {
@@ -248,11 +320,12 @@ export function WebGLWaveform({ bins, capturedSamples, waveformEndSample, record
         }
       }
       flushColumn();
-      if (!vertexLines) return;
-      const color: [number, number, number, number] = recordingRef.current
-        ? [0.88, 0.36, 0.40, 0.82]
-        : [0.35, 0.72, 0.70, 0.78];
-      uploadAndDraw(vertices.subarray(0, vertexLines * 4), gl.LINES, color);
+      if (idleLines) {
+        uploadAndDraw(idleVertices.subarray(0, idleLines * 4), gl.LINES, IDLE_WAVE_COLOR);
+      }
+      if (recordedLines) {
+        uploadAndDraw(recordedVertices.subarray(0, recordedLines * 4), gl.LINES, RECORDED_WAVE_COLOR);
+      }
     };
 
     const render = (now: number) => {
@@ -285,7 +358,14 @@ export function WebGLWaveform({ bins, capturedSamples, waveformEndSample, record
       gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
       drawGrid();
       if (playheadSampleRef.current !== null) {
-        drawWaveform(playheadSampleRef.current);
+        takesRef.current = pruneWaveformTakeSpans(
+          takesRef.current,
+          waveformWindowStartSample(playheadSampleRef.current, sampleRateRef.current),
+        );
+        const takes = takesRef.current;
+        drawTakeBands(playheadSampleRef.current, takes);
+        drawWaveform(playheadSampleRef.current, takes);
+        drawTakeMarkers(playheadSampleRef.current, takes);
       }
       frame = requestAnimationFrame(render);
     };
