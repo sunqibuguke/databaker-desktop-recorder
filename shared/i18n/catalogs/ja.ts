@@ -377,6 +377,7 @@ const ja: MessageTree = {
     stopReadingChip: '今すぐ読むのを止める',
     waveform: '波形',
     silenceMs: '無音 {ms} ms',
+    silenceLive: '無音 {ms} / {required} ms',
     preview: '試聴',
     previewKey: '試聴 P',
     previewThis: 'この文を試聴',

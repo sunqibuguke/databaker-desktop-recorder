@@ -5,6 +5,7 @@ const { pathToFileURL } = require('node:url');
 async function main() {
   const {
     actualHeadSilenceMs,
+    liveSilenceHint,
     liveSilencePair,
     peakNoteFromLevel,
     reviewSilencePair,
@@ -76,6 +77,24 @@ async function main() {
   assert.equal(bill.tailMet, false);
   assert.match(bill.hint, /首尾都短于 1.0 s/);
   assert.equal(bill.extra, '');
+
+  const rising = liveSilenceHint({ liveMs: 320, requiredMs: 1_000 });
+  assert.equal(rising.text, '静音 320 / 1000 ms');
+  assert.equal(rising.met, false);
+  assert.equal(rising.progress, 0.32);
+
+  const ready = liveSilenceHint({ liveMs: 1_000, requiredMs: 1_000 });
+  assert.equal(ready.text, '静音 1000 / 1000 ms');
+  assert.equal(ready.met, true);
+  assert.equal(ready.progress, 1);
+
+  const over = liveSilenceHint({ liveMs: 1_480, requiredMs: 1_000 });
+  assert.equal(over.met, true);
+  assert.equal(over.progress, 1);
+
+  const unset = liveSilenceHint({ liveMs: 800, requiredMs: 0 });
+  assert.equal(unset.met, false);
+  assert.equal(unset.progress, 0);
 
   console.log('silence readout tests passed');
 }

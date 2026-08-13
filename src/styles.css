@@ -379,6 +379,13 @@ input:disabled { color: #7d7d7d; background: #222; }
 .webgl-waveform canvas { width: 100%; height: 100%; display: block; }
 .webgl-waveform > span { position: absolute; inset: 0; display: grid; place-items: center; color: var(--danger); font: var(--text-xs) var(--mono); background: #151717; }
 .scope-scale { position: absolute; right: 6px; bottom: 3px; left: 6px; display: flex; justify-content: space-between; color: #576361; font: var(--text-xs) var(--mono); }
+.scope-silence-hint { position: absolute; z-index: 2; left: 50%; bottom: 20px; display: inline-flex; align-items: center; gap: 6px; min-height: 20px; padding: 2px 8px 2px 9px; overflow: hidden; border: 1px solid rgba(255, 255, 255, .07); border-radius: 3px; color: #7d8683; background: rgba(12, 16, 15, .68); font: var(--text-xs) var(--mono); font-variant-numeric: tabular-nums; letter-spacing: .03em; white-space: nowrap; transform: translateX(-50%); pointer-events: none; transition: color .16s ease, border-color .16s ease, background-color .16s ease; }
+.scope-silence-fill { position: absolute; inset: 0 auto 0 0; width: var(--silence-progress, 0%); background: rgba(120, 132, 128, .16); transition: width .12s linear, background-color .16s ease; }
+.scope-silence-hint > span, .scope-silence-mark { position: relative; }
+.scope-silence-mark { width: 11px; height: 11px; display: grid; place-items: center; color: #5d6663; opacity: .25; font-weight: 500; }
+.scope-silence-hint.met { color: #c5ebe6; border-color: rgba(94, 184, 176, .42); background: rgba(18, 38, 36, .78); }
+.scope-silence-hint.met .scope-silence-fill { background: rgba(88, 184, 178, .3); }
+.scope-silence-hint.met .scope-silence-mark { color: #8fd9d1; opacity: 1; }
 .horizontal-meter { position: relative; height: 5px; flex: none; overflow: hidden; border-top: 1px solid #303030; background: repeating-linear-gradient(90deg, #293130 0, #293130 calc(10% - 1px), #111 10%); }.meter-rms { display: block; height: 100%; background: linear-gradient(90deg, #4caaa5 0 80%, #c7a64f 92%, #d65b64); }.meter-peak { position: absolute; top: 0; width: 1px; height: 100%; background: #eee; }
 .preview-player-backdrop { z-index: 51; }
 .preview-player-dialog { width: min(560px, calc(100vw - 48px)); }

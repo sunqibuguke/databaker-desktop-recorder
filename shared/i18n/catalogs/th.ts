@@ -377,6 +377,7 @@ const th: MessageTree = {
     stopReadingChip: 'หยุดอ่านทันที',
     waveform: 'รูปคลื่น',
     silenceMs: 'ความเงียบ {ms} ms',
+    silenceLive: 'ความเงียบ {ms} / {required} ms',
     preview: 'ฟังตัวอย่าง',
     previewKey: 'ฟังตัวอย่าง P',
     previewThis: 'ฟังประโยคนี้',

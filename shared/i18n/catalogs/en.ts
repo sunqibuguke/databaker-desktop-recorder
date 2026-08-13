@@ -377,6 +377,7 @@ const en: MessageTree = {
     stopReadingChip: 'Stop reading now',
     waveform: 'Waveform',
     silenceMs: 'Silence {ms} ms',
+    silenceLive: 'Silence {ms} / {required} ms',
     preview: 'Preview',
     previewKey: 'Preview P',
     previewThis: 'Preview this sentence',

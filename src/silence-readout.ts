@@ -144,6 +144,25 @@ export function reviewSilencePair(input: {
   };
 }
 
+export type LiveSilenceHintView = {
+  text: string;
+  met: boolean;
+  progress: number;
+};
+
+export function liveSilenceHint(input: {
+  liveMs: number;
+  requiredMs: number;
+}): LiveSilenceHintView {
+  const liveMs = Math.max(0, Math.round(Number.isFinite(input.liveMs) ? input.liveMs : 0));
+  const requiredMs = Math.max(0, Math.round(Number.isFinite(input.requiredMs) ? input.requiredMs : 0));
+  return {
+    text: t('recorder.silenceLive', { ms: liveMs, required: requiredMs }),
+    met: requiredMs > 0 && liveMs >= requiredMs,
+    progress: requiredMs > 0 ? Math.min(1, liveMs / requiredMs) : 0,
+  };
+}
+
 export function liveHeadMsFromMeter(input: {
   sampleRate: number;
   armedSample: number;

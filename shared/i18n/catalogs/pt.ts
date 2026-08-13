@@ -377,6 +377,7 @@ const pt: MessageTree = {
     stopReadingChip: 'Pare de ler agora',
     waveform: 'Forma de onda',
     silenceMs: 'Silêncio {ms} ms',
+    silenceLive: 'Silêncio {ms} / {required} ms',
     preview: 'Pré-escuta',
     previewKey: 'Pré-escuta P',
     previewThis: 'Pré-escutar esta frase',

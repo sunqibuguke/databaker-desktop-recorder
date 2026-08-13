@@ -57,6 +57,7 @@ async function main() {
   assert.equal(t('setup.bit24'), '24-bit PCM');
   assert.match(t('setup.devWebCaptureHint'), /Windows/);
   assert.match(t('recorder.devWebCaptureOn'), /系统麦克风/);
+  assert.equal(t('recorder.silenceLive', { ms: 320, required: 1_000 }), '静音 320 / 1000 ms');
   assert.equal(t('silence.headDash'), '首 —');
   assert.equal(t('silence.tailEnough', { ms: '1000 ms' }), '尾已够 · 1000 ms');
   assert.equal(t('quality.bannerTitle'), '输入质量强提醒');

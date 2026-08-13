@@ -375,6 +375,7 @@ const zhCN = {
     stopReadingChip: '立即停止朗读',
     waveform: '波形',
     silenceMs: '静音 {ms} ms',
+    silenceLive: '静音 {ms} / {required} ms',
     preview: '试听',
     previewKey: '试听 P',
     previewThis: '试听本句',

@@ -377,6 +377,7 @@ const ko: MessageTree = {
     stopReadingChip: '지금 읽기를 멈추세요',
     waveform: '파형',
     silenceMs: '무음 {ms} ms',
+    silenceLive: '무음 {ms} / {required} ms',
     preview: '미리 듣기',
     previewKey: '미리 듣기 P',
     previewThis: '이 문장 미리 듣기',
