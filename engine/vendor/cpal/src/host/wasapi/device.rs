@@ -203,11 +203,8 @@ pub unsafe fn is_format_supported(
 ) -> Result<bool, Error> {
     if exclusive {
         // Exclusive IsFormatSupported forbids a closest-match out parameter.
-        let hr = client.IsFormatSupported(
-            Audio::AUDCLNT_SHAREMODE_EXCLUSIVE,
-            waveformatex_ptr,
-            None,
-        );
+        let hr =
+            client.IsFormatSupported(Audio::AUDCLNT_SHAREMODE_EXCLUSIVE, waveformatex_ptr, None);
         return Ok(hr.0 == 0);
     }
 
@@ -273,6 +270,21 @@ fn capture_candidate_within_mix_precision(
     sample_format_effective_precision_bits(sample_format)
         .zip(mix_precision_bits)
         .is_some_and(|(candidate_bits, mix_bits)| candidate_bits <= mix_bits)
+}
+
+/// Shared capture supplies a known mix-precision cap. Exclusive capture
+/// passes `None` to mean "no cap": `GetMixFormat` is the shared engine
+/// format, not a hardware exclusive limit. Treating that `None` as a
+/// failed comparison would skip every exclusive candidate and report
+/// `exclusive_empty` on devices that `IsFormatSupported` would accept.
+fn should_probe_capture_sample_format(
+    sample_format: SampleFormat,
+    mix_precision_cap: Option<u16>,
+) -> bool {
+    match mix_precision_cap {
+        None => true,
+        Some(_) => capture_candidate_within_mix_precision(sample_format, mix_precision_cap),
+    }
 }
 
 unsafe fn effective_precision_from_waveformatex_ptr(
@@ -797,6 +809,9 @@ impl Device {
             // described by GetMixFormat so that such conversion cannot be
             // reported as additional source precision. Unknown or invalid input
             // precision is rejected rather than promoted by probing.
+            // Exclusive: None means no cap (see should_probe_capture_sample_format).
+            // Shared capture requires a known mix precision and errors above if
+            // GetMixFormat cannot describe one.
             let capture_mix_precision_bits = if is_output || exclusive {
                 None
             } else {
@@ -882,7 +897,7 @@ impl Device {
                 for channels in channel_counts.iter().copied() {
                     for sample_format in WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS {
                         if !is_output
-                            && !capture_candidate_within_mix_precision(
+                            && !should_probe_capture_sample_format(
                                 sample_format,
                                 capture_mix_precision_bits,
                             )
@@ -1078,14 +1093,13 @@ impl Device {
                 stream_flags |= Audio::AUDCLNT_STREAMFLAGS_LOOPBACK;
             }
 
-            let format_attempt = config_to_waveformatextensible(config, sample_format).ok_or_else(
-                || {
+            let format_attempt =
+                config_to_waveformatextensible(config, sample_format).ok_or_else(|| {
                     Error::with_message(
                         ErrorKind::UnsupportedConfig,
                         "Stream configuration could not be converted to a compatible format",
                     )
-                },
-            )?;
+                })?;
 
             match super::device::is_format_supported(
                 &audio_client,
@@ -1202,7 +1216,11 @@ impl Device {
                 let share_mode = Audio::AUDCLNT_SHAREMODE_SHARED;
 
                 // Ensure the format is supported.
-                match super::device::is_format_supported(&audio_client, &format_attempt.Format, false) {
+                match super::device::is_format_supported(
+                    &audio_client,
+                    &format_attempt.Format,
+                    false,
+                ) {
                     Ok(false) => {
                         return Err(Error::with_message(
                             ErrorKind::UnsupportedConfig,
@@ -1714,9 +1732,7 @@ fn exclusive_initialize_error(error: windows::core::Error) -> Error {
     const AUDCLNT_E_UNSUPPORTED_FORMAT: u32 = 0x8889_0008;
     const AUDCLNT_E_ENDPOINT_CREATE_FAILED: u32 = 0x8889_000F;
     let detail = match code {
-        AUDCLNT_E_DEVICE_IN_USE => {
-            "声卡正被其他程序独占使用，请关闭后重试"
-        }
+        AUDCLNT_E_DEVICE_IN_USE => "声卡正被其他程序独占使用，请关闭后重试",
         AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED => "系统策略不允许该设备使用独占模式",
         AUDCLNT_E_UNSUPPORTED_FORMAT => "该设备不支持所选采样率或样本格式的独占开流",
         AUDCLNT_E_ENDPOINT_CREATE_FAILED => "无法以独占模式创建采集端点",
@@ -1908,6 +1924,26 @@ mod tests {
         assert!(!capture_candidate_within_mix_precision(
             SampleFormat::I16,
             None
+        ));
+    }
+
+    #[test]
+    fn exclusive_capture_probes_formats_without_a_mix_precision_cap() {
+        for sample_format in [
+            SampleFormat::I16,
+            SampleFormat::I24,
+            SampleFormat::I32,
+            SampleFormat::F32,
+        ] {
+            assert!(should_probe_capture_sample_format(sample_format, None));
+        }
+        assert!(should_probe_capture_sample_format(
+            SampleFormat::I16,
+            Some(16)
+        ));
+        assert!(!should_probe_capture_sample_format(
+            SampleFormat::I24,
+            Some(16)
         ));
     }
 

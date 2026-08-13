@@ -46,11 +46,12 @@ documented E_NOTFOUND result release it normally.
 WASAPI can open event-driven exclusive capture. `StreamConfig.share_mode`
 selects `AUDCLNT_SHAREMODE_EXCLUSIVE` and `supported_input_configs_for(true)`
 probes hardware-accepted exclusive formats without treating `GetMixFormat` as a
-precision upgrade. Exclusive WAVEFORMATEXTENSIBLE probes use speaker channel
-masks (stereo/mono/…) because a zero `DIRECTOUT` mask is rejected by many USB
-interfaces. Exclusive `Initialize` uses equal buffer and periodicity
-durations and retries once after `AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED`. Shared
-enumeration and open paths are unchanged.
+precision upgrade or as a reason to skip every exclusive candidate. Exclusive
+WAVEFORMATEXTENSIBLE probes use speaker channel masks (stereo/mono/…) because a
+zero `DIRECTOUT` mask is rejected by many USB interfaces. Exclusive
+`Initialize` uses equal buffer and periodicity durations and retries once after
+`AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED`. Shared enumeration and open paths are
+unchanged.
 
 Remove this vendor only after a released CPAL version containing both upstream
 fixes, equivalent silent-packet handling, and equivalent explicit-endpoint
