@@ -39,7 +39,6 @@ const ko: MessageTree = {
     engineOffline: '녹음 엔진 오프라인',
   },
   settings: {
-    eyebrow: 'APPLICATION SETTINGS',
     title: '앱 설정',
     language: '언어',
     languageHint: '인터페이스가 바로 바뀌며 재시작 후에도 유지됩니다',
@@ -64,7 +63,6 @@ const ko: MessageTree = {
     licenseDays: '{days}일 남음 · {date}',
   },
   license: {
-    eyebrow: 'OFFLINE LICENSE',
     title: '소프트웨어가 라이선스되지 않았습니다',
     titleExpired: '라이선스가 만료되었습니다',
     titleWrongMachine: '이 기기용 라이선스가 아닙니다',
@@ -139,7 +137,6 @@ const ko: MessageTree = {
     stateCompleted: '완료',
   },
   exportDialog: {
-    eyebrow: 'EXPORT TASK',
     title: '이 작업 내보내기',
     intro: '내보내기는 이미 안전하게 저장된 내용을 사용합니다. 모든 문장이 끝나지 않아도 됩니다. 폴더와 항목을 고르세요.',
     optionsAria: '내보내기 항목',
@@ -169,7 +166,6 @@ const ko: MessageTree = {
     failed: '마지막 내보내기 실패',
     current: '현재',
     currentWithTime: '현재 · {time}',
-    resultEyebrow: 'EXPORT RESULT',
     resultWorkingTitle: '내보내는 중…',
     resultWorkingBody: '{output}을(를) 쓰는 중입니다. 끝나면 여기에 결과가 표시됩니다.',
     resultOkTitle: '내보내기 완료',
@@ -184,13 +180,10 @@ const ko: MessageTree = {
     spotCheck: '내보내기는 끝났지만 복구 중 경고가 있었습니다. 파일을 확인하세요.',
   },
   alertDialog: {
-    errorEyebrow: 'ACTION REQUIRED',
-    warningEyebrow: 'PLEASE CHECK',
     errorTitle: '작업을 완료하지 못했습니다',
     dataSafetyTitle: '데이터 안전 알림',
   },
   sealDialog: {
-    eyebrow: 'INTERRUPTED TASK RECOVERY',
     title: '중단된 이 작업을 복구할까요?',
     body: '먼저 실시간 녹음이 없음을 확인한 뒤 WAV 헤더와 미완료 테이크를 고치고, 마스터와 진행 상태를 안전하게 봉인합니다.',
     taskLine: '작업: {id}',
@@ -199,7 +192,6 @@ const ko: MessageTree = {
     confirm: '복구 확인',
   },
   deleteDialog: {
-    eyebrow: 'MOVE TO TRASH',
     title: '이 녹음을 삭제할까요?',
     body: '작업 폴더 전체가 시스템 휴지통으로 갑니다. 마스터, 재녹음, 메타데이터, 내보내기를 포함합니다.',
     taskLine: '작업: {id}',
@@ -438,7 +430,6 @@ const ko: MessageTree = {
     headTail: '앞 / 뒤',
   },
   pauseDialog: {
-    eyebrow: 'SAFE PAUSE',
     titleRecording: '현재 문장을 끝낸 뒤 나갈까요?',
     titleIdle: '녹음을 일시 중지하고 이 작업을 나갈까요?',
     spoken: '음성이 감지되었습니다. 계속하면 이 테이크를 확인 대기로 닫고 실시간 수집을 멈춘 뒤 마스터를 봉인하고 목록으로 돌아갑니다.',
@@ -450,7 +441,6 @@ const ko: MessageTree = {
     pauseAndLeave: '일시 중지하고 나가기',
   },
   finishDialog: {
-    eyebrow: 'CAPTURE CONTROL',
     titleFault: '장애 보호: 안전하게 중지할까요?',
     titleNormal: '이 수집을 끝낼까요?',
     bodyFault: '수집을 멈추고 엔진이 더 이상 쓰지 않는지 확인합니다. 저장된 마스터는 유지됩니다. 작업이 완전히 봉인되지 않았다면 목록에서 검사 후 복구하세요.',
@@ -635,9 +625,15 @@ const ko: MessageTree = {
     noText: '읽을 텍스트가 없습니다',
     labelTitle: '태그 / 메모',
     none: '없음',
+    settings: '표시 설정',
+    settingsAria: '프롬프터 표시 설정 열기',
+    fontSize: '글자 크기',
+    fontSizeValue: '{size} px',
+    liveColor: '낭독 가능 색',
+    liveColorHint: '대기 종료 후 낭독을 시작할 때 본문 색',
+    resetAppearance: '기본값으로',
   },
   logs: {
-    eyebrow: 'RUNTIME LOG',
     title: '실행 로그',
     appScope: '앱 실행 로그',
     taskScope: '현재 작업 {id}',

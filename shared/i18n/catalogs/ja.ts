@@ -39,7 +39,6 @@ const ja: MessageTree = {
     engineOffline: '収録エンジンがオフライン',
   },
   settings: {
-    eyebrow: 'APPLICATION SETTINGS',
     title: 'アプリ設定',
     language: '言語',
     languageHint: '画面はすぐに切り替わり、再起動後も保持されます',
@@ -64,7 +63,6 @@ const ja: MessageTree = {
     licenseDays: '残り {days} 日 · {date}',
   },
   license: {
-    eyebrow: 'OFFLINE LICENSE',
     title: 'ソフトウェアは未ライセンスです',
     titleExpired: 'ライセンスの期限が切れています',
     titleWrongMachine: 'このマシン向けのライセンスではありません',
@@ -139,7 +137,6 @@ const ja: MessageTree = {
     stateCompleted: '完了',
   },
   exportDialog: {
-    eyebrow: 'EXPORT TASK',
     title: 'このタスクを書き出す',
     intro: '書き出しはすでに安全に保存された内容が対象です。全句の完了は不要です。フォルダと項目を選んでください。',
     optionsAria: '書き出し項目',
@@ -169,7 +166,6 @@ const ja: MessageTree = {
     failed: '前回の書き出しに失敗',
     current: '最新',
     currentWithTime: '最新 · {time}',
-    resultEyebrow: 'EXPORT RESULT',
     resultWorkingTitle: '書き出し中…',
     resultWorkingBody: '{output} を書き出しています。完了するとここに結果が表示されます。',
     resultOkTitle: '書き出し完了',
@@ -184,13 +180,10 @@ const ja: MessageTree = {
     spotCheck: '書き出しは完了しましたが、復旧で警告が出ました。ファイルを確認してください。',
   },
   alertDialog: {
-    errorEyebrow: 'ACTION REQUIRED',
-    warningEyebrow: 'PLEASE CHECK',
     errorTitle: '操作を完了できませんでした',
     dataSafetyTitle: 'データ保護の通知',
   },
   sealDialog: {
-    eyebrow: 'INTERRUPTED TASK RECOVERY',
     title: '中断したタスクを修復しますか？',
     body: '先にライブ収録がないことを確認し、WAVヘッダと未完了テイクを修復して、マスターと進捗を安全に封します。',
     taskLine: 'タスク：{id}',
@@ -199,7 +192,6 @@ const ja: MessageTree = {
     confirm: '修復する',
   },
   deleteDialog: {
-    eyebrow: 'MOVE TO TRASH',
     title: 'この収録を削除しますか？',
     body: 'タスクフォルダ全体がシステムのゴミ箱へ移されます。マスター、リテイク、メタデータ、書き出しを含みます。',
     taskLine: 'タスク：{id}',
@@ -438,7 +430,6 @@ const ja: MessageTree = {
     headTail: '頭 / 尾',
   },
   pauseDialog: {
-    eyebrow: 'SAFE PAUSE',
     titleRecording: '今の文を終えてからタスクを出ますか？',
     titleIdle: '収録を一時停止してタスクを出ますか？',
     spoken: '音声が検出されています。続行するとこのテイクを確認待ちとして閉じ、ライブ収録を止め、マスターを封して一覧へ戻ります。',
@@ -450,7 +441,6 @@ const ja: MessageTree = {
     pauseAndLeave: '一時停止して出る',
   },
   finishDialog: {
-    eyebrow: 'CAPTURE CONTROL',
     titleFault: '障害保護：安全に停止しますか？',
     titleNormal: 'この収録を終えますか？',
     bodyFault: '収録を止め、エンジンが書いていないことを確認します。保存済みマスターは残ります。封止が完了していなければ、一覧から確認して修復してください。',
@@ -635,9 +625,15 @@ const ja: MessageTree = {
     noText: '読むテキストがありません',
     labelTitle: 'タグ / メモ',
     none: 'なし',
+    settings: '表示設定',
+    settingsAria: 'プロンプタの表示設定を開く',
+    fontSize: '文字サイズ',
+    fontSizeValue: '{size} px',
+    liveColor: '読み上げ可能時の色',
+    liveColorHint: '待機終了後、読み始められるときの本文色',
+    resetAppearance: 'デフォルトに戻す',
   },
   logs: {
-    eyebrow: 'RUNTIME LOG',
     title: '実行ログ',
     appScope: 'アプリ実行ログ',
     taskScope: '現在のタスク {id}',

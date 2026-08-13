@@ -37,7 +37,6 @@ const zhCN = {
     engineOffline: '录音引擎离线',
   },
   settings: {
-    eyebrow: 'APPLICATION SETTINGS',
     title: '应用设置',
     language: '语言',
     languageHint: '立即切换界面语言，重启后保持',
@@ -62,7 +61,6 @@ const zhCN = {
     licenseDays: '剩余 {days} 天 · {date}',
   },
   license: {
-    eyebrow: 'OFFLINE LICENSE',
     title: '软件未授权',
     titleExpired: '授权已过期',
     titleWrongMachine: '授权不属于本机',
@@ -137,7 +135,6 @@ const zhCN = {
     stateCompleted: '已完成',
   },
   exportDialog: {
-    eyebrow: 'EXPORT TASK',
     title: '导出当前任务',
     intro: '导出以当前已安全保存的内容为准，不要求所有句子都已录完。请选择导出目录和一个导出项：',
     optionsAria: '导出内容',
@@ -167,7 +164,6 @@ const zhCN = {
     failed: '上次导出失败',
     current: '当前',
     currentWithTime: '当前 · {time}',
-    resultEyebrow: 'EXPORT RESULT',
     resultWorkingTitle: '正在导出…',
     resultWorkingBody: '正在写出 {output}，请稍候。完成后会在这里显示结果。',
     resultOkTitle: '导出完成',
@@ -182,13 +178,10 @@ const zhCN = {
     spotCheck: '导出已完成，但恢复过程有告警，请抽检导出文件。',
   },
   alertDialog: {
-    errorEyebrow: 'ACTION REQUIRED',
-    warningEyebrow: 'PLEASE CHECK',
     errorTitle: '操作未完成',
     dataSafetyTitle: '数据安全提示',
   },
   sealDialog: {
-    eyebrow: 'INTERRUPTED TASK RECOVERY',
     title: '修复这个中断任务？',
     body: '系统会先确认当前没有活跃录音，再修复已落盘 WAV 头和未正常结束的录音，安全收尾母音频和任务进度。',
     taskLine: '任务：{id}',
@@ -197,7 +190,6 @@ const zhCN = {
     confirm: '确认修复',
   },
   deleteDialog: {
-    eyebrow: 'MOVE TO TRASH',
     title: '删除这条录制任务？',
     body: '整条任务目录将移到系统回收站，包括母音频、各次重录数据、元数据和导出文件。',
     taskLine: '任务：{id}',
@@ -436,7 +428,6 @@ const zhCN = {
     headTail: '首 / 尾',
   },
   pauseDialog: {
-    eyebrow: 'SAFE PAUSE',
     titleRecording: '先结束当前句，再退出任务？',
     titleIdle: '暂停录制并退出任务？',
     spoken: '当前句已检测到语音。继续后会先封闭本句并保留为待确认录音，再停止持续采集、封存母音频并返回列表。',
@@ -448,7 +439,6 @@ const zhCN = {
     pauseAndLeave: '暂停并退出任务',
   },
   finishDialog: {
-    eyebrow: 'CAPTURE CONTROL',
     titleFault: '故障保护：安全结束？',
     titleNormal: '完成本次采集？',
     bodyFault: '将尝试停止采集并确认引擎不再写入。已落盘母轨会保留；若任务未能安全收尾，返回列表后需先执行“检查并修复”。',
@@ -633,9 +623,15 @@ const zhCN = {
     noText: '当前没有可朗读的文本',
     labelTitle: '标签备注',
     none: '无',
+    settings: '显示设置',
+    settingsAria: '打开领读显示设置',
+    fontSize: '字号',
+    fontSizeValue: '{size} px',
+    liveColor: '可朗读颜色',
+    liveColorHint: '等待结束后、可以开口朗读时的正文颜色',
+    resetAppearance: '恢复默认',
   },
   logs: {
-    eyebrow: 'RUNTIME LOG',
     title: '运行日志',
     appScope: '应用运行日志',
     taskScope: '当前任务 {id}',

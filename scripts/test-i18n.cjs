@@ -57,6 +57,10 @@ async function main() {
   assert.equal(t('exportDialog.destMissing'), '所选导出目录不存在，请重新选择');
   assert.equal(t('notice.copyingExport'), '正在复制到所选导出目录…');
   assert.equal(t('alertDialog.dataSafetyTitle'), '数据安全提示');
+  assert.equal(t('prompter.settings'), '显示设置');
+  assert.equal(t('prompter.fontSize'), '字号');
+  assert.equal(t('prompter.liveColor'), '可朗读颜色');
+  assert.equal(t('prompter.fontSizeValue', { size: 36 }), '36 px');
 
   const chineseKeys = new Set(flattenKeys(catalogs['zh-CN']));
   for (const locale of APP_LOCALES) {

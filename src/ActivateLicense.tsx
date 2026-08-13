@@ -158,7 +158,6 @@ export function ActivateLicense({
     </header>
     <main className="license-stage">
       <section className="license-card" aria-labelledby="license-title">
-        <small>{t('license.eyebrow')}</small>
         <h1 id="license-title">{reasonTitle(status.reason)}</h1>
         <p>{t('license.body')}</p>
         <label className="license-machine">

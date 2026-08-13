@@ -39,7 +39,6 @@ const en: MessageTree = {
     engineOffline: 'Capture engine offline',
   },
   settings: {
-    eyebrow: 'APPLICATION SETTINGS',
     title: 'Application settings',
     language: 'Language',
     languageHint: 'Switches the interface immediately and is remembered after restart',
@@ -64,7 +63,6 @@ const en: MessageTree = {
     licenseDays: '{days} days left · {date}',
   },
   license: {
-    eyebrow: 'OFFLINE LICENSE',
     title: 'Software is not licensed',
     titleExpired: 'License expired',
     titleWrongMachine: 'License is not for this machine',
@@ -139,7 +137,6 @@ const en: MessageTree = {
     stateCompleted: 'Completed',
   },
   exportDialog: {
-    eyebrow: 'EXPORT TASK',
     title: 'Export this task',
     intro: 'Export uses what is already safely saved. Not every sentence has to be finished. Choose a folder and one item:',
     optionsAria: 'Export items',
@@ -169,7 +166,6 @@ const en: MessageTree = {
     failed: 'Last export failed',
     current: 'Current',
     currentWithTime: 'Current · {time}',
-    resultEyebrow: 'EXPORT RESULT',
     resultWorkingTitle: 'Exporting…',
     resultWorkingBody: 'Writing {output}. The result will appear here when it finishes.',
     resultOkTitle: 'Export finished',
@@ -184,13 +180,10 @@ const en: MessageTree = {
     spotCheck: 'Export finished, but recovery reported a warning. Spot-check the files.',
   },
   alertDialog: {
-    errorEyebrow: 'ACTION REQUIRED',
-    warningEyebrow: 'PLEASE CHECK',
     errorTitle: 'Action did not finish',
     dataSafetyTitle: 'Data-safety notice',
   },
   sealDialog: {
-    eyebrow: 'INTERRUPTED TASK RECOVERY',
     title: 'Repair this interrupted task?',
     body: 'The app first confirms there is no live capture, then repairs WAV headers and unfinished takes, and safely seals the master audio and progress.',
     taskLine: 'Task: {id}',
@@ -199,7 +192,6 @@ const en: MessageTree = {
     confirm: 'Confirm repair',
   },
   deleteDialog: {
-    eyebrow: 'MOVE TO TRASH',
     title: 'Delete this recording?',
     body: 'The whole task folder goes to the system trash, including master audio, retakes, metadata, and exports.',
     taskLine: 'Task: {id}',
@@ -438,7 +430,6 @@ const en: MessageTree = {
     headTail: 'Head / tail',
   },
   pauseDialog: {
-    eyebrow: 'SAFE PAUSE',
     titleRecording: 'Finish the current sentence before leaving?',
     titleIdle: 'Pause recording and leave this task?',
     spoken: 'Speech was detected. Continuing will close this take as pending confirmation, then stop live capture, seal the master, and return to the list.',
@@ -450,7 +441,6 @@ const en: MessageTree = {
     pauseAndLeave: 'Pause and leave',
   },
   finishDialog: {
-    eyebrow: 'CAPTURE CONTROL',
     titleFault: 'Fault protection: stop safely?',
     titleNormal: 'Finish this capture?',
     bodyFault: 'The app will try to stop capture and confirm the engine is no longer writing. Saved master audio is kept. If the task did not seal completely, inspect and repair it from the list.',
@@ -635,9 +625,15 @@ const en: MessageTree = {
     noText: 'No text to read',
     labelTitle: 'Tag / note',
     none: 'None',
+    settings: 'Display settings',
+    settingsAria: 'Open prompter display settings',
+    fontSize: 'Text size',
+    fontSizeValue: '{size} px',
+    liveColor: 'Ready-to-read color',
+    liveColorHint: 'Script color after the wait, when you can start speaking',
+    resetAppearance: 'Reset defaults',
   },
   logs: {
-    eyebrow: 'RUNTIME LOG',
     title: 'Runtime log',
     appScope: 'Application runtime log',
     taskScope: 'Current task {id}',

@@ -147,7 +147,6 @@ export function LogPanel({
       <header>
         <span className="dialog-icon"><Icon name="log" size={19} /></span>
         <div>
-          <small>{t('logs.eyebrow')}</small>
           <h2 id="log-panel-title">{t('logs.title')}</h2>
         </div>
       </header>

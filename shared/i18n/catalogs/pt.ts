@@ -39,7 +39,6 @@ const pt: MessageTree = {
     engineOffline: 'Motor de captura offline',
   },
   settings: {
-    eyebrow: 'APPLICATION SETTINGS',
     title: 'Definições da aplicação',
     language: 'Idioma',
     languageHint: 'Muda a interface de imediato e fica gravado após reiniciar',
@@ -64,7 +63,6 @@ const pt: MessageTree = {
     licenseDays: 'Faltam {days} dias · {date}',
   },
   license: {
-    eyebrow: 'OFFLINE LICENSE',
     title: 'O software não está licenciado',
     titleExpired: 'A licença expirou',
     titleWrongMachine: 'A licença não é deste computador',
@@ -139,7 +137,6 @@ const pt: MessageTree = {
     stateCompleted: 'Concluída',
   },
   exportDialog: {
-    eyebrow: 'EXPORT TASK',
     title: 'Exportar esta tarefa',
     intro: 'A exportação usa o que já está guardado com segurança. Não é preciso terminar todas as frases. Escolha uma pasta e um item:',
     optionsAria: 'Itens de exportação',
@@ -169,7 +166,6 @@ const pt: MessageTree = {
     failed: 'A última exportação falhou',
     current: 'Atual',
     currentWithTime: 'Atual · {time}',
-    resultEyebrow: 'EXPORT RESULT',
     resultWorkingTitle: 'A exportar…',
     resultWorkingBody: 'A escrever {output}. O resultado aparece aqui quando terminar.',
     resultOkTitle: 'Exportação concluída',
@@ -184,13 +180,10 @@ const pt: MessageTree = {
     spotCheck: 'A exportação terminou, mas a recuperação gerou um aviso. Verifique os ficheiros.',
   },
   alertDialog: {
-    errorEyebrow: 'ACTION REQUIRED',
-    warningEyebrow: 'PLEASE CHECK',
     errorTitle: 'A ação não foi concluída',
     dataSafetyTitle: 'Aviso de segurança dos dados',
   },
   sealDialog: {
-    eyebrow: 'INTERRUPTED TASK RECOVERY',
     title: 'Reparar esta tarefa interrompida?',
     body: 'Primeiro confirma-se que não há captura ao vivo, depois reparam-se cabeçalhos WAV e tomas incompletas, e sela-se com segurança o master e o progresso.',
     taskLine: 'Tarefa: {id}',
@@ -199,7 +192,6 @@ const pt: MessageTree = {
     confirm: 'Confirmar reparação',
   },
   deleteDialog: {
-    eyebrow: 'MOVE TO TRASH',
     title: 'Eliminar esta gravação?',
     body: 'A pasta inteira da tarefa vai para o lixo do sistema, incluindo master, retomas, metadados e exportações.',
     taskLine: 'Tarefa: {id}',
@@ -438,7 +430,6 @@ const pt: MessageTree = {
     headTail: 'Início / fim',
   },
   pauseDialog: {
-    eyebrow: 'SAFE PAUSE',
     titleRecording: 'Terminar a frase atual antes de sair?',
     titleIdle: 'Pausar a gravação e sair desta tarefa?',
     spoken: 'Foi detetada fala. Continuar fecha esta toma como pendente de confirmação, para a captura ao vivo, sela o master e volta à lista.',
@@ -450,7 +441,6 @@ const pt: MessageTree = {
     pauseAndLeave: 'Pausar e sair',
   },
   finishDialog: {
-    eyebrow: 'CAPTURE CONTROL',
     titleFault: 'Proteção de falha: parar em segurança?',
     titleNormal: 'Terminar esta captura?',
     bodyFault: 'A aplicação tenta parar a captura e confirmar que o motor já não escreve. O master guardado mantém-se. Se a tarefa não selou por completo, inspecione e repare a partir da lista.',
@@ -635,9 +625,15 @@ const pt: MessageTree = {
     noText: 'Não há texto para ler',
     labelTitle: 'Etiqueta / nota',
     none: 'Nenhuma',
+    settings: 'Definições de apresentação',
+    settingsAria: 'Abrir definições de apresentação do prompter',
+    fontSize: 'Tamanho do texto',
+    fontSizeValue: '{size} px',
+    liveColor: 'Cor quando puder ler',
+    liveColorHint: 'Cor do texto após a espera, quando pode começar a ler',
+    resetAppearance: 'Repor predefinições',
   },
   logs: {
-    eyebrow: 'RUNTIME LOG',
     title: 'Registo de execução',
     appScope: 'Registo de execução da aplicação',
     taskScope: 'Tarefa atual {id}',

@@ -2426,7 +2426,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
 
   const settingsDialog = settingsOpen && <div className="dialog-backdrop" role="presentation">
     <section className="studio-dialog settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-dialog-title">
-      <header><span className="dialog-icon"><Icon name="settings" size={19} /></span><div><small>{t('settings.eyebrow')}</small><h2 id="settings-dialog-title">{t('settings.title')}</h2></div></header>
+      <header><span className="dialog-icon"><Icon name="settings" size={19} /></span><div><h2 id="settings-dialog-title">{t('settings.title')}</h2></div></header>
       <div className="settings-content">
         <section>
           <div><strong>{t('settings.language')}</strong><small>{t('settings.languageHint')}</small></div>
@@ -2501,7 +2501,6 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           <Icon name={exportFeedback.status === 'failed' ? 'stop' : exportFeedback.status === 'ok' ? 'check' : 'export'} size={19} />
         </span>
         <div>
-          <small>{t('exportDialog.resultEyebrow')}</small>
           <h2 id="export-result-title">
             {exportFeedback.status === 'working'
               ? t('exportDialog.resultWorkingTitle')
@@ -2540,7 +2539,6 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           <Icon name={userAlert.kind === 'error' ? 'stop' : 'meter'} size={19} />
         </span>
         <div>
-          <small>{userAlert.kind === 'error' ? t('alertDialog.errorEyebrow') : t('alertDialog.warningEyebrow')}</small>
           <h2 id="user-alert-title">{userAlert.title}</h2>
         </div>
       </header>
@@ -2619,7 +2617,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       </main>
       {exportRecording && <div className="dialog-backdrop" role="presentation">
         <section className="studio-dialog export-dialog" role="dialog" aria-modal="true" aria-labelledby="export-dialog-title">
-          <header><span className="dialog-icon"><Icon name="export" size={19} /></span><div><small>{t('exportDialog.eyebrow')}</small><h2 id="export-dialog-title">{t('exportDialog.title')}</h2></div></header>
+          <header><span className="dialog-icon"><Icon name="export" size={19} /></span><div><h2 id="export-dialog-title">{t('exportDialog.title')}</h2></div></header>
           <p>{t('exportDialog.intro')}</p>
           {exportDestinationPicker(exportRecording.session_dir)}
           <div className="export-options" aria-label={t('exportDialog.optionsAria')}>
@@ -2633,7 +2631,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       </div>}
       {sealConfirmRecording && <div className="dialog-backdrop" role="presentation">
         <section className="studio-dialog seal-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="seal-confirm-title">
-          <header><span className="dialog-icon"><Icon name="history" size={19} /></span><div><small>{t('sealDialog.eyebrow')}</small><h2 id="seal-confirm-title">{t('sealDialog.title')}</h2></div></header>
+          <header><span className="dialog-icon"><Icon name="history" size={19} /></span><div><h2 id="seal-confirm-title">{t('sealDialog.title')}</h2></div></header>
           <p>{t('sealDialog.body')}</p>
           <div className="dialog-warning">{t('sealDialog.taskLine', { id: sealConfirmRecording.session_id })}<br />{sealConfirmRecording.status === 'faulted' || sealConfirmRecording.overflow_samples > 0 ? t('sealDialog.keepFault') : t('sealDialog.canContinue')}</div>
           <footer><button className="button" onClick={() => setSealConfirmRecording(null)} disabled={Boolean(busy)}>{t('common.cancel')}</button><button data-testid="confirm-seal-recording" className="button primary" onClick={() => { const recording = sealConfirmRecording; setSealConfirmRecording(null); void sealHistoricalRecording(recording); }} disabled={Boolean(busy)}>{t('sealDialog.confirm')}</button></footer>
@@ -2641,7 +2639,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       </div>}
       {deleteConfirmRecording && <div className="dialog-backdrop" role="presentation">
         <section className="studio-dialog delete-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-confirm-title">
-          <header><span className="dialog-icon danger"><Icon name="trash" size={19} /></span><div><small>{t('deleteDialog.eyebrow')}</small><h2 id="delete-confirm-title">{t('deleteDialog.title')}</h2></div></header>
+          <header><span className="dialog-icon danger"><Icon name="trash" size={19} /></span><div><h2 id="delete-confirm-title">{t('deleteDialog.title')}</h2></div></header>
           <p>{t('deleteDialog.body')}</p>
           <div className="dialog-warning danger">{t('deleteDialog.taskLine', { id: deleteConfirmRecording.session_id })}<br />{t('deleteDialog.warning')}</div>
           <footer><button className="button" onClick={() => setDeleteConfirmRecording(null)} disabled={Boolean(deletingSessionDir)}>{t('common.cancel')}</button><button data-testid="confirm-delete-recording" className="button danger" onClick={() => { const recording = deleteConfirmRecording; setDeleteConfirmRecording(null); void deleteHistoricalRecording(recording); }} disabled={Boolean(deletingSessionDir)}>{t('deleteDialog.confirm')}</button></footer>
@@ -2710,7 +2708,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           <div className="inspector-section"><h3>{t('setup.dataPolicy')}</h3><ul className="feature-list"><li><Icon name="check" />{t('setup.policyMaster')}</li><li><Icon name="check" />{t('setup.policyInteger')}</li><li><Icon name="check" />{t('setup.policyRetake')}</li><li><Icon name="check" />{t('setup.policySnapshot')}</li></ul></div>
         </aside>
       </div>
-      <StudioStatus engineStatus={engineStatus} message={error || dataSafetyAlert || presetWarning || busy || notice} isError={Boolean(error || dataSafetyAlert)} right="READY · PCM · LOCAL" />
+      <StudioStatus engineStatus={engineStatus} message={error || dataSafetyAlert || presetWarning || busy || notice} isError={Boolean(error || dataSafetyAlert)} />
       {settingsDialog}
       {exportFeedbackDialog}
       {userAlertDialog}
@@ -2730,7 +2728,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       </aside>
       <main className="editor-document">
         <div className="document-tabs"><span className="active"><Icon name="microphone" size={13} /> {workflowComplete ? t('recorder.taskComplete') : currentItem?.id ?? 'Item'} <i>×</i></span></div>
-        <div className="editor-toolbar"><div className="editor-nav"><button title={t('recorder.prevItem')} disabled={recording || currentIndex === 0} onClick={() => setCurrentIndex((index) => Math.max(0, index - 1))}><Icon name="chevron-left" /></button><span>{currentIndex + 1} / {items.length}</span><button title={t('recorder.nextItem')} disabled={recording || currentIndex >= items.length - 1} onClick={() => setCurrentIndex((index) => Math.min(items.length - 1, index + 1))}><Icon name="chevron-right" /></button></div><div className="editor-time"><small>{recording ? 'TAKE' : 'TOTAL'}</small><strong className={recording ? 'recording' : ''}>{recording ? attemptDuration : sessionDuration}</strong></div><div className="editor-toolbar-actions"><button className="prompter-launch" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? t('recorder.locatePrompter') : t('recorder.openPrompter')}</button></div><div className={`save-health ${workspaceFaulted || captureFault ? 'fault' : meter.storage_status === 'warning' ? 'warning' : ''}`}><i />{workspaceFaulted ? t('recorder.healthReadonly') : !captureActive ? t('recorder.healthInspect') : captureFault ? t('recorder.healthFaultStop', { title: captureFaultCopy.title }) : meter.storage_status === 'warning' ? t('recorder.healthWarning', { minutes: Math.max(0, Math.floor(meter.storage_safe_remaining_seconds / 60)) }) : t('recorder.healthLive')}</div></div>
+        <div className="editor-toolbar"><div className="editor-nav"><button title={t('recorder.prevItem')} disabled={recording || currentIndex === 0} onClick={() => setCurrentIndex((index) => Math.max(0, index - 1))}><Icon name="chevron-left" /></button><span>{currentIndex + 1} / {items.length}</span><button title={t('recorder.nextItem')} disabled={recording || currentIndex >= items.length - 1} onClick={() => setCurrentIndex((index) => Math.min(items.length - 1, index + 1))}><Icon name="chevron-right" /></button></div><div className="editor-time"><strong className={recording ? 'recording' : ''}>{recording ? attemptDuration : sessionDuration}</strong></div><div className="editor-toolbar-actions"><button className="prompter-launch" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? t('recorder.locatePrompter') : t('recorder.openPrompter')}</button></div><div className={`save-health ${workspaceFaulted || captureFault ? 'fault' : meter.storage_status === 'warning' ? 'warning' : ''}`}><i />{workspaceFaulted ? t('recorder.healthReadonly') : !captureActive ? t('recorder.healthInspect') : captureFault ? t('recorder.healthFaultStop', { title: captureFaultCopy.title }) : meter.storage_status === 'warning' ? t('recorder.healthWarning', { minutes: Math.max(0, Math.floor(meter.storage_safe_remaining_seconds / 60)) }) : t('recorder.healthLive')}</div></div>
         <div className="editor-canvas">
           {(captureFault || discontinuityToast || noiseCheckBlocksAttempt || qualityWarning) && <div className="workspace-toasts" aria-live="polite">
             {captureFault && <div className="capture-fault-banner" role="alert"><Icon name="stop" size={16} /><div><strong>{captureFaultCopy.title}</strong><span>{captureFaultCopy.detail}{snapshot?.device_name ? ` ${t('issues.currentDevice', { name: snapshot.device_name })}` : ' '}{t('issues.stopThenFinish')}</span></div></div>}
@@ -2749,11 +2747,11 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             </div>
             <div className="transport-primary">
               {!captureActive
-                ? <button data-testid="main-transport" className="main-transport start" onClick={() => void activateCapture()} disabled={Boolean(busy) || workspaceFaulted}><span><Icon name="microphone" /></span><strong>{workspaceFaulted ? t('recorder.readonlyRepair') : t('recorder.enableCapture')}</strong><kbd>CLICK</kbd></button>
+                ? <button data-testid="main-transport" className="main-transport start" onClick={() => void activateCapture()} disabled={Boolean(busy) || workspaceFaulted}><span><Icon name="microphone" /></span><strong>{workspaceFaulted ? t('recorder.readonlyRepair') : t('recorder.enableCapture')}</strong></button>
                 : captureFault
                 ? <button data-testid="main-transport" className="main-transport stop" onClick={finishSession} disabled={Boolean(busy)}><span><Icon name="stop" /></span><strong>{t('recorder.finishKeepMaster')}</strong><kbd>SPACE</kbd></button>
                 : noiseCheckBlocksAttempt && primaryAction === 'start'
-                  ? <button data-testid="main-transport" className="main-transport waiting" onClick={() => snapshot && void runSessionNoiseCheck(sessionDir, snapshot)} disabled={noiseCheckRunning || Boolean(busy)}><span><Icon name="meter" /></span><strong>{noiseCheckRunning ? t('recorder.noiseChecking') : t('recorder.finishNoiseFirst')}</strong><kbd>{noiseCheckRunning ? '…' : 'CLICK'}</kbd></button>
+                  ? <button data-testid="main-transport" className="main-transport waiting" onClick={() => snapshot && void runSessionNoiseCheck(sessionDir, snapshot)} disabled={noiseCheckRunning || Boolean(busy)}><span><Icon name="meter" /></span><strong>{noiseCheckRunning ? t('recorder.noiseChecking') : t('recorder.finishNoiseFirst')}</strong></button>
                 : recording
                   ? <button data-testid="main-transport" className={`main-transport ${isPendingTake ? 'waiting' : 'stop'}`} onClick={() => void stopAttempt()} disabled={Boolean(busy)}><span><Icon name="stop" /></span><strong>{isPendingTake ? t('recorder.pendingCancel') : t('recorder.finishSentence')}</strong><kbd>SPACE</kbd></button>
                 : primaryAction === 'accept'
@@ -2802,7 +2800,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     </div>
     {pauseConfirmOpen && !captureFault && <div className="dialog-backdrop" role="presentation">
       <section className="studio-dialog" role="dialog" aria-modal="true" aria-labelledby="pause-dialog-title">
-        <header><span className="dialog-icon"><Icon name="chevron-left" size={19} /></span><div><small>{t('pauseDialog.eyebrow')}</small><h2 id="pause-dialog-title">{recording ? t('pauseDialog.titleRecording') : t('pauseDialog.titleIdle')}</h2></div></header>
+        <header><span className="dialog-icon"><Icon name="chevron-left" size={19} /></span><div><h2 id="pause-dialog-title">{recording ? t('pauseDialog.titleRecording') : t('pauseDialog.titleIdle')}</h2></div></header>
         <p>{recording
           ? hasSpoken
             ? t('pauseDialog.spoken')
@@ -2815,13 +2813,13 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     </div>}
     {finishConfirmOpen && <div className="dialog-backdrop" role="presentation">
       <section className="studio-dialog" role="dialog" aria-modal="true" aria-labelledby="finish-dialog-title">
-        <header><span className="dialog-icon"><Icon name="stop" size={19} /></span><div><small>{t('finishDialog.eyebrow')}</small><h2 id="finish-dialog-title">{captureFault ? t('finishDialog.titleFault') : t('finishDialog.titleNormal')}</h2></div></header>
+        <header><span className="dialog-icon"><Icon name="stop" size={19} /></span><div><h2 id="finish-dialog-title">{captureFault ? t('finishDialog.titleFault') : t('finishDialog.titleNormal')}</h2></div></header>
         <p>{captureFault ? t('finishDialog.bodyFault') : t('finishDialog.bodyNormal')}</p>
         <dl className="dialog-summary"><div><dt>{t('recorder.accepted')}</dt><dd>{counts.accepted ?? 0}</dd></div><div><dt>{t('recorder.skipped')}</dt><dd>{counts.skipped ?? 0}</dd></div><div><dt>{t('recorder.pending')}</dt><dd className={(counts.pending ?? 0) + (counts.review ?? 0) ? 'warning' : ''}>{(counts.pending ?? 0) + (counts.review ?? 0)}</dd></div></dl>
         <footer><button data-testid="finish-cancel" className="button" onClick={() => setFinishConfirmOpen(false)}>{captureFault ? t('finishDialog.stayFault') : t('common.cancel')}</button><button data-testid="finish-confirm" className="button primary" onClick={() => void confirmFinishSession()} disabled={Boolean(busy)}><Icon name="stop" size={14} />{captureFault ? t('finishDialog.confirmFault') : t('finishDialog.confirmNormal')}</button></footer>
       </section>
     </div>}
-    <StudioStatus engineStatus={engineStatus} message={error || dataSafetyAlert || busy || notice} isError={Boolean(error || dataSafetyAlert)} right={`${sampleRateForDisplay.toLocaleString(locale)} HZ · ${bitDepthForDisplay}-BIT · MONO`} />
+    <StudioStatus engineStatus={engineStatus} message={error || dataSafetyAlert || busy || notice} isError={Boolean(error || dataSafetyAlert)} />
     {settingsDialog}
     {exportFeedbackDialog}
     {userAlertDialog}

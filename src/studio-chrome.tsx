@@ -44,12 +44,11 @@ export function StudioChrome({ phase, title, onBack, onOpenSettings, backTitle, 
   </header>;
 }
 
-export function StudioStatus({ engineStatus, message, isError = false, right }: { engineStatus: EngineStatus; message: string; isError?: boolean; right: string }) {
+export function StudioStatus({ engineStatus, message, isError = false }: { engineStatus: EngineStatus; message: string; isError?: boolean }) {
   const { t } = useI18n();
   return <footer className="studio-status">
     <span className={`status-engine ${engineStatus}`}><i />{engineStatus === 'ready' ? t('chrome.engineReady') : engineStatus === 'connecting' ? t('chrome.engineConnecting') : t('chrome.engineOffline')}</span>
     <span className={isError ? 'status-message error' : 'status-message'}>{message}</span>
-    <span className="status-format">{right}</span>
   </footer>;
 }
 

@@ -39,7 +39,6 @@ const es: MessageTree = {
     engineOffline: 'Motor de captura sin conexión',
   },
   settings: {
-    eyebrow: 'APPLICATION SETTINGS',
     title: 'Ajustes de la aplicación',
     language: 'Idioma',
     languageHint: 'Cambia la interfaz al instante y se recuerda al reiniciar',
@@ -64,7 +63,6 @@ const es: MessageTree = {
     licenseDays: 'Quedan {days} días · {date}',
   },
   license: {
-    eyebrow: 'OFFLINE LICENSE',
     title: 'El software no está licenciado',
     titleExpired: 'La licencia ha caducado',
     titleWrongMachine: 'La licencia no es de este equipo',
@@ -139,7 +137,6 @@ const es: MessageTree = {
     stateCompleted: 'Completada',
   },
   exportDialog: {
-    eyebrow: 'EXPORT TASK',
     title: 'Exportar esta tarea',
     intro: 'La exportación usa lo ya guardado de forma segura. No hace falta terminar todas las frases. Elija una carpeta y un elemento:',
     optionsAria: 'Elementos de exportación',
@@ -169,7 +166,6 @@ const es: MessageTree = {
     failed: 'Falló la última exportación',
     current: 'Actual',
     currentWithTime: 'Actual · {time}',
-    resultEyebrow: 'EXPORT RESULT',
     resultWorkingTitle: 'Exportando…',
     resultWorkingBody: 'Escribiendo {output}. El resultado aparecerá aquí al terminar.',
     resultOkTitle: 'Exportación completada',
@@ -184,13 +180,10 @@ const es: MessageTree = {
     spotCheck: 'La exportación terminó, pero la recuperación avisó. Revise los archivos.',
   },
   alertDialog: {
-    errorEyebrow: 'ACTION REQUIRED',
-    warningEyebrow: 'PLEASE CHECK',
     errorTitle: 'La acción no se completó',
     dataSafetyTitle: 'Aviso de seguridad de datos',
   },
   sealDialog: {
-    eyebrow: 'INTERRUPTED TASK RECOVERY',
     title: '¿Reparar esta tarea interrumpida?',
     body: 'Primero se confirma que no hay captura en vivo, luego se reparan cabeceras WAV y tomas incompletas, y se sella con seguridad el máster y el progreso.',
     taskLine: 'Tarea: {id}',
@@ -199,7 +192,6 @@ const es: MessageTree = {
     confirm: 'Confirmar reparación',
   },
   deleteDialog: {
-    eyebrow: 'MOVE TO TRASH',
     title: '¿Eliminar esta grabación?',
     body: 'Toda la carpeta de la tarea irá a la papelera del sistema, incluido el máster, las repeticiones, los metadatos y las exportaciones.',
     taskLine: 'Tarea: {id}',
@@ -438,7 +430,6 @@ const es: MessageTree = {
     headTail: 'Inicio / final',
   },
   pauseDialog: {
-    eyebrow: 'SAFE PAUSE',
     titleRecording: '¿Terminar la frase actual antes de salir?',
     titleIdle: '¿Pausar la grabación y salir de esta tarea?',
     spoken: 'Se detectó voz. Continuar cerrará esta toma como pendiente de confirmación, detendrá la captura en vivo, sellará el máster y volverá a la lista.',
@@ -450,7 +441,6 @@ const es: MessageTree = {
     pauseAndLeave: 'Pausar y salir',
   },
   finishDialog: {
-    eyebrow: 'CAPTURE CONTROL',
     titleFault: 'Protección ante fallo: ¿detener con seguridad?',
     titleNormal: '¿Terminar esta captura?',
     bodyFault: 'La aplicación intentará detener la captura y confirmar que el motor ya no escribe. El máster guardado se conserva. Si la tarea no se selló del todo, inspéctela y repárela desde la lista.',
@@ -635,9 +625,15 @@ const es: MessageTree = {
     noText: 'No hay texto para leer',
     labelTitle: 'Etiqueta / nota',
     none: 'Ninguna',
+    settings: 'Ajustes de visualización',
+    settingsAria: 'Abrir ajustes de visualización del teleprompter',
+    fontSize: 'Tamaño del texto',
+    fontSizeValue: '{size} px',
+    liveColor: 'Color al poder leer',
+    liveColorHint: 'Color del texto tras la espera, cuando puede empezar a leer',
+    resetAppearance: 'Restablecer',
   },
   logs: {
-    eyebrow: 'RUNTIME LOG',
     title: 'Registro de ejecución',
     appScope: 'Registro de ejecución de la aplicación',
     taskScope: 'Tarea actual {id}',

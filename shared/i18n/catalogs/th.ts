@@ -39,7 +39,6 @@ const th: MessageTree = {
     engineOffline: 'เอนจินบันทึกออฟไลน์',
   },
   settings: {
-    eyebrow: 'APPLICATION SETTINGS',
     title: 'การตั้งค่าแอป',
     language: 'ภาษา',
     languageHint: 'สลับอินเทอร์เฟซทันที และจำค่าหลังรีสตาร์ท',
@@ -64,7 +63,6 @@ const th: MessageTree = {
     licenseDays: 'เหลือ {days} วัน · {date}',
   },
   license: {
-    eyebrow: 'OFFLINE LICENSE',
     title: 'ซอฟต์แวร์ยังไม่ได้รับอนุญาต',
     titleExpired: 'ใบอนุญาตหมดอายุ',
     titleWrongMachine: 'ใบอนุญาตไม่ใช่ของเครื่องนี้',
@@ -139,7 +137,6 @@ const th: MessageTree = {
     stateCompleted: 'เสร็จแล้ว',
   },
   exportDialog: {
-    eyebrow: 'EXPORT TASK',
     title: 'ส่งออกงานนี้',
     intro: 'การส่งออกใช้สิ่งที่บันทึกอย่างปลอดภัยแล้ว ไม่จำเป็นต้องบันทึกทุกประโยค เลือกโฟลเดอร์และหนึ่งรายการ:',
     optionsAria: 'รายการส่งออก',
@@ -169,7 +166,6 @@ const th: MessageTree = {
     failed: 'การส่งออกล่าสุดล้มเหลว',
     current: 'ปัจจุบัน',
     currentWithTime: 'ปัจจุบัน · {time}',
-    resultEyebrow: 'EXPORT RESULT',
     resultWorkingTitle: 'กำลังส่งออก…',
     resultWorkingBody: 'กำลังเขียน {output} เมื่อเสร็จจะแสดงผลที่นี่',
     resultOkTitle: 'ส่งออกสำเร็จ',
@@ -184,13 +180,10 @@ const th: MessageTree = {
     spotCheck: 'ส่งออกสำเร็จแล้ว แต่การกู้คืนมีคำเตือน โปรดตรวจไฟล์',
   },
   alertDialog: {
-    errorEyebrow: 'ACTION REQUIRED',
-    warningEyebrow: 'PLEASE CHECK',
     errorTitle: 'ดำเนินการไม่สำเร็จ',
     dataSafetyTitle: 'แจ้งเตือนความปลอดภัยของข้อมูล',
   },
   sealDialog: {
-    eyebrow: 'INTERRUPTED TASK RECOVERY',
     title: 'ซ่อมงานที่ถูกขัดจังหวะนี้หรือไม่?',
     body: 'ระบบจะยืนยันว่าไม่มีการบันทึกสด แล้วซ่อมส่วนหัว WAV และเทกที่ยังไม่จบ จากนั้นปิดผนึกเสียงมาสเตอร์และความคืบหน้าอย่างปลอดภัย',
     taskLine: 'งาน: {id}',
@@ -199,7 +192,6 @@ const th: MessageTree = {
     confirm: 'ยืนยันการซ่อม',
   },
   deleteDialog: {
-    eyebrow: 'MOVE TO TRASH',
     title: 'ลบงานบันทึกนี้หรือไม่?',
     body: 'ทั้งโฟลเดอร์งานจะถูกย้ายไปถังขยะของระบบ รวมเสียงมาสเตอร์ การอัดซ้ำ เมทาดาทา และไฟล์ส่งออก',
     taskLine: 'งาน: {id}',
@@ -438,7 +430,6 @@ const th: MessageTree = {
     headTail: 'หัว / ท้าย',
   },
   pauseDialog: {
-    eyebrow: 'SAFE PAUSE',
     titleRecording: 'จบประโยคปัจจุบันก่อนออกจากงานหรือไม่?',
     titleIdle: 'หยุดบันทึกชั่วคราวแล้วออกจากงานหรือไม่?',
     spoken: 'ตรวจพบเสียงพูดแล้ว การดำเนินการต่อจะปิดเทกนี้เป็นรอยืนยัน แล้วหยุดการเก็บเสียง ปิดผนึกมาสเตอร์ และกลับไปรายการ',
@@ -450,7 +441,6 @@ const th: MessageTree = {
     pauseAndLeave: 'หยุดชั่วคราวแล้วออก',
   },
   finishDialog: {
-    eyebrow: 'CAPTURE CONTROL',
     titleFault: 'การป้องกันความผิดปกติ: หยุดอย่างปลอดภัยหรือไม่?',
     titleNormal: 'จบการเก็บเสียงนี้หรือไม่?',
     bodyFault: 'แอปจะพยายามหยุดการเก็บเสียงและยืนยันว่าเอนจินไม่ได้เขียนแล้ว เสียงมาสเตอร์ที่บันทึกไว้จะคงอยู่ หากงานยังปิดผนึกไม่ครบ ให้ตรวจและซ่อมจากรายการ',
@@ -635,9 +625,15 @@ const th: MessageTree = {
     noText: 'ไม่มีข้อความให้อ่าน',
     labelTitle: 'แท็ก / หมายเหตุ',
     none: 'ไม่มี',
+    settings: 'ตั้งค่าการแสดงผล',
+    settingsAria: 'เปิดตั้งค่าการแสดงผลแผงอ่านนำ',
+    fontSize: 'ขนาดตัวอักษร',
+    fontSizeValue: '{size} px',
+    liveColor: 'สีตอนอ่านได้',
+    liveColorHint: 'สีข้อความหลังรอจบ เมื่อเริ่มอ่านได้',
+    resetAppearance: 'คืนค่าเริ่มต้น',
   },
   logs: {
-    eyebrow: 'RUNTIME LOG',
     title: 'บันทึกการทำงาน',
     appScope: 'บันทึกการทำงานของแอป',
     taskScope: 'งานปัจจุบัน {id}',
