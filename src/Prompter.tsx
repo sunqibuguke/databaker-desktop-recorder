@@ -28,7 +28,7 @@ function appearanceStorage(): Storage | null {
 }
 
 function PrompterCueMark({ cue, progress }: { cue: PrompterCue; progress: number }) {
-  if (cue === 'pending') {
+  if (cue === 'pending' || cue === 'checking') {
     const clamped = Math.max(0, Math.min(1, progress));
     return <svg className="prompter-cue-ring" viewBox="0 0 18 18" aria-hidden="true">
       <circle className="prompter-cue-ring-track" cx="9" cy="9" r={CUE_RING_RADIUS} />
@@ -44,6 +44,9 @@ function PrompterCueMark({ cue, progress }: { cue: PrompterCue; progress: number
   }
   if (cue === 'recording') {
     return <i className="prompter-rec-dot" aria-hidden="true" />;
+  }
+  if (cue === 'ready') {
+    return <i className="prompter-ready-dot" aria-hidden="true" />;
   }
   return null;
 }
@@ -87,12 +90,15 @@ export function PrompterView() {
     setAppearance(savePrompterAppearance(next, appearanceStorage()));
   }
   const cue = state?.cue ?? 'idle';
+  const readerLabel = state?.readerCueLabel || state?.cueLabel || t('prompter.waitTask');
   const qualityWarning = cue === 'fault' ? '' : state?.qualityWarning ?? '';
   const copyLength = Array.from(state?.text ?? '').length;
   const copyDensity = copyLength > 180 ? 'dense' : copyLength > 90 ? 'long' : '';
   return <main
     className={`prompter-shell ${cue} ${qualityWarning ? 'has-quality-warning' : ''}`}
-    aria-label={state?.cueLabel ?? t('prompter.panelAria')}
+    data-testid="prompter-shell"
+    data-cue={cue}
+    aria-label={readerLabel}
     style={{
       ['--prompter-copy-size' as string]: prompterFontSizeRem(appearance.fontSize),
       ['--prompter-live-color' as string]: appearance.liveColor,
@@ -104,14 +110,14 @@ export function PrompterView() {
         <i>· {t('prompter.sequence', { n: state?.sequence || t('common.dash') })}</i>
         <i>{t('prompter.ofTotal', { total: state?.total ?? 0 })}</i>
       </span>
-      <span className="prompter-cue" role={cue === 'fault' ? 'alert' : 'status'} aria-live={cue === 'fault' ? 'assertive' : 'polite'}>
+      <span className="prompter-cue" data-testid="prompter-cue" role={cue === 'fault' ? 'alert' : 'status'} aria-live={cue === 'fault' ? 'assertive' : 'polite'}>
         <PrompterCueMark cue={cue} progress={state?.silenceProgress ?? 0} />
-        {state?.cueLabel ?? t('prompter.waitTask')}
+        {readerLabel}
       </span>
     </header>
     {qualityWarning && <div className="prompter-quality-warning" role="alert"><i />{qualityWarning}</div>}
     <article className="prompter-content">
-      <p ref={copyRef} className={`${copyDensity} ${cue === 'pending' ? 'pending' : cue === 'recording' ? 'live' : ''}`.trim()}>{state?.text || t('prompter.noText')}</p>
+      <p ref={copyRef} className={`${copyDensity} ${cue === 'pending' || cue === 'checking' ? 'pending' : cue === 'ready' ? 'ready' : cue === 'recording' ? 'live' : ''}`.trim()}>{state?.text || t('prompter.noText')}</p>
       <aside ref={labelRef} className={`prompter-label ${state?.label ? '' : 'empty'}`}><span>{t('prompter.labelTitle')}</span><strong>{state?.label || t('prompter.none')}</strong></aside>
     </article>
     <footer className="prompter-footer">

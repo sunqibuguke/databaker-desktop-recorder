@@ -12,6 +12,7 @@ async function main() {
   } = await import(pathToFileURL(path.join(__dirname, '..', 'src', 'automation-rules.ts')).href);
 
   assert.deepEqual(DEFAULT_AUTOMATION_RULES, {
+    autoStartNext: true,
     headTailSilence: true,
     discardEmpty: true,
     envCheck: true,
@@ -56,6 +57,11 @@ async function main() {
   assert.deepEqual(
     normalizeAutomationRules({ discardEmpty: 'nope', peakHigh: true }),
     { ...DEFAULT_AUTOMATION_RULES, peakHigh: true },
+  );
+  assert.equal(
+    normalizeAutomationRules({ headTailSilence: false }).autoStartNext,
+    true,
+    'older saved rules without autoStartNext must default on',
   );
 
   console.log('automation rules tests passed');

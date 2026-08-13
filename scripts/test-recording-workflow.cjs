@@ -21,6 +21,8 @@ async function main() {
     resolveRunningItemIndex,
     sessionNoiseGate,
     shouldAutoRunSessionNoiseCheck,
+    previewShortcutAction,
+    shouldAutoStartAfterAccept,
     viewShortcutAction,
     workflowShortcutAction,
     workspacePosture,
@@ -235,7 +237,20 @@ async function main() {
   assert.deepEqual(
     continuationAfterAccept([item('accepted'), item('pending'), item('accepted')], 0),
     { kind: 'start', nextIndex: 1 },
-    'accepting a sentence must immediately start the next pending sentence',
+    'accepting a sentence names the next pending sentence as the start candidate',
+  );
+  assert.equal(
+    shouldAutoStartAfterAccept({ kind: 'start', nextIndex: 1 }, true),
+    true,
+  );
+  assert.equal(
+    shouldAutoStartAfterAccept({ kind: 'start', nextIndex: 1 }, false),
+    false,
+    'the auto-start rule must be able to keep confirm from arming the next take',
+  );
+  assert.equal(
+    shouldAutoStartAfterAccept({ kind: 'review', nextIndex: 1 }, true),
+    false,
   );
   assert.deepEqual(
     continuationAfterAccept([item('accepted'), item('review'), item('pending')], 0),
@@ -277,6 +292,10 @@ async function main() {
   assert.equal(viewShortcutAction('KeyP', 'p'), 'preview');
   assert.equal(viewShortcutAction('KeyR', 'r'), 'enter-capture');
   assert.equal(viewShortcutAction('KeyS', 's'), 'none');
+  assert.equal(previewShortcutAction('Space', ' '), 'confirm');
+  assert.equal(previewShortcutAction('Escape', 'Escape'), 'close');
+  assert.equal(previewShortcutAction('KeyP', 'p'), 'pause');
+  assert.equal(previewShortcutAction('ArrowLeft', 'ArrowLeft'), 'nudge-left');
   assert.equal(
     resolveRunningItemIndex(
       [{ id: 'a', status: 'accepted' }, { id: 'b', status: 'accepted' }, { id: 'c', status: 'accepted' }],

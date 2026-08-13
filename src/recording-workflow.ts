@@ -110,6 +110,24 @@ export function continuationAfterAccept(
   return areAllItemsHandled(items) ? { kind: 'finish' } : { kind: 'blocked' };
 }
 
+export function shouldAutoStartAfterAccept(
+  continuation: AcceptContinuation,
+  autoStartNext: boolean,
+): boolean {
+  return continuation.kind === 'start' && autoStartNext;
+}
+
+export type PreviewShortcutAction = 'confirm' | 'close' | 'pause' | 'nudge-left' | 'nudge-right' | 'none';
+
+export function previewShortcutAction(code: string, key: string): PreviewShortcutAction {
+  if (key === 'Escape') return 'close';
+  if (code === 'Space') return 'confirm';
+  if (key.toLowerCase() === 'p') return 'pause';
+  if (key === 'ArrowLeft') return 'nudge-left';
+  if (key === 'ArrowRight') return 'nudge-right';
+  return 'none';
+}
+
 export function idlePrimaryAction(
   items: readonly WorkflowItem[],
   currentIndex: number,

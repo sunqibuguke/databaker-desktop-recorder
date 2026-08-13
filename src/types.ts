@@ -244,7 +244,7 @@ export type SealInterruptedSessionResult = {
   warnings?: string[];
 };
 
-export type PrompterCue = 'idle' | 'checking' | 'pending' | 'recording' | 'review' | 'complete' | 'fault';
+export type PrompterCue = 'idle' | 'checking' | 'pending' | 'recording' | 'ready' | 'review' | 'complete' | 'fault';
 
 export type PrompterState = {
   sessionName: string;
@@ -255,6 +255,7 @@ export type PrompterState = {
   label: string;
   cue: PrompterCue;
   cueLabel: string;
+  readerCueLabel: string;
   silenceProgress: number;
   silenceDurationMs: number;
   qualityWarning?: string;

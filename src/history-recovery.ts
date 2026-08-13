@@ -136,3 +136,18 @@ export function engineRecoveryFailure(message: EngineEvent): EngineRecoveryFaile
 
   return { session_dir: payload.session_dir, error: payload.error };
 }
+
+export function isBenignJournalReplayWarning(warning: string): boolean {
+  return /最终快照不可用或不是最新/.test(warning) && /journal_seq/.test(warning);
+}
+
+export function splitRecoveryWarnings(warnings: string[] | undefined): {
+  benign: string[];
+  serious: string[];
+} {
+  const list = warnings?.filter((warning) => warning.trim()) ?? [];
+  return {
+    benign: list.filter(isBenignJournalReplayWarning),
+    serious: list.filter((warning) => !isBenignJournalReplayWarning(warning)),
+  };
+}

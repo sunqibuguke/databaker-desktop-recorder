@@ -1,4 +1,5 @@
 export type AutomationRules = {
+  autoStartNext: boolean;
   headTailSilence: boolean;
   discardEmpty: boolean;
   envCheck: boolean;
@@ -7,6 +8,7 @@ export type AutomationRules = {
 };
 
 export const DEFAULT_AUTOMATION_RULES: AutomationRules = {
+  autoStartNext: true,
   headTailSilence: true,
   discardEmpty: true,
   envCheck: true,
@@ -24,6 +26,7 @@ function asBoolean(value: unknown, fallback: boolean): boolean {
 export function normalizeAutomationRules(value: unknown): AutomationRules {
   const source = value && typeof value === 'object' ? value as Record<string, unknown> : {};
   return {
+    autoStartNext: asBoolean(source.autoStartNext, DEFAULT_AUTOMATION_RULES.autoStartNext),
     headTailSilence: asBoolean(source.headTailSilence, DEFAULT_AUTOMATION_RULES.headTailSilence),
     discardEmpty: asBoolean(source.discardEmpty, DEFAULT_AUTOMATION_RULES.discardEmpty),
     envCheck: asBoolean(source.envCheck, DEFAULT_AUTOMATION_RULES.envCheck),

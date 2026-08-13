@@ -8,8 +8,10 @@ async function main() {
     effectiveCaptureFaultKind,
     engineRecoveryFailure,
     isReconciliableInactiveStopError,
+    isBenignJournalReplayWarning,
     planHistoryRecovery,
     planTaskListEntry,
+    splitRecoveryWarnings,
   } = await import(pathToFileURL(modulePath).href);
   const base = {
     is_active: false,
@@ -169,6 +171,25 @@ async function main() {
     engineRecoveryFailure({ protocol_version: 1, event: 'meter', payload: {} }),
     null,
     'unrelated events must not trigger recovery-failure handling',
+  );
+
+  assert.equal(
+    isBenignJournalReplayWarning('最终快照不可用或不是最新，已从 journal line 1 恢复 journal_seq 23。'),
+    true,
+  );
+  assert.equal(
+    isBenignJournalReplayWarning('identity conflict: directory belongs to another session'),
+    false,
+  );
+  assert.deepEqual(
+    splitRecoveryWarnings([
+      '最终快照不可用或不是最新，已从 journal line 1 恢复 journal_seq 23。',
+      'directory identity mismatch',
+    ]),
+    {
+      benign: ['最终快照不可用或不是最新，已从 journal line 1 恢复 journal_seq 23。'],
+      serious: ['directory identity mismatch'],
+    },
   );
 
   console.log('history recovery UI policy tests passed');

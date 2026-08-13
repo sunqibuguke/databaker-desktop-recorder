@@ -58,6 +58,11 @@ async function main() {
   assert.equal(t('recorder.ruleEnvCheck'), '进任务环境检测');
   assert.equal(t('recorder.ruleAlmostSilent'), '几乎无声提示');
   assert.equal(t('recorder.rulePeakHigh'), '峰值偏高提示');
+  assert.equal(t('recorder.ruleAutoStartNext'), '确认后自动开下一句');
+  assert.equal(t('readerCue.hush'), '先别出声');
+  assert.equal(t('readerCue.halt'), '立即停止朗读');
+  assert.equal(t('notice.recoveryOk'), '进度已从安全日志恢复，可以继续。');
+  assert.match(t('recorder.previewHint'), /空格确认/);
   assert.equal(t('setup.exclusive'), '独占');
   assert.equal(t('setup.shared'), '系统混音');
   assert.equal(t('setup.exclusiveRecommended'), '独占（推荐）');

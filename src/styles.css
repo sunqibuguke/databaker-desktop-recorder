@@ -478,8 +478,9 @@ input:disabled { color: var(--quiet); background: var(--library-header); }
 .prompt-surface { flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: flex-start; justify-content: center; padding: 20px clamp(25px, 5vw, 65px) 22px; background: var(--chrome); }
 .label-chip { padding: 3px 7px; border: 1px solid var(--accent-deep-line); border-radius: 1px; color: var(--accent-muted); background: var(--accent-wash); font-size: var(--text-xs); }
 .prompt-surface p { max-width: 850px; margin: 13px 0 16px; color: var(--text-bright); font-size: var(--text-prompt); line-height: 1.55; letter-spacing: .018em; font-weight: 500; text-wrap: pretty; }
-.prompt-surface.pending p { color: var(--quiet); }
+.prompt-surface.pending p { color: var(--warning); }
 .prompt-surface.live p { color: var(--accent-tint); }
+.prompt-surface.ready p { color: var(--post-ready); }
 .prompt-surface small { color: var(--dot); font: var(--text-xs) var(--mono); letter-spacing: .05em; }.prompt-surface.fault { background: var(--chrome); }.prompt-surface.fault .label-chip { border-color: #8b444b; color: #f0b4b9; background: var(--danger-soft); }.prompt-surface.fault p { color: var(--danger-ink); }.prompt-surface.fault small { max-width: 850px; color: #d7aeb1; font-family: var(--sans); font-size: var(--text-xs); line-height: 1.55; letter-spacing: 0; }
 .silence-readout { color: var(--dot); font: var(--text-xs) var(--mono); letter-spacing: .04em; }.silence-readout.met { color: var(--accent-quiet); }.silence-readout.short, .silence-readout.note { color: var(--warning-copy); }
 .silence-pair { display: inline-flex; flex-wrap: wrap; align-items: baseline; gap: 8px; }
@@ -695,9 +696,13 @@ input:disabled { color: var(--quiet); background: var(--library-header); }
 
 /* Independent prompter: three quiet levels — progress, copy, note. */
 html:has(.prompter-shell), body:has(.prompter-shell), body:has(.prompter-shell) #root { min-width: 0; }
-.prompter-shell { --cue-color: var(--quiet); --prompter-copy-size: 2.25rem; --prompter-live-color: var(--prompter-live); min-width: 0; height: 100%; display: grid; grid-template-rows: 52px minmax(0, 1fr) 36px; overflow: hidden; color: var(--text-bright); background: var(--canvas); border-top: 3px solid var(--cue-color); user-select: none; }
+.prompter-shell { --cue-color: var(--quiet); --prompter-copy-size: 2.25rem; --prompter-live-color: var(--prompter-live); min-width: 0; height: 100%; display: grid; grid-template-rows: 52px minmax(0, 1fr) 36px; overflow: hidden; color: var(--text-bright); background: var(--canvas); border-top: 10px solid var(--cue-color); border-bottom: 10px solid var(--cue-color); user-select: none; }
 .prompter-shell.has-quality-warning { grid-template-rows: 52px auto minmax(0, 1fr) 36px; }
-.prompter-shell.pending { --cue-color: var(--quiet); }.prompter-shell.recording { --cue-color: var(--accent-quiet); }.prompter-shell.review, .prompter-shell.complete { --cue-color: var(--quiet); }.prompter-shell.fault { --cue-color: var(--danger); }
+.prompter-shell.idle, .prompter-shell.review, .prompter-shell.complete { --cue-color: var(--quiet); }
+.prompter-shell.checking, .prompter-shell.pending { --cue-color: var(--warning); background: var(--warning-banner); }
+.prompter-shell.recording { --cue-color: var(--prompter-rec); background: var(--danger-banner); }
+.prompter-shell.ready { --cue-color: var(--post-ready); background: var(--post-ready-fill); }
+.prompter-shell.fault { --cue-color: var(--danger); background: var(--danger-banner); }
 .prompter-header { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 0 clamp(20px, 4vw, 30px); border-bottom: 1px solid var(--library-raised); background: var(--chrome); }
 .prompter-sequence { min-width: 0; overflow: hidden; color: var(--quiet); font: var(--text-sm) var(--mono); font-variant-numeric: tabular-nums; letter-spacing: .015em; white-space: nowrap; text-overflow: ellipsis; }
 .prompter-sequence strong { color: var(--label); font-weight: 550; }
@@ -705,8 +710,8 @@ html:has(.prompter-shell), body:has(.prompter-shell), body:has(.prompter-shell) 
 .prompter-cue { min-width: 0; display: flex; align-items: center; gap: 9px; overflow: hidden; color: var(--cue-color); font-size: clamp(0.75rem, 2vw, 0.9375rem); font-weight: 650; white-space: nowrap; text-overflow: ellipsis; }
 .prompter-cue-ring { width: 18px; height: 18px; flex: none; transform: rotate(-90deg); }
 .prompter-cue-ring-track, .prompter-cue-ring-progress { fill: none; stroke-width: 2.4; }
-.prompter-cue-ring-track { stroke: rgba(61, 204, 122, .22); }
-.prompter-cue-ring-progress { stroke: var(--prompter-live); stroke-linecap: round; transition: stroke-dashoffset 80ms linear; }
+.prompter-cue-ring-track { stroke: var(--warning-soft); }
+.prompter-cue-ring-progress { stroke: var(--warning); stroke-linecap: round; transition: stroke-dashoffset 80ms linear; }
 .prompter-rec-dot { width: 10px; height: 10px; flex: none; border-radius: 50%; background: var(--prompter-rec); box-shadow: 0 0 0 3px var(--prompter-rec-soft); animation: prompter-rec-pulse 1.35s ease-out infinite; }
 @keyframes prompter-rec-pulse {
   0% { box-shadow: 0 0 0 0 rgba(255, 45, 45, .42); }
@@ -720,8 +725,10 @@ html:has(.prompter-shell), body:has(.prompter-shell), body:has(.prompter-shell) 
 .prompter-quality-warning { display: flex; align-items: center; justify-content: center; gap: 9px; min-height: 40px; padding: 7px clamp(20px, 4vw, 30px); border-bottom: 1px solid #745f35; color: #f3d58f; background: #3d3422; font-size: clamp(0.6875rem, 1.8vw, 0.875rem); font-weight: 600; text-align: center; }.prompter-quality-warning i { width: 9px; height: 9px; flex: none; border-radius: 50%; background: var(--warning); }
 .prompter-content { min-height: 0; display: flex; flex-direction: column; padding: clamp(24px, 6vh, 42px) clamp(24px, 6vw, 48px) clamp(20px, 4vh, 30px); }
 .prompter-content > p { min-height: 0; display: flex; flex: 1; align-items: center; max-width: 25em; margin: 0; overflow: auto; color: var(--text-bright); font-size: var(--prompter-copy-size); line-height: 1.55; letter-spacing: .018em; font-weight: 520; text-wrap: pretty; }
-.prompter-content > p.pending { color: var(--quiet); }
+.prompter-content > p.pending { color: var(--warning); }
 .prompter-content > p.live { color: var(--prompter-live-color); }
+.prompter-content > p.ready { color: var(--text-bright); }
+.prompter-ready-dot { width: 10px; height: 10px; flex: none; border-radius: 50%; background: var(--post-ready); box-shadow: 0 0 0 3px var(--accent-soft); }
 .prompter-content > p.long { display: block; font-size: calc(var(--prompter-copy-size) * .85); }
 .prompter-content > p.dense { display: block; font-size: calc(var(--prompter-copy-size) * .72); line-height: 1.48; }
 .prompter-footer { display: flex; align-items: center; justify-content: flex-end; padding: 0 10px; border-top: 1px solid var(--library-row-hover); background: var(--ink); }
