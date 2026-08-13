@@ -80,7 +80,7 @@ export function captureFormatsSupportBitDepth(
 export const CAPTURE_SAMPLE_FORMATS = ['i16', 'i24', 'i32', 'f32'] as const;
 export type CaptureSampleFormat = (typeof CAPTURE_SAMPLE_FORMATS)[number];
 
-const PREFERRED_CAPTURE_SAMPLE_FORMATS: readonly CaptureSampleFormat[] = ['i24', 'f32', 'i32', 'i16'];
+const PREFERRED_CAPTURE_SAMPLE_FORMATS: readonly CaptureSampleFormat[] = ['i16', 'i24', 'f32', 'i32'];
 
 export function normalizeCaptureSampleFormat(value: unknown): CaptureSampleFormat | null {
   if (typeof value !== 'string') return null;

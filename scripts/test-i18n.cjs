@@ -50,6 +50,9 @@ async function main() {
   assert.equal(t('setup.exclusive'), '独占');
   assert.equal(t('setup.shared'), '系统混音');
   assert.equal(t('setup.exclusiveRecommended'), '独占（推荐）');
+  assert.equal(t('setup.sharedRecommended'), '系统混音（推荐）');
+  assert.equal(t('setup.bit16'), '16-bit PCM（推荐）');
+  assert.equal(t('setup.bit24'), '24-bit PCM');
   assert.match(t('setup.devWebCaptureHint'), /Windows/);
   assert.match(t('recorder.devWebCaptureOn'), /系统麦克风/);
   assert.equal(t('silence.headDash'), '首 —');

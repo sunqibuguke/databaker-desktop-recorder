@@ -44,7 +44,9 @@ async function main() {
   assert.equal(classifyEngineError(activationOnly).canEditCaptureSettings, true);
 }
 
-main().catch((error) => {
+main().then(() => {
+  console.log('engine error sanitizer tests passed');
+}).catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });

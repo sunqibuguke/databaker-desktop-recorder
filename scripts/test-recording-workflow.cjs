@@ -155,7 +155,7 @@ async function main() {
   assert.equal(captureSampleFormatFromBitDepth(32), 'f32');
   assert.equal(deliveryBitDepthForCaptureFormat('i24'), 24);
   assert.equal(deliveryBitDepthForCaptureFormat('i32'), 32);
-  assert.equal(preferredCaptureSampleFormat(['f32', 'i16']), 'f32');
+  assert.equal(preferredCaptureSampleFormat(['f32', 'i16']), 'i16');
   assert.deepEqual(
     captureSampleFormatsForConfiguration(dualModeDevice.configurations, 48_000, 1),
     ['i24', 'f32'],
