@@ -13202,10 +13202,7 @@ mod tests {
         let root = test_root("recovery-stale-final");
         let mut final_snapshot = test_snapshot();
         final_snapshot.journal_seq = 12;
-        write_snapshot_file(
-            &root.join("metadata/items.snapshot.json"),
-            &final_snapshot,
-        );
+        write_snapshot_file(&root.join("metadata/items.snapshot.json"), &final_snapshot);
         let mut latest = final_snapshot.clone();
         latest.journal_seq = 13;
         latest.status = "stopped".to_string();
