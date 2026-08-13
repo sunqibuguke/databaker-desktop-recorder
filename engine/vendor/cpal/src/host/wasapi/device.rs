@@ -1598,7 +1598,7 @@ fn exclusive_probe_channel_masks(
     format_tag: u16,
     default_mask: u32,
 ) -> Vec<u32> {
-    if !exclusive || format_tag == Audio::WAVE_FORMAT_PCM {
+    if !exclusive || u32::from(format_tag) == Audio::WAVE_FORMAT_PCM {
         return vec![default_mask];
     }
     let preferred = exclusive_channel_mask(channels);
