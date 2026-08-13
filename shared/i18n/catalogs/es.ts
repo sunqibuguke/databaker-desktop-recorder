@@ -27,6 +27,7 @@ const es: MessageTree = {
     previewBadge: 'Vista previa del navegador',
     settingsTitle: 'Ajustes de la aplicación',
     settingsAria: 'Abrir ajustes de la aplicación',
+    skipToContent: 'Saltar al contenido',
     backToTasks: 'Volver a las grabaciones',
     leaveTask: 'Salir de la tarea',
     newTask: 'Nueva tarea',

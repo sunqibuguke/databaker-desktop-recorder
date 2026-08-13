@@ -25,6 +25,7 @@ const zhCN = {
     previewBadge: '浏览器界面预览',
     settingsTitle: '应用设置',
     settingsAria: '打开应用设置',
+    skipToContent: '跳到主要内容',
     backToTasks: '返回录制任务',
     leaveTask: '退出任务',
     newTask: '新建任务',

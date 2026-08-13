@@ -27,6 +27,7 @@ const ko: MessageTree = {
     previewBadge: '브라우저 UI 미리보기',
     settingsTitle: '앱 설정',
     settingsAria: '앱 설정 열기',
+    skipToContent: '본문으로 건너뛰기',
     backToTasks: '녹음 목록으로',
     leaveTask: '작업 나가기',
     newTask: '새 작업',

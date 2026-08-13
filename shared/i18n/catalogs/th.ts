@@ -27,6 +27,7 @@ const th: MessageTree = {
     previewBadge: 'ตัวอย่างอินเทอร์เฟซในเบราว์เซอร์',
     settingsTitle: 'การตั้งค่าแอป',
     settingsAria: 'เปิดการตั้งค่าแอป',
+    skipToContent: 'ข้ามไปยังเนื้อหา',
     backToTasks: 'กลับไปรายการบันทึก',
     leaveTask: 'ออกจากงาน',
     newTask: 'งานใหม่',

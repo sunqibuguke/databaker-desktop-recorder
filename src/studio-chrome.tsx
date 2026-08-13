@@ -41,6 +41,7 @@ export function StudioChrome({ phase, title, onBack, onOpenSettings, backTitle, 
   const { t } = useI18n();
   const resolvedBackTitle = backTitle ?? t('chrome.backToTasks');
   return <header className="workflow-header">
+    <a className="skip-link" href="#main">{t('chrome.skipToContent')}</a>
     <div className="workflow-identity"><span><img src={appLogo} alt={t('chrome.productName')} /></span>{onBack && <button title={resolvedBackTitle} aria-label={resolvedBackTitle} onClick={onBack}><Icon name="chevron-left" size={16} /></button>}<div><small>{activityLabel ?? (phase === 'setup' ? t('chrome.newTask') : t('chrome.capturing'))}</small><strong title={title}>{title}</strong></div></div>
     <button className="global-settings-button" title={t('chrome.settingsTitle')} aria-label={t('chrome.settingsAria')} onClick={onOpenSettings}><Icon name="settings" size={17} /></button>
   </header>;
@@ -57,6 +58,7 @@ export function StudioStatus({ engineStatus, message, isError = false }: { engin
 export function HomeHeader({ preview, onOpenSettings }: { preview: boolean; onOpenSettings: () => void }) {
   const { t } = useI18n();
   return <header className="home-header">
+    <a className="skip-link" href="#main">{t('chrome.skipToContent')}</a>
     <div className="home-brand"><span className="home-brand-mark"><img src={appLogo} alt={t('chrome.productName')} /></span><div><strong>{t('chrome.productName')}</strong><small>{t('chrome.appSubtitle')}</small></div>{preview && <em className="preview-badge">{t('chrome.previewBadge')}</em>}</div>
     <button className="global-settings-button" title={t('chrome.settingsTitle')} aria-label={t('chrome.settingsAria')} onClick={onOpenSettings}><Icon name="settings" size={17} /></button>
   </header>;

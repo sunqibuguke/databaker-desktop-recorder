@@ -32,6 +32,7 @@ async function main() {
   }
 
   assert.equal(t('chrome.productName'), '标贝音频采集');
+  assert.equal(t('chrome.skipToContent'), '跳到主要内容');
   assert.equal(t('chrome.windowTitle'), '标贝音频采集');
   assert.equal(t('chrome.prompterWindowTitle'), '标贝音频采集 · 领读');
   assert.equal(t('settings.title'), '应用设置');

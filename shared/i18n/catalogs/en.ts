@@ -27,6 +27,7 @@ const en: MessageTree = {
     previewBadge: 'Browser UI preview',
     settingsTitle: 'Application settings',
     settingsAria: 'Open application settings',
+    skipToContent: 'Skip to content',
     backToTasks: 'Back to recordings',
     leaveTask: 'Leave task',
     newTask: 'New task',

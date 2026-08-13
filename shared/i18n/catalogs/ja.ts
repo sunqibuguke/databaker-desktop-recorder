@@ -27,6 +27,7 @@ const ja: MessageTree = {
     previewBadge: 'ブラウザUIプレビュー',
     settingsTitle: 'アプリ設定',
     settingsAria: 'アプリ設定を開く',
+    skipToContent: '本文へスキップ',
     backToTasks: '収録一覧へ戻る',
     leaveTask: 'タスクを終了',
     newTask: '新規タスク',

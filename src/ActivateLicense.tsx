@@ -138,6 +138,7 @@ export function ActivateLicense({
 
   return <div className="license-gate" data-testid="license-gate">
     <header className="home-header">
+      <a className="skip-link" href="#main">{t('chrome.skipToContent')}</a>
       <div className="home-brand">
         <span className="home-brand-mark"><img src={appLogo} alt={t('chrome.productName')} /></span>
         <div>
@@ -156,7 +157,7 @@ export function ActivateLicense({
         ))}
       </select>
     </header>
-    <main className="license-stage">
+    <main id="main" className="license-stage">
       <section className="license-card" aria-labelledby="license-title">
         <h1 id="license-title">{reasonTitle(status.reason)}</h1>
         <p>{t('license.body')}</p>

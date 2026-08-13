@@ -2976,7 +2976,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     ];
     return <div className="home-shell">
       <HomeHeader preview={isBrowserPreview} onOpenSettings={() => setSettingsOpen(true)} />
-      <main className="home-main" data-testid="recordings-workspace">
+      <main id="main" className="home-main" data-testid="recordings-workspace">
         <header className="home-titlebar">
           <div><h1>{t('home.title')}</h1><p>{isBrowserPreview ? t('home.subtitlePreview') : t('home.subtitle')}</p></div>
           <button data-testid="new-recording" className="home-primary" onClick={beginNewRecording} disabled={Boolean(busy)}><Icon name="plus" size={16} />{t('home.newRecording')}</button>
@@ -2993,7 +2993,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
 
         <section className="home-list" aria-label={t('home.listAria')}>
           <div className="home-list-header"><span>{t('home.colTask')}</span><span>{t('home.colProgress')}</span><span>{t('home.colUpdated')}</span><span>{t('home.colStatus')}</span><span className="home-actions-heading">{t('home.colActions')}</span></div>
-          {historyLoading && <div className="home-empty"><Icon name="refresh" size={20} /><strong>{t('home.readingTasks')}</strong></div>}
+          {historyLoading && <div className="home-loading" aria-busy="true" aria-live="polite"><strong className="home-loading-label">{t('home.readingTasks')}</strong><i className="home-skeleton-row" /><i className="home-skeleton-row" /><i className="home-skeleton-row" /></div>}
           {!historyLoading && !filteredRecordings.length && <div className="home-empty"><span className="home-empty-icon"><Icon name="microphone" size={24} /></span><strong>{recordings.length ? t('home.emptyFilteredTitle') : t('home.emptyTitle')}</strong><p>{recordings.length ? t('home.emptyFilteredBody') : t('home.emptyBody')}</p>{!recordings.length && <button className="home-primary" onClick={beginNewRecording} disabled={Boolean(busy)}><Icon name="plus" size={15} />{t('home.newRecording')}</button>}</div>}
           {!historyLoading && filteredRecordings.map((recording) => {
             const state = recordingState(recording);
@@ -3099,7 +3099,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           </ol>
           <div className="outline-note"><Icon name="meter" /><p>{t('setup.outlineNote')}</p></div>
         </aside>
-        <main className="setup-document">
+        <main id="main" className="setup-document">
           <div className="document-tabs"><span className="active"><Icon name="sliders" size={13} /> {t('setup.documentTab')} <i>×</i></span></div>
           <div className="document-canvas">
             <section className="property-group">
@@ -3158,7 +3158,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         <div className="item-filter"><span>{t('recorder.allItems')}</span><em>{items.length}</em></div>
         <div className="professional-item-list">{items.map((item, index) => <button key={item.id} className={`professional-item ${index === currentIndex ? 'active' : ''}`} disabled={recording || captureFault} onClick={() => { setCurrentIndex(index); setReviewAttemptId(null); }}><span className={`item-state ${item.status}`}>{item.status === 'accepted' ? <Icon name="check" size={12} /> : item.status === 'skipped' ? '—' : String(index + 1).padStart(2, '0')}</span><span><strong>{item.id}</strong><small>{item.text}</small></span><em>{statusLabel(item.status)}</em></button>)}</div>
       </aside>
-      <main className="editor-document">
+      <main id="main" className="editor-document">
         <div className="document-tabs"><span className="active"><Icon name="microphone" size={13} /> {workflowComplete ? t('recorder.taskComplete') : currentItem?.id ?? 'Item'} <i>×</i></span></div>
         <div className="editor-toolbar"><div className="editor-nav"><button title={t('recorder.prevItem')} disabled={recording || currentIndex === 0} onClick={() => setCurrentIndex((index) => Math.max(0, index - 1))}><Icon name="chevron-left" /></button><span>{currentIndex + 1} / {items.length}</span><button title={t('recorder.nextItem')} disabled={recording || currentIndex >= items.length - 1} onClick={() => setCurrentIndex((index) => Math.min(items.length - 1, index + 1))}><Icon name="chevron-right" /></button></div><div className="editor-time"><strong className={recording ? 'recording' : ''}>{recording ? attemptDuration : sessionDuration}</strong></div><div className="editor-toolbar-actions"><button className="prompter-launch" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? t('recorder.locatePrompter') : t('recorder.openPrompter')}</button></div><div className={`save-health ${workspaceFaulted || captureFault ? 'fault' : meter.storage_status === 'warning' ? 'warning' : ''}`}><i />{workspaceFaulted ? t('recorder.healthReadonly') : !captureActive ? t('recorder.healthView') : captureFault ? t('recorder.healthFaultStop', { title: captureFaultCopy.title }) : meter.storage_status === 'warning' ? t('recorder.healthWarning', { minutes: Math.max(0, Math.floor(meter.storage_safe_remaining_seconds / 60)) }) : t('recorder.healthLive')}</div></div>
         <div className="editor-canvas">

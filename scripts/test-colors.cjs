@@ -17,7 +17,7 @@ const REQUIRED_TOKENS = [
   'accent', 'accent-fill', 'accent-fill-hover', 'accent-ink', 'accent-muted',
   'accent-tint', 'accent-soft', 'accent-wash', 'accent-line',
   'record', 'warning', 'ready', 'post-ready', 'danger', 'focus',
-  'danger-soft', 'warning-soft', 'shadow', 'scrim', 'brand-tile', 'prompter-live',
+  'danger-soft', 'warning-soft', 'shadow', 'shadow-soft', 'highlight', 'scrim', 'brand-tile', 'prompter-live',
 ];
 const NEAR_TOKEN_LIMIT = 8;
 const MAX_UNIQUE_LEFTOVERS = 120;
