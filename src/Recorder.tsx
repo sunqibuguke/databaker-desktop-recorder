@@ -506,6 +506,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const [sealingSessionDir, setSealingSessionDir] = useState('');
   const [sealConfirmRecording, setSealConfirmRecording] = useState<RecordingHistoryEntry | null>(null);
   const [deleteConfirmRecording, setDeleteConfirmRecording] = useState<RecordingHistoryEntry | null>(null);
+  const [resetConfirmRecording, setResetConfirmRecording] = useState<RecordingHistoryEntry | null>(null);
   const [exportRecording, setExportRecording] = useState<RecordingHistoryEntry | null>(null);
   const [exportDestination, setExportDestination] = useState(loadExportDestination);
   const [taskExportDir, setTaskExportDir] = useState('');
@@ -516,6 +517,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const [recoveryShareMode, setRecoveryShareMode] = useState<CaptureShareMode>('shared');
   const [recoverySampleFormat, setRecoverySampleFormat] = useState('i16');
   const [deletingSessionDir, setDeletingSessionDir] = useState('');
+  const [resettingSessionDir, setResettingSessionDir] = useState('');
   const [openActionsSessionDir, setOpenActionsSessionDir] = useState('');
   const [resumeError, setResumeError] = useState<{ sessionDir: string; message: string } | null>(null);
   const previewPlayerRef = useRef<PreviewPlayerHandle>(null);
@@ -1169,6 +1171,33 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       }
     } finally {
       if (sequence === historyLoadSequenceRef.current) setHistoryLoadingMore(false);
+    }
+  }
+
+  async function resetHistoricalRecording(recording: RecordingHistoryEntry) {
+    if (!outputDir || recording.is_active || resettingSessionDir || deletingSessionDir) return;
+    setResettingSessionDir(recording.session_dir);
+    setBusy(t('notice.resettingTask'));
+    setError('');
+    try {
+      logUserAction('ui.reset_task', `重置录制任务 ${recording.session_id}`, {
+        session_id: recording.session_id,
+        session_dir: recording.session_dir,
+        status: recording.status,
+      });
+      await window.recorder.resetRecording(
+        outputDir,
+        recording.session_dir,
+        recording.session_id,
+      );
+      setResumeError((current) => current?.sessionDir === recording.session_dir ? null : current);
+      setNotice(t('notice.resetTask', { id: recording.session_id }));
+      await refreshRecordings();
+    } catch (caught) {
+      showBlockingError(`${t('notice.resetTaskPrefix')}${errorMessage(caught)}`);
+    } finally {
+      setResettingSessionDir('');
+      setBusy('');
     }
   }
 
@@ -2655,6 +2684,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         if (event.key === 'Escape') setSettingsOpen(false);
         return;
       }
+      if (resetConfirmRecording) {
+        if (event.key === 'Escape' && !resettingSessionDir) setResetConfirmRecording(null);
+        return;
+      }
       if (deleteConfirmRecording) {
         if (event.key === 'Escape' && !deletingSessionDir) setDeleteConfirmRecording(null);
         return;
@@ -3001,6 +3034,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             const progress = recording.total_items ? handled / recording.total_items * 100 : 0;
             const isSealing = sealingSessionDir === recording.session_dir;
             const isDeleting = deletingSessionDir === recording.session_dir;
+            const isResetting = resettingSessionDir === recording.session_dir;
             const actionsOpen = openActionsSessionDir === recording.session_dir;
             const rowResumeError = resumeError?.sessionDir === recording.session_dir ? resumeError.message : '';
             const recoveryPlan = planHistoryRecovery(recording);
@@ -3029,11 +3063,11 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
                     </>}
                 <button className="row-folder" title={t('home.openFolder')} aria-label={t('home.openFolderAria', { id: recording.session_id })} onClick={() => void openRecordingDirectory(recording)} disabled={Boolean(busy)}><Icon name="folder" size={15} /></button>
                 <div className="home-actions-menu-wrap">
-                  <button data-testid="recording-actions-menu" className="row-more" title={t('common.moreActions')} aria-label={t('home.moreAria', { id: recording.session_id })} aria-haspopup="menu" aria-expanded={actionsOpen} onClick={() => setOpenActionsSessionDir(actionsOpen ? '' : recording.session_dir)} disabled={Boolean(busy) || Boolean(deletingSessionDir)}><Icon name="more" size={16} /></button>
+                  <button data-testid="recording-actions-menu" className="row-more" title={t('common.moreActions')} aria-label={t('home.moreAria', { id: recording.session_id })} aria-haspopup="menu" aria-expanded={actionsOpen} onClick={() => setOpenActionsSessionDir(actionsOpen ? '' : recording.session_dir)} disabled={Boolean(busy) || Boolean(deletingSessionDir) || Boolean(resettingSessionDir)}><Icon name="more" size={16} /></button>
                   {actionsOpen && <div className="home-actions-menu" role="menu" aria-label={t('home.actionsAria', { id: recording.session_id })}>
                     {!recording.is_active && recording.export_exists && <button role="menuitem" onClick={() => { setOpenActionsSessionDir(''); void openRecordingExport(recording); }}><Icon name="export" size={14} /><span>{t('home.openExportDir')}</span></button>}
                     {!recording.is_active && (recoveryPlan.secondary === 'seal' || recoveryPlan.primary === 'seal') && <button data-testid="seal-recording" role="menuitem" onClick={() => { setOpenActionsSessionDir(''); setSealConfirmRecording(recording); }} disabled={Boolean(busy) || Boolean(sealingSessionDir)}><Icon name="history" size={14} /><span>{isSealing ? t('common.checking') : t('home.inspectAndRepair')}</span></button>}
-                    {!recording.is_active && <><i className="home-actions-divider" /><button data-testid="delete-recording" className="danger" role="menuitem" aria-busy={isDeleting} onClick={() => { setOpenActionsSessionDir(''); setDeleteConfirmRecording(recording); }} disabled={Boolean(busy) || Boolean(sealingSessionDir) || Boolean(deletingSessionDir)}><Icon name="trash" size={14} /><span>{t('home.deleteTask')}</span></button></>}
+                    {!recording.is_active && <><i className="home-actions-divider" /><button data-testid="reset-recording" className="danger" role="menuitem" aria-busy={isResetting} onClick={() => { setOpenActionsSessionDir(''); setResetConfirmRecording(recording); }} disabled={Boolean(busy) || Boolean(sealingSessionDir) || Boolean(deletingSessionDir) || Boolean(resettingSessionDir)}><Icon name="refresh" size={14} /><span>{t('home.resetTask')}</span></button><button data-testid="delete-recording" className="danger" role="menuitem" aria-busy={isDeleting} onClick={() => { setOpenActionsSessionDir(''); setDeleteConfirmRecording(recording); }} disabled={Boolean(busy) || Boolean(sealingSessionDir) || Boolean(deletingSessionDir) || Boolean(resettingSessionDir)}><Icon name="trash" size={14} /><span>{t('home.deleteTask')}</span></button></>}
                   </div>}
                 </div>
               </div>
@@ -3065,6 +3099,14 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           <p>{t('sealDialog.body')}</p>
           <div className="dialog-warning">{t('sealDialog.taskLine', { id: sealConfirmRecording.session_id })}<br />{sealConfirmRecording.status === 'faulted' || sealConfirmRecording.overflow_samples > 0 ? t('sealDialog.keepFault') : t('sealDialog.canContinue')}</div>
           <footer><button className="button" onClick={() => setSealConfirmRecording(null)} disabled={Boolean(busy)}>{t('common.cancel')}</button><button data-testid="confirm-seal-recording" className="button primary" onClick={() => { const recording = sealConfirmRecording; setSealConfirmRecording(null); void sealHistoricalRecording(recording); }} disabled={Boolean(busy)}>{t('sealDialog.confirm')}</button></footer>
+        </section>
+      </div>}
+      {resetConfirmRecording && <div className="dialog-backdrop" role="presentation">
+        <section className="studio-dialog delete-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="reset-confirm-title">
+          <header><span className="dialog-icon danger"><Icon name="refresh" size={19} /></span><div><h2 id="reset-confirm-title">{t('resetDialog.title')}</h2></div></header>
+          <p>{t('resetDialog.body')}</p>
+          <div className="dialog-warning danger">{t('resetDialog.taskLine', { id: resetConfirmRecording.session_id })}<br />{t('resetDialog.warning')}</div>
+          <footer><button className="button" onClick={() => setResetConfirmRecording(null)} disabled={Boolean(resettingSessionDir)}>{t('common.cancel')}</button><button data-testid="confirm-reset-recording" className="button danger" onClick={() => { const recording = resetConfirmRecording; setResetConfirmRecording(null); void resetHistoricalRecording(recording); }} disabled={Boolean(resettingSessionDir)}>{t('resetDialog.confirm')}</button></footer>
         </section>
       </div>}
       {deleteConfirmRecording && <div className="dialog-backdrop" role="presentation">

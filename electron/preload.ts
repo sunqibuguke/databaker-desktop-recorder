@@ -79,6 +79,9 @@ contextBridge.exposeInMainWorld('recorder', {
   deleteRecording: (root: string, sessionDir: string, sessionId: string) => (
     ipcRenderer.invoke('recordings:delete', { root, session_dir: sessionDir, session_id: sessionId })
   ),
+  resetRecording: (root: string, sessionDir: string, sessionId: string) => (
+    ipcRenderer.invoke('recordings:reset', { root, session_dir: sessionDir, session_id: sessionId })
+  ),
   joinPath: (...parts: string[]) => ipcRenderer.invoke('path:join', ...parts),
   readAudio: (filePath: string) => ipcRenderer.invoke('audio:read', filePath),
   openPath: (target: string) => ipcRenderer.invoke('shell:open-path', target),

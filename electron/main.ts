@@ -134,7 +134,7 @@ const meterBackpressure = new LatestOnlyMeterBackpressure<Electron.WebContents, 
   },
 );
 
-type EnginePhase = 'idle' | 'creating' | 'inspecting' | 'starting' | 'active' | 'stopping' | 'recovering' | 'sealing' | 'exporting' | 'deleting' | 'quitting';
+type EnginePhase = 'idle' | 'creating' | 'inspecting' | 'starting' | 'active' | 'stopping' | 'recovering' | 'sealing' | 'exporting' | 'deleting' | 'resetting' | 'quitting';
 
 type EngineIntent = Readonly<{
   generation: number;
@@ -182,6 +182,7 @@ type ActiveExportOperation = {
 
 let activeExportOperation: ActiveExportOperation | null = null;
 let activeDeleteOperation: Promise<unknown> | null = null;
+let activeResetOperation: Promise<unknown> | null = null;
 
 type HistorySnapshotCandidate = {
   snapshot: Record<string, unknown>;
@@ -509,6 +510,7 @@ function operationBusyMessage(): string {
     case 'sealing': return '正在修复中断任务，请稍候';
     case 'exporting': return '录制任务正在导出，请等待完成';
     case 'deleting': return '录制任务正在移到回收站，请稍候';
+    case 'resetting': return '录制任务正在重置，请稍候';
     case 'quitting': return '应用正在安全退出';
     default: return '录音操作暂时不可用';
   }
@@ -530,6 +532,8 @@ function assertCanMutateActiveSession(command: string): void {
     || engineIntent.phase === 'stopping'
     || engineIntent.phase === 'recovering'
     || engineIntent.phase === 'sealing'
+    || engineIntent.phase === 'deleting'
+    || engineIntent.phase === 'resetting'
     || engineIntent.phase === 'quitting') {
     throw new Error(operationBusyMessage());
   }
@@ -1848,6 +1852,57 @@ async function deleteRecording(payload: unknown): Promise<Record<string, string>
   }
 }
 
+async function resetRecording(payload: unknown): Promise<Record<string, unknown>> {
+  if (!isRecord(payload)
+    || typeof payload.root !== 'string'
+    || typeof payload.session_dir !== 'string'
+    || typeof payload.session_id !== 'string'
+    || !payload.session_id.trim()) {
+    throw new Error('重置录制任务的参数无效');
+  }
+  if (engineIntent.phase !== 'idle') throw new Error(operationBusyMessage());
+  if (!engine) throw new Error('录音引擎不可用');
+  const activeEngine = engine;
+  const resetIntent = beginEngineIntent('resetting', path.resolve(payload.session_dir));
+  try {
+    const canonicalRoot = await resolveAuthorizedOutputRoot(path.resolve(payload.root), false);
+    assertCurrentEngineIntent(resetIntent, ['resetting']);
+    const canonicalSession = await resolveKnownSession(payload.session_dir);
+    if (!canonicalSession) throw new Error('只能重置当前任务列表中的录制，请刷新后重试');
+    if (!isSameSessionDir(path.dirname(canonicalSession), canonicalRoot)) {
+      throw new Error('录制任务已离开当前授权的保存位置');
+    }
+
+    const expectedSessionId = knownSessionId(canonicalSession);
+    if (expectedSessionId) {
+      if (expectedSessionId !== payload.session_id) {
+        throw new Error('录制任务身份与当前列表不一致，请刷新后重试');
+      }
+      await assertAuthorizedSessionUnchanged(
+        await bindAuthorizedSession(canonicalSession, [canonicalRoot], expectedSessionId),
+        [canonicalRoot],
+      );
+    } else {
+      throw new Error('无法确认录制任务身份，请刷新任务列表后重试');
+    }
+
+    assertCurrentEngineIntent(resetIntent, ['resetting']);
+    await activeEngine.start();
+    const result = await activeEngine.request('reset_session', {
+      session_dir: canonicalSession,
+      expected_session_id: expectedSessionId,
+    }, 20_000);
+    assertCurrentEngineIntent(resetIntent, ['resetting']);
+    rememberKnownSession(canonicalSession, expectedSessionId);
+    clearCrashSealObligation(canonicalSession);
+    return isRecord(result)
+      ? { ...result, session_dir: canonicalSession, session_id: expectedSessionId }
+      : { session_dir: canonicalSession, session_id: expectedSessionId };
+  } finally {
+    transitionEngineIntent(resetIntent, 'idle', null);
+  }
+}
+
 function sendToRendererWindows(channel: string, ...args: unknown[]): void {
   sendToMain(channel, ...args);
   if (
@@ -1971,6 +2026,7 @@ function effectiveRecordingTrayStatus(requestedStatus?: string): string {
     case 'sealing': return '◌ 正在修复中断任务';
     case 'exporting': return '◌ 正在导出已保留音频';
     case 'deleting': return '◌ 正在将录制任务移到回收站';
+    case 'resetting': return '◌ 正在重置录制任务';
     case 'quitting': return '◌ 正在安全停止并退出';
     case 'idle': return requestedStatus ?? '录音引擎待命';
   }
@@ -2216,6 +2272,12 @@ function requestSafeStopAndQuit(source: string): Promise<void> {
   if (exportExitPromise) return exportExitPromise;
   if (activeDeleteOperation) {
     return activeDeleteOperation.then(
+      () => requestSafeStopAndQuit(source),
+      () => requestSafeStopAndQuit(source),
+    );
+  }
+  if (activeResetOperation) {
+    return activeResetOperation.then(
       () => requestSafeStopAndQuit(source),
       () => requestSafeStopAndQuit(source),
     );
@@ -2865,6 +2927,14 @@ function mainWindowCloseCopy(fault: CaptureFaultNotice | null): MainWindowCloseC
         backgroundButton: '继续等待',
         exitButton: '继续等待',
       };
+    case 'resetting':
+      return {
+        title: '正在重置录制任务',
+        message: '正在清除已有录制数据，任务将回到尚未开始的状态。',
+        detail: '请等待重置完成后再关闭应用。',
+        backgroundButton: '继续等待',
+        exitButton: '继续等待',
+      };
     case 'active':
       return {
         title: '录音正在进行',
@@ -2900,6 +2970,18 @@ async function handleMainWindowClose(window: BrowserWindow): Promise<void> {
       title: '正在删除录制任务',
       message: '任务目录正在移到系统回收站。',
       detail: '请等待操作完成后再关闭应用。',
+      buttons: ['知道了'],
+      defaultId: 0,
+      cancelId: 0,
+    });
+    return;
+  }
+  if (engineIntent.phase === 'resetting') {
+    await dialog.showMessageBox(window, {
+      type: 'info',
+      title: '正在重置录制任务',
+      message: '正在清除已有录制数据。',
+      detail: '请等待重置完成后再关闭应用。',
       buttons: ['知道了'],
       defaultId: 0,
       cancelId: 0,
@@ -4380,12 +4462,23 @@ function registerIpc(): void {
   ipcMain.handle('recordings:delete', async (event, payload: unknown) => {
     assertMainRenderer(event.sender);
     await assertAppLicensed();
-    if (activeDeleteOperation) throw new Error(operationBusyMessage());
+    if (activeDeleteOperation || activeResetOperation) throw new Error(operationBusyMessage());
     const operation = deleteRecording(payload);
     const tracked = operation.finally(() => {
       if (activeDeleteOperation === tracked) activeDeleteOperation = null;
     });
     activeDeleteOperation = tracked;
+    return tracked;
+  });
+  ipcMain.handle('recordings:reset', async (event, payload: unknown) => {
+    assertMainRenderer(event.sender);
+    await assertAppLicensed();
+    if (activeDeleteOperation || activeResetOperation) throw new Error(operationBusyMessage());
+    const operation = resetRecording(payload);
+    const tracked = operation.finally(() => {
+      if (activeResetOperation === tracked) activeResetOperation = null;
+    });
+    activeResetOperation = tracked;
     return tracked;
   });
   ipcMain.handle('path:join', (_event, ...parts: string[]) => path.join(...parts));

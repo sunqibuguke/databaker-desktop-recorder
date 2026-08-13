@@ -205,6 +205,13 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
                 .context("invalid create_session payload")?;
             engine.create_session(payload)
         }
+        "reset_session" => {
+            let payload: OfflineSessionPayload = parse(command.payload)?;
+            engine.reset_session_expected(
+                &PathBuf::from(payload.session_dir),
+                &payload.expected_session_id,
+            )
+        }
         #[cfg(feature = "system-test")]
         "test_start_session" => {
             let payload: SystemTestStartSessionPayload = serde_json::from_value(command.payload)

@@ -799,6 +799,34 @@ export function installDevRecorderMock() {
           scanned_directories: end - offset,
         };
       },
+      resetRecording: async (_root: string, sessionDir: string, sessionId: string) => {
+        const recording = previewHistory.find((candidate) => (
+          candidate.session_dir === sessionDir && candidate.session_id === sessionId
+        ));
+        if (!recording) throw new Error('Mock 中没有该录制任务');
+        if (recording.is_active) throw new Error('当前录制任务不能重置');
+        const now = new Date().toISOString();
+        recording.status = 'stopped';
+        recording.updated_at = now;
+        recording.captured_samples = 0;
+        recording.overflow_samples = 0;
+        recording.accepted_items = 0;
+        recording.skipped_items = 0;
+        recording.review_items = 0;
+        recording.pending_items = recording.total_items;
+        recording.noise_check = null;
+        recording.export_exists = false;
+        recording.export_artifacts = undefined;
+        recording.data_health = 'normal';
+        recording.history_issue = undefined;
+        mockAppendDebugLog({
+          event: 'history.reset_task',
+          message: '任务已重置为尚未开始的干净状态',
+          category: 'history',
+          data: { session_dir: sessionDir, session_id: sessionId },
+        });
+        return { session_dir: sessionDir, session_id: sessionId };
+      },
       deleteRecording: async (_root: string, sessionDir: string, sessionId: string) => {
         const index = previewHistory.findIndex((recording) => (
           recording.session_dir === sessionDir && recording.session_id === sessionId

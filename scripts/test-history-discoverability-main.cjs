@@ -19,6 +19,45 @@ class FakeEngineClient extends EventEmitter {
   async request(command, payload) {
     this.commands.push({ command, payload });
     if (command === 'get_state_optional') return { active: false };
+    if (command === 'reset_session') {
+      const sessionDir = payload.session_dir;
+      const expectedId = payload.expected_session_id;
+      const snapshotPath = path.join(sessionDir, 'metadata', 'items.snapshot.json');
+      const current = JSON.parse(await fs.readFile(snapshotPath, 'utf8'));
+      if (current.session_id !== expectedId) {
+        throw new Error('录制任务身份与当前列表不一致');
+      }
+      const now = new Date().toISOString();
+      const cleaned = {
+        ...current,
+        journal_seq: 0,
+        status: 'stopped',
+        captured_samples: 0,
+        committed_samples: 0,
+        overflow_samples: 0,
+        capture_provenance: [],
+        noise_check: null,
+        started_at: now,
+        updated_at: now,
+        items: (current.items || []).map((item) => ({
+          ...item,
+          status: 'pending',
+          attempts: [],
+          selected_attempt_id: null,
+        })),
+      };
+      await fs.writeFile(snapshotPath, `${JSON.stringify(cleaned)}\n`);
+      await fs.writeFile(
+        path.join(sessionDir, 'session.json'),
+        `${JSON.stringify({ schema_version: 1, session_id: expectedId, status: 'stopped' })}\n`,
+      );
+      for (const name of ['audio', 'export', 'preview']) {
+        await fs.rm(path.join(sessionDir, name), { recursive: true, force: true });
+        await fs.mkdir(path.join(sessionDir, name));
+      }
+      await fs.rm(path.join(sessionDir, 'metadata', 'events.jsonl'), { force: true });
+      return { snapshot: cleaned, session_dir: sessionDir, mode: 'inspect', faulted: false };
+    }
     return {};
   }
 }
@@ -122,6 +161,17 @@ async function main() {
   await fs.mkdir(path.join(validDir, 'export'));
   await writeJson(path.join(validDir, 'session.json'), { schema_version: 1, session_id: 'valid-session' });
   await writeJson(path.join(validDir, 'metadata', 'items.snapshot.json'), snapshot('valid-session'));
+
+  const resetDir = path.join(recordingRoot, 'reset-session');
+  await fs.mkdir(path.join(resetDir, 'metadata'), { recursive: true });
+  await fs.mkdir(path.join(resetDir, 'audio', 'segments'), { recursive: true });
+  await fs.mkdir(path.join(resetDir, 'export'));
+  await fs.mkdir(path.join(resetDir, 'preview'));
+  await writeJson(path.join(resetDir, 'session.json'), { schema_version: 1, session_id: 'reset-session' });
+  await writeJson(path.join(resetDir, 'metadata', 'items.snapshot.json'), snapshot('reset-session'));
+  await fs.writeFile(path.join(resetDir, 'audio', 'segments', 'master-000001.wav'), 'AUDIO');
+  await fs.writeFile(path.join(resetDir, 'export', 'full-track.wav'), 'EXPORT');
+  await fs.writeFile(path.join(resetDir, 'metadata', 'events.jsonl'), '{"journal_seq":1}\n');
 
   const conflictDir = path.join(recordingRoot, 'conflicting-session');
   await fs.mkdir(path.join(conflictDir, 'metadata'), { recursive: true });
@@ -258,7 +308,7 @@ async function main() {
       assert.equal(page.scanned_directories <= 100, true);
       rows.push(...page.recordings);
     }
-    assert.equal(rows.length, bulkSessionCount + 3,
+    assert.equal(rows.length, bulkSessionCount + 4,
       'pagination must reach the 201st task, and damaged directories must remain visible');
     assert.equal(rows.some((row) => row.session_id === 'valid-session' && !row.history_issue), true);
     const conflict = rows.find((row) => row.session_id === 'conflicting-session');
@@ -272,6 +322,42 @@ async function main() {
     await handlers.get('shell:open-path')(event, path.join(validDir, 'export'));
     assert.deepEqual(openedPaths, [validDir, path.join(validDir, 'export')],
       'task and delivery actions must open their exact directories in the OS file manager');
+
+    const resetRecording = handlers.get('recordings:reset');
+    await assert.rejects(
+      resetRecording(event, {
+        root: selected,
+        session_dir: resetDir,
+        session_id: 'wrong-session-id',
+      }),
+      /身份.*不一致/,
+      'reset must bind the exact task identity shown in history',
+    );
+    assert.equal(
+      (await fs.readFile(path.join(resetDir, 'audio', 'segments', 'master-000001.wav'), 'utf8')),
+      'AUDIO',
+      'an identity mismatch must not wipe recorded audio',
+    );
+    await resetRecording(event, {
+      root: selected,
+      session_dir: resetDir,
+      session_id: 'reset-session',
+    });
+    assert.deepEqual(
+      globalThis.discoverabilityEngine.commands.filter((entry) => entry.command === 'reset_session')
+        .map((entry) => entry.payload.expected_session_id),
+      ['reset-session'],
+    );
+    await assert.rejects(fs.lstat(path.join(resetDir, 'audio', 'segments', 'master-000001.wav')), { code: 'ENOENT' });
+    await assert.rejects(fs.lstat(path.join(resetDir, 'export', 'full-track.wav')), { code: 'ENOENT' });
+    const resetRow = (await listRecordings(event, selected, { offset: 0, limit: 100 }))
+      .recordings.find((row) => row.session_id === 'reset-session');
+    assert.equal(resetRow.status, 'stopped');
+    assert.equal(resetRow.accepted_items, 0);
+    assert.equal(resetRow.pending_items, 1);
+    assert.equal(resetRow.captured_samples, 0);
+    assert.equal(resetRow.export_exists, false);
+    assert.ok(await fs.lstat(resetDir), 'reset must keep the task directory');
 
     const deleteRecording = handlers.get('recordings:delete');
     await assert.rejects(

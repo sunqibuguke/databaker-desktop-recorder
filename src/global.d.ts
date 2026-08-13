@@ -35,6 +35,7 @@ declare global {
       setLastCapturePreset(id: string | null): Promise<CapturePresetStore>;
       listRecordings(root: string, options?: { offset?: number; limit?: number }): Promise<RecordingHistoryPage>;
       deleteRecording(root: string, sessionDir: string, sessionId: string): Promise<{ session_dir: string; session_id: string }>;
+      resetRecording(root: string, sessionDir: string, sessionId: string): Promise<{ session_dir: string; session_id: string }>;
       joinPath(...parts: string[]): Promise<string>;
       readAudio(filePath: string): Promise<ArrayBuffer>;
       openPath(target: string): Promise<void>;

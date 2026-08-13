@@ -40,6 +40,8 @@ async function main() {
   assert.equal(t('home.emptyTitle'), '开始第一条录制任务');
   assert.equal(t('home.viewTask'), '查看');
   assert.equal(t('home.recordTask'), '录制');
+  assert.equal(t('home.resetTask'), '重置任务');
+  assert.equal(t('resetDialog.confirm'), '重置任务');
   assert.equal(t('home.subtitle'), '查看进度与录音，或进入录制继续作业。');
   assert.equal(t('recorder.previewThis'), '试听本句');
   assert.equal(t('recorder.previewTitle'), '试听');

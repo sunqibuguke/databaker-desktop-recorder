@@ -1551,6 +1551,109 @@ impl Engine {
         }))
     }
 
+    pub fn reset_session_expected(
+        &self,
+        session_dir: &Path,
+        expected_session_id: &str,
+    ) -> Result<Value> {
+        if self.session.is_some() {
+            bail!("当前已有录制进行中，请先安全暂停后再重置任务");
+        }
+        let expected_session_id = expected_session_id.trim();
+        if expected_session_id.is_empty() {
+            bail!("重置任务需要明确的录制任务身份");
+        }
+        validate_offline_session_tree(session_dir)?;
+        let _session_lock = SessionLock::acquire(session_dir, &Utc::now().to_rfc3339())?;
+        let mut journal = read_journal(session_dir)?;
+        let existing = load_recovery_snapshot_for_session(
+            session_dir,
+            &mut journal,
+            Some(expected_session_id),
+        )?;
+        if existing.items.is_empty() {
+            bail!("录制任务没有可保留的脚本条目，无法重置");
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let segment_frames = existing
+            .segment_frames
+            .map(Ok)
+            .unwrap_or_else(|| {
+                storage_layout_v1_default_segment_frames(existing.audio_format.sample_rate)
+            })?;
+        let snapshot = SessionSnapshot {
+            schema_version: 1,
+            journal_seq: 0,
+            session_id: existing.session_id,
+            script_name: existing.script_name,
+            status: "stopped".to_string(),
+            device_name: existing.device_name,
+            device_id: existing.device_id,
+            input_sample_format: existing.input_sample_format,
+            capture_share_mode: existing.capture_share_mode,
+            capture_provenance: Vec::new(),
+            audio_format: existing.audio_format,
+            master_audio: SEGMENTED_MASTER_AUDIO.to_string(),
+            storage_layout_version: STORAGE_LAYOUT_VERSION,
+            segment_frames: Some(segment_frames),
+            captured_samples: 0,
+            committed_samples: 0,
+            overflow_samples: 0,
+            input_discontinuity_count: 0,
+            input_discontinuity_silence_samples: 0,
+            started_at: now.clone(),
+            updated_at: now,
+            noise_check: None,
+            noise_threshold_dbfs: Some(
+                existing
+                    .noise_threshold_dbfs
+                    .unwrap_or(existing.silence_threshold_dbfs),
+            ),
+            silence_duration_ms: existing.silence_duration_ms,
+            silence_threshold_dbfs: existing.silence_threshold_dbfs,
+            items: existing
+                .items
+                .into_iter()
+                .map(|item| ItemState {
+                    id: item.id,
+                    text: item.text,
+                    label: item.label,
+                    status: "pending".to_string(),
+                    attempts: Vec::new(),
+                    selected_attempt_id: None,
+                })
+                .collect(),
+        };
+        storage_layout_segment_frames(&snapshot)?;
+
+        wipe_recorded_session_data(session_dir)?;
+        for name in ["audio", "metadata", "script", "preview", "export"] {
+            ensure_real_directory(&session_dir.join(name))?;
+        }
+        // Drop older snapshot generations before publishing journal_seq=0.
+        // Recovery prefers the highest sequence, so a leftover `.prev` would
+        // resurrect the recorded task.
+        remove_stale_snapshot_generations(session_dir)?;
+        // Do not use atomic_snapshot_json here: it would rotate the recorded
+        // snapshot to `.prev`, and recovery prefers the highest journal_seq.
+        atomic_json(&session_dir.join("metadata/items.snapshot.json"), &snapshot)?;
+        atomic_json(&session_dir.join("script/normalized.json"), &snapshot.items)?;
+        atomic_json(
+            &session_dir.join("session.json"),
+            &session_summary_value(&snapshot),
+        )?;
+        remove_stale_snapshot_generations(session_dir)?;
+
+        Ok(json!({
+            "snapshot": snapshot,
+            "session_dir": session_dir,
+            "mode": "inspect",
+            "recovery_warnings": [],
+            "faulted": false,
+        }))
+    }
+
     #[cfg(feature = "system-test")]
     pub fn start_system_test_session(
         &mut self,
@@ -4251,6 +4354,75 @@ impl Engine {
     fn active_session_mut(&mut self) -> Result<&mut RecordingSession> {
         self.session.as_mut().ok_or_else(no_active_session_error)
     }
+}
+
+fn ensure_real_directory(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => bail!("{} must be a real directory", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            durable_create_directory(path)
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect directory {}", path.display()))
+        }
+    }
+}
+
+fn remove_existing_leaf(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
+        Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
+            std::fs::remove_file(path).with_context(|| format!("remove {}", path.display()))
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            empty_real_directory(path)?;
+            std::fs::remove_dir(path).with_context(|| format!("remove {}", path.display()))
+        }
+        Ok(_) => bail!("cannot remove unexpected file type {}", path.display()),
+    }
+}
+
+fn empty_real_directory(path: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("{} must be a real directory", path.display());
+    }
+    for entry in std::fs::read_dir(path)
+        .with_context(|| format!("list {}", path.display()))?
+    {
+        remove_existing_leaf(&entry?.path())?;
+    }
+    Ok(())
+}
+
+fn wipe_recorded_session_data(session_dir: &Path) -> Result<()> {
+    for name in ["audio", "export", "preview"] {
+        empty_real_directory(&session_dir.join(name))?;
+    }
+    remove_existing_leaf(&session_dir.join("metadata/events.jsonl"))?;
+    remove_existing_leaf(&session_dir.join(AUDIO_FAULT_MARKER))?;
+    remove_existing_leaf(&session_dir.join(AUDIO_FAULT_RESERVE))?;
+    remove_existing_leaf(&session_dir.join("metadata/audio-fault.tmp"))?;
+    Ok(())
+}
+
+fn remove_stale_snapshot_generations(session_dir: &Path) -> Result<()> {
+    let final_path = session_dir.join("metadata/items.snapshot.json");
+    for (path, _, _) in snapshot_candidate_paths(session_dir) {
+        if path == final_path {
+            continue;
+        }
+        remove_existing_leaf(&path)?;
+    }
+    Ok(())
 }
 
 fn validate_offline_session_tree(session_dir: &Path) -> Result<()> {
@@ -12781,6 +12953,109 @@ mod tests {
             .export_session_artifact_expected(&root, "offline-create", ExportArtifact::FullTrack)
             .unwrap();
         assert!(root.join("export/full-track.wav").is_file());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reset_session_returns_a_pristine_unused_task() {
+        let root = test_root("reset-session-pristine");
+        for directory in ["audio/segments", "metadata", "script", "preview", "export"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        std::fs::write(root.join("audio/segments/master-000001.wav"), b"AUDIO").unwrap();
+        std::fs::write(root.join("export/full-track.wav"), b"EXPORT").unwrap();
+        std::fs::write(root.join("preview/001-a1.wav"), b"PREVIEW").unwrap();
+        std::fs::write(root.join(AUDIO_FAULT_MARKER), b"{\"reason\":\"overflow\"}\n").unwrap();
+        let mut snapshot = test_snapshot();
+        snapshot.status = "faulted".to_string();
+        snapshot.journal_seq = 8;
+        snapshot.captured_samples = 48_000;
+        snapshot.committed_samples = 48_000;
+        snapshot.overflow_samples = 12;
+        snapshot.noise_check = Some(NoiseCheckResult {
+            passed: true,
+            threshold_dbfs: -42.0,
+            average_dbfs: -50.0,
+            maximum_dbfs: -46.0,
+            failing_windows: 0,
+            samples: vec![-50.0],
+            completed_at: "2026-08-10T12:00:00Z".to_string(),
+        });
+        snapshot.items[0].status = "accepted".to_string();
+        snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
+        snapshot.items[0].attempts = vec![Attempt {
+            attempt_id: "001-a1".to_string(),
+            start_sample: 0,
+            recording_started_sample: 0,
+            head_silence_armed_sample: 0,
+            head_silence_passed_sample: 0,
+            required_head_silence_samples: 0,
+            content_started_sample: 0,
+            end_sample: 48_000,
+            forced_without_tail_silence: false,
+            tail_silence_samples: 0,
+            required_tail_silence_samples: 0,
+            status: "accepted".to_string(),
+            created_at: "2026-08-10T12:00:00Z".to_string(),
+        }];
+        write_snapshot_file(&root.join("metadata/items.snapshot.json"), &snapshot);
+        write_snapshot_file(&root.join("metadata/items.snapshot.prev"), &snapshot);
+        write_journal(&root, &[sequenced_event("attempt_accepted", &snapshot)]);
+        std::fs::write(
+            root.join("session.json"),
+            format!("{}\n", serde_json::to_string(&session_summary_value(&snapshot)).unwrap()),
+        )
+        .unwrap();
+
+        let engine = Engine::new(Emitter::new());
+        let identity_error = engine
+            .reset_session_expected(&root, "other-session")
+            .unwrap_err();
+        assert!(
+            format!("{identity_error:#}").contains("其他录制")
+                || format!("{identity_error:#}").contains("不一致")
+                || format!("{identity_error:#}").contains("预期"),
+            "{identity_error:#}"
+        );
+        assert!(root.join("audio/segments/master-000001.wav").is_file());
+
+        let reset = engine.reset_session_expected(&root, "resume-test").unwrap();
+        assert!(engine.session.is_none());
+        assert_eq!(reset["mode"], "inspect");
+        assert_eq!(reset["faulted"], false);
+        assert_eq!(reset["snapshot"]["session_id"], "resume-test");
+        assert_eq!(reset["snapshot"]["status"], "stopped");
+        assert_eq!(reset["snapshot"]["journal_seq"], 0);
+        assert_eq!(reset["snapshot"]["captured_samples"], 0);
+        assert_eq!(reset["snapshot"]["committed_samples"], 0);
+        assert_eq!(reset["snapshot"]["overflow_samples"], 0);
+        assert!(reset["snapshot"]["noise_check"].is_null());
+        assert_eq!(reset["snapshot"]["items"][0]["id"], "001");
+        assert_eq!(reset["snapshot"]["items"][0]["text"], "测试文本");
+        assert_eq!(reset["snapshot"]["items"][0]["status"], "pending");
+        assert!(reset["snapshot"]["items"][0]["attempts"].as_array().unwrap().is_empty());
+        assert!(reset["snapshot"]["items"][0]["selected_attempt_id"].is_null());
+        assert!(!root.join("audio/segments/master-000001.wav").exists());
+        assert!(!root.join("export/full-track.wav").exists());
+        assert!(!root.join("preview/001-a1.wav").exists());
+        assert!(!root.join("metadata/events.jsonl").exists());
+        assert!(!root.join(AUDIO_FAULT_MARKER).exists());
+        assert!(!root.join("metadata/items.snapshot.prev").exists());
+        assert!(root.join("audio").is_dir());
+        assert!(root.join("export").is_dir());
+        assert!(root.join("preview").is_dir());
+
+        let inspected = engine
+            .inspect_session_expected(&root, "resume-test")
+            .unwrap();
+        assert_eq!(inspected["snapshot"]["status"], "stopped");
+        assert_eq!(inspected["snapshot"]["items"][0]["status"], "pending");
+        assert_eq!(inspected["data_health"], "normal");
+        let persisted: SessionSnapshot = serde_json::from_slice(
+            &std::fs::read(root.join("metadata/items.snapshot.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(is_pristine_bootstrap(&persisted));
         let _ = std::fs::remove_dir_all(root);
     }
 
