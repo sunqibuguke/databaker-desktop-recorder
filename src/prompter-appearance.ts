@@ -30,6 +30,10 @@ export function normalizePrompterFontSize(value: unknown): number {
   return Math.min(MAX_PROMPTER_FONT_SIZE, Math.max(MIN_PROMPTER_FONT_SIZE, Math.round(numeric)));
 }
 
+export function prompterFontSizeRem(value: unknown): string {
+  return `${normalizePrompterFontSize(value) / 16}rem`;
+}
+
 export function normalizePrompterLiveColor(value: unknown): string {
   if (typeof value !== 'string') return DEFAULT_PROMPTER_LIVE_COLOR;
   const trimmed = value.trim();

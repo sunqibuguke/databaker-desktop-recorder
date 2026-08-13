@@ -98,6 +98,15 @@ export type WaveformTakeSpan = {
 };
 
 /**
+ * Pending silence after the operator clicks is not a deliverable take.
+ * The live scope only paints a recorded slice once speech has started;
+ * a discarded silent stop therefore leaves no red band or markers.
+ */
+export function waveformTakeIsActive(recording: boolean, hasSpoken: boolean): boolean {
+  return recording && hasSpoken;
+}
+
+/**
  * Recorded-take spans ride the same PCM clock as the scrolling waveform.
  * A rising recording edge opens a span; a falling edge closes it at the
  * live capture cursor so start/end markers keep their historical place.

@@ -241,6 +241,19 @@ async function main() {
       { startSample: 288_000, endSample: 336_000 },
     ]);
 
+    assert.equal(
+      waveform.waveformTakeIsActive(true, false),
+      false,
+      'pending silence after the click is not a recorded slice',
+    );
+    assert.equal(waveform.waveformTakeIsActive(true, true), true);
+    assert.equal(waveform.waveformTakeIsActive(false, true), false);
+    assert.deepEqual(
+      waveform.reconcileWaveformTakeSpans([], waveform.waveformTakeIsActive(true, false), 96_000, 144_000),
+      [],
+      'a discarded silent stop must not leave red markers',
+    );
+
     const reconnected = waveform.reconcileWaveformTakeSpans([], true, 48_000, 72_000);
     assert.deepEqual(
       reconnected,

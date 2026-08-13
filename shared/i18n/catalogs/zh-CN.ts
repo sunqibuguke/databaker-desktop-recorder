@@ -378,6 +378,15 @@ const zhCN = {
     preview: '试听',
     previewKey: '试听 P',
     previewThis: '试听本句',
+    previewTitle: '试听',
+    previewAttempt: '录音 {id}',
+    previewPlay: '播放',
+    previewPause: '暂停',
+    previewReplay: '重播',
+    previewClose: '关闭试听',
+    previewHint: '空格暂停 / 继续 · ← → 微调 · Esc 关闭',
+    previewProgressAria: '试听进度',
+    previewSeekAria: '跳转到指定位置',
     retake: '重录',
     retakeKey: '重录 R',
     skip: '跳过',
@@ -693,6 +702,7 @@ const zhCN = {
   },
   waveform: {
     aria: '实时 PCM 波形（WebGL）',
+    previewAria: '试听波形',
     unavailable: 'WebGL 不可用，无法显示实时波形',
   },
 } as const;

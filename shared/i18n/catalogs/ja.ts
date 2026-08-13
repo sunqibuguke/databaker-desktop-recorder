@@ -380,6 +380,15 @@ const ja: MessageTree = {
     preview: '試聴',
     previewKey: '試聴 P',
     previewThis: 'この文を試聴',
+    previewTitle: '試聴',
+    previewAttempt: 'テイク {id}',
+    previewPlay: '再生',
+    previewPause: '一時停止',
+    previewReplay: '最初から再生',
+    previewClose: '試聴を閉じる',
+    previewHint: 'Space で一時停止 / 再開 · ← → で微調整 · Esc で閉じる',
+    previewProgressAria: '試聴の進行状況',
+    previewSeekAria: '再生位置を移動',
     retake: 'リテイク',
     retakeKey: 'リテイク R',
     skip: 'スキップ',
@@ -695,6 +704,7 @@ const ja: MessageTree = {
   },
   waveform: {
     aria: 'リアルタイムPCM波形（WebGL）',
+    previewAria: '試聴波形',
     unavailable: 'WebGLが使えないため、リアルタイム波形を表示できません',
   },
 };

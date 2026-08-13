@@ -380,6 +380,15 @@ const en: MessageTree = {
     preview: 'Preview',
     previewKey: 'Preview P',
     previewThis: 'Preview this sentence',
+    previewTitle: 'Preview',
+    previewAttempt: 'Take {id}',
+    previewPlay: 'Play',
+    previewPause: 'Pause',
+    previewReplay: 'Replay',
+    previewClose: 'Close preview',
+    previewHint: 'Space pause / resume · ← → nudge · Esc close',
+    previewProgressAria: 'Preview progress',
+    previewSeekAria: 'Seek to a position',
     retake: 'Retake',
     retakeKey: 'Retake R',
     skip: 'Skip',
@@ -695,6 +704,7 @@ const en: MessageTree = {
   },
   waveform: {
     aria: 'Live PCM waveform (WebGL)',
+    previewAria: 'Preview waveform',
     unavailable: 'WebGL is unavailable, so the live waveform cannot be shown',
   },
 };

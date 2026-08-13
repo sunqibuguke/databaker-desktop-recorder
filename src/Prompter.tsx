@@ -9,6 +9,7 @@ import {
   loadPrompterAppearance,
   normalizePrompterFontSize,
   normalizePrompterLiveColor,
+  prompterFontSizeRem,
   savePrompterAppearance,
   type PrompterAppearance,
 } from './prompter-appearance';
@@ -93,7 +94,7 @@ export function PrompterView() {
     className={`prompter-shell ${cue} ${qualityWarning ? 'has-quality-warning' : ''}`}
     aria-label={state?.cueLabel ?? t('prompter.panelAria')}
     style={{
-      ['--prompter-copy-size' as string]: `${appearance.fontSize}px`,
+      ['--prompter-copy-size' as string]: prompterFontSizeRem(appearance.fontSize),
       ['--prompter-live-color' as string]: appearance.liveColor,
     }}
   >

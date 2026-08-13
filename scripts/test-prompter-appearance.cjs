@@ -17,6 +17,7 @@ async function main() {
     normalizePrompterFontSize,
     normalizePrompterLiveColor,
     parsePrompterAppearance,
+    prompterFontSizeRem,
     savePrompterAppearance,
   } = await import(pathToFileURL(helperPath).href);
 
@@ -26,6 +27,8 @@ async function main() {
   assert.equal(normalizePrompterFontSize(8), MIN_PROMPTER_FONT_SIZE);
   assert.equal(normalizePrompterFontSize(200), MAX_PROMPTER_FONT_SIZE);
   assert.equal(normalizePrompterFontSize('nope'), DEFAULT_PROMPTER_FONT_SIZE);
+  assert.equal(prompterFontSizeRem(36), '2.25rem');
+  assert.equal(prompterFontSizeRem(8), `${MIN_PROMPTER_FONT_SIZE / 16}rem`);
   assert.equal(normalizePrompterLiveColor('#3DCC7A'), '#3dcc7a');
   assert.equal(normalizePrompterLiveColor('#fff'), '#ffffff');
   assert.equal(normalizePrompterLiveColor('green'), DEFAULT_PROMPTER_LIVE_COLOR);

@@ -380,6 +380,15 @@ const pt: MessageTree = {
     preview: 'Pré-escuta',
     previewKey: 'Pré-escuta P',
     previewThis: 'Pré-escutar esta frase',
+    previewTitle: 'Pré-escuta',
+    previewAttempt: 'Toma {id}',
+    previewPlay: 'Reproduzir',
+    previewPause: 'Pausar',
+    previewReplay: 'Repetir',
+    previewClose: 'Fechar pré-escuta',
+    previewHint: 'Espaço pausa / retoma · ← → ajusta · Esc fecha',
+    previewProgressAria: 'Progresso da pré-escuta',
+    previewSeekAria: 'Ir para a posição',
     retake: 'Repetir',
     retakeKey: 'Repetir R',
     skip: 'Ignorar',
@@ -695,6 +704,7 @@ const pt: MessageTree = {
   },
   waveform: {
     aria: 'Forma de onda PCM ao vivo (WebGL)',
+    previewAria: 'Forma de onda da pré-escuta',
     unavailable: 'O WebGL não está disponível, por isso a forma de onda ao vivo não pode ser mostrada',
   },
 };

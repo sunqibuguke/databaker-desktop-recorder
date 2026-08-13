@@ -25,6 +25,7 @@ type Props = {
   takeStartSample?: number;
   sampleRate: number;
   mode?: 'live' | 'review';
+  ariaLabel?: string;
 };
 
 const IDLE_WAVE_COLOR: [number, number, number, number] = [0.35, 0.72, 0.70, 0.78];
@@ -85,6 +86,7 @@ export function WebGLWaveform({
   takeStartSample,
   sampleRate,
   mode = 'live',
+  ariaLabel,
 }: Props) {
   const { t } = useI18n();
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -430,7 +432,7 @@ export function WebGLWaveform({
   }, []);
 
   return <div className="webgl-waveform" data-renderer={available ? 'webgl' : 'unavailable'}>
-    <canvas ref={canvasRef} role="img" aria-label={t('waveform.aria')} />
+    <canvas ref={canvasRef} role="img" aria-label={ariaLabel ?? t('waveform.aria')} />
     {!available && <span>{t('waveform.unavailable')}</span>}
   </div>;
 }

@@ -4,21 +4,29 @@
   <meta charset="UTF-8" />
   <title>DataBaker 授权注册机</title>
   <style>
-    :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; }
-    body { margin: 0; background: #161616; color: #e6e6e6; }
+    :root {
+      color-scheme: dark;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+      --text-xs: 0.625rem;
+      --text-md: 0.75rem;
+      --text-lg: 0.8125rem;
+      --text-title: 1.25rem;
+    }
+    html { font-size: 16px; }
+    body { margin: 0; background: #161616; color: #e6e6e6; font-size: var(--text-md); }
     main { max-width: 520px; margin: 0 auto; padding: 28px 22px 32px; }
-    h1 { margin: 0 0 6px; font-size: 20px; }
-    p { margin: 0 0 18px; color: #9c9c9c; font-size: 13px; line-height: 1.55; }
-    label { display: grid; gap: 6px; margin-bottom: 12px; font-size: 12px; color: #b9b9b9; }
-    input, textarea { padding: 8px 10px; border: 1px solid #434846; border-radius: 2px; color: #d5dad7; background: #1f2221; font: 13px ui-monospace, SFMono-Regular, Consolas, monospace; }
+    h1 { margin: 0 0 6px; font-size: var(--text-title); }
+    p { margin: 0 0 18px; color: #9c9c9c; font-size: var(--text-lg); line-height: 1.55; }
+    label { display: grid; gap: 6px; margin-bottom: 12px; font-size: var(--text-md); color: #b9b9b9; }
+    input, textarea { padding: 8px 10px; border: 1px solid #434846; border-radius: 2px; color: #d5dad7; background: #1f2221; font: var(--text-lg) ui-monospace, SFMono-Regular, Consolas, monospace; }
     textarea { min-height: 92px; resize: vertical; }
     .row { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: end; }
-    button { min-height: 34px; padding: 0 14px; border: 1px solid #6abeb9; background: #69bdb8; color: #0d2422; font-weight: 600; }
+    button { min-height: 34px; padding: 0 14px; border: 1px solid #6abeb9; background: #69bdb8; color: #0d2422; font-weight: 600; font-size: var(--text-md); }
     button.secondary { border-color: #434846; background: #2b2b2b; color: #d5dad7; }
-    .error { margin: 10px 0 0; color: #ef6a72; font-size: 12px; }
+    .error { margin: 10px 0 0; color: #ef6a72; font-size: var(--text-md); }
     .ok { margin-top: 16px; }
     .ok code { display: block; margin-top: 8px; padding: 10px; border: 1px solid #3d3d3d; background: #1b1d1c; white-space: pre-wrap; word-break: break-all; }
-    .check { display: flex; align-items: center; gap: 8px; margin: 4px 0 14px; color: #b9b9b9; font-size: 13px; }
+    .check { display: flex; align-items: center; gap: 8px; margin: 4px 0 14px; color: #b9b9b9; font-size: var(--text-lg); }
   </style>
 </head>
 <body>

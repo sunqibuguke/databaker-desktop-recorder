@@ -15,6 +15,35 @@ type MockActiveAttempt = {
   content_started_sample: number;
 };
 
+function previewWavBytes(seconds = 1.2, sampleRate = 48_000): ArrayBuffer {
+  const samples = Math.max(1, Math.floor(seconds * sampleRate));
+  const dataSize = samples * 2;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+  const writeString = (offset: number, text: string) => {
+    for (let index = 0; index < text.length; index += 1) view.setUint8(offset + index, text.charCodeAt(index));
+  };
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, 'data');
+  view.setUint32(40, dataSize, true);
+  for (let index = 0; index < samples; index += 1) {
+    const envelope = Math.sin((Math.PI * index) / samples);
+    const sample = Math.round(Math.sin((2 * Math.PI * 440 * index) / sampleRate) * envelope * 8_000);
+    view.setInt16(44 + index * 2, sample, true);
+  }
+  return buffer;
+}
+
 export function installDevRecorderMock() {
   if ('recorder' in window) return;
 
@@ -790,7 +819,7 @@ export function installDevRecorderMock() {
         return { session_dir: sessionDir, session_id: sessionId };
       },
       joinPath: async (...parts: string[]) => parts.join('/').replace(/\/+/g, '/'),
-      readAudio: async () => new ArrayBuffer(44),
+      readAudio: async () => previewWavBytes(1.2, mockSampleRate),
       openPath: async (target: string) => {
         throw new Error(`浏览器界面预览无法打开本机文件夹：${target}。请在 DataBaker 桌面应用中使用此按钮。`);
       },

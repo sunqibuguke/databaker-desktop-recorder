@@ -380,6 +380,15 @@ const th: MessageTree = {
     preview: 'ฟังตัวอย่าง',
     previewKey: 'ฟังตัวอย่าง P',
     previewThis: 'ฟังประโยคนี้',
+    previewTitle: 'ฟังตัวอย่าง',
+    previewAttempt: 'เทค {id}',
+    previewPlay: 'เล่น',
+    previewPause: 'หยุดชั่วคราว',
+    previewReplay: 'เล่นใหม่',
+    previewClose: 'ปิดหน้าต่างฟังตัวอย่าง',
+    previewHint: 'Space หยุด / เล่นต่อ · ← → ขยับ · Esc ปิด',
+    previewProgressAria: 'ความคืบหน้าการฟัง',
+    previewSeekAria: 'ไปยังตำแหน่ง',
     retake: 'อัดใหม่',
     retakeKey: 'อัดใหม่ R',
     skip: 'ข้าม',
@@ -695,6 +704,7 @@ const th: MessageTree = {
   },
   waveform: {
     aria: 'รูปคลื่น PCM สด (WebGL)',
+    previewAria: 'รูปคลื่นตัวอย่าง',
     unavailable: 'WebGL ใช้ไม่ได้ จึงแสดงรูปคลื่นสดไม่ได้',
   },
 };

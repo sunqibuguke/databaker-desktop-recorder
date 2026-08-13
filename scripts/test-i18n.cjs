@@ -41,6 +41,8 @@ async function main() {
   assert.equal(t('home.recordTask'), '录制');
   assert.equal(t('home.subtitle'), '查看进度与录音，或进入录制继续作业。');
   assert.equal(t('recorder.previewThis'), '试听本句');
+  assert.equal(t('recorder.previewTitle'), '试听');
+  assert.equal(t('recorder.previewPause'), '暂停');
   assert.equal(t('recorder.enterCapture'), '进入录制');
   assert.equal(t('recorder.leaveView'), '退出查看');
   assert.equal(t('notice.importedItems', { count: 12 }), '已导入 12 条文本');

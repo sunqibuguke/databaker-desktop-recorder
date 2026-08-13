@@ -26,7 +26,9 @@ import {
   viewShortcutAction,
   workflowShortcutAction,
 } from './recording-workflow';
+import { waveformTakeIsActive } from './waveform-buffer';
 import { WebGLWaveform } from './WebGLWaveform';
+import { PreviewPlayer, type PreviewPlayerHandle } from './PreviewPlayer';
 import { inputQualityWarning, shouldHandleLiveMeter } from './input-quality';
 import {
   liveHeadMsFromMeter,
@@ -428,6 +430,9 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const [error, setError] = useState('');
   const [dataSafetyAlert, setDataSafetyAlert] = useState('');
   const [audioUrl, setAudioUrl] = useState('');
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewBins, setPreviewBins] = useState<Array<[number, number]>>([]);
+  const [previewingAttemptId, setPreviewingAttemptId] = useState('');
   const [finishConfirmOpen, setFinishConfirmOpen] = useState(false);
   const [pauseConfirmOpen, setPauseConfirmOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -459,7 +464,8 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const [deletingSessionDir, setDeletingSessionDir] = useState('');
   const [openActionsSessionDir, setOpenActionsSessionDir] = useState('');
   const [resumeError, setResumeError] = useState<{ sessionDir: string; message: string } | null>(null);
-  const audioRef = useRef<HTMLAudioElement>(null);
+  const previewPlayerRef = useRef<PreviewPlayerHandle>(null);
+  const previewWaveformRequestRef = useRef(0);
   const sealOperationRef = useRef(false);
   const pauseOperationRef = useRef(false);
   const presetOperationRef = useRef(false);
@@ -1215,10 +1221,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         setAttemptRecordingStartedSample(0);
         setReviewAttemptId(null);
         setMeter(emptyMeter);
-        setAudioUrl((current) => {
-          if (current) URL.revokeObjectURL(current);
-          return '';
-        });
+        clearAudioPreview();
         setFinishConfirmOpen(false);
         setPauseConfirmOpen(false);
         clearSessionNoiseCheck();
@@ -1280,6 +1283,11 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   useEffect(() => () => {
     if (audioUrl) URL.revokeObjectURL(audioUrl);
   }, [audioUrl]);
+
+  useEffect(() => {
+    if (!previewOpen) return;
+    clearAudioPreview();
+  }, [currentIndex]);
 
   useEffect(() => {
     window.recorder.sendPrompterState(prompterState);
@@ -1496,7 +1504,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
 
   function enterInspectionWorkspace(current: InspectedSessionState) {
     const nextSnapshot = current.snapshot;
-    if (audioUrl) URL.revokeObjectURL(audioUrl);
+    clearAudioPreview();
     meterFrameCommitterRef.current?.invalidate();
     setSnapshot(nextSnapshot);
     setSessionDir(current.session_dir);
@@ -1544,7 +1552,6 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     const firstItem = nextSnapshot.items[0];
     setReviewAttemptId(firstItem?.selected_attempt_id ?? (firstItem ? latestUsableAttempt(firstItem)?.attempt_id : null) ?? null);
     setMeter({ ...emptyMeter, captured_samples: nextSnapshot.captured_samples, committed_samples: nextSnapshot.committed_samples, overflow_samples: nextSnapshot.overflow_samples });
-    setAudioUrl('');
     clearSessionNoiseCheck();
     setPhase('running');
     const warning = recoveryWarning(t('notice.openStorageHint'), current.recovery_warnings);
@@ -1812,6 +1819,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   async function startAttempt(item = currentItem) {
     if (!item || recording || phase !== 'running' || captureFault || !captureActive) return;
     if (currentNoiseGate !== 'ready') return;
+    clearAudioPreview();
     const result = await run(t('notice.starting'), () => window.recorder.request<{
       attempt_id: string;
       start_sample: number;
@@ -1971,6 +1979,21 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     if (latest) moveToNext(latest);
   }
 
+  function closePreviewPlayer() {
+    clearAudioPreview();
+  }
+
+  function clearAudioPreview() {
+    previewWaveformRequestRef.current += 1;
+    setPreviewOpen(false);
+    setPreviewBins([]);
+    setPreviewingAttemptId('');
+    setAudioUrl((current) => {
+      if (current) URL.revokeObjectURL(current);
+      return '';
+    });
+  }
+
   async function previewAttempt() {
     if (!currentItem || recording) return;
     const attemptId = reviewAttemptId
@@ -1978,18 +2001,39 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       ?? latestUsableAttempt(currentItem)?.attempt_id;
     if (!attemptId) return;
     const command = captureActive ? 'render_attempt' : 'render_session_attempt';
+    const waveformCommand = captureActive ? 'preview_attempt_waveform' : 'preview_session_waveform';
+    const requestId = previewWaveformRequestRef.current + 1;
+    previewWaveformRequestRef.current = requestId;
+    const reusedBins = !captureActive && reviewAttempt?.attempt_id === attemptId ? reviewWaveformBins : [];
+    void window.recorder.request<{ bins: Array<[number, number]> }>(waveformCommand, {
+      ...(captureActive ? {} : { session_dir: sessionDir }),
+      item_id: currentItem.id,
+      attempt_id: attemptId,
+    }).then((result) => {
+      if (requestId !== previewWaveformRequestRef.current) return;
+      setPreviewBins(Array.isArray(result.bins) ? result.bins : []);
+    }).catch(() => {
+      if (requestId !== previewWaveformRequestRef.current) return;
+      if (!reusedBins.length) setPreviewBins([]);
+    });
     const rendered = await run(t('notice.preparingPreview'), () => window.recorder.request<{ file_path: string }>(command, {
       ...(captureActive ? {} : { session_dir: sessionDir }),
       item_id: currentItem.id,
       attempt_id: attemptId,
     }));
-    if (!rendered) return;
+    if (!rendered || requestId !== previewWaveformRequestRef.current) return;
     const audio = await run(t('notice.readingPreview'), () => window.recorder.readAudio(rendered.file_path));
-    if (!audio) return;
+    if (!audio || requestId !== previewWaveformRequestRef.current) return;
     if (audioUrl) URL.revokeObjectURL(audioUrl);
     const url = URL.createObjectURL(new Blob([audio], { type: 'audio/wav' }));
+    if (requestId !== previewWaveformRequestRef.current) {
+      URL.revokeObjectURL(url);
+      return;
+    }
     setAudioUrl(url);
-    setTimeout(() => void audioRef.current?.play(), 0);
+    setPreviewingAttemptId(attemptId);
+    setPreviewBins((current) => current.length ? current : reusedBins);
+    setPreviewOpen(true);
     setNotice(t('notice.previewing', { id: attemptId }));
   }
 
@@ -2262,7 +2306,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   }
 
   function leaveInspectionWorkspace() {
-    if (audioUrl) URL.revokeObjectURL(audioUrl);
+    clearAudioPreview();
     setPhase('home');
     setSnapshot(null);
     setSessionDir('');
@@ -2272,7 +2316,6 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setRecording(false);
     setCurrentIndex(0);
     setReviewAttemptId(null);
-    setAudioUrl('');
     setMeter(emptyMeter);
     clearSessionNoiseCheck();
     clearActivationFailure();
@@ -2359,7 +2402,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         || stopped.snapshot.status === 'faulted'
         || stopped.snapshot.overflow_samples > 0;
       const warning = recoveryWarning(mode === 'pause' ? t('notice.pauseWarning') : t('notice.finishWarning'), stopped.warnings);
-      if (audioUrl) URL.revokeObjectURL(audioUrl);
+      clearAudioPreview();
       meterFrameCommitterRef.current?.invalidate();
       setResumeError(null);
       setSealConfirmRecording(null);
@@ -2374,7 +2417,6 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       setAttemptRecordingStartedSample(0);
       setReviewAttemptId(null);
       setMeter(emptyMeter);
-      setAudioUrl('');
       setFinishConfirmOpen(false);
       setPauseConfirmOpen(false);
       unbindTaskLog(mode);
@@ -2416,7 +2458,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   }
 
   function resetForNewSession() {
-    if (audioUrl) URL.revokeObjectURL(audioUrl);
+    clearAudioPreview();
     meterFrameCommitterRef.current?.invalidate();
     setResumeError(null);
     setSealConfirmRecording(null);
@@ -2433,7 +2475,6 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setAttemptRecordingStartedSample(0);
     setReviewAttemptId(null);
     setMeter(emptyMeter);
-    setAudioUrl('');
     setFinishConfirmOpen(false);
     setPauseConfirmOpen(false);
     clearActivationFailure();
@@ -2454,7 +2495,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   }
 
   function returnToRecordings() {
-    if (audioUrl) URL.revokeObjectURL(audioUrl);
+    clearAudioPreview();
     meterFrameCommitterRef.current?.invalidate();
     setResumeError(null);
     setSealConfirmRecording(null);
@@ -2470,7 +2511,6 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setAttemptRecordingStartedSample(0);
     setReviewAttemptId(null);
     setMeter(emptyMeter);
-    setAudioUrl('');
     setFinishConfirmOpen(false);
     setPauseConfirmOpen(false);
     setNotice(t('notice.historyRefreshed'));
@@ -2507,6 +2547,34 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       }
       if (openActionsSessionDir && event.key === 'Escape') {
         setOpenActionsSessionDir('');
+        return;
+      }
+      if (previewOpen) {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          closePreviewPlayer();
+          return;
+        }
+        if (event.code === 'Space') {
+          event.preventDefault();
+          previewPlayerRef.current?.toggle();
+          return;
+        }
+        if (event.key.toLowerCase() === 'p') {
+          event.preventDefault();
+          previewPlayerRef.current?.replay();
+          return;
+        }
+        if (event.key === 'ArrowLeft') {
+          event.preventDefault();
+          previewPlayerRef.current?.nudge(-1);
+          return;
+        }
+        if (event.key === 'ArrowRight') {
+          event.preventDefault();
+          previewPlayerRef.current?.nudge(1);
+          return;
+        }
         return;
       }
       if (phase !== 'running' || busy) return;
@@ -2969,10 +3037,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             {qualityWarning && <div className="input-quality-banner" role="alert"><Icon name="meter" size={16} /><div><strong>{t('quality.bannerTitle')}</strong><span>{qualityWarning}. {t('quality.bannerHint')}</span></div></div>}
           </div>}
           <section className="script-monitor"><header><span>{t('recorder.currentSentence')}</span><div><span className="studio-cue">{cueLabel}</span><em>{workflowComplete ? t('recorder.itemsCount', { count: items.length }) : `${currentIndex + 1} / ${items.length}`}</em></div></header><div className={`prompt-surface ${captureFault ? 'fault' : cue === 'pending' ? 'pending' : cue === 'recording' ? 'live' : ''}`}>{captureFault ? <span className="label-chip">{t('recorder.stopReadingChip')}</span> : noiseCheckBlocksAttempt ? <span className="label-chip">{t('recorder.envChip')}</span> : (workflowComplete || currentItem?.label) && <span className="label-chip">{workflowComplete ? t('recorder.allDoneChip') : currentItem?.label}</span>}<p>{captureFault ? captureFaultCopy.title : noiseCheckBlocksAttempt ? t('recorder.keepQuiet') : workflowComplete ? t('recorder.scriptFinished') : currentItem?.text ?? t('recorder.noText')}</p><small>{captureFault ? captureFaultCopy.detail : noiseCheckBlocksAttempt ? noiseCheckMessage : workflowComplete ? t('recorder.exportLater') : <>{currentItem?.id}</>}</small></div></section>
-          <section className="signal-monitor"><header><div><strong>{t('recorder.waveform')}</strong>{captureActive ? <SilencePairReadout pair={silencePair} /> : reviewAttempt ? <SilencePairReadout pair={reviewSilencePair({ attempt: reviewAttempt, sampleRate: sampleRateForDisplay, requiredMs: effectiveSilenceDurationMs, peak: reviewPeak })} /> : null}</div><div>{captureActive ? <><span>RMS <b>{db(meter.rms)}</b></span><span>PEAK <b className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</b></span></> : <span>{reviewAttempt ? formatDuration(reviewAttempt.end_sample - reviewAttempt.start_sample, sampleRateForDisplay) : t('recorder.noTakeWaveform')}</span>}</div></header><div className="signal-scope"><WebGLWaveform key={showReviewWaveform ? `${sessionDir}:${reviewAttempt?.attempt_id}` : `${sessionDir}:${waveformGeneration}`} mode={showReviewWaveform ? 'review' : 'live'} bins={showReviewWaveform ? reviewWaveformBins : (meter.waveform ?? [])} capturedSamples={meter.captured_samples} waveformEndSample={meter.waveform_end_sample} recording={recording && !captureFault} takeStartSample={recording && !captureFault ? attemptStartSample : undefined} sampleRate={sampleRateForDisplay} /><div className="scope-scale"><span>−1.0</span><span>−0.5</span><span>0</span><span>+0.5</span><span>+1.0</span></div></div><div className="horizontal-meter"><i className="meter-rms" style={{ width: `${rmsPercent}%` }} /><i className="meter-peak" style={{ left: `${peakPercent}%` }} /></div></section>
-          <div className={`audio-player-slot${audioUrl ? ' has-player' : ''}`}>
-            {audioUrl && <audio ref={audioRef} src={audioUrl} controls className="audio-player" />}
-          </div>
+          <section className="signal-monitor"><header><div><strong>{t('recorder.waveform')}</strong>{captureActive ? <SilencePairReadout pair={silencePair} /> : reviewAttempt ? <SilencePairReadout pair={reviewSilencePair({ attempt: reviewAttempt, sampleRate: sampleRateForDisplay, requiredMs: effectiveSilenceDurationMs, peak: reviewPeak })} /> : null}</div><div>{captureActive ? <><span>RMS <b>{db(meter.rms)}</b></span><span>PEAK <b className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</b></span></> : <span>{reviewAttempt ? formatDuration(reviewAttempt.end_sample - reviewAttempt.start_sample, sampleRateForDisplay) : t('recorder.noTakeWaveform')}</span>}</div></header><div className="signal-scope"><WebGLWaveform key={showReviewWaveform ? `${sessionDir}:${reviewAttempt?.attempt_id}` : `${sessionDir}:${waveformGeneration}`} mode={showReviewWaveform ? 'review' : 'live'} bins={showReviewWaveform ? reviewWaveformBins : (meter.waveform ?? [])} capturedSamples={meter.captured_samples} waveformEndSample={meter.waveform_end_sample} recording={waveformTakeIsActive(recording && !captureFault, hasSpoken)} takeStartSample={recording && !captureFault ? attemptStartSample : undefined} sampleRate={sampleRateForDisplay} /><div className="scope-scale"><span>−1.0</span><span>−0.5</span><span>0</span><span>+0.5</span><span>+1.0</span></div></div><div className="horizontal-meter"><i className="meter-rms" style={{ width: `${rmsPercent}%` }} /><i className="meter-peak" style={{ left: `${peakPercent}%` }} /></div></section>
           <section className="transport-panel">
             <div className="transport-review">
               {showReviewSilenceBill && <span className={`silence-bill${silencePair.hint || silencePair.extra ? ' has-issue' : ''}`} data-testid="review-silence-bill"><SilencePairReadout pair={silencePair} hint /></span>}
@@ -3054,6 +3119,17 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         <footer><button data-testid="pause-cancel" className="button" onClick={() => setPauseConfirmOpen(false)} disabled={Boolean(busy)}>{t('pauseDialog.keepRecording')}</button><button data-testid="pause-confirm" className="button primary" onClick={() => void safePauseAndReturn()} disabled={Boolean(busy)}><Icon name="stop" size={14} />{recording ? t('pauseDialog.endAndLeave') : t('pauseDialog.pauseAndLeave')}</button></footer>
       </section>
     </div>}
+    {previewOpen && audioUrl && <PreviewPlayer
+      ref={previewPlayerRef}
+      url={audioUrl}
+      attemptId={previewingAttemptId}
+      itemId={currentItem?.id ?? ''}
+      itemText={currentItem?.text ?? ''}
+      itemLabel={currentItem?.label}
+      bins={previewBins}
+      sampleRate={sampleRateForDisplay}
+      onClose={closePreviewPlayer}
+    />}
     {finishConfirmOpen && <div className="dialog-backdrop" role="presentation">
       <section className="studio-dialog" role="dialog" aria-modal="true" aria-labelledby="finish-dialog-title">
         <header><span className="dialog-icon"><Icon name="stop" size={19} /></span><div><h2 id="finish-dialog-title">{captureFault ? t('finishDialog.titleFault') : t('finishDialog.titleNormal')}</h2></div></header>

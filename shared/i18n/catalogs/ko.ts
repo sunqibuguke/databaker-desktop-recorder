@@ -380,6 +380,15 @@ const ko: MessageTree = {
     preview: '미리 듣기',
     previewKey: '미리 듣기 P',
     previewThis: '이 문장 미리 듣기',
+    previewTitle: '미리 듣기',
+    previewAttempt: '테이크 {id}',
+    previewPlay: '재생',
+    previewPause: '일시정지',
+    previewReplay: '다시 듣기',
+    previewClose: '미리 듣기 닫기',
+    previewHint: 'Space 일시정지 / 계속 · ← → 미세 이동 · Esc 닫기',
+    previewProgressAria: '미리 듣기 진행',
+    previewSeekAria: '재생 위치 이동',
     retake: '재녹음',
     retakeKey: '재녹음 R',
     skip: '건너뛰기',
@@ -695,6 +704,7 @@ const ko: MessageTree = {
   },
   waveform: {
     aria: '실시간 PCM 파형(WebGL)',
+    previewAria: '미리 듣기 파형',
     unavailable: 'WebGL을 사용할 수 없어 실시간 파형을 표시할 수 없습니다',
   },
 };

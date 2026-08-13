@@ -3,12 +3,13 @@ import { useI18n } from './i18n';
 
 export type Phase = 'home' | 'setup' | 'running';
 export type EngineStatus = 'connecting' | 'ready' | 'offline';
-export type IconName = 'check' | 'chevron-left' | 'chevron-right' | 'copy' | 'export' | 'file' | 'folder' | 'history' | 'home' | 'headphones' | 'log' | 'meter' | 'microphone' | 'more' | 'play' | 'plus' | 'record' | 'refresh' | 'retake' | 'settings' | 'skip' | 'sliders' | 'stop' | 'trash';
+export type IconName = 'check' | 'chevron-left' | 'chevron-right' | 'close' | 'copy' | 'export' | 'file' | 'folder' | 'history' | 'home' | 'headphones' | 'log' | 'meter' | 'microphone' | 'more' | 'pause' | 'play' | 'plus' | 'record' | 'refresh' | 'retake' | 'settings' | 'skip' | 'sliders' | 'stop' | 'trash';
 
 export function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
   const common = { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const, 'aria-hidden': true };
   switch (name) {
     case 'check': return <svg {...common}><path d="m5 12 4 4L19 6" /></svg>;
+    case 'close': return <svg {...common}><path d="M6 6l12 12M18 6 6 18" /></svg>;
     case 'chevron-left': return <svg {...common}><path d="m15 18-6-6 6-6" /></svg>;
     case 'chevron-right': return <svg {...common}><path d="m9 18 6-6-6-6" /></svg>;
     case 'copy': return <svg {...common}><rect x="9" y="9" width="11" height="11" rx="1.5" /><path d="M5 15V5h10" /></svg>;
@@ -23,6 +24,7 @@ export function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
     case 'meter': return <svg {...common}><path d="M4 18V9m5 9V5m6 13v-7m5 7V3" /></svg>;
     case 'microphone': return <svg {...common}><rect x="8" y="3" width="8" height="12" rx="4" /><path d="M5 11a7 7 0 0 0 14 0M12 18v3M9 21h6" /></svg>;
     case 'more': return <svg {...common}><circle cx="5" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="19" cy="12" r="1" fill="currentColor" stroke="none" /></svg>;
+    case 'pause': return <svg {...common}><path d="M8 5v14M16 5v14" /></svg>;
     case 'play': return <svg {...common}><path d="m8 5 11 7-11 7z" /></svg>;
     case 'plus': return <svg {...common}><path d="M12 5v14M5 12h14" /></svg>;
     case 'record': return <svg {...common}><circle cx="12" cy="12" r="6" fill="currentColor" stroke="none" /></svg>;
