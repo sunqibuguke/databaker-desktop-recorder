@@ -268,7 +268,7 @@ function SilencePairReadout({ pair, hint }: { pair: SilencePairView; hint?: bool
     <span className={pair.headWarn ? 'silence-readout short' : 'silence-readout'}>{pair.headText}</span>
     <span className={pair.tailMet ? 'silence-readout met' : 'silence-readout'}>{pair.tailText}</span>
     {pair.extra ? <span className="silence-readout note">{pair.extra}</span> : null}
-    {hint && pair.hint ? <small className="silence-hint">{pair.hint}</small> : null}
+    {hint && pair.hint ? <small className="silence-hint" title={pair.hint}>{pair.hint}</small> : null}
   </span>;
 }
 
@@ -2970,14 +2970,19 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           </div>}
           <section className="script-monitor"><header><span>{t('recorder.currentSentence')}</span><div><span className="studio-cue">{cueLabel}</span><em>{workflowComplete ? t('recorder.itemsCount', { count: items.length }) : `${currentIndex + 1} / ${items.length}`}</em></div></header><div className={`prompt-surface ${captureFault ? 'fault' : cue === 'pending' ? 'pending' : cue === 'recording' ? 'live' : ''}`}>{captureFault ? <span className="label-chip">{t('recorder.stopReadingChip')}</span> : noiseCheckBlocksAttempt ? <span className="label-chip">{t('recorder.envChip')}</span> : (workflowComplete || currentItem?.label) && <span className="label-chip">{workflowComplete ? t('recorder.allDoneChip') : currentItem?.label}</span>}<p>{captureFault ? captureFaultCopy.title : noiseCheckBlocksAttempt ? t('recorder.keepQuiet') : workflowComplete ? t('recorder.scriptFinished') : currentItem?.text ?? t('recorder.noText')}</p><small>{captureFault ? captureFaultCopy.detail : noiseCheckBlocksAttempt ? noiseCheckMessage : workflowComplete ? t('recorder.exportLater') : <>{currentItem?.id}</>}</small></div></section>
           <section className="signal-monitor"><header><div><strong>{t('recorder.waveform')}</strong>{captureActive ? <SilencePairReadout pair={silencePair} /> : reviewAttempt ? <SilencePairReadout pair={reviewSilencePair({ attempt: reviewAttempt, sampleRate: sampleRateForDisplay, requiredMs: effectiveSilenceDurationMs, peak: reviewPeak })} /> : null}</div><div>{captureActive ? <><span>RMS <b>{db(meter.rms)}</b></span><span>PEAK <b className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</b></span></> : <span>{reviewAttempt ? formatDuration(reviewAttempt.end_sample - reviewAttempt.start_sample, sampleRateForDisplay) : t('recorder.noTakeWaveform')}</span>}</div></header><div className="signal-scope"><WebGLWaveform key={showReviewWaveform ? `${sessionDir}:${reviewAttempt?.attempt_id}` : `${sessionDir}:${waveformGeneration}`} mode={showReviewWaveform ? 'review' : 'live'} bins={showReviewWaveform ? reviewWaveformBins : (meter.waveform ?? [])} capturedSamples={meter.captured_samples} waveformEndSample={meter.waveform_end_sample} recording={recording && !captureFault} takeStartSample={recording && !captureFault ? attemptStartSample : undefined} sampleRate={sampleRateForDisplay} /><div className="scope-scale"><span>−1.0</span><span>−0.5</span><span>0</span><span>+0.5</span><span>+1.0</span></div></div><div className="horizontal-meter"><i className="meter-rms" style={{ width: `${rmsPercent}%` }} /><i className="meter-peak" style={{ left: `${peakPercent}%` }} /></div></section>
-          {audioUrl && <audio ref={audioRef} src={audioUrl} controls className="audio-player" />}
+          <div className={`audio-player-slot${audioUrl ? ' has-player' : ''}`}>
+            {audioUrl && <audio ref={audioRef} src={audioUrl} controls className="audio-player" />}
+          </div>
           <section className="transport-panel">
-            <div className="transport-secondary">
-              {showReviewSilenceBill && <span className="silence-bill" data-testid="review-silence-bill"><SilencePairReadout pair={silencePair} hint /></span>}
+            <div className="transport-review">
+              {showReviewSilenceBill && <span className={`silence-bill${silencePair.hint || silencePair.extra ? ' has-issue' : ''}`} data-testid="review-silence-bill"><SilencePairReadout pair={silencePair} hint /></span>}
+            </div>
+            <div className="transport-controls">
+              <div className="transport-secondary">
               <button title={t('recorder.previewKey')} onClick={() => void previewAttempt()} disabled={recording || !currentItem?.attempts.length || Boolean(busy)}><Icon name="play" /><span>{t('recorder.preview')}</span><kbd>P</kbd></button>
               {captureActive && <button title={t('recorder.retakeKey')} onClick={() => void startAttempt()} disabled={workspaceFaulted || captureFault || noiseCheckBlocksAttempt || recording || !currentItem || Boolean(busy)}><Icon name="retake" /><span>{t('recorder.retake')}</span><kbd>R</kbd></button>}
-            </div>
-            <div className="transport-primary">
+              </div>
+              <div className="transport-primary">
               {!captureActive
                 ? workspaceFaulted
                   ? <button data-testid="main-transport" className="main-transport start" disabled><span><Icon name="microphone" /></span><strong>{t('recorder.readonlyRepair')}</strong></button>
@@ -2996,7 +3001,8 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
                       ? <button data-testid="main-transport" className="main-transport start" onClick={() => void startAttempt()} disabled={Boolean(busy)}><span><Icon name="record" /></span><strong>{t('recorder.startRecording')}</strong><kbd>SPACE</kbd></button>
                       : <button data-testid="main-transport" className="main-transport handled" disabled><span><Icon name="check" /></span><strong>{t('recorder.itemHandled')}</strong><kbd>R</kbd></button>}
             </div>
-            <div className="transport-secondary right">{captureActive && <button title={t('recorder.skipKey')} onClick={() => void skipItem()} disabled={captureFault || recording || Boolean(busy) || !currentItem || !['pending', 'review'].includes(currentItem.status)}><Icon name="skip" /><span>{t('recorder.skip')}</span><kbd>S</kbd></button>}</div>
+              <div className="transport-secondary right">{captureActive && <button title={t('recorder.skipKey')} onClick={() => void skipItem()} disabled={captureFault || recording || Boolean(busy) || !currentItem || !['pending', 'review'].includes(currentItem.status)}><Icon name="skip" /><span>{t('recorder.skip')}</span><kbd>S</kbd></button>}</div>
+            </div>
           </section>
         </div>
       </main>
