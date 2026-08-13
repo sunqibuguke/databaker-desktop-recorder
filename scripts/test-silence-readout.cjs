@@ -7,8 +7,10 @@ async function main() {
     actualHeadSilenceMs,
     liveSilenceHint,
     liveSilencePair,
+    peakFromWaveformBins,
     peakNoteFromLevel,
     reviewSilencePair,
+    takeReviewPeak,
   } = await import(pathToFileURL(path.join(__dirname, '..', 'src', 'silence-readout.ts')).href);
 
   assert.equal(actualHeadSilenceMs(1_000, 1_480, 48_000), 10);
@@ -54,6 +56,13 @@ async function main() {
   assert.equal(tailReady.tailText, '尾已够 · 1000 ms');
   assert.equal(tailReady.tailMet, true);
 
+  assert.equal(peakFromWaveformBins([[-0.2, 0.31], [-0.05, 0.08]]), 0.31);
+  assert.equal(takeReviewPeak({ livePeak: 0.02, waveformBins: [[-0.2, 0.31]] }), 0.31);
+  assert.ok(
+    takeReviewPeak({ livePeak: 0.02, waveformBins: [[-0.2, 0.31]] }) >= 0.04,
+    'a decaying live meter must not override the take’s true peak',
+  );
+
   const bill = reviewSilencePair({
     attempt: {
       attempt_id: '001-a2',
@@ -77,6 +86,62 @@ async function main() {
   assert.equal(bill.tailMet, false);
   assert.match(bill.hint, /首尾都短于 1.0 s/);
   assert.equal(bill.extra, '');
+
+  const quietDecayed = reviewSilencePair({
+    attempt: {
+      attempt_id: '001-a3',
+      start_sample: 0,
+      recording_started_sample: 0,
+      content_started_sample: 4_800,
+      end_sample: 48_000,
+      tail_silence_samples: 48_000,
+      status: 'recorded',
+      created_at: '2026-08-13T00:00:00Z',
+    },
+    sampleRate: 48_000,
+    requiredMs: 1_000,
+    peak: 0.02,
+  });
+  assert.equal(quietDecayed.extra, '', 'almost-silent is off unless the operator enables the rule');
+
+  const quietEnabled = reviewSilencePair({
+    attempt: {
+      attempt_id: '001-a3',
+      start_sample: 0,
+      recording_started_sample: 0,
+      content_started_sample: 4_800,
+      end_sample: 48_000,
+      tail_silence_samples: 48_000,
+      status: 'recorded',
+      created_at: '2026-08-13T00:00:00Z',
+    },
+    sampleRate: 48_000,
+    requiredMs: 1_000,
+    peak: 0.02,
+    showAlmostSilent: true,
+  });
+  assert.equal(quietEnabled.extra, '几乎无声');
+
+  const hiddenHeadTail = reviewSilencePair({
+    attempt: {
+      attempt_id: '001-a4',
+      start_sample: 2_400_000,
+      recording_started_sample: 2_400_000,
+      content_started_sample: 2_409_600,
+      end_sample: 2_496_000,
+      tail_silence_samples: 9_600,
+      required_tail_silence_samples: 48_000,
+      forced_without_tail_silence: true,
+      status: 'recorded',
+      created_at: '2026-08-13T00:00:00Z',
+    },
+    sampleRate: 48_000,
+    requiredMs: 1_000,
+    peak: 0.3,
+    showHeadTailHints: false,
+  });
+  assert.equal(hiddenHeadTail.headWarn, false);
+  assert.equal(hiddenHeadTail.hint, '');
 
   const rising = liveSilenceHint({ liveMs: 320, requiredMs: 1_000 });
   assert.equal(rising.text, '静音 320 / 1000 ms');

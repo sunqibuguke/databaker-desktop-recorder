@@ -2459,8 +2459,14 @@ async function requestAttemptWithReconciliation(
     && typeof payload.force !== 'boolean') {
     throw new Error('结束录音的 force 参数无效');
   }
+  if (command === 'stop_attempt'
+    && payload.discard_empty !== undefined
+    && typeof payload.discard_empty !== 'boolean') {
+    throw new Error('结束录音的 discard_empty 参数无效');
+  }
   const itemId = payload.item_id;
   const force = command === 'stop_attempt' && payload.force === true;
+  const discardEmpty = command !== 'stop_attempt' || payload.discard_empty !== false;
   const attemptIntent = engineIntent;
   const expectedSessionDir = attemptIntent.sessionDir;
   if (!expectedSessionDir) throw new Error('当前没有可对账的录音任务');
@@ -2481,10 +2487,10 @@ async function requestAttemptWithReconciliation(
   }
 
   // item_id is renderer/main-process reconciliation metadata for stop_attempt.
-  // Rust intentionally receives only its existing StopAttemptPayload shape.
+  // Rust receives only force and discard_empty.
   const enginePayload = command === 'start_attempt'
     ? { item_id: itemId }
-    : { force };
+    : { force, discard_empty: discardEmpty };
   let requestError: unknown;
   try {
     const result = await engine.request(

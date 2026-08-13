@@ -372,6 +372,11 @@ input:disabled { color: #7d7d7d; background: #222; }
 .silence-review-toggle { display: flex; align-items: flex-start; gap: 8px; margin: 12px 0 2px; padding-top: 12px; border-top: 1px solid #353a38; color: #cbd1cf; font-size: var(--text-xs); }
 .silence-review-toggle input { margin-top: 2px; }
 .silence-review-toggle small { display: block; margin-top: 4px; color: #747c79; font-size: var(--text-xs); line-height: 1.45; }
+.automation-rules { margin: 12px 0 2px; padding-top: 12px; border-top: 1px solid #353a38; }
+.automation-rules > header { display: block; margin-bottom: 4px; color: #cbd1cf; font-size: var(--text-xs); }
+.automation-rules > header strong, .automation-rules > header small { display: block; }
+.automation-rules > header small { margin-top: 4px; color: #747c79; font-size: var(--text-xs); line-height: 1.45; }
+.automation-rules .automation-rule { margin: 8px 0 0; padding-top: 8px; border-top: 1px solid #2c322f; }
 .script-monitor.cue-fault { border-color: #7b4348; }
 .signal-monitor > header > div { display: flex; align-items: center; gap: 10px; }.signal-monitor > header strong { color: #aaa; font-size: var(--text-xs); font-weight: 500; }.signal-monitor > header span { color: #696969; font: var(--text-xs) var(--mono); letter-spacing: .05em; }.signal-monitor > header > div:last-child span { display: flex; gap: 4px; }.signal-monitor > header b { color: #b7b7b7; font-weight: 500; }
 .signal-scope { position: relative; min-height: 0; flex: 1; padding-bottom: 15px; background: #121515; }

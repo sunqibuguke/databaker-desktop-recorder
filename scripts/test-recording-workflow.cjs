@@ -71,6 +71,13 @@ async function main() {
     false,
     'a persisted pass keeps every later sentence and retake open',
   );
+  assert.equal(sessionNoiseGate(null, false, false), 'ready');
+  assert.equal(sessionNoiseGate({ passed: false }, true, false), 'ready');
+  assert.equal(
+    shouldAutoRunSessionNoiseCheck(null, true, false),
+    false,
+    'a disabled room-noise rule must not auto-run the gate',
+  );
   const firstNoiseOperation = { activation: 1, request: 1, sessionDir: '/recordings/session-a' };
   const retryNoiseOperation = { activation: 1, request: 2, sessionDir: '/recordings/session-a' };
   const recoveredNoiseOperation = { activation: 2, request: 3, sessionDir: '/recordings/session-a' };

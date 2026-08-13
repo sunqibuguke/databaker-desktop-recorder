@@ -1,4 +1,5 @@
 import { t } from '../shared/i18n/index.ts';
+import { loadAutomationRules, saveAutomationRules } from './automation-rules.ts';
 import type { Attempt, HeadSilencePhase } from './types';
 
 export type SilencePairView = {
@@ -101,11 +102,36 @@ export function liveSilencePair(input: {
   };
 }
 
+export function peakFromWaveformBins(bins: Array<[number, number]> | undefined): number {
+  if (!bins?.length) return 0;
+  let peak = 0;
+  for (const [minimum, maximum] of bins) {
+    if (Number.isFinite(minimum)) peak = Math.max(peak, Math.abs(minimum));
+    if (Number.isFinite(maximum)) peak = Math.max(peak, Math.abs(maximum));
+  }
+  return peak;
+}
+
+export function takeReviewPeak(input: {
+  livePeak?: number;
+  storedPeak?: number;
+  waveformBins?: Array<[number, number]>;
+}): number {
+  return Math.max(
+    peakFromWaveformBins(input.waveformBins),
+    Number.isFinite(input.storedPeak) ? Number(input.storedPeak) : 0,
+    Number.isFinite(input.livePeak) ? Number(input.livePeak) : 0,
+  );
+}
+
 export function reviewSilencePair(input: {
   attempt: Attempt | null | undefined;
   sampleRate: number;
   requiredMs: number;
   peak?: number;
+  showHeadTailHints?: boolean;
+  showAlmostSilent?: boolean;
+  showPeakHigh?: boolean;
 }): SilencePairView {
   const required = Math.max(0, input.requiredMs);
   const attempt = input.attempt;
@@ -124,11 +150,18 @@ export function reviewSilencePair(input: {
   const tailMs = attempt.tail_silence_samples === undefined
     ? null
     : samplesToMs(attempt.tail_silence_samples, input.sampleRate);
-  const headShort = isHeadSilenceShort(headMs, required);
-  const tailShort = attempt.forced_without_tail_silence === true
-    || isTailSilenceShort(tailMs, required);
+  const showHeadTailHints = input.showHeadTailHints !== false;
+  const headShort = showHeadTailHints && isHeadSilenceShort(headMs, required);
+  const tailShort = showHeadTailHints && (
+    attempt.forced_without_tail_silence === true
+    || isTailSilenceShort(tailMs, required)
+  );
   const note = peakNoteFromLevel(input.peak);
-  const extra = note === 'clip' ? t('silence.peakHigh') : note === 'quiet' ? t('silence.almostSilent') : '';
+  const extra = note === 'clip' && input.showPeakHigh
+    ? t('silence.peakHigh')
+    : note === 'quiet' && input.showAlmostSilent
+      ? t('silence.almostSilent')
+      : '';
   const requiredLabel = `${(required / 1_000).toFixed(1)} s`;
   let hint = '';
   if (headShort && tailShort) hint = t('silence.hintBoth', { required: requiredLabel });
@@ -173,25 +206,11 @@ export function liveHeadMsFromMeter(input: {
   return actualHeadSilenceMs(input.armedSample, input.contentStartedSample, input.sampleRate);
 }
 
-const POST_TAKE_STORAGE_PREFIX = 'databaker:post-take-silence:';
-
 export function loadPostTakeSilenceReview(sessionDir: string): boolean {
-  if (!sessionDir) return true;
-  try {
-    const stored = localStorage.getItem(`${POST_TAKE_STORAGE_PREFIX}${sessionDir}`);
-    if (stored === '0') return false;
-    if (stored === '1') return true;
-  } catch {
-    return true;
-  }
-  return true;
+  return loadAutomationRules(sessionDir).headTailSilence;
 }
 
 export function savePostTakeSilenceReview(sessionDir: string, enabled: boolean): void {
-  if (!sessionDir) return;
-  try {
-    localStorage.setItem(`${POST_TAKE_STORAGE_PREFIX}${sessionDir}`, enabled ? '1' : '0');
-  } catch {
-    // Preference is workstation-local; a blocked store must not stop capture.
-  }
+  const current = loadAutomationRules(sessionDir);
+  saveAutomationRules(sessionDir, { ...current, headTailSilence: enabled });
 }

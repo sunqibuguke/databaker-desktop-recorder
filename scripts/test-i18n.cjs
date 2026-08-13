@@ -49,6 +49,12 @@ async function main() {
   assert.equal(t('recorder.headTail'), '首 / 尾');
   assert.equal(t('recorder.showPostTakeReview'), '停句后显示首尾检查');
   assert.equal(t('recorder.showPostTakeReviewHint'), '首是点击到开口，尾是最后有声到停止。等待朗读是定时器，不是首静音。关闭只藏账单，空格照旧。');
+  assert.equal(t('recorder.automationRules'), '自动化规则');
+  assert.equal(t('recorder.ruleHeadTail'), '首尾静音检查');
+  assert.equal(t('recorder.ruleDiscardEmpty'), '空录丢弃');
+  assert.equal(t('recorder.ruleEnvCheck'), '进任务环境检测');
+  assert.equal(t('recorder.ruleAlmostSilent'), '几乎无声提示');
+  assert.equal(t('recorder.rulePeakHigh'), '峰值偏高提示');
   assert.equal(t('setup.exclusive'), '独占');
   assert.equal(t('setup.shared'), '系统混音');
   assert.equal(t('setup.exclusiveRecommended'), '独占（推荐）');

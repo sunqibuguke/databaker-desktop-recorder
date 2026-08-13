@@ -418,10 +418,25 @@ fn effective_capture_share_mode(requested: CaptureShareMode) -> CaptureShareMode
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
 pub struct StopAttemptPayload {
     #[serde(default)]
     pub force: bool,
+    #[serde(default = "default_true")]
+    pub discard_empty: bool,
+}
+
+impl Default for StopAttemptPayload {
+    fn default() -> Self {
+        Self {
+            force: false,
+            discard_empty: true,
+        }
+    }
 }
 
 fn default_sample_rate() -> u32 {
@@ -2979,7 +2994,7 @@ impl Engine {
         }))
     }
 
-    pub fn stop_attempt(&mut self, force: bool) -> Result<Value> {
+    pub fn stop_attempt(&mut self, force: bool, discard_empty: bool) -> Result<Value> {
         let session = self.active_session_mut()?;
         session.ensure_metadata_mutation_allowed()?;
         let active = session
@@ -3022,7 +3037,7 @@ impl Engine {
         } else {
             observed_content_started_sample
         };
-        if content_started_sample == 0 {
+        if content_started_sample == 0 && discard_empty {
             session.persist(
                 "attempt_discarded",
                 json!({
@@ -9754,7 +9769,7 @@ mod tests {
         engine.session = Some(session);
 
         engine.start_attempt("001").unwrap();
-        let before_pass = engine.stop_attempt(true).unwrap();
+        let before_pass = engine.stop_attempt(true, true).unwrap();
         assert_eq!(before_pass["discarded"], true);
         assert!(before_pass["attempt"].is_null());
 
@@ -9774,7 +9789,7 @@ mod tests {
                 .phase
                 .store(HEAD_SILENCE_PASSED, Ordering::Release);
         }
-        let before_speech = engine.stop_attempt(true).unwrap();
+        let before_speech = engine.stop_attempt(true, true).unwrap();
         assert_eq!(before_speech["discarded"], true);
         assert!(before_speech["attempt"].is_null());
         assert!(
@@ -9801,7 +9816,7 @@ mod tests {
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
 
-        let stopped = engine.stop_attempt(true).unwrap();
+        let stopped = engine.stop_attempt(true, true).unwrap();
 
         assert_eq!(stopped["discarded"], true);
         assert!(stopped["attempt"].is_null());
@@ -9813,6 +9828,62 @@ mod tests {
         assert_eq!(
             journal.entries.last().unwrap()["event"],
             "attempt_discarded"
+        );
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn keep_empty_stop_without_speech_creates_an_attempt() {
+        let root = test_root("keep-empty-without-speech");
+        std::fs::create_dir_all(root.join("script")).unwrap();
+        let mut session = prepare_metadata_test_session(&root);
+        session.captured.store(100, Ordering::Release);
+        session.committed.store(100, Ordering::Release);
+        session.analyzed_samples.store(100, Ordering::Release);
+        session
+            .head_silence
+            .armed_sample
+            .store(20, Ordering::Release);
+        session
+            .head_silence
+            .progress_samples
+            .store(20, Ordering::Release);
+        session
+            .head_silence
+            .passed_sample
+            .store(40, Ordering::Release);
+        session
+            .head_silence
+            .phase
+            .store(HEAD_SILENCE_PASSED, Ordering::Release);
+        let (writer_tx, writer_rx) = bounded::<WriterMessage>(1);
+        session.writer_tx = writer_tx;
+        session.writer_join = Some(thread::spawn(move || {
+            if let Ok(WriterMessage::Checkpoint(reply)) = writer_rx.recv() {
+                let _ = reply.send(Ok(100));
+            }
+        }));
+        session.active_attempt = Some(ActiveAttempt {
+            item_id: "001".to_string(),
+            attempt_id: "001-a1".to_string(),
+            start_sample: 0,
+            recording_started_sample: 20,
+            input_discontinuity_count_at_start: 0,
+        });
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+
+        let stopped = engine.stop_attempt(true, false).unwrap();
+
+        assert_eq!(stopped["discarded"], Value::Null);
+        assert_eq!(stopped["attempt"]["attempt_id"], "001-a1");
+        assert_eq!(stopped["attempt"]["content_started_sample"], 0);
+        assert_eq!(stopped["attempt"]["start_sample"], 20);
+        assert_eq!(stopped["attempt"]["end_sample"], 100);
+        assert_eq!(
+            engine.session.as_ref().unwrap().snapshot.items[0].status,
+            "review"
         );
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
@@ -9835,7 +9906,7 @@ mod tests {
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
 
-        assert!(engine.stop_attempt(true).is_err());
+        assert!(engine.stop_attempt(true, true).is_err());
 
         let session = engine.session.as_ref().unwrap();
         assert!(session.active_attempt.is_some());
@@ -10031,7 +10102,7 @@ mod tests {
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
 
-        let stopped = engine.stop_attempt(true).unwrap();
+        let stopped = engine.stop_attempt(true, true).unwrap();
 
         assert_eq!(stopped["forced"], true);
         assert_eq!(stopped["attempt"]["attempt_id"], "001-a2");
@@ -10117,7 +10188,7 @@ mod tests {
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
 
-        let stopped = engine.stop_attempt(false).unwrap();
+        let stopped = engine.stop_attempt(false, true).unwrap();
 
         assert_eq!(stopped["attempt"]["start_sample"], 20);
         assert_eq!(stopped["attempt"]["forced_without_tail_silence"], true);
@@ -10199,7 +10270,7 @@ mod tests {
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
 
-        let stopped = engine.stop_attempt(false).unwrap();
+        let stopped = engine.stop_attempt(false, true).unwrap();
 
         assert_eq!(stopped["recovered_discontinuity"], true);
         assert_eq!(stopped["attempt"]["status"], "recorded");
@@ -10284,7 +10355,7 @@ mod tests {
 
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
-        let stopped = engine.stop_attempt(true).unwrap();
+        let stopped = engine.stop_attempt(true, true).unwrap();
 
         assert_eq!(stopped["interrupted"], true);
         assert_eq!(stopped["attempt"]["status"], "interrupted");

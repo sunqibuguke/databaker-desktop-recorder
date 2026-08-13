@@ -635,7 +635,8 @@ export function installDevRecorderMock() {
     }
     if (command === 'stop_attempt') {
       if (!activeAttempt) throw new Error('没有正在录制的版本');
-      if (!firstAttemptSignalSample) {
+      const discardEmpty = data.discard_empty !== false;
+      if (!firstAttemptSignalSample && discardEmpty) {
         const itemId = activeAttempt.item_id;
         activeAttempt = null;
         return { item_id: itemId, attempt: null, discarded: true, forced: true } as T;

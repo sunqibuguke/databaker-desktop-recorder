@@ -346,7 +346,7 @@ async function main() {
     assert.equal(stopped.reconciled_after_timeout, true);
     assert.deepEqual(
       engine.attemptCalls.at(-1).payload,
-      { force: false },
+      { force: false, discard_empty: true },
       'item_id is reconciliation-only metadata and must not reach Rust stop_attempt',
     );
     assert.ok(
@@ -364,7 +364,7 @@ async function main() {
     assert.equal(discarded.discarded, true);
     assert.equal(discarded.attempt, null);
     assert.equal(discarded.reconciled_after_timeout, true);
-    assert.deepEqual(engine.attemptCalls.at(-1).payload, { force: true });
+    assert.deepEqual(engine.attemptCalls.at(-1).payload, { force: true, discard_empty: true });
 
     engine.nextAttemptOutcome = 'timeout-start-wrong-item';
     await assert.rejects(

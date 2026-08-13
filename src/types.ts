@@ -40,6 +40,8 @@ export type Attempt = {
   forced_without_tail_silence?: boolean;
   tail_silence_samples?: number;
   required_tail_silence_samples?: number;
+  /** True peak of this take, linear 0–1. Absent on older takes. */
+  peak?: number;
   status: string;
   created_at: string;
 };

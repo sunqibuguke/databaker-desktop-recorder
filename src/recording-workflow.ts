@@ -170,7 +170,9 @@ export function workflowShortcutAction(
 export function sessionNoiseGate(
   noiseCheck: PersistedNoiseCheck,
   checking: boolean,
+  enabled = true,
 ): SessionNoiseGate {
+  if (!enabled) return 'ready';
   if (checking) return 'checking';
   if (!noiseCheck) return 'pending';
   return noiseCheck.passed ? 'ready' : 'failed';
@@ -179,8 +181,9 @@ export function sessionNoiseGate(
 export function shouldAutoRunSessionNoiseCheck(
   noiseCheck: PersistedNoiseCheck,
   isNewActivation: boolean,
+  enabled = true,
 ): boolean {
-  return isNewActivation && !noiseCheck;
+  return enabled && isNewActivation && !noiseCheck;
 }
 
 export function isCurrentSessionNoiseCheckOperation(

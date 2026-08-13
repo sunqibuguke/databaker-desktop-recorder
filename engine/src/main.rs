@@ -283,7 +283,7 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
             } else {
                 parse(command.payload)?
             };
-            engine.stop_attempt(payload.force)
+            engine.stop_attempt(payload.force, payload.discard_empty)
         }
         "accept_attempt" => {
             let payload: AttemptPayload = parse(command.payload)?;
