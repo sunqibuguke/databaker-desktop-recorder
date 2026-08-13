@@ -5,6 +5,8 @@ type PersistedNoiseCheck = { passed: boolean } | null | undefined;
 
 export type IdlePrimaryAction = 'finish' | 'accept' | 'start' | 'retake-only' | 'none';
 export type WorkflowShortcutAction = 'finish' | 'accept' | 'start' | 'retake' | 'none';
+export type ViewShortcutAction = 'preview' | 'enter-capture' | 'none';
+export type WorkspacePosture = 'home' | 'setup' | 'view' | 'record';
 export type CaptureExitAction = 'pause' | 'complete' | 'fault';
 export type CaptureExitDialog = 'pause' | 'finish';
 export type SessionNoiseGate = 'pending' | 'checking' | 'failed' | 'ready';
@@ -95,6 +97,37 @@ export function idlePrimaryAction(
   if (currentItem.status === 'review') return 'accept';
   if (currentItem.status === 'pending') return 'start';
   return 'retake-only';
+}
+
+export function workspacePosture(
+  phase: 'home' | 'setup' | 'running',
+  captureActive: boolean,
+): WorkspacePosture {
+  if (phase !== 'running') return phase;
+  return captureActive ? 'record' : 'view';
+}
+
+export function viewShortcutAction(code: string, key: string): ViewShortcutAction {
+  if (code === 'Space' || key.toLowerCase() === 'p') return 'preview';
+  if (key.toLowerCase() === 'r') return 'enter-capture';
+  return 'none';
+}
+
+export function resolveRunningItemIndex(
+  items: readonly { id: string; status: string }[],
+  activeItemId?: string | null,
+  keepItemId?: string | null,
+): number {
+  if (activeItemId) {
+    const active = items.findIndex((item) => item.id === activeItemId);
+    if (active >= 0) return active;
+  }
+  if (keepItemId) {
+    const kept = items.findIndex((item) => item.id === keepItemId);
+    if (kept >= 0) return kept;
+  }
+  const next = items.findIndex((item) => item.status === 'review' || item.status === 'pending');
+  return next >= 0 ? next : 0;
 }
 
 export function workflowShortcutAction(

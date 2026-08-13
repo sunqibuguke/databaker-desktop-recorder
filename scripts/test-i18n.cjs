@@ -37,6 +37,12 @@ async function main() {
   assert.equal(t('settings.title'), '应用设置');
   assert.equal(t('home.newRecording'), '新建录制');
   assert.equal(t('home.emptyTitle'), '开始第一条录制任务');
+  assert.equal(t('home.viewTask'), '查看');
+  assert.equal(t('home.recordTask'), '录制');
+  assert.equal(t('home.subtitle'), '查看进度与录音，或进入录制继续作业。');
+  assert.equal(t('recorder.previewThis'), '试听本句');
+  assert.equal(t('recorder.enterCapture'), '进入录制');
+  assert.equal(t('recorder.leaveView'), '退出查看');
   assert.equal(t('notice.importedItems', { count: 12 }), '已导入 12 条文本');
   assert.equal(t('recorder.headTail'), '首 / 尾');
   assert.equal(t('recorder.showPostTakeReview'), '停句后显示首尾检查');

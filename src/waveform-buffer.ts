@@ -68,6 +68,11 @@ export function advanceWaveformPlayhead(
   return Math.min(latest, current + advance);
 }
 
+export function reviewBinHorizontalPosition(index: number, count: number): number {
+  if (count <= 0) return 0;
+  return -1 + (index + 0.5) / Math.max(1, count) * 2;
+}
+
 export function waveformSampleHorizontalPosition(
   sample: number,
   playheadSample: number,

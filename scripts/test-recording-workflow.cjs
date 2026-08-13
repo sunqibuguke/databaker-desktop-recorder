@@ -16,9 +16,12 @@ async function main() {
     idlePrimaryAction,
     isCurrentSessionNoiseCheckOperation,
     isFinalReview,
+    resolveRunningItemIndex,
     sessionNoiseGate,
     shouldAutoRunSessionNoiseCheck,
+    viewShortcutAction,
     workflowShortcutAction,
+    workspacePosture,
   } = await import(pathToFileURL(modulePath).href);
   const {
     DIGITAL_SILENCE_WARNING,
@@ -249,6 +252,41 @@ async function main() {
     workflowShortcutAction('KeyR', 'r', 'retake-only', true),
     'retake',
     'R remains an explicit retake action',
+  );
+
+  assert.equal(workspacePosture('running', false), 'view');
+  assert.equal(workspacePosture('running', true), 'record');
+  assert.equal(workspacePosture('home', false), 'home');
+  assert.equal(viewShortcutAction('Space', ' '), 'preview');
+  assert.equal(viewShortcutAction('KeyP', 'p'), 'preview');
+  assert.equal(viewShortcutAction('KeyR', 'r'), 'enter-capture');
+  assert.equal(viewShortcutAction('KeyS', 's'), 'none');
+  assert.equal(
+    resolveRunningItemIndex(
+      [{ id: 'a', status: 'accepted' }, { id: 'b', status: 'accepted' }, { id: 'c', status: 'accepted' }],
+      null,
+      'c',
+    ),
+    2,
+    'entering capture from view must keep the sentence the operator was inspecting',
+  );
+  assert.equal(
+    resolveRunningItemIndex(
+      [{ id: 'a', status: 'accepted' }, { id: 'b', status: 'pending' }],
+      null,
+      null,
+    ),
+    1,
+    'arming from the list without a kept sentence still lands on the first pending row',
+  );
+  assert.equal(
+    resolveRunningItemIndex(
+      [{ id: 'a', status: 'accepted' }, { id: 'b', status: 'accepted' }],
+      'b',
+      'a',
+    ),
+    1,
+    'a live attempt wins over a kept inspect sentence',
   );
 
   const wrappedReview = [item('review'), item('accepted'), item('accepted')];

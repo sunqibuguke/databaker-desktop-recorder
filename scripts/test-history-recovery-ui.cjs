@@ -9,6 +9,7 @@ async function main() {
     engineRecoveryFailure,
     isReconciliableInactiveStopError,
     planHistoryRecovery,
+    planTaskListEntry,
   } = await import(pathToFileURL(modulePath).href);
   const base = {
     is_active: false,
@@ -57,6 +58,47 @@ async function main() {
     planHistoryRecovery({ ...base, is_active: true }),
     { canResume: false, canSeal: false, primary: null, secondary: null },
     'an active session uses the dedicated return-to-recording action',
+  );
+
+  assert.deepEqual(
+    planTaskListEntry({ ...base, is_active: true, status: 'recording' }),
+    { kind: 'return' },
+    'an active session keeps a single return-to-recording action',
+  );
+  assert.deepEqual(
+    planTaskListEntry({ ...base, is_active: true, status: 'stopping' }),
+    { kind: 'continue-stop' },
+    'an active safe-stop keeps the dedicated continue-stop action',
+  );
+  assert.deepEqual(
+    planTaskListEntry({ ...base, status: 'stopped', pending_items: 2 }),
+    { kind: 'view-record', viewPrimary: false, recordEnabled: true },
+    'an unfinished stopped task offers record as the primary row action',
+  );
+  assert.deepEqual(
+    planTaskListEntry({ ...base, status: 'stopped' }),
+    { kind: 'view-record', viewPrimary: true, recordEnabled: true },
+    'a completed stopped task offers view as the primary row action',
+  );
+  assert.deepEqual(
+    planTaskListEntry({ ...base, status: 'recording', pending_items: 2 }),
+    { kind: 'view-only', recordDisabledReason: 'fault' },
+    'an interrupted unfinished task must be sealed before record can arm capture',
+  );
+  assert.deepEqual(
+    planTaskListEntry({ ...base, status: 'faulted', pending_items: 2 }),
+    { kind: 'view-only', recordDisabledReason: 'fault' },
+    'faulted audio stays viewable but cannot jump into capture',
+  );
+  assert.deepEqual(
+    planTaskListEntry({ ...base, status: 'stopped', history_issue: 'snapshot unreadable' }),
+    { kind: 'view-only', recordDisabledReason: 'issue' },
+    'a history issue blocks record even when the row looks complete',
+  );
+  assert.deepEqual(
+    planTaskListEntry({ ...base, status: 'stopped', data_health: 'readonly' }),
+    { kind: 'view-only', recordDisabledReason: 'readonly' },
+    'readonly health keeps view available and disables record',
   );
 
   const healthy = { faulted: false, overflow_samples: 0, storage_status: 'healthy' };

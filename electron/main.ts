@@ -289,6 +289,8 @@ const allowedCommands = new Set([
   'skip_item',
   'render_attempt',
   'render_session_attempt',
+  'preview_session_waveform',
+  'preview_attempt_waveform',
   'select_session_attempt',
   'get_state',
   'stop_session',
@@ -3926,6 +3928,7 @@ function registerIpc(): void {
     }
     if (command === 'inspect_session'
       || command === 'render_session_attempt'
+      || command === 'preview_session_waveform'
       || command === 'select_session_attempt') {
       const sessionDir = (payload as { session_dir?: unknown })?.session_dir;
       if (typeof sessionDir !== 'string') throw new Error('录制目录无效');
@@ -3946,7 +3949,7 @@ function registerIpc(): void {
           ...(payload as Record<string, unknown>),
           session_dir: canonical,
           expected_session_id: binding.sessionId,
-        }, command === 'render_session_attempt' ? 60_000 : 20_000);
+        }, command === 'render_session_attempt' || command === 'preview_session_waveform' ? 60_000 : 20_000);
         await assertAuthorizedSessionUnchanged(binding, authorizedRoots);
         transitionEngineIntent(inspectIntent, 'idle', null);
         rememberKnownSession(canonical, binding.sessionId);
@@ -4116,7 +4119,7 @@ function registerIpc(): void {
     if (command === 'start_attempt' || command === 'stop_attempt') {
       return await requestAttemptWithReconciliation(command, payload);
     }
-    const timeout = 20_000;
+    const timeout = command === 'preview_attempt_waveform' ? 60_000 : 20_000;
     const commandIntent = engineIntent;
     try {
       const result = await activeEngine.request(command, payload, timeout);

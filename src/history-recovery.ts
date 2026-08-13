@@ -14,6 +14,19 @@ type HistoryRecoveryFields = Pick<
   'is_active' | 'overflow_samples' | 'pending_items' | 'review_items' | 'status'
 >;
 
+type TaskListFields = HistoryRecoveryFields & Pick<
+  RecordingHistoryEntry,
+  'history_issue' | 'data_health'
+>;
+
+export type TaskListRecordDisabledReason = 'fault' | 'issue' | 'readonly';
+
+export type TaskListEntry =
+  | { kind: 'return' }
+  | { kind: 'continue-stop' }
+  | { kind: 'view-record'; viewPrimary: boolean; recordEnabled: boolean }
+  | { kind: 'view-only'; recordDisabledReason: TaskListRecordDisabledReason };
+
 export type HistoryRecoveryPlan = {
   canResume: boolean;
   canSeal: boolean;
@@ -81,6 +94,33 @@ export function planHistoryRecovery(recording: HistoryRecoveryFields): HistoryRe
   }
 
   return { canResume: false, canSeal: false, primary: null, secondary: null };
+}
+
+/**
+ * Home-row actions declare an intent at the door: view (inspect, card off)
+ * or record (activate capture). Recovery/seal stay in overflow. A row that
+ * still needs offline repair must not jump straight into exclusive capture.
+ */
+export function planTaskListEntry(recording: TaskListFields): TaskListEntry {
+  if (recording.is_active) {
+    return recording.status === 'stopping' ? { kind: 'continue-stop' } : { kind: 'return' };
+  }
+  if (recording.history_issue) {
+    return { kind: 'view-only', recordDisabledReason: 'issue' };
+  }
+  if (recording.data_health === 'readonly') {
+    return { kind: 'view-only', recordDisabledReason: 'readonly' };
+  }
+  const recovery = planHistoryRecovery(recording);
+  if (recovery.canSeal) {
+    return { kind: 'view-only', recordDisabledReason: 'fault' };
+  }
+  const unfinished = recording.pending_items + recording.review_items > 0;
+  return {
+    kind: 'view-record',
+    viewPrimary: !unfinished,
+    recordEnabled: true,
+  };
 }
 
 export function engineRecoveryFailure(message: EngineEvent): EngineRecoveryFailedPayload | null {

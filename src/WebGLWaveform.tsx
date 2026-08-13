@@ -8,6 +8,7 @@ import {
   reconcileWaveformTimelineSample,
   sampleIsRecordedTake,
   WAVEFORM_BIN_SAMPLES,
+  reviewBinHorizontalPosition,
   waveformSampleHorizontalPosition,
   waveformWindowBinCount,
   waveformWindowStartSample,
@@ -23,6 +24,7 @@ type Props = {
   recording: boolean;
   takeStartSample?: number;
   sampleRate: number;
+  mode?: 'live' | 'review';
 };
 
 const IDLE_WAVE_COLOR: [number, number, number, number] = [0.35, 0.72, 0.70, 0.78];
@@ -82,6 +84,7 @@ export function WebGLWaveform({
   recording,
   takeStartSample,
   sampleRate,
+  mode = 'live',
 }: Props) {
   const { t } = useI18n();
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -92,9 +95,14 @@ export function WebGLWaveform({
   const playheadSampleRef = useRef<number | null>(null);
   const takesRef = useRef<WaveformTakeSpan[]>([]);
   const sampleRateRef = useRef(sampleRate);
+  const modeRef = useRef(mode);
+  const reviewBinsRef = useRef<WaveformBin[]>(mode === 'review' ? bins : []);
+  modeRef.current = mode;
+  if (mode === 'review') reviewBinsRef.current = bins;
   const [available, setAvailable] = useState(true);
 
   useEffect(() => {
+    if (mode === 'review') return;
     const timelineSample = reconcileWaveformTimelineSample(
       capturedSamples,
       waveformEndSample,
@@ -267,6 +275,40 @@ export function WebGLWaveform({
       }
     };
 
+    const drawReviewWaveform = (reviewBins: WaveformBin[]) => {
+      if (!reviewBins.length) return;
+      const columnCapacity = Math.max(1, width) * 4;
+      const vertices = new Float32Array(columnCapacity);
+      let lines = 0;
+      let currentColumn = -1;
+      let columnMinimum = 1;
+      let columnMaximum = -1;
+      const flushColumn = () => {
+        if (currentColumn < 0 || columnMaximum < columnMinimum) return;
+        const x = -1 + (currentColumn + 0.5) / width * 2;
+        const cursor = lines * 4;
+        vertices[cursor] = x;
+        vertices[cursor + 1] = Math.max(-1, Math.min(1, columnMinimum * 0.92));
+        vertices[cursor + 2] = x;
+        vertices[cursor + 3] = Math.max(-1, Math.min(1, columnMaximum * 0.92));
+        lines += 1;
+      };
+      for (let index = 0; index < reviewBins.length; index += 1) {
+        const x = reviewBinHorizontalPosition(index, reviewBins.length);
+        const column = Math.max(0, Math.min(width - 1, Math.floor((x + 1) * width / 2)));
+        if (column !== currentColumn) {
+          flushColumn();
+          currentColumn = column;
+          columnMinimum = 1;
+          columnMaximum = -1;
+        }
+        columnMinimum = Math.min(columnMinimum, reviewBins[index][0]);
+        columnMaximum = Math.max(columnMaximum, reviewBins[index][1]);
+      }
+      flushColumn();
+      if (lines) uploadAndDraw(vertices.subarray(0, lines * 4), gl.LINES, RECORDED_WAVE_COLOR);
+    };
+
     const drawWaveform = (playheadSample: number, takes: WaveformTakeSpan[]) => {
       const history = historyRef.current;
       const historyEndSample = historyEndSampleRef.current;
@@ -357,6 +399,11 @@ export function WebGLWaveform({
       gl.enable(gl.BLEND);
       gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
       drawGrid();
+      if (modeRef.current === 'review') {
+        drawReviewWaveform(reviewBinsRef.current);
+        frame = requestAnimationFrame(render);
+        return;
+      }
       if (playheadSampleRef.current !== null) {
         takesRef.current = pruneWaveformTakeSpans(
           takesRef.current,

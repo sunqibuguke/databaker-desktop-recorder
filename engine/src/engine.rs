@@ -17,6 +17,7 @@ use crate::storage_guard::{
 use crate::wav::{
     RecoverableWav, WavEncoding, WavExportMode, WavExportWriter, automatic_wav_container_name,
     automatic_wav_file_size, slice_wav_mono, standard_wav_file_size, validate_standard_wav_size,
+    waveform_wav_mono,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
@@ -104,6 +105,7 @@ const CAPTURE_FAULT_INPUT_STREAM_ERROR: u32 = 4;
 // protocol loop before that deadline so a slow preview worker can never block
 // a subsequent safe-stop request until the 90-second process kill budget.
 const PREVIEW_RENDER_TIMEOUT: Duration = Duration::from_secs(15);
+const WAVEFORM_RENDER_TIMEOUT: Duration = Duration::from_secs(30);
 const AUDIO_FAULT_MARKER: &str = "metadata/audio-fault.json";
 // Provision this small, already-synced file while the recording volume still
 // has startup headroom. If a later PCM write consumes the last allocatable
@@ -1174,6 +1176,11 @@ enum WriterMessage {
         end_frame: u64,
         reply: Sender<Result<u64, String>>,
     },
+    WaveformRange {
+        start_frame: u64,
+        end_frame: u64,
+        reply: Sender<Result<Vec<[f32; 2]>, String>>,
+    },
     FaultAndStop(String),
     Stop(Sender<Result<u64, String>>),
 }
@@ -1851,6 +1858,39 @@ impl Engine {
             attempt.end_sample,
         )?;
         Ok(json!({ "file_path": destination }))
+    }
+
+    pub fn preview_session_waveform_expected(
+        &self,
+        session_dir: &Path,
+        expected_session_id: &str,
+        item_id: &str,
+        attempt_id: &str,
+    ) -> Result<Value> {
+        if self.session.is_some() {
+            bail!("当前已有录制进行中，请使用实时任务波形");
+        }
+        validate_offline_session_tree(session_dir)?;
+        let _session_lock = SessionLock::acquire(session_dir, &Utc::now().to_rfc3339())?;
+        let mut journal = read_journal(session_dir)?;
+        let snapshot = load_recovery_snapshot_for_session(
+            session_dir,
+            &mut journal,
+            Some(expected_session_id.trim()),
+        )?;
+        let attempt = usable_preview_attempt(&snapshot, item_id, attempt_id)?;
+        let bins = waveform_offline_range(
+            session_dir,
+            &snapshot,
+            attempt.start_sample,
+            attempt.end_sample,
+        )?;
+        Ok(json!({
+            "bins": bins,
+            "start_sample": attempt.start_sample,
+            "end_sample": attempt.end_sample,
+            "sample_rate": snapshot.audio_format.sample_rate,
+        }))
     }
 
     pub fn select_session_attempt_expected(
@@ -3219,6 +3259,31 @@ impl Engine {
         Ok(json!({ "file_path": destination }))
     }
 
+    pub fn preview_attempt_waveform(&mut self, item_id: &str, attempt_id: &str) -> Result<Value> {
+        let session = self.active_session_mut()?;
+        let attempt = session
+            .snapshot
+            .items
+            .iter()
+            .find(|item| item.id == item_id)
+            .and_then(|item| item.attempts.iter().find(|a| a.attempt_id == attempt_id))
+            .cloned()
+            .ok_or_else(|| anyhow!("attempt not found"))?;
+        if matches!(attempt.status.as_str(), "interrupted" | "needs_rerecord")
+            || attempt.end_sample <= attempt.start_sample
+        {
+            bail!("异常中断的录音版本不能试听或交付");
+        }
+        session.wait_until_committed(attempt.end_sample)?;
+        let bins = session.waveform_range(attempt.start_sample, attempt.end_sample)?;
+        Ok(json!({
+            "bins": bins,
+            "start_sample": attempt.start_sample,
+            "end_sample": attempt.end_sample,
+            "sample_rate": session.snapshot.audio_format.sample_rate,
+        }))
+    }
+
     pub fn get_state(&self) -> Result<Value> {
         let session = self.session.as_ref().ok_or_else(no_active_session_error)?;
         Ok(json!({
@@ -4292,6 +4357,69 @@ fn render_offline_range(
         }
     }
     Ok(end_sample - start_sample)
+}
+
+fn waveform_offline_range(
+    session_dir: &Path,
+    snapshot: &SessionSnapshot,
+    start_sample: u64,
+    end_sample: u64,
+) -> Result<Vec<[f32; 2]>> {
+    let master_relative = Path::new(&snapshot.master_audio);
+    if master_relative.is_absolute()
+        || master_relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("snapshot master_audio must be a safe relative path");
+    }
+    let source = session_dir.join(master_relative);
+    match MasterStorageKind::from_snapshot(snapshot)? {
+        MasterStorageKind::LegacySingleWav => waveform_wav_mono(
+            &source,
+            snapshot.audio_format.sample_rate,
+            snapshot.audio_format.bit_depth,
+            start_sample,
+            end_sample,
+        ),
+        MasterStorageKind::SegmentedWav => {
+            let mut segmented = SegmentedWav::resume(
+                &source,
+                snapshot.audio_format.sample_rate,
+                1,
+                snapshot.audio_format.bit_depth,
+                storage_layout_segment_frames(snapshot)?,
+            )?;
+            let dummy = source.join(".waveform-preview");
+            segmented
+                .prepare_export_range(&dummy, start_sample, end_sample)?
+                .waveform_bins()
+        }
+    }
+}
+
+fn usable_preview_attempt<'a>(
+    snapshot: &'a SessionSnapshot,
+    item_id: &str,
+    attempt_id: &str,
+) -> Result<&'a Attempt> {
+    let attempt = snapshot
+        .items
+        .iter()
+        .find(|item| item.id == item_id)
+        .and_then(|item| {
+            item.attempts
+                .iter()
+                .find(|attempt| attempt.attempt_id == attempt_id)
+        })
+        .ok_or_else(|| anyhow!("录音版本不存在"))?;
+    if matches!(attempt.status.as_str(), "interrupted" | "needs_rerecord")
+        || attempt.end_sample <= attempt.start_sample
+        || attempt.end_sample > snapshot.committed_samples
+    {
+        bail!("异常中断或样本边界越界的录音版本不能试听");
+    }
+    Ok(attempt)
 }
 
 /// Loads every mutable recovery projection while holding the same exclusive
@@ -5487,6 +5615,21 @@ impl RecordingSession {
             .context("audio preview render timed out")?
             .map_err(|message| anyhow!(message))?;
         Ok(frames)
+    }
+
+    fn waveform_range(&mut self, start_frame: u64, end_frame: u64) -> Result<Vec<[f32; 2]>> {
+        let (reply_tx, reply_rx) = bounded(1);
+        self.writer_tx
+            .send(WriterMessage::WaveformRange {
+                start_frame,
+                end_frame,
+                reply: reply_tx,
+            })
+            .context("audio writer is unavailable")?;
+        reply_rx
+            .recv_timeout(WAVEFORM_RENDER_TIMEOUT)
+            .context("audio waveform render timed out")?
+            .map_err(|message| anyhow!(message))
     }
 
     fn wait_until_committed(&mut self, target: u64) -> Result<()> {
@@ -6842,6 +6985,83 @@ fn writer_loop(
                                 export_busy.store(false, Ordering::Release);
                                 let _ = spawn_failure_reply
                                     .send(Err(format!("start audio preview worker: {error}")));
+                            }
+                        }
+                    }
+                }
+            }
+            WriterMessage::WaveformRange {
+                start_frame,
+                end_frame,
+                reply,
+            } => {
+                if shutdown_after_drain {
+                    let _ = reply.send(Err("录音写入正在故障封存，暂时不能生成波形".to_string()));
+                } else if export_busy
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    let _ = reply.send(Err("已有试听或波形正在生成，请稍后再试".to_string()));
+                } else {
+                    let dummy = path.with_file_name(".waveform-preview");
+                    let prepared =
+                        match validate_live_preview_range(sample_rate, start_frame, end_frame) {
+                            Err(error) => Err(error),
+                            Ok(()) => match writer.checkpoint() {
+                                Ok(frames) => {
+                                    committed.store(frames, Ordering::Release);
+                                    last_checkpoint = Instant::now();
+                                    writer.prepare_export_range_after_checkpoint(
+                                        path,
+                                        &dummy,
+                                        sample_rate,
+                                        bit_depth,
+                                        start_frame,
+                                        end_frame,
+                                    )
+                                }
+                                Err(error) => {
+                                    let reason = format!(
+                                        "audio checkpoint failed before waveform: {error:#}"
+                                    );
+                                    if !latch_audio_fault_marker(
+                                        storage_directory,
+                                        &mut latched_fault_reason,
+                                        &reason,
+                                        committed.load(Ordering::Acquire),
+                                        &faulted,
+                                    ) {
+                                        eprintln!(
+                                            "waveform checkpoint fault has no durable marker"
+                                        );
+                                    }
+                                    queue.close_and_wait();
+                                    shutdown_after_drain = true;
+                                    Err(anyhow!(reason))
+                                }
+                            },
+                        };
+                    match prepared {
+                        Err(error) => {
+                            export_busy.store(false, Ordering::Release);
+                            let _ = reply.send(Err(format!("{error:#}")));
+                        }
+                        Ok(prepared) => {
+                            let worker_busy = Arc::clone(&export_busy);
+                            let spawn_failure_reply = reply.clone();
+                            if let Err(error) = thread::Builder::new()
+                                .name("audio-preview-waveform".to_string())
+                                .spawn(move || {
+                                    let result = prepared
+                                        .waveform_bins()
+                                        .map_err(|error| format!("{error:#}"));
+                                    worker_busy.store(false, Ordering::Release);
+                                    let _ = reply.send(result);
+                                })
+                            {
+                                export_busy.store(false, Ordering::Release);
+                                let _ = spawn_failure_reply
+                                    .send(Err(format!("start audio waveform worker: {error}")));
                             }
                         }
                     }
@@ -12570,6 +12790,57 @@ mod tests {
             journal.entries.last().unwrap()["event"],
             "attempt_selected_offline"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preview_session_waveform_returns_bins_for_a_usable_attempt() {
+        let root = test_root("preview-session-waveform");
+        for directory in ["audio", "metadata", "script", "preview"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        let mut writer =
+            RecoverableWav::create(&root.join("audio/master.wav"), 48_000, 1, 24).unwrap();
+        writer.write_samples(&[0.1, -0.4, 0.8, -0.2]).unwrap();
+        writer.finalize().unwrap();
+        let mut snapshot = test_snapshot();
+        snapshot.journal_seq = 1;
+        snapshot.captured_samples = 4;
+        snapshot.committed_samples = 4;
+        snapshot.status = "stopped".to_string();
+        snapshot.items[0].status = "accepted".to_string();
+        snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
+        snapshot.items[0].attempts = vec![Attempt {
+            attempt_id: "001-a1".to_string(),
+            start_sample: 0,
+            recording_started_sample: 0,
+            head_silence_armed_sample: 0,
+            head_silence_passed_sample: 0,
+            required_head_silence_samples: 0,
+            content_started_sample: 0,
+            end_sample: 4,
+            forced_without_tail_silence: false,
+            tail_silence_samples: 0,
+            required_tail_silence_samples: 0,
+            status: "accepted".to_string(),
+            created_at: "2026-08-11T00:00:00Z".to_string(),
+        }];
+        write_journal(&root, &[sequenced_event("session_stopped", &snapshot)]);
+        write_snapshot_file(&root.join("metadata/items.snapshot.json"), &snapshot);
+
+        let engine = Engine::new(Emitter::new());
+        let preview = engine
+            .preview_session_waveform_expected(&root, "resume-test", "001", "001-a1")
+            .unwrap();
+        let bins = preview["bins"].as_array().unwrap();
+        assert!(!bins.is_empty());
+        assert_eq!(preview["start_sample"], 0);
+        assert_eq!(preview["end_sample"], 4);
+        assert_eq!(preview["sample_rate"], 48_000);
+        let error = engine
+            .preview_session_waveform_expected(&root, "resume-test", "001", "missing")
+            .unwrap_err();
+        assert!(error.to_string().contains("不存在"));
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -52,6 +52,79 @@ fn bytes_per_sample(bit_depth: u16) -> Result<u16> {
     Ok(bit_depth / 8)
 }
 
+pub(crate) const REVIEW_WAVEFORM_BIN_SAMPLES: usize = 64;
+
+pub(crate) fn decode_encoded_mono_samples(bytes: &[u8], bit_depth: u16) -> Result<Vec<f32>> {
+    let sample_bytes = usize::from(bytes_per_sample(bit_depth)?);
+    if !bytes.len().is_multiple_of(sample_bytes) {
+        bail!("encoded PCM length is not a whole number of samples");
+    }
+    let mut samples = Vec::with_capacity(bytes.len() / sample_bytes);
+    match bit_depth {
+        16 => {
+            for chunk in bytes.chunks_exact(2) {
+                let value = i16::from_le_bytes([chunk[0], chunk[1]]);
+                samples.push(f32::from(value) / 32_768.0);
+            }
+        }
+        24 => {
+            for chunk in bytes.chunks_exact(3) {
+                let sign = if chunk[2] & 0x80 == 0 { 0 } else { 0xFF };
+                let value = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], sign]);
+                samples.push(value as f32 / 8_388_608.0);
+            }
+        }
+        32 => {
+            for chunk in bytes.chunks_exact(4) {
+                samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+        }
+        _ => bail!("bit depth must be one of 16-bit PCM, 24-bit PCM, or 32-bit Float"),
+    }
+    Ok(samples)
+}
+
+pub(crate) struct ReviewWaveformFold {
+    pending: usize,
+    minimum: f32,
+    maximum: f32,
+    bins: Vec<[f32; 2]>,
+}
+
+impl ReviewWaveformFold {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: 0,
+            minimum: 0.0,
+            maximum: 0.0,
+            bins: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push_bytes(&mut self, bytes: &[u8], bit_depth: u16) -> Result<()> {
+        for sample in decode_encoded_mono_samples(bytes, bit_depth)? {
+            let normalized = sample.clamp(-1.0, 1.0);
+            self.minimum = self.minimum.min(normalized);
+            self.maximum = self.maximum.max(normalized);
+            self.pending += 1;
+            if self.pending == REVIEW_WAVEFORM_BIN_SAMPLES {
+                self.bins.push([self.minimum, self.maximum]);
+                self.pending = 0;
+                self.minimum = 0.0;
+                self.maximum = 0.0;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> Vec<[f32; 2]> {
+        if self.pending > 0 {
+            self.bins.push([self.minimum, self.maximum]);
+        }
+        self.bins
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WavExportMode {
     /// Sentence bundles and previews stay ordinary RIFF/WAVE. They should
@@ -797,6 +870,44 @@ impl RecoverableWav {
         self.file.write_all(&data_size.to_le_bytes())?;
         Ok(())
     }
+}
+
+pub fn waveform_wav_mono(
+    source: &Path,
+    sample_rate: u32,
+    bit_depth: u16,
+    start_frame: u64,
+    end_frame: u64,
+) -> Result<Vec<[f32; 2]>> {
+    let _ = sample_rate;
+    if end_frame <= start_frame {
+        bail!("invalid slice: end must be after start");
+    }
+    let encoding = WavEncoding::for_bit_depth(bit_depth)?;
+    let frame_bytes = u64::from(bytes_per_sample(bit_depth)?);
+    let mut input =
+        File::open(source).with_context(|| format!("open source WAV {}", source.display()))?;
+    let input_len = input.metadata()?.len();
+    let start_byte = encoding.header_len() + start_frame * frame_bytes;
+    let end_byte = encoding.header_len() + end_frame * frame_bytes;
+    if end_byte > input_len {
+        bail!(
+            "slice exceeds committed audio: requested byte {}, file length {}",
+            end_byte,
+            input_len
+        );
+    }
+    input.seek(SeekFrom::Start(start_byte))?;
+    let mut remaining = end_byte - start_byte;
+    let mut bytes = vec![0u8; 48 * 1024];
+    let mut fold = ReviewWaveformFold::new();
+    while remaining > 0 {
+        let count = usize::try_from(remaining.min(bytes.len() as u64))?;
+        input.read_exact(&mut bytes[..count])?;
+        fold.push_bytes(&bytes[..count], bit_depth)?;
+        remaining -= count as u64;
+    }
+    Ok(fold.finish())
 }
 
 pub fn slice_wav_mono(
@@ -1663,5 +1774,19 @@ mod tests {
             assert_eq!(parsed.payload, data);
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn review_waveform_fold_keeps_extrema_and_a_partial_tail() {
+        let mut encoded = Vec::new();
+        for sample in [-0.5f32, 0.25, 0.75] {
+            encoded.extend_from_slice(&sample.to_le_bytes());
+        }
+        let mut fold = ReviewWaveformFold::new();
+        fold.push_bytes(&encoded, 32).unwrap();
+        let bins = fold.finish();
+        assert_eq!(bins.len(), 1);
+        assert!((bins[0][0] + 0.5).abs() < 0.001);
+        assert!((bins[0][1] - 0.75).abs() < 0.001);
     }
 }

@@ -1,7 +1,7 @@
 use crate::durable_fs::{
     durable_create_directory_all, durable_rename, durable_replace, sync_directory,
 };
-use crate::wav::{RecoverableWav, WavExportMode, WavExportWriter};
+use crate::wav::{RecoverableWav, ReviewWaveformFold, WavExportMode, WavExportWriter};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -160,6 +160,29 @@ impl PreparedWavExport {
     #[cfg(test)]
     pub(crate) fn destination(&self) -> &Path {
         &self.destination
+    }
+
+    pub(crate) fn waveform_bins(self) -> Result<Vec<[f32; 2]>> {
+        let layout = WavLayout::for_bit_depth(self.bit_depth)?;
+        let frame_bytes = layout.frame_bytes(self.channels)?;
+        let mut fold = ReviewWaveformFold::new();
+        for part in self.parts {
+            match part {
+                PreparedExportPart::ClosedSegment(part) => {
+                    fold_closed_part(
+                        &part,
+                        layout.header_len,
+                        frame_bytes,
+                        self.bit_depth,
+                        &mut fold,
+                    )?;
+                }
+                PreparedExportPart::EncodedFrames(bytes) => {
+                    fold.push_bytes(&bytes, self.bit_depth)?;
+                }
+            }
+        }
+        Ok(fold.finish())
     }
 
     pub(crate) fn write(self) -> Result<u64> {
@@ -1373,6 +1396,34 @@ fn create_segment(
         )
     })?;
     RecoverableWav::open_append(path, sample_rate, channels, bit_depth)
+}
+
+fn fold_closed_part(
+    part: &SegmentRange,
+    header_len: u64,
+    frame_bytes: u64,
+    bit_depth: u16,
+    fold: &mut ReviewWaveformFold,
+) -> Result<()> {
+    let mut source = File::open(&part.path)
+        .with_context(|| format!("open WAV segment {}", part.path.display()))?;
+    source.seek(SeekFrom::Start(
+        header_len + part.local_start_frame * frame_bytes,
+    ))?;
+    let mut remaining = (part.local_end_frame - part.local_start_frame) * frame_bytes;
+    let mut buffer = vec![0u8; 48 * 1024];
+    while remaining > 0 {
+        let mut count = remaining.min(buffer.len() as u64);
+        count -= count % frame_bytes;
+        if count == 0 {
+            count = remaining;
+        }
+        let count = usize::try_from(count)?;
+        source.read_exact(&mut buffer[..count])?;
+        fold.push_bytes(&buffer[..count], bit_depth)?;
+        remaining -= count as u64;
+    }
+    Ok(())
 }
 
 fn copy_closed_part(

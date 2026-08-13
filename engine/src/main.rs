@@ -244,6 +244,15 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
                 &payload.attempt_id,
             )
         }
+        "preview_session_waveform" => {
+            let payload: OfflineAttemptPayload = parse(command.payload)?;
+            engine.preview_session_waveform_expected(
+                &PathBuf::from(payload.session_dir),
+                &payload.expected_session_id,
+                &payload.item_id,
+                &payload.attempt_id,
+            )
+        }
         "select_session_attempt" => {
             let payload: OfflineAttemptPayload = parse(command.payload)?;
             engine.select_session_attempt_expected(
@@ -287,6 +296,10 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
         "render_attempt" => {
             let payload: AttemptPayload = parse(command.payload)?;
             engine.render_attempt(&payload.item_id, &payload.attempt_id)
+        }
+        "preview_attempt_waveform" => {
+            let payload: AttemptPayload = parse(command.payload)?;
+            engine.preview_attempt_waveform(&payload.item_id, &payload.attempt_id)
         }
         "get_state" => engine.get_state(),
         "get_state_optional" => Ok(engine.get_state_optional()),

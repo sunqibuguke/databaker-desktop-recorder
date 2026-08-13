@@ -649,6 +649,13 @@ export function installDevRecorderMock() {
     }
     if (command === 'get_state') return { snapshot: snapshotCopy(), session_dir: currentSessionDir, active_attempt: activeAttempt ? { ...activeAttempt } : null } as T;
     if (command === 'render_attempt' || command === 'render_session_attempt') return { file_path: '/tmp/databaker-dev-preview.wav' } as T;
+    if (command === 'preview_attempt_waveform' || command === 'preview_session_waveform') {
+      const bins = Array.from({ length: 80 }, (_, index): [number, number] => {
+        const envelope = Math.sin((index + 1) / 12) * 0.55;
+        return [-Math.abs(envelope), Math.abs(envelope) + 0.08];
+      });
+      return { bins, start_sample: 0, end_sample: 80 * 64, sample_rate: 48_000 } as T;
+    }
     if (command === 'select_session_attempt') {
       const item = snapshot.items.find((candidate) => candidate.id === data.item_id);
       const attempt = item?.attempts.find((candidate) => candidate.attempt_id === data.attempt_id);

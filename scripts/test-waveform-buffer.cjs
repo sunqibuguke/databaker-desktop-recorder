@@ -7,6 +7,9 @@ async function main() {
   const waveform = await import(pathToFileURL(modulePath).href);
 
   assert.equal(waveform.WAVEFORM_WINDOW_SECONDS, 20);
+  assert.equal(waveform.reviewBinHorizontalPosition(0, 1), 0);
+  assert.equal(waveform.reviewBinHorizontalPosition(0, 2), -0.5);
+  assert.equal(waveform.reviewBinHorizontalPosition(1, 2), 0.5);
   assert.equal(waveform.waveformWindowBinCount(44_100), 13_782);
   assert.equal(waveform.waveformWindowBinCount(48_000), 15_000);
   assert.equal(waveform.waveformWindowBinCount(96_000), 30_000);

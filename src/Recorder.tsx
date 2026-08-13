@@ -5,7 +5,9 @@ import {
   engineRecoveryFailure,
   isReconciliableInactiveStopError,
   planHistoryRecovery,
+  planTaskListEntry,
 } from './history-recovery';
+import type { TaskListEntry, TaskListRecordDisabledReason } from './history-recovery';
 import type { EffectiveCaptureFaultKind } from './history-recovery';
 import { parseScript } from './script-parser';
 import {
@@ -18,8 +20,10 @@ import {
   idlePrimaryAction,
   isCurrentSessionNoiseCheckOperation,
   isFinalReview,
+  resolveRunningItemIndex,
   sessionNoiseGate,
   shouldAutoRunSessionNoiseCheck,
+  viewShortcutAction,
   workflowShortcutAction,
 } from './recording-workflow';
 import { WebGLWaveform } from './WebGLWaveform';
@@ -273,6 +277,18 @@ function recordingState(recording: RecordingHistoryEntry): { kind: RecordingStat
   return { kind: 'completed', label: t('home.stateCompleted') };
 }
 
+function listViewIsPrimary(entry: TaskListEntry): boolean {
+  return entry.kind === 'view-only' || (entry.kind === 'view-record' && entry.viewPrimary);
+}
+
+function listRecordEnabled(entry: TaskListEntry): boolean {
+  return entry.kind === 'view-record' && entry.recordEnabled;
+}
+
+function listRecordDisabledReason(entry: TaskListEntry): TaskListRecordDisabledReason | undefined {
+  return entry.kind === 'view-only' ? entry.recordDisabledReason : undefined;
+}
+
 function recordingMatchesFilter(recording: RecordingHistoryEntry, filter: HistoryFilter): boolean {
   if (filter === 'all') return true;
   const kind = recordingState(recording).kind;
@@ -369,6 +385,8 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const [prompterStatus, setPrompterStatus] = useState({ open: false, ready: false });
   const [sessionDir, setSessionDir] = useState('');
   const [waveformGeneration, setWaveformGeneration] = useState(0);
+  const [reviewWaveformBins, setReviewWaveformBins] = useState<Array<[number, number]>>([]);
+  const reviewWaveformRequestRef = useRef(0);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [recording, setRecording] = useState(false);
   const [attemptStartSample, setAttemptStartSample] = useState(0);
@@ -1359,14 +1377,20 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     };
   }, [devWebCaptureEnabled, captureActive, sessionDir, workspaceFaulted, snapshot?.audio_format.sample_rate, snapshot?.device_name, t]);
 
-  function enterRunningSession(current: RunningSessionState, wasRecovered: boolean, availableDevices = devices) {
+  function enterRunningSession(
+    current: RunningSessionState,
+    wasRecovered: boolean,
+    availableDevices = devices,
+    keepItemId?: string | null,
+  ) {
     const nextSnapshot = current.snapshot;
     const nextSessionDir = current.session_dir || activeSessionDirRef.current || sessionDir;
     const threshold = nextSnapshot.silence_threshold_dbfs ?? nextSnapshot.noise_check?.threshold_dbfs ?? -42;
-    const activeIndex = current.active_attempt
-      ? nextSnapshot.items.findIndex((item) => item.id === current.active_attempt?.item_id)
-      : nextSnapshot.items.findIndex((item) => item.status === 'review' || item.status === 'pending');
-    const restoredIndex = activeIndex >= 0 ? activeIndex : 0;
+    const restoredIndex = resolveRunningItemIndex(
+      nextSnapshot.items,
+      current.active_attempt?.item_id,
+      keepItemId,
+    );
     const restoredItem = nextSnapshot.items[restoredIndex];
     // A suspended renderer may still hold a healthy meter from the previous
     // engine/session generation. It must not overwrite this authoritative
@@ -1662,13 +1686,13 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setNotice(t('notice.taskCreated'));
   }
 
-  async function activateCapture(): Promise<boolean> {
+  async function activateCapture(keepItemId?: string | null): Promise<boolean> {
     if (!snapshot || !sessionDir || captureActive || workspaceFaulted) return captureActive;
     const result = await run(t('notice.enablingCard'), () => window.recorder.request<RunningSessionState>('activate_session', {
       session_dir: sessionDir,
     }));
     if (!result) return false;
-    enterRunningSession(result, true);
+    enterRunningSession(result, true, devices, keepItemId);
     setNotice(t('notice.cardEnabled'));
     return true;
   }
@@ -1680,11 +1704,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   }
 
   async function startAttempt(item = currentItem) {
-    if (!item || recording || phase !== 'running' || captureFault) return;
-    if (!captureActive) {
-      await activateCapture();
-      return;
-    }
+    if (!item || recording || phase !== 'running' || captureFault || !captureActive) return;
     if (currentNoiseGate !== 'ready') return;
     const result = await run(t('notice.starting'), () => window.recorder.request<{
       attempt_id: string;
@@ -1867,7 +1887,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setNotice(t('notice.previewing', { id: attemptId }));
   }
 
-  async function openHistoricalRecording(recording: RecordingHistoryEntry) {
+  async function openHistoricalRecording(
+    recording: RecordingHistoryEntry,
+    options: { activate?: boolean } = {},
+  ) {
     if (recording.is_active) {
       await returnToActiveRecording(recording);
       return;
@@ -1877,6 +1900,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     }));
     if (!inspected) return;
     enterInspectionWorkspace(inspected);
+    if (options.activate) await activateCapture();
   }
 
   async function exportRecordingArtifact(
@@ -2377,6 +2401,23 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       if (phase !== 'running' || busy) return;
       const target = event.target as HTMLElement | null;
       if (target?.closest('input, textarea, select, button, audio')) return;
+      if (!captureActive) {
+        const viewAction = viewShortcutAction(event.code, event.key);
+        if (viewAction === 'preview') {
+          event.preventDefault();
+          void previewAttempt();
+        } else if (viewAction === 'enter-capture' && !workspaceFaulted) {
+          event.preventDefault();
+          void activateCapture(currentItem?.id);
+        } else if (event.key === 'ArrowLeft') {
+          setCurrentIndex((index) => Math.max(0, index - 1));
+          setReviewAttemptId(null);
+        } else if (event.key === 'ArrowRight') {
+          setCurrentIndex((index) => Math.min(items.length - 1, index + 1));
+          setReviewAttemptId(null);
+        }
+        return;
+      }
       if (captureFault) {
         // During a live fault every recording shortcut is captured by the
         // stop-reading state. Space opens the sole safe action; navigation,
@@ -2423,6 +2464,29 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     window.addEventListener('pointerdown', closeActionsMenu);
     return () => window.removeEventListener('pointerdown', closeActionsMenu);
   }, [openActionsSessionDir]);
+
+  useEffect(() => {
+    if (recording || !reviewAttempt || !sessionDir || !currentItem) {
+      setReviewWaveformBins([]);
+      return undefined;
+    }
+    const requestId = reviewWaveformRequestRef.current + 1;
+    reviewWaveformRequestRef.current = requestId;
+    const command = captureActive ? 'preview_attempt_waveform' : 'preview_session_waveform';
+    const payload = captureActive
+      ? { item_id: currentItem.id, attempt_id: reviewAttempt.attempt_id }
+      : { session_dir: sessionDir, item_id: currentItem.id, attempt_id: reviewAttempt.attempt_id };
+    void window.recorder.request<{ bins: Array<[number, number]> }>(command, payload).then((result) => {
+      if (requestId !== reviewWaveformRequestRef.current) return;
+      setReviewWaveformBins(Array.isArray(result.bins) ? result.bins : []);
+    }).catch(() => {
+      if (requestId !== reviewWaveformRequestRef.current) return;
+      setReviewWaveformBins([]);
+    });
+    return () => {
+      if (reviewWaveformRequestRef.current === requestId) reviewWaveformRequestRef.current += 1;
+    };
+  }, [recording, captureActive, sessionDir, currentItem?.id, reviewAttempt?.attempt_id]);
 
   const settingsDialog = settingsOpen && <div className="dialog-backdrop" role="presentation">
     <section className="studio-dialog settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-dialog-title">
@@ -2585,18 +2649,29 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             const actionsOpen = openActionsSessionDir === recording.session_dir;
             const rowResumeError = resumeError?.sessionDir === recording.session_dir ? resumeError.message : '';
             const recoveryPlan = planHistoryRecovery(recording);
+            const listEntry = planTaskListEntry(recording);
+            const recordDisabledReason = listRecordDisabledReason(listEntry);
+            const recordDisabledCopy = recordDisabledReason === 'fault'
+              ? t('home.recordDisabledFault')
+              : recordDisabledReason === 'issue'
+                ? t('home.recordDisabledIssue')
+                : recordDisabledReason === 'readonly'
+                  ? t('home.recordDisabledReadonly')
+                  : undefined;
             return <article key={recording.session_dir} className={`home-recording-row ${rowResumeError ? 'has-error' : ''} ${actionsOpen ? 'menu-open' : ''}`}>
               <button className="home-recording-name" onClick={() => showTaskDetails(recording)} aria-label={t('home.openTaskAria', { id: recording.session_id })}><i className={`recording-dot ${state.kind}`} /><div><strong>{recording.session_id}</strong><small title={recording.history_issue}>{recording.history_issue || <>{recording.script_name || t('home.unknownSource')} · {recording.sample_rate ? `${recording.sample_rate.toLocaleString(locale)} Hz / ${recording.bit_depth}-bit` : t('home.unknownFormat')}</>}</small></div></button>
               <div className="home-recording-progress"><span><b>{handled}</b><small> / {recording.total_items}</small></span><i><em style={{ width: `${progress}%` }} /></i></div>
               <time>{formatDateTime(recording.updated_at)}</time>
               <span><em className={`recording-status ${state.kind}`}>{state.label}</em></span>
               <div className="home-row-actions">
-                {recording.is_active
-                  ? recording.status === 'stopping'
-                    ? <button className="row-primary" onClick={() => void continuePendingStop(recording)} disabled={Boolean(busy)}>{t('home.continueSafeStop')}</button>
-                    : <button className="row-primary" onClick={() => void returnToActiveRecording(recording)} disabled={Boolean(busy)}>{t('home.returnToRecording')}</button>
-                  : <button className="row-primary" onClick={() => showTaskDetails(recording)} disabled={Boolean(busy)}>{t('common.open')}</button>}
-                {!recording.is_active && <button data-testid="export-recording" className="row-export" onClick={() => showExport(recording)} disabled={Boolean(busy) || Boolean(sealingSessionDir) || Boolean(recording.history_issue)}><Icon name="export" size={13} />{t('common.export')}</button>}
+                {listEntry.kind === 'continue-stop'
+                  ? <button className="row-primary" onClick={() => void continuePendingStop(recording)} disabled={Boolean(busy)}>{t('home.continueSafeStop')}</button>
+                  : listEntry.kind === 'return'
+                    ? <button className="row-primary" onClick={() => void returnToActiveRecording(recording)} disabled={Boolean(busy)}>{t('home.returnToRecording')}</button>
+                    : <>
+                      <button data-testid="view-recording" className={listViewIsPrimary(listEntry) ? 'row-primary' : 'row-secondary'} onClick={() => showTaskDetails(recording)} disabled={Boolean(busy)} aria-label={t('home.viewTaskAria', { id: recording.session_id })}>{t('home.viewTask')}</button>
+                      <button data-testid="record-recording" className={listRecordEnabled(listEntry) && !listViewIsPrimary(listEntry) ? 'row-primary' : 'row-secondary'} onClick={() => void openHistoricalRecording(recording, { activate: true })} disabled={Boolean(busy) || Boolean(sealingSessionDir) || !listRecordEnabled(listEntry)} title={recordDisabledCopy} aria-label={t('home.recordTaskAria', { id: recording.session_id })}>{t('home.recordTask')}</button>
+                    </>}
                 <button className="row-folder" title={t('home.openFolder')} aria-label={t('home.openFolderAria', { id: recording.session_id })} onClick={() => void openRecordingDirectory(recording)} disabled={Boolean(busy)}><Icon name="folder" size={15} /></button>
                 <div className="home-actions-menu-wrap">
                   <button data-testid="recording-actions-menu" className="row-more" title={t('common.moreActions')} aria-label={t('home.moreAria', { id: recording.session_id })} aria-haspopup="menu" aria-expanded={actionsOpen} onClick={() => setOpenActionsSessionDir(actionsOpen ? '' : recording.session_dir)} disabled={Boolean(busy) || Boolean(deletingSessionDir)}><Icon name="more" size={16} /></button>
@@ -2717,7 +2792,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   }
 
   return <div className="studio-shell">
-    <StudioChrome phase={phase} title={snapshot?.session_id ?? t('home.stateCurrent')} onBack={requestSafePause} onOpenSettings={() => setSettingsOpen(true)} backTitle={t('chrome.leaveTask')} activityLabel={workspaceFaulted ? t('chrome.inspectReadonly') : captureActive ? t('chrome.consoleCapturing') : t('chrome.consoleInspect')} />
+    <StudioChrome phase={phase} title={snapshot?.session_id ?? t('home.stateCurrent')} onBack={requestSafePause} onOpenSettings={() => setSettingsOpen(true)} backTitle={t('chrome.leaveTask')} activityLabel={workspaceFaulted ? t('chrome.inspectReadonly') : captureActive ? t('chrome.consoleCapturing') : t('chrome.consoleView')} />
     <div className="studio-workspace recording-workspace" data-testid="recording-workspace">
       <aside className="tool-rail" aria-label={t('recorder.toolsAria')} />
       <aside className="panel item-browser">
@@ -2728,7 +2803,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       </aside>
       <main className="editor-document">
         <div className="document-tabs"><span className="active"><Icon name="microphone" size={13} /> {workflowComplete ? t('recorder.taskComplete') : currentItem?.id ?? 'Item'} <i>×</i></span></div>
-        <div className="editor-toolbar"><div className="editor-nav"><button title={t('recorder.prevItem')} disabled={recording || currentIndex === 0} onClick={() => setCurrentIndex((index) => Math.max(0, index - 1))}><Icon name="chevron-left" /></button><span>{currentIndex + 1} / {items.length}</span><button title={t('recorder.nextItem')} disabled={recording || currentIndex >= items.length - 1} onClick={() => setCurrentIndex((index) => Math.min(items.length - 1, index + 1))}><Icon name="chevron-right" /></button></div><div className="editor-time"><strong className={recording ? 'recording' : ''}>{recording ? attemptDuration : sessionDuration}</strong></div><div className="editor-toolbar-actions"><button className="prompter-launch" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? t('recorder.locatePrompter') : t('recorder.openPrompter')}</button></div><div className={`save-health ${workspaceFaulted || captureFault ? 'fault' : meter.storage_status === 'warning' ? 'warning' : ''}`}><i />{workspaceFaulted ? t('recorder.healthReadonly') : !captureActive ? t('recorder.healthInspect') : captureFault ? t('recorder.healthFaultStop', { title: captureFaultCopy.title }) : meter.storage_status === 'warning' ? t('recorder.healthWarning', { minutes: Math.max(0, Math.floor(meter.storage_safe_remaining_seconds / 60)) }) : t('recorder.healthLive')}</div></div>
+        <div className="editor-toolbar"><div className="editor-nav"><button title={t('recorder.prevItem')} disabled={recording || currentIndex === 0} onClick={() => setCurrentIndex((index) => Math.max(0, index - 1))}><Icon name="chevron-left" /></button><span>{currentIndex + 1} / {items.length}</span><button title={t('recorder.nextItem')} disabled={recording || currentIndex >= items.length - 1} onClick={() => setCurrentIndex((index) => Math.min(items.length - 1, index + 1))}><Icon name="chevron-right" /></button></div><div className="editor-time"><strong className={recording ? 'recording' : ''}>{recording ? attemptDuration : sessionDuration}</strong></div><div className="editor-toolbar-actions"><button className="prompter-launch" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? t('recorder.locatePrompter') : t('recorder.openPrompter')}</button></div><div className={`save-health ${workspaceFaulted || captureFault ? 'fault' : meter.storage_status === 'warning' ? 'warning' : ''}`}><i />{workspaceFaulted ? t('recorder.healthReadonly') : !captureActive ? t('recorder.healthView') : captureFault ? t('recorder.healthFaultStop', { title: captureFaultCopy.title }) : meter.storage_status === 'warning' ? t('recorder.healthWarning', { minutes: Math.max(0, Math.floor(meter.storage_safe_remaining_seconds / 60)) }) : t('recorder.healthLive')}</div></div>
         <div className="editor-canvas">
           {(captureFault || discontinuityToast || noiseCheckBlocksAttempt || qualityWarning) && <div className="workspace-toasts" aria-live="polite">
             {captureFault && <div className="capture-fault-banner" role="alert"><Icon name="stop" size={16} /><div><strong>{captureFaultCopy.title}</strong><span>{captureFaultCopy.detail}{snapshot?.device_name ? ` ${t('issues.currentDevice', { name: snapshot.device_name })}` : ' '}{t('issues.stopThenFinish')}</span></div></div>}
@@ -2737,17 +2812,19 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             {qualityWarning && <div className="input-quality-banner" role="alert"><Icon name="meter" size={16} /><div><strong>{t('quality.bannerTitle')}</strong><span>{qualityWarning}. {t('quality.bannerHint')}</span></div></div>}
           </div>}
           <section className="script-monitor"><header><span>{t('recorder.currentSentence')}</span><div><span className="studio-cue">{cueLabel}</span><em>{workflowComplete ? t('recorder.itemsCount', { count: items.length }) : `${currentIndex + 1} / ${items.length}`}</em></div></header><div className={`prompt-surface ${captureFault ? 'fault' : cue === 'pending' ? 'pending' : cue === 'recording' ? 'live' : ''}`}>{captureFault ? <span className="label-chip">{t('recorder.stopReadingChip')}</span> : noiseCheckBlocksAttempt ? <span className="label-chip">{t('recorder.envChip')}</span> : (workflowComplete || currentItem?.label) && <span className="label-chip">{workflowComplete ? t('recorder.allDoneChip') : currentItem?.label}</span>}<p>{captureFault ? captureFaultCopy.title : noiseCheckBlocksAttempt ? t('recorder.keepQuiet') : workflowComplete ? t('recorder.scriptFinished') : currentItem?.text ?? t('recorder.noText')}</p><small>{captureFault ? captureFaultCopy.detail : noiseCheckBlocksAttempt ? noiseCheckMessage : workflowComplete ? t('recorder.exportLater') : <>{currentItem?.id}</>}</small></div></section>
-          <section className="signal-monitor"><header><div><strong>{t('recorder.waveform')}</strong><SilencePairReadout pair={silencePair} /></div><div><span>RMS <b>{db(meter.rms)}</b></span><span>PEAK <b className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</b></span></div></header><div className="signal-scope"><WebGLWaveform key={`${sessionDir}:${waveformGeneration}`} bins={meter.waveform ?? []} capturedSamples={meter.captured_samples} waveformEndSample={meter.waveform_end_sample} recording={recording && !captureFault} takeStartSample={recording && !captureFault ? attemptStartSample : undefined} sampleRate={sampleRateForDisplay} /><div className="scope-scale"><span>−1.0</span><span>−0.5</span><span>0</span><span>+0.5</span><span>+1.0</span></div></div><div className="horizontal-meter"><i className="meter-rms" style={{ width: `${rmsPercent}%` }} /><i className="meter-peak" style={{ left: `${peakPercent}%` }} /></div></section>
+          <section className="signal-monitor"><header><div><strong>{t('recorder.waveform')}</strong>{captureActive ? <SilencePairReadout pair={silencePair} /> : reviewAttempt ? <SilencePairReadout pair={reviewSilencePair({ attempt: reviewAttempt, sampleRate: sampleRateForDisplay, requiredMs: effectiveSilenceDurationMs, peak: reviewPeak })} /> : null}</div><div>{captureActive ? <><span>RMS <b>{db(meter.rms)}</b></span><span>PEAK <b className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</b></span></> : <span>{reviewAttempt ? formatDuration(reviewAttempt.end_sample - reviewAttempt.start_sample, sampleRateForDisplay) : t('recorder.noTakeWaveform')}</span>}</div></header><div className="signal-scope"><WebGLWaveform key={reviewAttempt && !recording ? `${sessionDir}:${reviewAttempt.attempt_id}` : `${sessionDir}:${waveformGeneration}`} mode={reviewAttempt && !recording ? 'review' : 'live'} bins={reviewAttempt && !recording ? reviewWaveformBins : (meter.waveform ?? [])} capturedSamples={meter.captured_samples} waveformEndSample={meter.waveform_end_sample} recording={recording && !captureFault} takeStartSample={recording && !captureFault ? attemptStartSample : undefined} sampleRate={sampleRateForDisplay} /><div className="scope-scale"><span>−1.0</span><span>−0.5</span><span>0</span><span>+0.5</span><span>+1.0</span></div></div><div className="horizontal-meter"><i className="meter-rms" style={{ width: `${rmsPercent}%` }} /><i className="meter-peak" style={{ left: `${peakPercent}%` }} /></div></section>
           {audioUrl && <audio ref={audioRef} src={audioUrl} controls className="audio-player" />}
           <section className="transport-panel">
             <div className="transport-secondary">
               {showReviewSilenceBill && <span className="silence-bill" data-testid="review-silence-bill"><SilencePairReadout pair={silencePair} hint /></span>}
               <button title={t('recorder.previewKey')} onClick={() => void previewAttempt()} disabled={recording || !currentItem?.attempts.length || Boolean(busy)}><Icon name="play" /><span>{t('recorder.preview')}</span><kbd>P</kbd></button>
-              <button title={t('recorder.retakeKey')} onClick={() => void startAttempt()} disabled={workspaceFaulted || captureFault || noiseCheckBlocksAttempt || recording || !currentItem || Boolean(busy)}><Icon name="retake" /><span>{t('recorder.retake')}</span><kbd>R</kbd></button>
+              {captureActive && <button title={t('recorder.retakeKey')} onClick={() => void startAttempt()} disabled={workspaceFaulted || captureFault || noiseCheckBlocksAttempt || recording || !currentItem || Boolean(busy)}><Icon name="retake" /><span>{t('recorder.retake')}</span><kbd>R</kbd></button>}
             </div>
             <div className="transport-primary">
               {!captureActive
-                ? <button data-testid="main-transport" className="main-transport start" onClick={() => void activateCapture()} disabled={Boolean(busy) || workspaceFaulted}><span><Icon name="microphone" /></span><strong>{workspaceFaulted ? t('recorder.readonlyRepair') : t('recorder.enableCapture')}</strong></button>
+                ? workspaceFaulted
+                  ? <button data-testid="main-transport" className="main-transport start" disabled><span><Icon name="microphone" /></span><strong>{t('recorder.readonlyRepair')}</strong></button>
+                  : <button data-testid="main-transport" className="main-transport start" onClick={() => void previewAttempt()} disabled={Boolean(busy) || !currentItem?.attempts.length}><span><Icon name="play" /></span><strong>{t('recorder.previewThis')}</strong><kbd>SPACE</kbd></button>
                 : captureFault
                 ? <button data-testid="main-transport" className="main-transport stop" onClick={finishSession} disabled={Boolean(busy)}><span><Icon name="stop" /></span><strong>{t('recorder.finishKeepMaster')}</strong><kbd>SPACE</kbd></button>
                 : noiseCheckBlocksAttempt && primaryAction === 'start'
@@ -2762,13 +2839,13 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
                       ? <button data-testid="main-transport" className="main-transport start" onClick={() => void startAttempt()} disabled={Boolean(busy)}><span><Icon name="record" /></span><strong>{t('recorder.startRecording')}</strong><kbd>SPACE</kbd></button>
                       : <button data-testid="main-transport" className="main-transport handled" disabled><span><Icon name="check" /></span><strong>{t('recorder.itemHandled')}</strong><kbd>R</kbd></button>}
             </div>
-            <div className="transport-secondary right"><button title={t('recorder.skipKey')} onClick={() => void skipItem()} disabled={!captureActive || captureFault || recording || Boolean(busy) || !currentItem || !['pending', 'review'].includes(currentItem.status)}><Icon name="skip" /><span>{t('recorder.skip')}</span><kbd>S</kbd></button></div>
+            <div className="transport-secondary right">{captureActive && <button title={t('recorder.skipKey')} onClick={() => void skipItem()} disabled={captureFault || recording || Boolean(busy) || !currentItem || !['pending', 'review'].includes(currentItem.status)}><Icon name="skip" /><span>{t('recorder.skip')}</span><kbd>S</kbd></button>}</div>
           </section>
         </div>
       </main>
       <aside className="panel inspector recording-inspector">
         <div className={`monitor-status-strip ${captureFault || workspaceFaulted ? 'fault' : meter.storage_status === 'warning' ? 'warning' : ''}`}>
-          <span><i />{captureFault ? captureFaultCopy.title : workspaceFaulted ? t('recorder.monitorReadonly') : captureActive ? t('recorder.monitorLive') : t('recorder.monitorInspect')}</span>
+          <span><i />{captureFault ? captureFaultCopy.title : workspaceFaulted ? t('recorder.monitorReadonly') : captureActive ? t('recorder.monitorLive') : t('recorder.monitorView')}</span>
           <span className={prompterStatus.ready ? 'ready' : ''}><i />{prompterStatus.ready ? t('recorder.prompterConnected') : t('recorder.prompterDisconnected')}</span>
         </div>
         <div className="monitor-panel-body">
@@ -2795,7 +2872,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             {hasMonitorIssues && <button className={monitorPanelTab === 'issues' ? 'active issue' : 'issue'} onClick={() => setMonitorPanelTab('issues')} title={t('recorder.tabIssues')}><Icon name="stop" /><span>{t('recorder.tabIssues')}</span></button>}
           </nav>
         </div>
-        <button data-testid="finish-session" className="button finish-session" onClick={() => void finishSession()} disabled={Boolean(busy)}><Icon name={captureActive ? 'stop' : 'chevron-left'} size={14} />{!captureActive ? t('recorder.leaveTask') : exitAction === 'fault' ? t('recorder.finishAndLeave') : t('recorder.pauseAndLeave')}</button>
+        <div className="inspector-footer">
+          {!captureActive && <button data-testid="enter-capture" className="button finish-session enter-capture" title={t('recorder.enterCaptureKey')} onClick={() => void activateCapture(currentItem?.id)} disabled={Boolean(busy) || workspaceFaulted}><Icon name="microphone" size={14} />{t('recorder.enterCapture')}<kbd>R</kbd></button>}
+          <button data-testid="finish-session" className={`button finish-session ${captureActive ? '' : 'leave-task'}`} onClick={() => void finishSession()} disabled={Boolean(busy)}><Icon name={captureActive ? 'stop' : 'chevron-left'} size={14} />{!captureActive ? t('recorder.leaveView') : exitAction === 'fault' ? t('recorder.finishAndLeave') : t('recorder.pauseAndLeave')}</button>
+        </div>
       </aside>
     </div>
     {pauseConfirmOpen && !captureFault && <div className="dialog-backdrop" role="presentation">
