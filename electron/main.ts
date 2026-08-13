@@ -306,6 +306,24 @@ const SESSION_LIVE_PHASES: readonly EnginePhase[] = [
   'recovering',
 ];
 
+const INSPECT_SESSION_COMMANDS = new Set([
+  'inspect_session',
+  'render_session_attempt',
+  'preview_session_waveform',
+  'select_session_attempt',
+]);
+
+// Inspect commands share one exclusive engine intent. The inspect workspace
+// fires waveform and render together, so they must queue instead of failing
+// the second call with "正在读取录制任务".
+let inspectSessionCommandTail: Promise<void> = Promise.resolve();
+
+function enqueueInspectSessionCommand<T>(work: () => Promise<T>): Promise<T> {
+  const run = inspectSessionCommandTail.then(work, work);
+  inspectSessionCommandTail = run.then(() => undefined, () => undefined);
+  return run;
+}
+
 function beginEngineIntent(
   phase: EnginePhase,
   sessionDir: string | null,
@@ -3932,38 +3950,37 @@ function registerIpc(): void {
         throw error;
       }
     }
-    if (command === 'inspect_session'
-      || command === 'render_session_attempt'
-      || command === 'preview_session_waveform'
-      || command === 'select_session_attempt') {
-      const sessionDir = (payload as { session_dir?: unknown })?.session_dir;
-      if (typeof sessionDir !== 'string') throw new Error('录制目录无效');
-      assertCanStartOrResume();
-      const inspectIntent = beginEngineIntent('inspecting', path.resolve(sessionDir));
-      try {
-        const canonical = await resolveKnownSession(sessionDir);
-        if (!canonical) throw new Error('只能打开已授权保存位置中的录制任务');
-        transitionEngineIntent(inspectIntent, 'inspecting', canonical);
-        const expectedSessionId = knownSessionId(canonical);
-        if (!expectedSessionId) throw new Error('无法确认录制任务身份，请刷新任务列表后重试');
-        const authorizedRoots = Array.from(canonicalOutputRoots.values());
-        const binding = await bindAuthorizedSession(canonical, authorizedRoots, expectedSessionId);
-        attachAuthorizedBinding(inspectIntent, binding);
-        await activeEngine.start();
-        await assertAuthorizedSessionUnchanged(binding, authorizedRoots);
-        const result = await activeEngine.request(command, {
-          ...(payload as Record<string, unknown>),
-          session_dir: canonical,
-          expected_session_id: binding.sessionId,
-        }, command === 'render_session_attempt' || command === 'preview_session_waveform' ? 60_000 : 20_000);
-        await assertAuthorizedSessionUnchanged(binding, authorizedRoots);
-        transitionEngineIntent(inspectIntent, 'idle', null);
-        rememberKnownSession(canonical, binding.sessionId);
-        return result;
-      } catch (error) {
-        if (ownsEngineGeneration(inspectIntent)) transitionEngineIntent(inspectIntent, 'idle', null);
-        throw error;
-      }
+    if (INSPECT_SESSION_COMMANDS.has(command)) {
+      return enqueueInspectSessionCommand(async () => {
+        const sessionDir = (payload as { session_dir?: unknown })?.session_dir;
+        if (typeof sessionDir !== 'string') throw new Error('录制目录无效');
+        assertCanStartOrResume();
+        const inspectIntent = beginEngineIntent('inspecting', path.resolve(sessionDir));
+        try {
+          const canonical = await resolveKnownSession(sessionDir);
+          if (!canonical) throw new Error('只能打开已授权保存位置中的录制任务');
+          transitionEngineIntent(inspectIntent, 'inspecting', canonical);
+          const expectedSessionId = knownSessionId(canonical);
+          if (!expectedSessionId) throw new Error('无法确认录制任务身份，请刷新任务列表后重试');
+          const authorizedRoots = Array.from(canonicalOutputRoots.values());
+          const binding = await bindAuthorizedSession(canonical, authorizedRoots, expectedSessionId);
+          attachAuthorizedBinding(inspectIntent, binding);
+          await activeEngine.start();
+          await assertAuthorizedSessionUnchanged(binding, authorizedRoots);
+          const result = await activeEngine.request(command, {
+            ...(payload as Record<string, unknown>),
+            session_dir: canonical,
+            expected_session_id: binding.sessionId,
+          }, command === 'render_session_attempt' || command === 'preview_session_waveform' ? 60_000 : 20_000);
+          await assertAuthorizedSessionUnchanged(binding, authorizedRoots);
+          transitionEngineIntent(inspectIntent, 'idle', null);
+          rememberKnownSession(canonical, binding.sessionId);
+          return result;
+        } catch (error) {
+          if (ownsEngineGeneration(inspectIntent)) transitionEngineIntent(inspectIntent, 'idle', null);
+          throw error;
+        }
+      });
     }
     if (command === 'start_session') {
       const sessionDir = (payload as { session_dir?: unknown })?.session_dir;

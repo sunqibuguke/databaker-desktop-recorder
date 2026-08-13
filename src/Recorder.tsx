@@ -66,7 +66,12 @@ import type { Attempt, AudioDevice, CapturePreset, CapturePresetDraft, CapturePr
 import { reportRendererError } from './sentry';
 import { logUserAction } from './debug-log';
 import { translateExportDeliverError } from './export-deliver-i18n';
-import { DISCONTINUITY_TOAST_MS, discontinuityDurationMs, shouldShowDiscontinuityToast } from './discontinuity-toast';
+import {
+  DISCONTINUITY_TOAST_MS,
+  discontinuityDurationMs,
+  initialDiscontinuityToastState,
+  shouldShowDiscontinuityToast,
+} from './discontinuity-toast';
 import { classifyEngineError, userFacingEngineError, type ClassifiedEngineError } from './engine-error';
 import { LogPanel } from './LogPanel';
 import { NoiseCheckDialog } from './NoiseCheckDialog';
@@ -523,7 +528,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const noiseCheckOperationRef = useRef<SessionNoiseCheckOperation | null>(null);
   const silenceSettingsSaveSequenceRef = useRef(0);
   const hadMonitorIssuesRef = useRef(false);
-  const lastDiscontinuityCountRef = useRef(0);
+  const discontinuityToastStateRef = useRef(initialDiscontinuityToastState());
   const lastOperationErrorRef = useRef('');
   const discontinuityToastTimerRef = useRef<number | null>(null);
   const activeSessionDirRef = useRef('');
@@ -1390,7 +1395,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setAutomationRules(loadAutomationRules(sessionDir));
     takePeakRef.current = 0;
     setReviewPeak(0);
-    lastDiscontinuityCountRef.current = 0;
+    discontinuityToastStateRef.current = initialDiscontinuityToastState();
     setDiscontinuityToast('');
     if (discontinuityToastTimerRef.current !== null) {
       window.clearTimeout(discontinuityToastTimerRef.current);
@@ -1404,10 +1409,14 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   }, [recording, meter.peak]);
 
   useEffect(() => {
-    if (!shouldShowDiscontinuityToast(lastDiscontinuityCountRef.current, discontinuityCount) || !discontinuityWarning) {
-      return;
-    }
-    lastDiscontinuityCountRef.current = discontinuityCount;
+    const observed = shouldShowDiscontinuityToast(discontinuityToastStateRef.current, {
+      count: discontinuityCount,
+      silenceSamples: discontinuitySilenceSamples,
+      sampleRate: sampleRateForDisplay,
+      nowMs: Date.now(),
+    });
+    discontinuityToastStateRef.current = observed.state;
+    if (!observed.show || !discontinuityWarning) return;
     setDiscontinuityToast(discontinuityWarning);
     if (discontinuityToastTimerRef.current !== null) {
       window.clearTimeout(discontinuityToastTimerRef.current);
@@ -1416,7 +1425,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       setDiscontinuityToast('');
       discontinuityToastTimerRef.current = null;
     }, DISCONTINUITY_TOAST_MS);
-  }, [discontinuityCount, discontinuityWarning]);
+  }, [discontinuityCount, discontinuitySilenceSamples, discontinuityWarning, sampleRateForDisplay]);
 
   useEffect(() => () => {
     if (discontinuityToastTimerRef.current !== null) {
@@ -2111,23 +2120,34 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     const requestId = previewWaveformRequestRef.current + 1;
     previewWaveformRequestRef.current = requestId;
     const reusedBins = !captureActive && reviewAttempt?.attempt_id === attemptId ? reviewWaveformBins : [];
-    void window.recorder.request<{ bins: Array<[number, number]> }>(waveformCommand, {
-      ...(captureActive ? {} : { session_dir: sessionDir }),
-      item_id: currentItem.id,
-      attempt_id: attemptId,
-    }).then((result) => {
+    const applyPreviewBins = (bins: Array<[number, number]>) => {
       if (requestId !== previewWaveformRequestRef.current) return;
-      setPreviewBins(Array.isArray(result.bins) ? result.bins : []);
-    }).catch(() => {
-      if (requestId !== previewWaveformRequestRef.current) return;
-      if (!reusedBins.length) setPreviewBins([]);
-    });
+      setPreviewBins(bins);
+    };
+    const requestPreviewWaveform = () => {
+      void window.recorder.request<{ bins: Array<[number, number]> }>(waveformCommand, {
+        ...(captureActive ? {} : { session_dir: sessionDir }),
+        item_id: currentItem.id,
+        attempt_id: attemptId,
+      }).then((result) => {
+        applyPreviewBins(Array.isArray(result.bins) ? result.bins : []);
+      }).catch(() => {
+        if (requestId !== previewWaveformRequestRef.current) return;
+        if (!reusedBins.length) setPreviewBins([]);
+      });
+    };
+    if (reusedBins.length) applyPreviewBins(reusedBins);
+    // Live capture can fetch waveform in parallel. Inspect-mode waveform and
+    // render share one exclusive lock, so start render first and only fetch
+    // bins after if the review waveform is not already available.
+    if (captureActive) requestPreviewWaveform();
     const rendered = await run(t('notice.preparingPreview'), () => window.recorder.request<{ file_path: string }>(command, {
       ...(captureActive ? {} : { session_dir: sessionDir }),
       item_id: currentItem.id,
       attempt_id: attemptId,
     }));
     if (!rendered || requestId !== previewWaveformRequestRef.current) return;
+    if (!captureActive && !reusedBins.length) requestPreviewWaveform();
     const audio = await run(t('notice.readingPreview'), () => window.recorder.readAudio(rendered.file_path));
     if (!audio || requestId !== previewWaveformRequestRef.current) return;
     if (audioUrl) URL.revokeObjectURL(audioUrl);
