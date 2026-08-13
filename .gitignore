@@ -15,3 +15,7 @@ recordings/
 
 # Sentry Config File
 .env.sentry-build-plugin
+
+# Production license signing key. Never commit the private half.
+tools/license-issuer/keys/*.pem
+!tools/license-issuer/keys/*.pub.pem

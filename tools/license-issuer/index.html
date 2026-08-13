@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>DataBaker 授权注册机</title>
+  <style>
+    :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; }
+    body { margin: 0; background: #161616; color: #e6e6e6; }
+    main { max-width: 520px; margin: 0 auto; padding: 28px 22px 32px; }
+    h1 { margin: 0 0 6px; font-size: 20px; }
+    p { margin: 0 0 18px; color: #9c9c9c; font-size: 13px; line-height: 1.55; }
+    label { display: grid; gap: 6px; margin-bottom: 12px; font-size: 12px; color: #b9b9b9; }
+    input, textarea { padding: 8px 10px; border: 1px solid #434846; border-radius: 2px; color: #d5dad7; background: #1f2221; font: 13px ui-monospace, SFMono-Regular, Consolas, monospace; }
+    textarea { min-height: 92px; resize: vertical; }
+    .row { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: end; }
+    button { min-height: 34px; padding: 0 14px; border: 1px solid #6abeb9; background: #69bdb8; color: #0d2422; font-weight: 600; }
+    button.secondary { border-color: #434846; background: #2b2b2b; color: #d5dad7; }
+    .error { margin: 10px 0 0; color: #ef6a72; font-size: 12px; }
+    .ok { margin-top: 16px; }
+    .ok code { display: block; margin-top: 8px; padding: 10px; border: 1px solid #3d3d3d; background: #1b1d1c; white-space: pre-wrap; word-break: break-all; }
+    .check { display: flex; align-items: center; gap: 8px; margin: 4px 0 14px; color: #b9b9b9; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>DataBaker 授权注册机</h1>
+    <p>输入工位机器码和客户名称，生成绑定该机器的离线授权码。私钥只放在本机，不要随采集安装包分发。</p>
+    <label>注册机口令（若公司设置了口令）<input id="password" type="password" autocomplete="off" /></label>
+    <label>机器码<input id="machine" placeholder="A7K2-9M3P-Q4WX" /></label>
+    <label>客户 / 工位名<input id="subject" placeholder="客户A-工位3" /></label>
+    <div class="row">
+      <label>有效天数<input id="days" type="number" min="1" value="365" /></label>
+      <label class="check"><input id="perpetual" type="checkbox" />永久</label>
+    </div>
+    <button id="issue" type="button">生成授权码</button>
+    <div id="error" class="error" hidden></div>
+    <div id="result" class="ok" hidden>
+      <div>授权码</div>
+      <code id="ticket"></code>
+      <button id="copy" class="secondary" type="button" style="margin-top:10px">复制授权码</button>
+    </div>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    $('perpetual').addEventListener('change', () => {
+      $('days').disabled = $('perpetual').checked;
+    });
+    $('issue').addEventListener('click', async () => {
+      $('error').hidden = true;
+      $('result').hidden = true;
+      try {
+        const ticket = await window.issuer.issue({
+          password: $('password').value,
+          machineCode: $('machine').value,
+          subject: $('subject').value,
+          days: Number($('days').value || 365),
+          perpetual: $('perpetual').checked,
+        });
+        $('ticket').textContent = ticket;
+        $('result').hidden = false;
+      } catch (error) {
+        $('error').textContent = error instanceof Error ? error.message : String(error);
+        $('error').hidden = false;
+      }
+    });
+    $('copy').addEventListener('click', async () => {
+      await navigator.clipboard.writeText($('ticket').textContent);
+      $('copy').textContent = '已复制';
+      setTimeout(() => { $('copy').textContent = '复制授权码'; }, 1200);
+    });
+  </script>
+</body>
+</html>

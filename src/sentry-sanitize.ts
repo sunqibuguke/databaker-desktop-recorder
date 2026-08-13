@@ -1,5 +1,5 @@
 const FILTERED = '[Filtered]';
-const SENSITIVE_KEY = /(?:^|[_-])(?:authorization|cookie|dsn|password|secret|token|script(?:[_-]?name)?|text|content|session[_-]?(?:id|dir)|file[_-]?path|output[_-]?root)(?:$|[_-])/i;
+const SENSITIVE_KEY = /(?:^|[_-])(?:authorization|cookie|dsn|password|secret|token|ticket|license|machine(?:[_-]?code)?|script(?:[_-]?name)?|text|content|session[_-]?(?:id|dir)|file[_-]?path|output[_-]?root)(?:$|[_-])/i;
 const UUID = /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi;
 const WINDOWS_PATH = /\b[A-Za-z]:\\(?:[^\s\\/:*?"<>|]+\\)*[^\s\\/:*?"<>|]*/g;
 const POSIX_PATH = /(?:^|[\s"'`(])\/(?:Users|home|Volumes|private|tmp|var|opt|mnt)\/[^\s"'`)]+/g;
