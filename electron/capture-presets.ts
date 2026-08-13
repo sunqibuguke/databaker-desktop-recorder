@@ -11,6 +11,7 @@ export type CapturePreset = {
   deviceName: string;
   sampleRate: number;
   bitDepth: 16 | 24 | 32;
+  inputSampleFormat: 'i16' | 'i24' | 'i32' | 'f32';
   inputChannel: number;
   captureShareMode: CaptureShareMode;
   silenceDurationMs: number;
@@ -54,6 +55,18 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
+function inferredInputSampleFormat(bitDepth: number, value: unknown): 'i16' | 'i24' | 'i32' | 'f32' {
+  if (value === undefined || value === null || value === '') {
+    if (bitDepth === 16) return 'i16';
+    if (bitDepth === 32) return 'f32';
+    return 'i24';
+  }
+  if (value !== 'i16' && value !== 'i24' && value !== 'i32' && value !== 'f32') {
+    throw new Error('预设采集格式无效');
+  }
+  return value;
+}
+
 function validatePreset(value: unknown): CapturePreset {
   if (!isPlainObject(value)) throw new Error('采集预设格式无效');
   const name = typeof value.name === 'string' ? value.name.trim() : '';
@@ -68,6 +81,7 @@ function validatePreset(value: unknown): CapturePreset {
     throw new Error('预设采样率无效');
   }
   if (value.bitDepth !== 16 && value.bitDepth !== 24 && value.bitDepth !== 32) throw new Error('预设位深无效');
+  const inputSampleFormat = inferredInputSampleFormat(Number(value.bitDepth), value.inputSampleFormat);
   if (!Number.isSafeInteger(value.inputChannel) || Number(value.inputChannel) < 1 || Number(value.inputChannel) > MAX_INPUT_CHANNEL) {
     throw new Error('预设输入通道无效');
   }
@@ -93,6 +107,7 @@ function validatePreset(value: unknown): CapturePreset {
     deviceName,
     sampleRate: Number(value.sampleRate),
     bitDepth: Number(value.bitDepth) as 16 | 24 | 32,
+    inputSampleFormat,
     inputChannel: Number(value.inputChannel),
     captureShareMode,
     silenceDurationMs: Number(value.silenceDurationMs),

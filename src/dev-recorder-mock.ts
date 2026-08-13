@@ -125,7 +125,13 @@ export function installDevRecorderMock() {
     prompterListeners.forEach((listener) => listener(event.data));
   });
   const mockDevices: AudioDevice[] = [
-    { id: 'mock:studio-usb-microphone', name: 'Studio USB Microphone', is_default: true, sample_rates: [44_100, 48_000, 96_000], input_channels: [1, 2], configurations: [{ min_sample_rate: 44_100, max_sample_rate: 96_000, channels: 2, sample_format: 'f32', share_mode: 'exclusive' }, { min_sample_rate: 44_100, max_sample_rate: 96_000, channels: 2, sample_format: 'f32', share_mode: 'shared' }] },
+    { id: 'mock:studio-usb-microphone', name: 'Studio USB Microphone', is_default: true, sample_rates: [44_100, 48_000, 96_000], input_channels: [1, 2], configurations: [
+      { min_sample_rate: 44_100, max_sample_rate: 96_000, channels: 2, sample_format: 'i16', share_mode: 'exclusive' },
+      { min_sample_rate: 44_100, max_sample_rate: 96_000, channels: 2, sample_format: 'i24', share_mode: 'exclusive' },
+      { min_sample_rate: 44_100, max_sample_rate: 96_000, channels: 2, sample_format: 'i32', share_mode: 'exclusive' },
+      { min_sample_rate: 44_100, max_sample_rate: 96_000, channels: 2, sample_format: 'f32', share_mode: 'exclusive' },
+      { min_sample_rate: 44_100, max_sample_rate: 48_000, channels: 2, sample_format: 'f32', share_mode: 'shared' },
+    ], exclusive_available: true, exclusive_sample_rates: [44_100, 48_000, 96_000], exclusive_input_channels: [1, 2], exclusive_formats: ['i16', 'i24', 'i32', 'f32'], exclusive_probe_error: null, shared_sample_rates: [44_100, 48_000], shared_input_channels: [1, 2] },
     { id: 'mock:built-in-microphone', name: 'Built-in Microphone', is_default: false, sample_rates: [44_100, 48_000], input_channels: [1], configurations: [{ min_sample_rate: 44_100, max_sample_rate: 48_000, channels: 1, sample_format: 'f32', share_mode: 'exclusive' }, { min_sample_rate: 44_100, max_sample_rate: 48_000, channels: 1, sample_format: 'f32', share_mode: 'shared' }] },
   ];
   const previewHistory: RecordingHistoryEntry[] = [{
@@ -354,7 +360,7 @@ export function installDevRecorderMock() {
         status: command === 'start_session' ? 'recording' : 'stopped',
         device_name: requestedDevice.name,
         device_id: requestedDevice.id,
-        input_sample_format: requestedDevice.configurations?.[0]?.sample_format ?? 'f32',
+        input_sample_format: String(data.input_sample_format || requestedDevice.configurations?.[0]?.sample_format || 'f32').toLowerCase(),
         capture_share_mode: data.capture_share_mode === 'shared' ? 'shared' : 'exclusive',
         audio_format: { sample_rate: Number(data.sample_rate), bit_depth: Number(data.bit_depth ?? 24), encoding: Number(data.bit_depth ?? 24) === 32 ? 'float' : 'pcm', channels: 1, input_channels: 2, input_channel: Number(data.input_channel ?? 1) },
         master_audio: 'audio/master.wav', storage_layout_version: 1, segment_frames: Number(data.sample_rate) * 300, captured_samples: 0, committed_samples: 0, overflow_samples: 0,
@@ -668,6 +674,7 @@ export function installDevRecorderMock() {
     value: {
       runtime: 'preview',
       platform: 'darwin',
+      devWebCapture: async () => false,
       request,
       openScript: async () => null,
       chooseOutput: async () => '/tmp/DataBaker Recordings',

@@ -101,6 +101,21 @@ export function reportEngineOffline(phase: string, message: string): void {
   });
 }
 
+export function reportExclusiveProbeIssue(
+  kind: string,
+  attributes: Record<string, string | number | boolean>,
+): void {
+  if (!Sentry) return;
+  Sentry.withScope((scope) => {
+    scope.setLevel('warning');
+    scope.setTag('audio.host', 'wasapi');
+    scope.setTag('audio.exclusive.probe', kind);
+    scope.setFingerprint(['wasapi-exclusive-probe', kind]);
+    scope.setContext('exclusive_probe', sanitizeValue(attributes) as Record<string, unknown>);
+    Sentry.captureMessage(`WASAPI exclusive probe: ${kind}`);
+  });
+}
+
 export async function flushSentry(timeoutMs = 1_500): Promise<void> {
   if (!Sentry) return;
   await Sentry.flush(timeoutMs);

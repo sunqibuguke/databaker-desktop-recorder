@@ -133,6 +133,8 @@ async function main() {
 
     assert.equal(shouldLogEngineCommand('get_state', false), false);
     assert.equal(shouldLogEngineCommand('get_state', true), true);
+    assert.equal(shouldLogEngineCommand('dev_feed_pcm', false), false);
+    assert.equal(shouldLogEngineCommand('dev_feed_pcm', true), true);
     assert.equal(shouldLogEngineCommand('start_attempt', false), true);
 
     const identity = sessionIdentityFromResult({

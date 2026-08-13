@@ -3,9 +3,15 @@ import {
   isSentryEnabled,
   recordRecorderPhase,
   reportEngineOffline,
+  reportExclusiveProbeIssue,
   reportOperationalError,
   setOperationalErrorSink,
 } from './sentry';
+import {
+  collectExclusiveProbeIssues,
+  exclusiveProbeIssueAttributes,
+  exclusiveProbeIssueKey,
+} from './exclusive-probe';
 import {
   DEBUG_LOG_APP_FILE_NAME,
   DebugLogStore,
@@ -20,6 +26,7 @@ import {
   Menu,
   nativeImage,
   screen,
+  session,
   shell,
   systemPreferences,
   Tray,
@@ -66,6 +73,7 @@ import {
   isMeterEngineEvent,
   LatestOnlyMeterBackpressure,
 } from './meter-backpressure';
+import { applyDevWebCaptureEnv, isDevWebCaptureEnabled } from './dev-web-capture';
 
 let mainWindow: BrowserWindow | null = null;
 let prompterWindow: BrowserWindow | null = null;
@@ -89,6 +97,7 @@ let prompterRendererReady = false;
 let latestPrompterState: unknown = null;
 let engine: EngineClient | null = null;
 let debugLog: DebugLogStore | null = null;
+const reportedExclusiveProbes = new Set<string>();
 let lastMeterFaultSignature = '';
 let recordingTray: Tray | null = null;
 let closeDecisionPromise: Promise<void> | null = null;
@@ -2512,6 +2521,24 @@ function shouldSkipMicrophonePreflight(): boolean {
   return process.env.DATABAKER_SKIP_MIC_PREFLIGHT === '1' && !app.isPackaged;
 }
 
+function devWebCaptureEnabled(): boolean {
+  return isDevWebCaptureEnabled(process.platform, app.isPackaged);
+}
+
+function installDevWebCapturePermissions(): void {
+  if (!devWebCaptureEnabled()) return;
+  const electronSession = session?.defaultSession;
+  if (!electronSession) return;
+  if (typeof electronSession.setPermissionRequestHandler === 'function') {
+    electronSession.setPermissionRequestHandler((_webContents, permission, callback) => {
+      callback(permission === 'media');
+    });
+  }
+  if (typeof electronSession.setPermissionCheckHandler === 'function') {
+    electronSession.setPermissionCheckHandler((_webContents, permission) => permission === 'media');
+  }
+}
+
 async function requestMicrophoneAccessQuietly(): Promise<boolean> {
   if (process.platform !== 'darwin') return true;
   const status = systemPreferences.getMediaAccessStatus('microphone');
@@ -3648,6 +3675,25 @@ function assertExpectedActiveSession(payload: unknown): void {
   }
 }
 
+function reportExclusiveProbeInventory(inventory: unknown): void {
+  if (process.platform !== 'win32') return;
+  for (const issue of collectExclusiveProbeIssues(inventory)) {
+    const key = exclusiveProbeIssueKey(issue);
+    if (reportedExclusiveProbes.has(key)) continue;
+    reportedExclusiveProbes.add(key);
+    const attributes = exclusiveProbeIssueAttributes(issue);
+    debugLog?.append({
+      level: 'warn',
+      source: 'main',
+      category: 'audio',
+      event: 'wasapi.exclusive.probe',
+      message: `WASAPI 独占探测：${issue.kind} · ${issue.deviceName}`,
+      data: attributes,
+    });
+    reportExclusiveProbeIssue(issue.kind, attributes);
+  }
+}
+
 async function bindDebugLogFromCommand(command: string, result: unknown): Promise<void> {
   if (!debugLog || !SESSION_BIND_COMMANDS.has(command)) return;
   const identity = sessionIdentityFromResult(result);
@@ -3700,11 +3746,7 @@ function registerIpc(): void {
   };
   const readLicenseStatus = async (): Promise<LicenseStatus> => {
     if (isLicenseCheckDisabled()) {
-      const fingerprint = await machineFingerprint().catch(() => ({
-        machineCode: '',
-        componentHashes: [],
-      }));
-      return disabledLicenseStatus(fingerprint.machineCode);
+      return disabledLicenseStatus('');
     }
     return licenseRepository.evaluate(await machineFingerprint());
   };
@@ -3825,8 +3867,20 @@ function registerIpc(): void {
       return await failSealingSession(sealIntent, error);
     }
   });
+  ipcMain.handle('app:dev-web-capture', () => devWebCaptureEnabled());
   ipcMain.handle('engine:request', async (event, command: string, payload: unknown) => {
     assertMainRenderer(event.sender);
+    if (command === 'dev_feed_pcm') {
+      if (!devWebCaptureEnabled()) throw new Error(`不允许的录音引擎命令：${command}`);
+      if (!engine) throw new Error('录音引擎不可用');
+      if (!isLicenseExemptEngineCommand(command)) await assertAppLicensed();
+      assertCanMutateActiveSession(command);
+      const samples = isRecord(payload) ? payload.samples : null;
+      if (!Array.isArray(samples) || samples.length === 0 || samples.length > 16_384) {
+        throw new Error('dev_feed_pcm 样本无效');
+      }
+      return engine.request(command, { samples }, 5_000);
+    }
     if (!allowedCommands.has(command)) throw new Error(`不允许的录音引擎命令：${command}`);
     if (!isLicenseExemptEngineCommand(command)) await assertAppLicensed();
     if (!engine) throw new Error('录音引擎不可用');
@@ -4066,6 +4120,7 @@ function registerIpc(): void {
     const commandIntent = engineIntent;
     try {
       const result = await activeEngine.request(command, payload, timeout);
+      if (command === 'list_devices') reportExclusiveProbeInventory(result);
       if (command === 'get_state_optional'
         && ownsEngineGeneration(commandIntent)
         && !isQuitting()) {
@@ -4408,6 +4463,8 @@ if (!hasSingleInstanceLock) {
 
 app.whenReady().then(async () => {
   if (!hasSingleInstanceLock) return;
+  applyDevWebCaptureEnv(process.platform, app.isPackaged);
+  installDevWebCapturePermissions();
   debugLog = new DebugLogStore(path.join(app.getPath('userData'), DEBUG_LOG_APP_FILE_NAME));
   await debugLog.loadAppLog().catch(() => undefined);
   debugLog.onEntry(publishDebugLogEntry);

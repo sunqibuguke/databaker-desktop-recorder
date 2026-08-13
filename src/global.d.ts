@@ -10,6 +10,7 @@ declare global {
     recorder: {
       runtime: 'desktop' | 'preview';
       platform?: string;
+      devWebCapture?(): Promise<boolean>;
       request<T = unknown>(command: string, payload?: unknown): Promise<T>;
       openScript(): Promise<{ filePath: string; name: string; content: string } | null>;
       chooseOutput(): Promise<string | null>;

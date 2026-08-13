@@ -76,3 +76,72 @@ export function captureFormatsSupportBitDepth(
     return representationBits !== null && representationBits >= minimumBits;
   });
 }
+
+export const CAPTURE_SAMPLE_FORMATS = ['i16', 'i24', 'i32', 'f32'] as const;
+export type CaptureSampleFormat = (typeof CAPTURE_SAMPLE_FORMATS)[number];
+
+const PREFERRED_CAPTURE_SAMPLE_FORMATS: readonly CaptureSampleFormat[] = ['i24', 'f32', 'i32', 'i16'];
+
+export function normalizeCaptureSampleFormat(value: unknown): CaptureSampleFormat | null {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().toLowerCase();
+  return CAPTURE_SAMPLE_FORMATS.find((format) => format === normalized) ?? null;
+}
+
+export function captureSampleFormatFromBitDepth(bitDepth: number): CaptureSampleFormat {
+  if (bitDepth === 16) return 'i16';
+  if (bitDepth === 32) return 'f32';
+  return 'i24';
+}
+
+export function deliveryBitDepthForCaptureFormat(format: string): 16 | 24 | 32 {
+  switch (normalizeCaptureSampleFormat(format)) {
+    case 'i16':
+      return 16;
+    case 'i24':
+      return 24;
+    default:
+      return 32;
+  }
+}
+
+export function preferredCaptureSampleFormat(formats: readonly string[]): CaptureSampleFormat | null {
+  const available = new Set(
+    formats
+      .map((format) => normalizeCaptureSampleFormat(format))
+      .filter((format): format is CaptureSampleFormat => format !== null),
+  );
+  return PREFERRED_CAPTURE_SAMPLE_FORMATS.find((format) => available.has(format))
+    ?? [...available][0]
+    ?? null;
+}
+
+export function captureSampleFormatsForConfiguration(
+  configurations: readonly DeviceStreamConfiguration[],
+  sampleRate: number,
+  inputChannel: number,
+): CaptureSampleFormat[] {
+  const available = new Set<CaptureSampleFormat>();
+  for (const configuration of configurations) {
+    if (configuration.channels < inputChannel) continue;
+    if (sampleRate < configuration.min_sample_rate || sampleRate > configuration.max_sample_rate) continue;
+    const format = normalizeCaptureSampleFormat(configuration.sample_format);
+    if (format) available.add(format);
+  }
+  return CAPTURE_SAMPLE_FORMATS.filter((format) => available.has(format));
+}
+
+export function captureSampleFormatLabel(format: string): string {
+  switch (normalizeCaptureSampleFormat(format)) {
+    case 'i16':
+      return t('setup.bit16');
+    case 'i24':
+      return t('setup.bit24');
+    case 'i32':
+      return t('setup.bit32Int');
+    case 'f32':
+      return t('setup.bit32');
+    default:
+      return format.toUpperCase();
+  }
+}

@@ -90,17 +90,19 @@ kbd { min-width: 20px; padding: 1px 5px; border: 1px solid #505050; border-botto
 .license-gate-loading { background: #161616; }
 .license-gate .home-header { -webkit-app-region: drag; }
 .license-locale { margin-right: 4px; -webkit-app-region: no-drag; }
-.license-card { width: min(520px, calc(100% - 64px)); margin: clamp(36px, 8vh, 72px) auto 0; padding: 22px 22px 20px; border: 1px solid #3d3d3d; background: #242424; }
+.license-stage { min-height: 0; display: grid; place-items: center; padding: 28px 24px; overflow: auto; }
+.license-card { width: min(460px, 100%); height: fit-content; padding: 18px 18px 16px; border: 1px solid #555; border-top-color: #6a6a6a; border-radius: 2px; background: #292929; box-shadow: 0 18px 55px rgba(0, 0, 0, .55); }
 .license-card > small { display: block; color: #717171; font: 7px var(--mono); letter-spacing: .08em; }
-.license-card h1 { margin: 6px 0 10px; color: #eceeed; font-size: 22px; font-weight: 600; letter-spacing: -.03em; }
-.license-card > p { margin: 0 0 18px; color: #9c9c9c; font-size: 11px; line-height: 1.65; }
-.license-machine, .license-ticket { display: grid; gap: 6px; margin-bottom: 14px; }
+.license-card h1 { margin: 5px 0 8px; color: #eceeed; font-size: 18px; font-weight: 600; letter-spacing: -.02em; }
+.license-card > p { margin: 0 0 14px; color: #9c9c9c; font-size: 11px; line-height: 1.6; }
+.license-machine, .license-ticket { display: grid; gap: 6px; margin-bottom: 12px; }
 .license-machine > span, .license-ticket > span { color: #8a8a8a; font-size: 9px; }
 .license-machine > div { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
 .license-machine code { min-height: 32px; display: flex; align-items: center; padding: 0 10px; border: 1px solid #434846; color: #d7eeeb; background: #1b1d1c; font: 13px var(--mono); letter-spacing: .08em; }
-.license-ticket textarea { width: 100%; min-height: 110px; padding: 9px 10px; border: 1px solid #434846; border-radius: 2px; color: #d5dad7; background: #1f2221; font: 10px var(--mono); resize: vertical; }
+.license-ticket textarea { width: 100%; min-height: 84px; padding: 8px 10px; border: 1px solid #434846; border-radius: 2px; color: #d5dad7; background: #1f2221; font: 10px var(--mono); resize: vertical; }
+.license-card > .dialog-warning { margin: 0 0 12px; }
 .license-card > .button.primary { width: 100%; min-height: 34px; }
-.license-pending { margin-top: 18px; padding-top: 14px; border-top: 1px solid #353837; }
+.license-pending { margin-top: 14px; padding-top: 12px; border-top: 1px solid #353837; }
 .license-pending strong { display: block; color: #e0c48a; font-size: 10px; }
 .license-pending > p { margin: 6px 0 10px; color: #9e8e6c; font-size: 9px; line-height: 1.55; }
 .license-pending > div { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; margin-top: 8px; }
@@ -269,6 +271,8 @@ input:disabled { color: #7d7d7d; background: #222; }
 .hardware-line span { display: flex; align-items: center; gap: 5px; }.hardware-line i { width: 6px; height: 6px; border-radius: 50%; background: #686868; }.hardware-line span.ok { color: #9fc7c4; }.hardware-line span.ok i { background: var(--accent); }
 .hardware-line.invalid span { color: #df858b; }.hardware-line.invalid span i { background: var(--danger); }
 .hardware-line em { font-style: normal; }
+.hardware-hint { grid-column: 2; margin: 6px 0 0; color: #777; font-size: 11px; line-height: 1.45; }
+.dev-web-capture-hint { margin: 8px 0 0; color: #8a938c; font-size: 11px; line-height: 1.45; }
 .storage-form { grid-template-columns: .7fr 1.3fr; }
 .document-actions { display: flex; align-items: center; gap: 16px; padding: 15px 25px; background: #202020; }
 .document-actions p { display: flex; align-items: center; gap: 6px; margin: 0 auto 0 0; color: #7e7e7e; font-size: 9px; }.document-actions p svg { color: var(--accent); }

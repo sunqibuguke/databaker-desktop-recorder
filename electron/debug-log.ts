@@ -56,6 +56,7 @@ const QUIET_SUCCESS_COMMANDS = new Set([
   'get_state',
   'get_state_optional',
   'hello',
+  'dev_feed_pcm',
 ]);
 
 function errorMessage(error: unknown): string {

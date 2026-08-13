@@ -327,6 +327,10 @@ pub struct StartSessionPayload {
     pub sample_rate: u32,
     #[serde(default = "default_bit_depth")]
     pub bit_depth: u16,
+    /// Requested WASAPI capture sample format (`i16` / `i24` / `i32` / `f32`).
+    /// Empty keeps the previous auto-pick from delivery bit depth.
+    #[serde(default)]
+    pub input_sample_format: String,
     #[serde(default = "default_input_channel")]
     pub input_channel: u16,
     #[serde(default)]
@@ -1206,8 +1210,24 @@ enum AudioWriterBackend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureActivation {
     Device,
+    #[cfg(not(windows))]
+    DevWebFeed,
     #[cfg(feature = "system-test")]
     SystemTestSynthetic,
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+fn wants_dev_web_capture() -> bool {
+    cfg!(not(windows))
+        && std::env::var_os("DATABAKER_DEV_WEB_CAPTURE").is_some_and(|value| value == "1")
+}
+
+fn live_capture_activation() -> CaptureActivation {
+    #[cfg(not(windows))]
+    if wants_dev_web_capture() {
+        return CaptureActivation::DevWebFeed;
+    }
+    CaptureActivation::Device
 }
 
 impl AudioWriterBackend {
@@ -1424,6 +1444,14 @@ impl Engine {
             };
             let exclusive = collect_input_format_catalog(&device, true);
             let shared = collect_input_format_catalog(&device, false);
+            if let Some(error) = exclusive.probe_error.as_deref() {
+                eprintln!("exclusive format probe failed for {name}: {error}");
+            } else if !exclusive.available {
+                eprintln!(
+                    "exclusive format probe empty for {name}; shared_rates={:?} shared_channels={:?}",
+                    shared.sample_rates, shared.input_channels
+                );
+            }
             if exclusive.configurations.is_empty() && shared.configurations.is_empty() {
                 continue;
             }
@@ -1435,6 +1463,7 @@ impl Engine {
             input_channels.extend(shared.input_channels.iter().copied());
             input_channels.sort_unstable();
             input_channels.dedup();
+            let exclusive_formats = catalog_sample_formats(&exclusive);
             let mut configurations = exclusive.configurations;
             configurations.extend(shared.configurations);
             let is_default = default_device_id.as_deref() == Some(id.as_str());
@@ -1454,6 +1483,8 @@ impl Engine {
                 "exclusive_available": exclusive.available,
                 "exclusive_sample_rates": exclusive.sample_rates,
                 "exclusive_input_channels": exclusive.input_channels,
+                "exclusive_formats": exclusive_formats,
+                "exclusive_probe_error": exclusive.probe_error,
                 "shared_sample_rates": shared.sample_rates,
                 "shared_input_channels": shared.input_channels,
             }));
@@ -1475,7 +1506,7 @@ impl Engine {
             "session_started",
             None,
             None,
-            CaptureActivation::Device,
+            live_capture_activation(),
         )
     }
 
@@ -1542,7 +1573,15 @@ impl Engine {
         if payload.items.is_empty() {
             bail!("script contains no items");
         }
-        let output_encoding = WavEncoding::for_bit_depth(payload.bit_depth)?;
+        let requested_input_sample_format =
+            parse_requested_input_sample_format(&payload.input_sample_format)?;
+        let bit_depth = requested_input_sample_format
+            .map(delivery_bit_depth_for_sample_format)
+            .unwrap_or(payload.bit_depth);
+        let output_encoding = WavEncoding::for_bit_depth(bit_depth)?;
+        let input_sample_format = requested_input_sample_format
+            .map(|format| format.to_string())
+            .unwrap_or_default();
         let segment_frames = match segment_frames_override {
             Some(frames) => frames,
             None => storage_layout_v1_default_segment_frames(payload.sample_rate)?,
@@ -1588,12 +1627,12 @@ impl Engine {
             status: "recording".to_string(),
             device_name: payload.device_name.unwrap_or_default(),
             device_id: payload.device_id.unwrap_or_default(),
-            input_sample_format: String::new(),
+            input_sample_format,
             capture_share_mode: effective_capture_share_mode(payload.capture_share_mode),
             capture_provenance: Vec::new(),
             audio_format: AudioFormat {
                 sample_rate: payload.sample_rate,
-                bit_depth: payload.bit_depth,
+                bit_depth,
                 encoding: output_encoding.name().to_string(),
                 channels: 1,
                 input_channels: 1,
@@ -1712,7 +1751,7 @@ impl Engine {
             "session_resumed",
             Some(session_lock),
             Some(journal),
-            CaptureActivation::Device,
+            live_capture_activation(),
         )?;
         if let Some(object) = result.as_object_mut() {
             object.insert("previous_status".to_string(), json!(previous_status));
@@ -1920,12 +1959,15 @@ impl Engine {
                         .context("read stable input device id")?
                         .to_string();
                     let device_name = input_device_name(&device)?;
+                    let requested_format =
+                        parse_requested_input_sample_format(&snapshot.input_sample_format)?;
                     let supported = select_config(
                         &device,
                         snapshot.audio_format.sample_rate,
                         input_channel_index,
                         snapshot.audio_format.bit_depth,
                         snapshot.capture_share_mode,
+                        requested_format,
                     )?;
                     let input_channels = supported.channels();
                     let sample_format = supported.sample_format();
@@ -1943,6 +1985,21 @@ impl Engine {
                         Some((device, config)),
                     )
                 }
+                #[cfg(not(windows))]
+                CaptureActivation::DevWebFeed => (
+                    if snapshot.device_name.trim().is_empty() {
+                        "Mac development web capture".to_string()
+                    } else {
+                        snapshot.device_name.clone()
+                    },
+                    snapshot.device_id.clone(),
+                    snapshot
+                        .audio_format
+                        .input_channels
+                        .max(snapshot.audio_format.input_channel),
+                    SampleFormat::F32,
+                    None,
+                ),
                 #[cfg(feature = "system-test")]
                 CaptureActivation::SystemTestSynthetic => (
                     "DataBaker system-test synthetic input".to_string(),
@@ -2510,6 +2567,13 @@ impl Engine {
                 "silence_duration_ms": session.snapshot.silence_duration_ms,
                 "silence_threshold_dbfs": session.snapshot.silence_threshold_dbfs,
                 "existing_samples": expected_existing_frames,
+                "capture_source": match capture_activation {
+                    CaptureActivation::Device => "device",
+                    #[cfg(not(windows))]
+                    CaptureActivation::DevWebFeed => "dev_web_feed",
+                    #[cfg(feature = "system-test")]
+                    CaptureActivation::SystemTestSynthetic => "system_test",
+                },
             }),
         ) {
             return Err(self.finish_activation_failure(
@@ -2632,6 +2696,53 @@ impl Engine {
         Ok(json!({
             "captured_samples": session.captured.load(Ordering::Acquire),
             "committed_samples": session.committed.load(Ordering::Acquire),
+            "queued_frames": session.writer_queue.queued_frames.load(Ordering::Acquire),
+        }))
+    }
+
+    #[cfg(not(windows))]
+    pub fn dev_feed_pcm(&mut self, samples: Vec<f32>) -> Result<Value> {
+        let session = self.active_session_mut()?;
+        if session.stream.is_some() {
+            bail!("dev_feed_pcm cannot inject into a live device capture session");
+        }
+        session.ensure_metadata_mutation_allowed()?;
+        if samples.is_empty() {
+            bail!("dev_feed_pcm samples must not be empty");
+        }
+        if samples.len() > 16_384 {
+            bail!("dev_feed_pcm cannot inject more than 16384 samples per command");
+        }
+        let silence = SilenceMonitor {
+            silence_samples: Arc::clone(&session.silence_samples),
+            digital_silence_samples: Arc::clone(&session.digital_silence_samples),
+            last_signal_sample: Arc::clone(&session.last_signal_sample),
+            attempt_signal_start_sample: Arc::clone(&session.attempt_signal_start_sample),
+            analyzed_samples: Arc::clone(&session.analyzed_samples),
+            analysis_epoch: Arc::clone(&session.analysis_epoch),
+            threshold_bits: Arc::clone(&session.silence_threshold_bits),
+            capture_heartbeat: Arc::clone(&session.capture_heartbeat),
+            head_silence: session.head_silence.clone(),
+        };
+        saturating_atomic_add(&session.capture_heartbeat, 1);
+        // Do not arm the production stall watchdog. Chromium may pause the
+        // renderer callback while the operator grants TCC or switches Spaces.
+        publish_block(
+            samples,
+            &session.writer_tx,
+            &session.captured,
+            &session.overflow,
+            &session.faulted,
+            &session.peak,
+            &session.rms,
+            &session.writer_queue,
+            &silence,
+        );
+        if session.faulted.load(Ordering::Acquire) {
+            bail!("dev_feed_pcm was not accepted because capture is already faulted");
+        }
+        Ok(json!({
+            "captured_samples": session.captured.load(Ordering::Acquire),
             "queued_frames": session.writer_queue.queued_frames.load(Ordering::Acquire),
         }))
     }
@@ -6890,32 +7001,63 @@ fn minimum_input_representation_bits(output_bit_depth: u16) -> Result<u16> {
     }
 }
 
+fn parse_requested_input_sample_format(value: &str) -> Result<Option<SampleFormat>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(match trimmed.to_ascii_lowercase().as_str() {
+        "i16" => SampleFormat::I16,
+        "i24" => SampleFormat::I24,
+        "i32" => SampleFormat::I32,
+        "f32" => SampleFormat::F32,
+        other => bail!("不支持的采集格式：{other}。可选 i16、i24、i32、f32"),
+    }))
+}
+
+fn delivery_bit_depth_for_sample_format(format: SampleFormat) -> u16 {
+    match format {
+        SampleFormat::I16 => 16,
+        SampleFormat::I24 => 24,
+        // i32 and f32 both land in the existing 32-bit Float WAV writer.
+        SampleFormat::I32 | SampleFormat::F32 => 32,
+        _ => 24,
+    }
+}
+
 struct InputFormatCatalog {
     sample_rates: Vec<u32>,
     input_channels: Vec<u16>,
     configurations: Vec<Value>,
     available: bool,
+    probe_error: Option<String>,
 }
 
 fn collect_input_format_catalog(device: &Device, exclusive: bool) -> InputFormatCatalog {
     let mut sample_rates = Vec::<u32>::new();
     let mut input_channels = Vec::<u16>::new();
     let mut configurations = Vec::<Value>::new();
-    if let Ok(configs) = device.supported_input_configs_for(exclusive) {
-        for config in configs {
-            if !is_supported_input_format(config.sample_format()) {
-                continue;
+    let mut probe_error = None;
+    match device.supported_input_configs_for(exclusive) {
+        Ok(configs) => {
+            for config in configs {
+                if !is_supported_input_format(config.sample_format()) {
+                    continue;
+                }
+                input_channels.push(config.channels());
+                sample_rates.push(config.min_sample_rate());
+                sample_rates.push(config.max_sample_rate());
+                configurations.push(json!({
+                    "min_sample_rate": config.min_sample_rate(),
+                    "max_sample_rate": config.max_sample_rate(),
+                    "channels": config.channels(),
+                    "sample_format": config.sample_format().to_string(),
+                    "share_mode": if exclusive { "exclusive" } else { "shared" },
+                }));
             }
-            input_channels.push(config.channels());
-            sample_rates.push(config.min_sample_rate());
-            sample_rates.push(config.max_sample_rate());
-            configurations.push(json!({
-                "min_sample_rate": config.min_sample_rate(),
-                "max_sample_rate": config.max_sample_rate(),
-                "channels": config.channels(),
-                "sample_format": config.sample_format().to_string(),
-                "share_mode": if exclusive { "exclusive" } else { "shared" },
-            }));
+        }
+        Err(error) => {
+            probe_error = Some(format!("{error:#}"));
         }
     }
     sample_rates.sort_unstable();
@@ -6928,7 +7070,24 @@ fn collect_input_format_catalog(device: &Device, exclusive: bool) -> InputFormat
         input_channels,
         configurations,
         available,
+        probe_error,
     }
+}
+
+fn catalog_sample_formats(catalog: &InputFormatCatalog) -> Vec<String> {
+    let mut formats = catalog
+        .configurations
+        .iter()
+        .filter_map(|configuration| {
+            configuration
+                .get("sample_format")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    formats.sort();
+    formats.dedup();
+    formats
 }
 
 fn select_config(
@@ -6937,8 +7096,13 @@ fn select_config(
     input_channel_index: usize,
     output_bit_depth: u16,
     share_mode: CaptureShareMode,
+    requested_sample_format: Option<SampleFormat>,
 ) -> Result<SupportedStreamConfig> {
-    let minimum_representation_bits = minimum_input_representation_bits(output_bit_depth)?;
+    let minimum_representation_bits = if requested_sample_format.is_some() {
+        0
+    } else {
+        minimum_input_representation_bits(output_bit_depth)?
+    };
     let mut selected: Option<(u8, SupportedStreamConfig)> = None;
     let mut compatible_rates = Vec::<(u32, u32)>::new();
     let mut formats_at_requested_rate = Vec::<(String, u16)>::new();
@@ -6964,7 +7128,10 @@ fn select_config(
         let representation_bits = input_representation_bits(range.sample_format())
             .context("supported input format has no representation precision")?;
         formats_at_requested_rate.push((range.sample_format().to_string(), representation_bits));
-        if representation_bits < minimum_representation_bits {
+        if requested_sample_format.is_some_and(|requested| requested != range.sample_format()) {
+            continue;
+        }
+        if requested_sample_format.is_none() && representation_bits < minimum_representation_bits {
             continue;
         }
         let score = input_format_score(range.sample_format());
@@ -7003,6 +7170,16 @@ fn select_config(
             })
             .collect::<Vec<_>>()
             .join("、");
+        if let Some(requested) = requested_sample_format {
+            if exclusive {
+                bail!(
+                    "独占模式：所选设备在 {sample_rate} Hz、输入通道 {requested_channel} 不支持采集格式 {requested}。当前提供：{offered}。不会自动改选其他格式。"
+                );
+            }
+            bail!(
+                "系统混音：所选设备在 {sample_rate} Hz、输入通道 {requested_channel} 不支持采集格式 {requested}。当前提供：{offered}。"
+            );
+        }
         if exclusive {
             bail!(
                 "独占模式：所选设备在 {sample_rate} Hz、输入通道 {requested_channel} 仅提供 {offered}，无法满足 {output_bit_depth}-bit 交付的最低 {minimum_representation_bits} 位输入有效数字精度。可改采样率/位深，或改为「系统混音」。不会自动降级。"
@@ -7478,7 +7655,7 @@ fn fail_capture_block(
     let _ = writer.try_send(WriterMessage::FaultAndStop(reason));
 }
 
-#[cfg(any(test, feature = "system-test"))]
+#[cfg(any(test, feature = "system-test", not(windows)))]
 #[allow(clippy::too_many_arguments)]
 fn publish_block(
     mono: Vec<f32>,
@@ -7515,7 +7692,7 @@ fn publish_block(
     );
 }
 
-#[cfg(any(test, feature = "system-test"))]
+#[cfg(any(test, feature = "system-test", not(windows)))]
 #[allow(clippy::too_many_arguments)]
 fn publish_leased_block(
     mono: Vec<f32>,
@@ -8492,7 +8669,10 @@ fn csv_cell(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static DEV_WEB_CAPTURE_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -12252,6 +12432,7 @@ mod tests {
                 device_name: Some("Remembered input".to_string()),
                 sample_rate: 48_000,
                 bit_depth: 24,
+                input_sample_format: String::new(),
                 input_channel: 1,
                 capture_share_mode: CaptureShareMode::Exclusive,
                 silence_duration_ms: 1_000,
@@ -12746,6 +12927,85 @@ mod tests {
     }
 
     #[test]
+    fn wants_dev_web_capture_follows_env_only_off_windows() {
+        let _guard = DEV_WEB_CAPTURE_ENV_LOCK.lock().expect("env lock");
+        let previous = std::env::var_os("DATABAKER_DEV_WEB_CAPTURE");
+        // Serialized by the mutex above; required by recent Rust `set_var` safety rules.
+        unsafe {
+            std::env::remove_var("DATABAKER_DEV_WEB_CAPTURE");
+        }
+        assert!(!wants_dev_web_capture());
+        unsafe {
+            std::env::set_var("DATABAKER_DEV_WEB_CAPTURE", "1");
+        }
+        assert_eq!(wants_dev_web_capture(), cfg!(not(windows)));
+        unsafe {
+            std::env::set_var("DATABAKER_DEV_WEB_CAPTURE", "0");
+        }
+        assert!(!wants_dev_web_capture());
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("DATABAKER_DEV_WEB_CAPTURE", value),
+                None => std::env::remove_var("DATABAKER_DEV_WEB_CAPTURE"),
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn dev_web_feed_publishes_pcm_without_opening_a_device() {
+        let root = test_root("dev-web-feed");
+        std::fs::remove_dir_all(&root).unwrap();
+        let mut engine = Engine::new(Emitter::new());
+        let payload = StartSessionPayload {
+            session_dir: root.to_string_lossy().into_owned(),
+            session_id: "mac-dev-feed".to_string(),
+            script_name: "script.csv".to_string(),
+            device_id: Some("coreaudio:unused-in-web-feed".to_string()),
+            device_name: Some("Built-in Microphone".to_string()),
+            sample_rate: 48_000,
+            bit_depth: 24,
+            input_sample_format: String::new(),
+            input_channel: 1,
+            capture_share_mode: CaptureShareMode::Shared,
+            silence_duration_ms: 1_000,
+            noise_threshold_dbfs: Some(-42.0),
+            silence_threshold_dbfs: -42.0,
+            items: vec![ScriptItem {
+                id: "001".to_string(),
+                text: "第一句".to_string(),
+                label: String::new(),
+            }],
+        };
+        let (session_dir, snapshot) = engine.prepare_new_session(payload, None).unwrap();
+        engine
+            .activate_session(
+                session_dir,
+                snapshot,
+                false,
+                "session_started",
+                None,
+                None,
+                CaptureActivation::DevWebFeed,
+            )
+            .unwrap();
+        let fed = engine
+            .dev_feed_pcm(vec![0.4; 480])
+            .expect("web-feed PCM should be accepted");
+        assert_eq!(fed["captured_samples"], 480);
+        let peak = f32::from_bits(
+            engine
+                .session
+                .as_ref()
+                .expect("active session")
+                .peak
+                .load(Ordering::Relaxed),
+        );
+        assert!(peak > 0.2, "peak {peak} should move after a loud block");
+        engine.stop_session().unwrap();
+    }
+
+    #[test]
     fn start_session_payload_defaults_to_exclusive_capture() {
         let payload: StartSessionPayload = serde_json::from_value(json!({
             "session_dir": "/tmp/session",
@@ -12754,6 +13014,55 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(payload.capture_share_mode, CaptureShareMode::Exclusive);
+        assert_eq!(payload.input_sample_format, "");
+    }
+
+    #[test]
+    fn requested_input_sample_format_wins_over_bit_depth() {
+        let root = test_root("requested-input-format");
+        std::fs::remove_dir_all(&root).unwrap();
+        let engine = Engine::new(Emitter::new());
+        let created = engine
+            .create_session(StartSessionPayload {
+                session_dir: root.to_string_lossy().into_owned(),
+                session_id: "format-wins".to_string(),
+                script_name: "script.csv".to_string(),
+                device_id: Some("device:remembered".to_string()),
+                device_name: Some("Remembered input".to_string()),
+                sample_rate: 48_000,
+                bit_depth: 16,
+                input_sample_format: "I24".to_string(),
+                input_channel: 1,
+                capture_share_mode: CaptureShareMode::Exclusive,
+                silence_duration_ms: 1_000,
+                noise_threshold_dbfs: Some(-42.0),
+                silence_threshold_dbfs: -42.0,
+                items: vec![ScriptItem {
+                    id: "001".to_string(),
+                    text: "第一句".to_string(),
+                    label: String::new(),
+                }],
+            })
+            .unwrap();
+        assert_eq!(created["snapshot"]["input_sample_format"], "i24");
+        assert_eq!(created["snapshot"]["audio_format"]["bit_depth"], 24);
+        assert_eq!(created["snapshot"]["audio_format"]["encoding"], "pcm");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn requested_input_sample_format_must_be_supported() {
+        assert!(
+            parse_requested_input_sample_format("i24")
+                .unwrap()
+                .is_some()
+        );
+        assert!(parse_requested_input_sample_format("").unwrap().is_none());
+        assert!(parse_requested_input_sample_format("pcm24").is_err());
+        assert_eq!(
+            delivery_bit_depth_for_sample_format(SampleFormat::I32),
+            32
+        );
     }
 
     #[test]

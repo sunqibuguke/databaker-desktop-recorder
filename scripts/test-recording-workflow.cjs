@@ -27,11 +27,17 @@ async function main() {
   } = await import(pathToFileURL(inputQualityModulePath).href);
   const {
     captureFormatsSupportBitDepth,
+    captureSampleFormatFromBitDepth,
+    captureSampleFormatLabel,
+    captureSampleFormatsForConfiguration,
     captureShareModeLabel,
     configurationsForShareMode,
+    deliveryBitDepthForCaptureFormat,
     inputSampleFormatRepresentationBits,
     minimumInputRepresentationBits,
+    normalizeCaptureSampleFormat,
     normalizeCaptureShareMode,
+    preferredCaptureSampleFormat,
   } = await import(pathToFileURL(captureConfigurationModulePath).href);
 
   const item = (status) => ({ status });
@@ -140,6 +146,26 @@ async function main() {
   );
   assert.equal(captureFormatsSupportBitDepth(['I16', 'I24'], 24), true);
   assert.equal(captureFormatsSupportBitDepth(['F32'], 32), true);
+  assert.equal(normalizeCaptureSampleFormat('I24'), 'i24');
+  assert.equal(normalizeCaptureSampleFormat('pcm24'), null);
+  assert.equal(captureSampleFormatFromBitDepth(16), 'i16');
+  assert.equal(captureSampleFormatFromBitDepth(32), 'f32');
+  assert.equal(deliveryBitDepthForCaptureFormat('i24'), 24);
+  assert.equal(deliveryBitDepthForCaptureFormat('i32'), 32);
+  assert.equal(preferredCaptureSampleFormat(['f32', 'i16']), 'f32');
+  assert.deepEqual(
+    captureSampleFormatsForConfiguration(dualModeDevice.configurations, 48_000, 1),
+    ['i24', 'f32'],
+  );
+  assert.deepEqual(
+    captureSampleFormatsForConfiguration(
+      dualModeDevice.configurations.filter((configuration) => configuration.share_mode === 'exclusive'),
+      48_000,
+      1,
+    ),
+    ['i24'],
+  );
+  assert.match(captureSampleFormatLabel('i32'), /32/);
 
   const threeComplete = [item('accepted'), item('skipped'), item('accepted')];
   assert.equal(captureExitAction(threeComplete, false), 'complete');

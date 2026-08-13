@@ -156,62 +156,64 @@ export function ActivateLicense({
         ))}
       </select>
     </header>
-    <main className="license-card">
-      <small>{t('license.eyebrow')}</small>
-      <h1>{reasonTitle(status.reason)}</h1>
-      <p>{t('license.body')}</p>
-      <label className="license-machine">
-        <span>{t('license.machineCode')}</span>
-        <div>
-          <code data-testid="license-machine-code">{status.machineCode || t('license.machineUnavailable')}</code>
-          <button
-            className="button"
-            type="button"
-            disabled={!status.machineCode}
-            onClick={() => void copyMachineCode()}
-          >
-            <Icon name="copy" size={14} />
-            {copied ? t('license.copied') : t('license.copy')}
-          </button>
-        </div>
-      </label>
-      <label className="license-ticket">
-        <span>{t('license.ticketLabel')}</span>
-        <textarea
-          data-testid="license-ticket"
-          rows={5}
-          value={ticket}
-          placeholder={t('license.ticketPlaceholder')}
-          onChange={(event) => setTicket(event.target.value)}
-        />
-      </label>
-      {error && <div className="dialog-warning danger">{error}</div>}
-      <button
-        className="button primary"
-        type="button"
-        data-testid="license-activate"
-        disabled={busy || !ticket.trim() || !status.machineCode}
-        onClick={() => void activate()}
-      >
-        {busy ? t('license.activating') : t('license.activate')}
-      </button>
-      {pending.length > 0 && <section className="license-pending">
-        <strong>{t('license.pendingSealTitle')}</strong>
-        <p>{t('license.pendingSealBody')}</p>
-        {pending.map((recording) => (
-          <div key={recording.session_dir}>
-            <code>{recording.session_id}</code>
+    <main className="license-stage">
+      <section className="license-card" aria-labelledby="license-title">
+        <small>{t('license.eyebrow')}</small>
+        <h1 id="license-title">{reasonTitle(status.reason)}</h1>
+        <p>{t('license.body')}</p>
+        <label className="license-machine">
+          <span>{t('license.machineCode')}</span>
+          <div>
+            <code data-testid="license-machine-code">{status.machineCode || t('license.machineUnavailable')}</code>
             <button
               className="button"
               type="button"
-              disabled={Boolean(sealing)}
-              onClick={() => void sealPending(recording)}
+              disabled={!status.machineCode}
+              onClick={() => void copyMachineCode()}
             >
-              {sealing === recording.session_id ? t('license.pendingSealWorking') : t('license.pendingSealAction')}
+              <Icon name="copy" size={14} />
+              {copied ? t('license.copied') : t('license.copy')}
             </button>
           </div>
-        ))}
-      </section>}
+        </label>
+        <label className="license-ticket">
+          <span>{t('license.ticketLabel')}</span>
+          <textarea
+            data-testid="license-ticket"
+            rows={4}
+            value={ticket}
+            placeholder={t('license.ticketPlaceholder')}
+            onChange={(event) => setTicket(event.target.value)}
+          />
+        </label>
+        {error && <div className="dialog-warning danger">{error}</div>}
+        <button
+          className="button primary"
+          type="button"
+          data-testid="license-activate"
+          disabled={busy || !ticket.trim() || !status.machineCode}
+          onClick={() => void activate()}
+        >
+          {busy ? t('license.activating') : t('license.activate')}
+        </button>
+        {pending.length > 0 && <section className="license-pending">
+          <strong>{t('license.pendingSealTitle')}</strong>
+          <p>{t('license.pendingSealBody')}</p>
+          {pending.map((recording) => (
+            <div key={recording.session_dir}>
+              <code>{recording.session_id}</code>
+              <button
+                className="button"
+                type="button"
+                disabled={Boolean(sealing)}
+                onClick={() => void sealPending(recording)}
+              >
+                {sealing === recording.session_id ? t('license.pendingSealWorking') : t('license.pendingSealAction')}
+              </button>
+            </div>
+          ))}
+        </section>}
+      </section>
     </main>
   </div>;
 }

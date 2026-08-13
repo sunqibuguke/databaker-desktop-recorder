@@ -32,7 +32,18 @@ import {
   savePostTakeSilenceReview,
   type SilencePairView,
 } from './silence-readout';
-import { captureFormatsSupportBitDepth, captureShareModeLabel, configurationsForShareMode, deviceExclusiveAvailable, minimumInputRepresentationBits, normalizeCaptureShareMode } from './capture-configuration';
+import {
+  captureSampleFormatFromBitDepth,
+  captureSampleFormatLabel,
+  captureSampleFormatsForConfiguration,
+  captureShareModeLabel,
+  configurationsForShareMode,
+  deliveryBitDepthForCaptureFormat,
+  deviceExclusiveAvailable,
+  normalizeCaptureSampleFormat,
+  normalizeCaptureShareMode,
+  preferredCaptureSampleFormat,
+} from './capture-configuration';
 import { createLatestFrameCommitter } from './latest-frame';
 import type { LatestFrameCommitter } from './latest-frame';
 import type { SessionNoiseCheckOperation } from './recording-workflow';
@@ -44,6 +55,7 @@ import { translateExportDeliverError } from './export-deliver-i18n';
 import { DISCONTINUITY_TOAST_MS, discontinuityDurationMs, shouldShowDiscontinuityToast } from './discontinuity-toast';
 import { LogPanel } from './LogPanel';
 import { APP_LOCALES, LOCALE_NATIVE_NAMES, getLocale, t, useI18n } from './i18n';
+import { startDevWebCapture, type DevWebCaptureHandle } from './dev-web-capture';
 
 type HistoryFilter = 'all' | 'completed' | 'unfinished';
 type RecordingStateKind = 'completed' | 'unfinished' | 'attention';
@@ -337,8 +349,9 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const [deviceId, setDeviceId] = useState('');
   const [deviceName, setDeviceName] = useState('');
   const [sampleRate, setSampleRate] = useState(48_000);
-  const [bitDepth, setBitDepth] = useState(24);
+  const [inputSampleFormat, setInputSampleFormat] = useState('i24');
   const [inputChannel, setInputChannel] = useState(1);
+  const bitDepth = deliveryBitDepthForCaptureFormat(inputSampleFormat);
   const [captureShareMode, setCaptureShareMode] = useState<CaptureShareMode>(
     exclusiveCaptureAvailable ? 'exclusive' : 'shared',
   );
@@ -349,6 +362,8 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const [scriptErrors, setScriptErrors] = useState<string[]>([]);
   const [snapshot, setSnapshot] = useState<SessionSnapshot | null>(null);
   const [captureActive, setCaptureActive] = useState(false);
+  const [devWebCaptureEnabled, setDevWebCaptureEnabled] = useState(false);
+  const [devWebCaptureNotice, setDevWebCaptureNotice] = useState('');
   const [workspaceFaulted, setWorkspaceFaulted] = useState(false);
   const [monitorPanelTab, setMonitorPanelTab] = useState<MonitorPanelTab>('monitor');
   const [prompterStatus, setPrompterStatus] = useState({ open: false, ready: false });
@@ -476,20 +491,17 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       .filter((configuration) => sampleRate >= configuration.min_sample_rate && sampleRate <= configuration.max_sample_rate)
       .map((configuration) => configuration.channels))
     : maximumInputChannels;
-  const captureFormats = [...new Set(modeConfigurations
-    .filter((configuration) => (
-      configuration.channels >= inputChannel
-      && sampleRate >= configuration.min_sample_rate
-      && sampleRate <= configuration.max_sample_rate
-    ))
-    .map((configuration) => configuration.sample_format.toUpperCase()))];
-  const capturePrecisionValid = captureFormatsSupportBitDepth(captureFormats, bitDepth);
+  const formatOptions = captureSampleFormatsForConfiguration(
+    modeConfigurations,
+    sampleRate,
+    inputChannel,
+  );
+  const captureFormats = formatOptions.map((format) => format.toUpperCase());
   const captureConfigurationValid = Boolean(
     selectedDevice
     && rateOptions.includes(sampleRate)
     && inputChannel <= activeInputChannels
-    && captureFormats.length > 0
-    && capturePrecisionValid,
+    && formatOptions.some((format) => format === inputSampleFormat),
   );
   const captureConfigurationIssue = !deviceId
     ? t('setup.pickDevice')
@@ -503,16 +515,18 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             rate: sampleRate.toLocaleString(locale),
             channel: inputChannel,
           })
-          : inputChannel > activeInputChannels || captureFormats.length === 0
+          : inputChannel > activeInputChannels || formatOptions.length === 0
             ? t('setup.channelUnsupported', {
               mode: captureShareModeLabel(captureShareMode),
               rate: sampleRate.toLocaleString(locale),
               channel: inputChannel,
             })
-            : !capturePrecisionValid
-              ? t('setup.precisionInsufficient', {
-                bits: minimumInputRepresentationBits(bitDepth) ?? bitDepth,
-                depth: bitDepth,
+            : !formatOptions.some((format) => format === inputSampleFormat)
+              ? t('setup.formatUnsupported', {
+                mode: captureShareModeLabel(captureShareMode),
+                rate: sampleRate.toLocaleString(locale),
+                channel: inputChannel,
+                format: captureSampleFormatLabel(inputSampleFormat),
               })
             : '';
   const presetDirty = Boolean(selectedCapturePreset && (
@@ -520,6 +534,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     || selectedCapturePreset.deviceName !== deviceName
     || selectedCapturePreset.sampleRate !== sampleRate
     || selectedCapturePreset.bitDepth !== bitDepth
+    || (selectedCapturePreset.inputSampleFormat ?? captureSampleFormatFromBitDepth(selectedCapturePreset.bitDepth)) !== inputSampleFormat
     || selectedCapturePreset.inputChannel !== inputChannel
     || normalizeCaptureShareMode(selectedCapturePreset.captureShareMode) !== captureShareMode
     || selectedCapturePreset.silenceDurationMs !== silenceDurationMs
@@ -838,7 +853,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setDeviceId(preset.deviceId);
     setDeviceName(preset.deviceName);
     setSampleRate(preset.sampleRate);
-    setBitDepth(preset.bitDepth);
+    setInputSampleFormat(
+      normalizeCaptureSampleFormat(preset.inputSampleFormat)
+      ?? captureSampleFormatFromBitDepth(preset.bitDepth),
+    );
     setInputChannel(preset.inputChannel);
     setCaptureShareMode(
       exclusiveCaptureAvailable ? normalizeCaptureShareMode(preset.captureShareMode) : 'shared',
@@ -899,6 +917,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       deviceName: selectedDevice.name,
       sampleRate,
       bitDepth: bitDepth as 16 | 24 | 32,
+      inputSampleFormat: normalizeCaptureSampleFormat(inputSampleFormat) ?? captureSampleFormatFromBitDepth(bitDepth),
       inputChannel,
       captureShareMode,
       silenceDurationMs,
@@ -1285,13 +1304,60 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     if (selectedDevice && !rateOptions.includes(sampleRate)) {
       setSampleRate(rateOptions.includes(48_000) ? 48_000 : rateOptions[0] ?? 48_000);
     }
-  }, [activeInputChannels, inputChannel, rateOptions, sampleRate, selectedCapturePreset, selectedDevice]);
+    if (selectedDevice && formatOptions.length > 0 && !formatOptions.some((format) => format === inputSampleFormat)) {
+      setInputSampleFormat(preferredCaptureSampleFormat(formatOptions) ?? formatOptions[0]);
+    }
+  }, [activeInputChannels, formatOptions, inputChannel, inputSampleFormat, rateOptions, sampleRate, selectedCapturePreset, selectedDevice]);
 
   useEffect(() => {
     if (!capturePresetsLoaded || !devicesLoaded || initialPresetAppliedRef.current || phase === 'running' || snapshot) return;
     initialPresetAppliedRef.current = true;
     if (selectedCapturePreset) applyCapturePreset(selectedCapturePreset);
   }, [capturePresetsLoaded, devicesLoaded, phase, selectedCapturePreset, snapshot]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void window.recorder.devWebCapture?.().then((enabled) => {
+      if (!cancelled) setDevWebCaptureEnabled(Boolean(enabled));
+    }).catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!devWebCaptureEnabled || !captureActive || !sessionDir || workspaceFaulted) {
+      setDevWebCaptureNotice('');
+      return;
+    }
+    const sampleRate = snapshot?.audio_format.sample_rate ?? 48_000;
+    const preferredDeviceLabel = snapshot?.device_name ?? '';
+    let stopped = false;
+    let handle: DevWebCaptureHandle | null = null;
+    setDevWebCaptureNotice(t('recorder.devWebCaptureStarting'));
+    void startDevWebCapture({
+      sampleRate,
+      preferredDeviceLabel,
+      feed: (samples) => window.recorder.request('dev_feed_pcm', { samples }),
+    }).then((started) => {
+      if (stopped) {
+        started.stop();
+        return;
+      }
+      handle = started;
+      setDevWebCaptureNotice(t('recorder.devWebCaptureOn'));
+    }).catch((caught) => {
+      if (stopped) return;
+      const denied = caught instanceof DOMException && caught.name === 'NotAllowedError';
+      setDevWebCaptureNotice(denied
+        ? t('recorder.devWebCaptureDenied')
+        : t('recorder.devWebCaptureFailed', { error: errorMessage(caught) }));
+    });
+    return () => {
+      stopped = true;
+      handle?.stop();
+    };
+  }, [devWebCaptureEnabled, captureActive, sessionDir, workspaceFaulted, snapshot?.audio_format.sample_rate, snapshot?.device_name, t]);
 
   function enterRunningSession(current: RunningSessionState, wasRecovered: boolean, availableDevices = devices) {
     const nextSnapshot = current.snapshot;
@@ -1316,7 +1382,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setDeviceId(nextSnapshot.device_id ?? availableDevices.find((device) => device.name === nextSnapshot.device_name)?.id ?? '');
     setDeviceName(nextSnapshot.device_name);
     setSampleRate(nextSnapshot.audio_format.sample_rate);
-    setBitDepth(nextSnapshot.audio_format.bit_depth);
+    setInputSampleFormat(
+      normalizeCaptureSampleFormat(nextSnapshot.input_sample_format)
+      ?? captureSampleFormatFromBitDepth(nextSnapshot.audio_format.bit_depth),
+    );
     setInputChannel(nextSnapshot.audio_format.input_channel ?? 1);
     setCaptureShareMode(
       exclusiveCaptureAvailable
@@ -1393,7 +1462,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setDeviceId(nextSnapshot.device_id ?? '');
     setDeviceName(nextSnapshot.device_name);
     setSampleRate(nextSnapshot.audio_format.sample_rate);
-    setBitDepth(nextSnapshot.audio_format.bit_depth);
+    setInputSampleFormat(
+      normalizeCaptureSampleFormat(nextSnapshot.input_sample_format)
+      ?? captureSampleFormatFromBitDepth(nextSnapshot.audio_format.bit_depth),
+    );
     setInputChannel(nextSnapshot.audio_format.input_channel ?? 1);
     setCaptureShareMode(
       exclusiveCaptureAvailable
@@ -1564,6 +1636,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       device_name: selectedDevice.name,
       sample_rate: sampleRate,
       bit_depth: bitDepth,
+      input_sample_format: inputSampleFormat,
       input_channel: inputChannel,
       capture_share_mode: captureShareMode,
       silence_duration_ms: silenceDurationMs,
@@ -1581,6 +1654,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       device_name: selectedDevice.name,
       sample_rate: sampleRate,
       bit_depth: bitDepth,
+      input_sample_format: inputSampleFormat,
       input_channel: inputChannel,
       item_count: scriptItems.length,
     });
@@ -2617,8 +2691,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
                   <div><button className="button" onClick={() => void saveCapturePreset('new')} disabled={!presetName.trim() || Boolean(busy) || presetBusy}>{selectedCapturePreset ? t('setup.saveAsNew') : t('setup.saveAsPreset')}</button>{selectedCapturePreset && <><button className="button primary" onClick={() => void saveCapturePreset('update')} disabled={!presetName.trim() || Boolean(busy) || presetBusy}>{t('setup.updatePreset')}</button><button className="button danger-button" onClick={() => void deleteCapturePreset()} disabled={Boolean(busy) || presetBusy}>{t('common.delete')}</button></>}</div>
                 </div>}
               </div>
-              <div className="form-grid audio-form"><label className="field span-2"><span>{t('setup.deviceLabel')}</span><div className="field-row"><select value={deviceId} onChange={(event) => { const device = devices.find((candidate) => candidate.id === event.target.value); setDeviceId(event.target.value); setDeviceName(device?.name ?? ''); }} disabled={Boolean(busy)}>{!devices.length && <option value="">{t('setup.noDevices')}</option>}{deviceId && !selectedDevice && <option value={deviceId}>{t('setup.deviceUnavailable', { name: deviceName || deviceId })}</option>}{devices.map((device) => <option value={device.id} key={device.id}>{device.name}{device.is_default ? t('setup.systemDefault') : ''}</option>)}</select><button className="square-button" title={t('setup.refreshDevices')} onClick={() => void loadDevices()}><Icon name="refresh" /></button></div></label>{exclusiveCaptureAvailable ? <label className="field"><span>{t('setup.shareMode')}</span><select data-testid="capture-share-mode" value={captureShareMode} onChange={(event) => setCaptureShareMode(normalizeCaptureShareMode(event.target.value))} disabled={Boolean(busy)}><option value="exclusive">{t('setup.exclusiveRecommended')}</option><option value="shared">{t('setup.sharedMode')}</option></select></label> : <label className="field"><span>{t('setup.shareMode')}</span><input value={t('setup.shareModeDev')} readOnly /></label>}<label className={`field ${selectedDevice && !rateOptions.includes(sampleRate) ? 'invalid' : ''}`}><span>{t('setup.sampleRate')}</span><select value={sampleRate} onChange={(event) => setSampleRate(Number(event.target.value))}>{!rateOptions.includes(sampleRate) && <option value={sampleRate}>{t('setup.rateIncompatible', { rate: sampleRate.toLocaleString(locale) })}</option>}{rateOptions.map((rate) => <option value={rate} key={rate}>{rate.toLocaleString(locale)} Hz</option>)}</select></label><label className="field"><span>{t('setup.bitDepth')}</span><select value={bitDepth} onChange={(event) => setBitDepth(Number(event.target.value))}><option value={16}>{t('setup.bit16')}</option><option value={24}>{t('setup.bit24')}</option><option value={32}>{t('setup.bit32')}</option></select></label><label className={`field ${selectedDevice && inputChannel > activeInputChannels ? 'invalid' : ''}`}><span>{t('setup.inputChannel')}</span><select value={inputChannel} onChange={(event) => setInputChannel(Number(event.target.value))}>{inputChannel > activeInputChannels && <option value={inputChannel}>{t('setup.inputIncompatible', { n: inputChannel })}</option>}{Array.from({ length: activeInputChannels }, (_, index) => <option value={index + 1} key={index + 1}>{t('setup.inputN', { n: index + 1 })}</option>)}</select></label><label className="field"><span>{t('setup.silenceThreshold')}</span><input type="number" min="-72" max="-12" step="1" value={noiseThresholdDbfs} onChange={(event) => setNoiseThresholdDbfs(Math.min(-12, Math.max(-72, Number(event.target.value) || -42)))} /></label><label className="field"><span>{t('setup.silenceDuration')}</span><input type="number" min="0.2" max="5" step="0.1" value={silenceDurationMs / 1_000} onChange={(event) => setSilenceDurationMs(Math.round(Math.min(5, Math.max(.2, Number(event.target.value) || 1)) * 1_000))} /></label></div>
-              <div className={`hardware-line ${captureConfigurationIssue ? 'invalid' : ''}`}><span className={captureConfigurationValid ? 'ok' : ''}><i />{captureConfigurationIssue || t('setup.configOk')}</span><em>{captureShareModeLabel(captureShareMode)}</em><em>{t('setup.inputChannelOf', { channel: inputChannel, total: activeInputChannels })}</em><em>{t('setup.driverFormats', { formats: captureFormats.join(' / ') || t('setup.driverIncompatible') })}</em><em>{bitDepth === 32 ? 'Float' : 'PCM'} {bitDepth}-bit / Mono</em></div>
+              <div className="form-grid audio-form"><label className="field span-2"><span>{t('setup.deviceLabel')}</span><div className="field-row"><select value={deviceId} onChange={(event) => { const device = devices.find((candidate) => candidate.id === event.target.value); setDeviceId(event.target.value); setDeviceName(device?.name ?? ''); }} disabled={Boolean(busy)}>{!devices.length && <option value="">{t('setup.noDevices')}</option>}{deviceId && !selectedDevice && <option value={deviceId}>{t('setup.deviceUnavailable', { name: deviceName || deviceId })}</option>}{devices.map((device) => <option value={device.id} key={device.id}>{device.name}{device.is_default ? t('setup.systemDefault') : ''}</option>)}</select><button className="square-button" title={t('setup.refreshDevices')} onClick={() => void loadDevices()}><Icon name="refresh" /></button></div></label>{exclusiveCaptureAvailable ? <label className="field"><span>{t('setup.shareMode')}</span><select data-testid="capture-share-mode" value={captureShareMode} onChange={(event) => setCaptureShareMode(normalizeCaptureShareMode(event.target.value))} disabled={Boolean(busy)}><option value="exclusive">{t('setup.exclusiveRecommended')}</option><option value="shared">{t('setup.sharedMode')}</option></select></label> : <label className="field"><span>{t('setup.shareMode')}</span><input value={t('setup.shareModeDev')} readOnly /></label>}<label className={`field ${selectedDevice && !rateOptions.includes(sampleRate) ? 'invalid' : ''}`}><span>{t('setup.sampleRate')}</span><select value={sampleRate} onChange={(event) => setSampleRate(Number(event.target.value))}>{!rateOptions.includes(sampleRate) && <option value={sampleRate}>{t('setup.rateIncompatible', { rate: sampleRate.toLocaleString(locale) })}</option>}{rateOptions.map((rate) => <option value={rate} key={rate}>{rate.toLocaleString(locale)} Hz</option>)}</select></label><label className={`field ${selectedDevice && !formatOptions.some((format) => format === inputSampleFormat) ? 'invalid' : ''}`}><span>{t('setup.bitDepth')}</span><select data-testid="capture-sample-format" value={inputSampleFormat} onChange={(event) => setInputSampleFormat(event.target.value)}>{!formatOptions.some((format) => format === inputSampleFormat) && <option value={inputSampleFormat}>{t('setup.formatIncompatible', { format: captureSampleFormatLabel(inputSampleFormat) })}</option>}{formatOptions.map((format) => <option value={format} key={format}>{captureSampleFormatLabel(format)}</option>)}</select></label><label className={`field ${selectedDevice && inputChannel > activeInputChannels ? 'invalid' : ''}`}><span>{t('setup.inputChannel')}</span><select value={inputChannel} onChange={(event) => setInputChannel(Number(event.target.value))}>{inputChannel > activeInputChannels && <option value={inputChannel}>{t('setup.inputIncompatible', { n: inputChannel })}</option>}{Array.from({ length: activeInputChannels }, (_, index) => <option value={index + 1} key={index + 1}>{t('setup.inputN', { n: index + 1 })}</option>)}</select></label><label className="field"><span>{t('setup.silenceThreshold')}</span><input type="number" min="-72" max="-12" step="1" value={noiseThresholdDbfs} onChange={(event) => setNoiseThresholdDbfs(Math.min(-12, Math.max(-72, Number(event.target.value) || -42)))} /></label><label className="field"><span>{t('setup.silenceDuration')}</span><input type="number" min="0.2" max="5" step="0.1" value={silenceDurationMs / 1_000} onChange={(event) => setSilenceDurationMs(Math.round(Math.min(5, Math.max(.2, Number(event.target.value) || 1)) * 1_000))} /></label></div>
+              <div className={`hardware-line ${captureConfigurationIssue ? 'invalid' : ''}`}><span className={captureConfigurationValid ? 'ok' : ''}><i />{captureConfigurationIssue || t('setup.configOk')}</span><em>{captureShareModeLabel(captureShareMode)}</em><em>{t('setup.inputChannelOf', { channel: inputChannel, total: activeInputChannels })}</em><em>{t('setup.driverFormats', { formats: captureFormats.join(' / ') || t('setup.driverIncompatible') })}</em><em>{captureSampleFormatLabel(inputSampleFormat)}</em></div>
+              <p className="hardware-hint">{captureShareMode === 'shared' || !exclusiveCaptureAvailable ? t('setup.sharedFormatHint') : t('setup.exclusiveFormatHint')}</p>
+              {!exclusiveCaptureAvailable && window.recorder.runtime === 'desktop' && <p className="dev-web-capture-hint">{t('setup.devWebCaptureHint')}</p>}
             </section>
             <section className="property-group">
               <div className="property-heading"><span>03</span><div><h2>{t('setup.storageHeading')}</h2><p>{t('setup.storageHelp')}</p></div></div>
@@ -2629,7 +2705,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         </main>
         <aside className="panel inspector setup-inspector">
           <div className="panel-tabs"><button className="active">{t('setup.inspector')}</button></div>
-          <div className="inspector-section"><h3>{t('setup.summary')}</h3><dl className="property-list"><div><dt>{t('setup.scriptItems')}</dt><dd>{scriptItems.length || t('common.dash')}</dd></div><div><dt>{t('setup.shareMode')}</dt><dd>{captureShareModeLabel(captureShareMode)}</dd></div><div><dt>{t('setup.sampleRate')}</dt><dd>{sampleRate.toLocaleString(locale)} Hz</dd></div><div><dt>{t('setup.bitDepth')}</dt><dd>{bitDepth === 32 ? '32-bit Float' : `${bitDepth}-bit PCM`}</dd></div><div><dt>{t('setup.inputChannel')}</dt><dd>{inputChannel}</dd></div><div><dt>{t('setup.channels')}</dt><dd>{t('setup.mono')}</dd></div><div><dt>{t('setup.noiseCeiling')}</dt><dd>{noiseThresholdDbfs} dBFS</dd></div><div><dt>{t('setup.headTailSilence')}</dt><dd>{(silenceDurationMs / 1_000).toFixed(1)} s</dd></div></dl></div>
+          <div className="inspector-section"><h3>{t('setup.summary')}</h3><dl className="property-list"><div><dt>{t('setup.scriptItems')}</dt><dd>{scriptItems.length || t('common.dash')}</dd></div><div><dt>{t('setup.shareMode')}</dt><dd>{captureShareModeLabel(captureShareMode)}</dd></div><div><dt>{t('setup.sampleRate')}</dt><dd>{sampleRate.toLocaleString(locale)} Hz</dd></div><div><dt>{t('setup.bitDepth')}</dt><dd>{captureSampleFormatLabel(inputSampleFormat)}</dd></div><div><dt>{t('setup.inputChannel')}</dt><dd>{inputChannel}</dd></div><div><dt>{t('setup.channels')}</dt><dd>{t('setup.mono')}</dd></div><div><dt>{t('setup.noiseCeiling')}</dt><dd>{noiseThresholdDbfs} dBFS</dd></div><div><dt>{t('setup.headTailSilence')}</dt><dd>{(silenceDurationMs / 1_000).toFixed(1)} s</dd></div></dl></div>
           <div className="inspector-section"><h3>{t('setup.inputDevice')}</h3><div className="device-summary"><span><Icon name="microphone" /></span><div><strong>{deviceName || t('setup.noDeviceSelected')}</strong><small>{selectedDevice?.is_default ? t('setup.defaultInput') : t('setup.externalInput')}</small></div></div></div>
           <div className="inspector-section"><h3>{t('setup.dataPolicy')}</h3><ul className="feature-list"><li><Icon name="check" />{t('setup.policyMaster')}</li><li><Icon name="check" />{t('setup.policyInteger')}</li><li><Icon name="check" />{t('setup.policyRetake')}</li><li><Icon name="check" />{t('setup.policySnapshot')}</li></ul></div>
         </aside>
@@ -2700,7 +2776,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         <div className="monitor-panel-body">
           <div className="monitor-tab-content">
             {monitorPanelTab === 'monitor' && <>
-              <section className="monitor-section input-inspector"><h3>{t('recorder.listenInput')}</h3><div className="vertical-meter-wrap"><div className="vertical-meter"><i className="safe-zone" /><i className="vertical-fill" style={{ height: `${peakPercent}%` }} /></div><div className="vertical-scale"><span>0</span><span>−6</span><span>−12</span><span>−24</span><span>−48</span></div><div className="level-readout"><strong className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</strong><small>PEAK</small><strong>{db(meter.rms)}</strong><small>RMS</small></div></div><p className={`level-hint ${captureFault || meter.peak > .92 ? 'danger' : meter.peak > .04 ? 'good' : ''}`}><i />{!captureActive ? t('recorder.cardOff') : captureFault ? t('recorder.inputStopped') : meter.peak > .92 ? t('recorder.inputClip') : meter.peak > .04 ? t('recorder.inputOk') : t('recorder.inputWait')}</p></section>
+              <section className="monitor-section input-inspector"><h3>{t('recorder.listenInput')}</h3><div className="vertical-meter-wrap"><div className="vertical-meter"><i className="safe-zone" /><i className="vertical-fill" style={{ height: `${peakPercent}%` }} /></div><div className="vertical-scale"><span>0</span><span>−6</span><span>−12</span><span>−24</span><span>−48</span></div><div className="level-readout"><strong className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</strong><small>PEAK</small><strong>{db(meter.rms)}</strong><small>RMS</small></div></div><p className={`level-hint ${captureFault || meter.peak > .92 ? 'danger' : meter.peak > .04 ? 'good' : ''}`}><i />{!captureActive ? t('recorder.cardOff') : captureFault ? t('recorder.inputStopped') : meter.peak > .92 ? t('recorder.inputClip') : meter.peak > .04 ? t('recorder.inputOk') : t('recorder.inputWait')}</p>{devWebCaptureEnabled && captureActive && <p className="dev-web-capture-hint">{devWebCaptureNotice || t('recorder.devWebCaptureOn')}</p>}</section>
               <section className="monitor-section"><h3>{t('recorder.currentState')}</h3><dl className="property-list"><div><dt>{t('recorder.sentence')}</dt><dd>{cueLabel}</dd></div><div><dt>{t('recorder.headTail')}</dt><dd><SilencePairReadout pair={silencePair} /></dd></div><div><dt>{t('recorder.disk')}</dt><dd>{meter.storage_status === 'healthy' ? t('recorder.diskHealthy') : meter.storage_status === 'warning' ? t('recorder.diskWarning') : t('recorder.diskCritical')}</dd></div></dl></section>
               <button className="detection-summary" onClick={() => setMonitorPanelTab('detection')}><span><strong>{t('recorder.silenceJudge')}</strong><small>{noiseThresholdDbfs} dBFS / {(effectiveSilenceDurationMs / 1_000).toFixed(1)} {t('recorder.seconds')}</small></span><em>{t('recorder.adjust')}</em></button>
             </>}

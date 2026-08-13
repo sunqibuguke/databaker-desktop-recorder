@@ -136,6 +136,8 @@ export type AudioDevice = {
   exclusive_available?: boolean;
   exclusive_sample_rates?: number[];
   exclusive_input_channels?: number[];
+  exclusive_formats?: string[];
+  exclusive_probe_error?: string | null;
   shared_sample_rates?: number[];
   shared_input_channels?: number[];
 };
@@ -147,6 +149,7 @@ export type CapturePreset = {
   deviceName: string;
   sampleRate: number;
   bitDepth: 16 | 24 | 32;
+  inputSampleFormat?: 'i16' | 'i24' | 'i32' | 'f32';
   inputChannel: number;
   captureShareMode?: CaptureShareMode;
   silenceDurationMs: number;

@@ -37,6 +37,7 @@ ipcRenderer.on(
 contextBridge.exposeInMainWorld('recorder', {
   runtime: 'desktop',
   platform: process.platform,
+  devWebCapture: () => ipcRenderer.invoke('app:dev-web-capture'),
   request: (command: string, payload: unknown = {}) => ipcRenderer.invoke('engine:request', command, payload),
   openScript: () => ipcRenderer.invoke('dialog:open-script'),
   chooseOutput: () => ipcRenderer.invoke('dialog:choose-output'),

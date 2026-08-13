@@ -44,6 +44,8 @@ async function main() {
   assert.equal(t('setup.exclusive'), '独占');
   assert.equal(t('setup.shared'), '系统混音');
   assert.equal(t('setup.exclusiveRecommended'), '独占（推荐）');
+  assert.match(t('setup.devWebCaptureHint'), /Windows/);
+  assert.match(t('recorder.devWebCaptureOn'), /系统麦克风/);
   assert.equal(t('silence.headDash'), '首 —');
   assert.equal(t('silence.tailEnough', { ms: '1000 ms' }), '尾已够 · 1000 ms');
   assert.equal(t('quality.bannerTitle'), '输入质量强提醒');

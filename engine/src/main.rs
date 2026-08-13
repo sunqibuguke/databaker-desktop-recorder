@@ -79,6 +79,12 @@ fn default_system_test_block_frames() -> usize {
     256
 }
 
+#[cfg(not(windows))]
+#[derive(Deserialize)]
+struct DevFeedPcmPayload {
+    samples: Vec<f32>,
+}
+
 fn main() -> Result<()> {
     let emitter = Emitter::new();
     emitter.event(
@@ -209,6 +215,11 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
         "test_feed_pcm" => {
             let payload: SystemTestFeedPayload = parse(command.payload)?;
             engine.system_test_feed(payload.frames, payload.seed, payload.block_frames)
+        }
+        #[cfg(not(windows))]
+        "dev_feed_pcm" => {
+            let payload: DevFeedPcmPayload = parse(command.payload)?;
+            engine.dev_feed_pcm(payload.samples)
         }
         #[cfg(feature = "system-test")]
         "test_checkpoint" => engine.system_test_checkpoint(),
