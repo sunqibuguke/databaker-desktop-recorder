@@ -5052,7 +5052,15 @@ fn load_recovery_snapshot_for_session(
         }
         previous_sequence = Some(sequence);
     }
-    if !selected.source.starts_with("final snapshot") {
+    // Journal projections outrank the replaceable final snapshot at the same
+    // sequence. That is the normal post-compaction path: do not treat it as
+    // recovery. Warn only when the final file is missing, unreadable, or older.
+    let latest_final_snapshot_seq = matching
+        .iter()
+        .filter(|candidate| candidate.source.starts_with("final snapshot"))
+        .map(|candidate| candidate.snapshot.journal_seq)
+        .max();
+    if latest_final_snapshot_seq.is_none_or(|seq| seq < selected.snapshot.journal_seq) {
         journal.warnings.push(format!(
             "最终快照不可用或不是最新，已从 {} 恢复 journal_seq {}。",
             selected.source, selected.snapshot.journal_seq
@@ -13160,6 +13168,62 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("journal line"))
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovery_does_not_warn_when_final_snapshot_matches_compacted_journal() {
+        let root = test_root("recovery-current-final");
+        let mut snapshot = test_snapshot();
+        snapshot.journal_seq = 13;
+        snapshot.status = "stopped".to_string();
+        write_snapshot_file(&root.join("metadata/items.snapshot.json"), &snapshot);
+        write_journal(&root, &[sequenced_event("session_stopped", &snapshot)]);
+
+        let mut journal = read_journal(&root).unwrap();
+        let recovered = load_recovery_snapshot(&root, &mut journal).unwrap();
+
+        assert_eq!(recovered.journal_seq, 13);
+        assert_eq!(recovered.status, "stopped");
+        assert!(
+            journal
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("最终快照不可用")),
+            "{:?}",
+            journal.warnings
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovery_warns_when_final_snapshot_lags_journal() {
+        let root = test_root("recovery-stale-final");
+        let mut final_snapshot = test_snapshot();
+        final_snapshot.journal_seq = 12;
+        write_snapshot_file(
+            &root.join("metadata/items.snapshot.json"),
+            &final_snapshot,
+        );
+        let mut latest = final_snapshot.clone();
+        latest.journal_seq = 13;
+        latest.status = "stopped".to_string();
+        write_journal(&root, &[sequenced_event("session_stopped", &latest)]);
+
+        let mut journal = read_journal(&root).unwrap();
+        let recovered = load_recovery_snapshot(&root, &mut journal).unwrap();
+
+        assert_eq!(recovered.journal_seq, 13);
+        assert_eq!(recovered.status, "stopped");
+        assert!(
+            journal.warnings.iter().any(|warning| {
+                warning.contains("最终快照不可用")
+                    && warning.contains("journal line 1")
+                    && warning.contains("journal_seq 13")
+            }),
+            "{:?}",
+            journal.warnings
         );
         let _ = std::fs::remove_dir_all(root);
     }
