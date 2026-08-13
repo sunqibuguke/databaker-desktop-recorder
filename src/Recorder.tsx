@@ -20,6 +20,7 @@ import {
   idlePrimaryAction,
   isCurrentSessionNoiseCheckOperation,
   isFinalReview,
+  NOISE_CHECK_STEPS,
   resolveRunningItemIndex,
   sessionNoiseGate,
   shouldAutoRunSessionNoiseCheck,
@@ -55,13 +56,14 @@ import { createLatestFrameCommitter } from './latest-frame';
 import type { LatestFrameCommitter } from './latest-frame';
 import type { SessionNoiseCheckOperation } from './recording-workflow';
 import { licenseSummary } from './ActivateLicense';
-import type { Attempt, AudioDevice, CapturePreset, CapturePresetDraft, CapturePresetStore, CaptureShareMode, EngineEvent, ExportArtifact, ExportResult, HeadSilencePhase, InspectedSessionState, ItemState, LicenseStatus, Meter, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SealInterruptedSessionResult, SessionSnapshot } from './types';
+import type { Attempt, AudioDevice, CapturePreset, CapturePresetDraft, CapturePresetStore, CaptureShareMode, EngineEvent, ExportArtifact, ExportResult, HeadSilencePhase, InspectedSessionState, ItemState, LicenseStatus, Meter, NoiseCheckProgress, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SealInterruptedSessionResult, SessionSnapshot } from './types';
 import { reportRendererError } from './sentry';
 import { logUserAction } from './debug-log';
 import { translateExportDeliverError } from './export-deliver-i18n';
 import { DISCONTINUITY_TOAST_MS, discontinuityDurationMs, shouldShowDiscontinuityToast } from './discontinuity-toast';
 import { classifyEngineError, userFacingEngineError, type ClassifiedEngineError } from './engine-error';
 import { LogPanel } from './LogPanel';
+import { NoiseCheckDialog } from './NoiseCheckDialog';
 import { APP_LOCALES, LOCALE_NATIVE_NAMES, getLocale, t, useI18n } from './i18n';
 import { startDevWebCapture, type DevWebCaptureHandle } from './dev-web-capture';
 
@@ -110,8 +112,6 @@ type UserAlert = {
   body: string;
 };
 
-const NOISE_CHECK_PROGRESS_STEPS = 15;
-const NOISE_CHECK_PROGRESS_INTERVAL_MS = 200;
 const HISTORY_PAGE_SIZE = 100;
 
 const emptyMeter: Meter = {
@@ -442,6 +442,8 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const [silenceDurationMs, setSilenceDurationMs] = useState(1_000);
   const [noiseCheckRunning, setNoiseCheckRunning] = useState(false);
   const [noiseCheckProgress, setNoiseCheckProgress] = useState(0);
+  const [noiseCheckLive, setNoiseCheckLive] = useState<NoiseCheckProgress | null>(null);
+  const [noiseCheckSamples, setNoiseCheckSamples] = useState<number[]>([]);
   const [noiseCheckError, setNoiseCheckError] = useState('');
   const [busy, setBusy] = useState('');
   const [notice, setNotice] = useState(() => t('notice.connectingEngine'));
@@ -709,8 +711,15 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const hasMonitorIssues = Boolean(hasBlockingMonitorIssues || discontinuityWarning);
   const currentNoiseGate = sessionNoiseGate(snapshot?.noise_check, noiseCheckRunning);
   const noiseCheckBlocksAttempt = phase === 'running' && captureActive && !recording && currentNoiseGate !== 'ready';
+  const showNoiseCheckDialog = noiseCheckBlocksAttempt && !captureFault;
+  const noiseLimitDbfs = snapshot?.noise_threshold_dbfs
+    ?? snapshot?.noise_check?.threshold_dbfs
+    ?? noiseThresholdDbfs;
+  const noiseSamples = noiseCheckRunning
+    ? noiseCheckSamples
+    : (snapshot?.noise_check?.samples ?? noiseCheckSamples);
   const noiseCheckMessage = currentNoiseGate === 'checking'
-    ? t('noise.checking', { current: noiseCheckProgress, total: NOISE_CHECK_PROGRESS_STEPS })
+    ? t('noise.checking', { current: noiseCheckProgress, total: NOISE_CHECK_STEPS })
     : currentNoiseGate === 'failed'
       ? t('noise.failed', { peak: snapshot?.noise_check?.maximum_dbfs.toFixed(1) ?? t('common.dash') })
       : currentNoiseGate === 'pending'
@@ -815,6 +824,8 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     noiseCheckOperationRef.current = null;
     setNoiseCheckRunning(false);
     setNoiseCheckProgress(0);
+    setNoiseCheckLive(null);
+    setNoiseCheckSamples([]);
     setNoiseCheckError('');
   }
 
@@ -831,20 +842,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     noiseCheckOperationRef.current = operation;
     setNoiseCheckRunning(true);
     setNoiseCheckProgress(0);
+    setNoiseCheckLive(null);
+    setNoiseCheckSamples([]);
     setNoiseCheckError('');
     setError('');
-    const progressTimer = window.setInterval(() => {
-      if (!isCurrentSessionNoiseCheckOperation(
-        noiseCheckOperationRef.current,
-        operation,
-        noiseCheckActivationRef.current,
-        activeSessionDirRef.current,
-      )) {
-        window.clearInterval(progressTimer);
-        return;
-      }
-      setNoiseCheckProgress((current) => Math.min(NOISE_CHECK_PROGRESS_STEPS - 1, current + 1));
-    }, NOISE_CHECK_PROGRESS_INTERVAL_MS);
     try {
       const result = await window.recorder.request<NoiseCheckResult>('check_noise', {
         threshold_dbfs: currentSnapshot.noise_threshold_dbfs
@@ -857,6 +858,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         noiseCheckActivationRef.current,
         activeSessionDirRef.current,
       )) return;
+      setNoiseCheckSamples(result.samples ?? []);
       setSnapshot((previous) => previous ? {
         ...previous,
         noise_check: result,
@@ -875,7 +877,6 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       setNoiseCheckError(`${t('notice.noiseFailedPrefix')}${errorMessage(caught)}`);
       setError(`${t('notice.noiseFailedPrefix')}${errorMessage(caught)}`);
     } finally {
-      window.clearInterval(progressTimer);
       if (isCurrentSessionNoiseCheckOperation(
         noiseCheckOperationRef.current,
         operation,
@@ -884,7 +885,6 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       )) {
         noiseCheckOperationRef.current = null;
         setNoiseCheckRunning(false);
-        setNoiseCheckProgress(0);
       }
     }
   }
@@ -1254,6 +1254,26 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       } else if (message.event === 'engine_idle_after_stopping_crash') {
         setEngineStatus('ready');
         setNotice(t('notice.engineRestarted'));
+      } else if (message.event === 'noise_check_started') {
+        if (!noiseCheckOperationRef.current) return;
+        setNoiseCheckLive(null);
+        setNoiseCheckSamples([]);
+        setNoiseCheckProgress(0);
+      } else if (message.event === 'noise_check_progress') {
+        if (!noiseCheckOperationRef.current) return;
+        const progress = message.payload as Partial<NoiseCheckProgress> | undefined;
+        if (!progress || typeof progress.rms_dbfs !== 'number') return;
+        const sampleIndex = typeof progress.sample_index === 'number' ? progress.sample_index : 0;
+        const rmsDbfs = progress.rms_dbfs;
+        setNoiseCheckLive({
+          sample_index: sampleIndex,
+          sample_count: typeof progress.sample_count === 'number' ? progress.sample_count : NOISE_CHECK_STEPS,
+          rms_dbfs: rmsDbfs,
+          peak_dbfs: typeof progress.peak_dbfs === 'number' ? progress.peak_dbfs : rmsDbfs,
+          threshold_dbfs: typeof progress.threshold_dbfs === 'number' ? progress.threshold_dbfs : -42,
+        });
+        setNoiseCheckProgress(sampleIndex);
+        setNoiseCheckSamples((samples) => [...samples, rmsDbfs].slice(-NOISE_CHECK_STEPS));
       }
     });
     const unsubscribeOffline = window.recorder.onEngineOffline((message) => {
@@ -2625,6 +2645,13 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         }
         return;
       }
+      if (showNoiseCheckDialog) {
+        if (event.code === 'Space' && !noiseCheckRunning && snapshot) {
+          event.preventDefault();
+          void runSessionNoiseCheck(sessionDir, snapshot);
+        }
+        return;
+      }
       if (event.code === 'Space') {
         event.preventDefault();
         if (recording) void stopAttempt();
@@ -3047,11 +3074,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         <div className="document-tabs"><span className="active"><Icon name="microphone" size={13} /> {workflowComplete ? t('recorder.taskComplete') : currentItem?.id ?? 'Item'} <i>×</i></span></div>
         <div className="editor-toolbar"><div className="editor-nav"><button title={t('recorder.prevItem')} disabled={recording || currentIndex === 0} onClick={() => setCurrentIndex((index) => Math.max(0, index - 1))}><Icon name="chevron-left" /></button><span>{currentIndex + 1} / {items.length}</span><button title={t('recorder.nextItem')} disabled={recording || currentIndex >= items.length - 1} onClick={() => setCurrentIndex((index) => Math.min(items.length - 1, index + 1))}><Icon name="chevron-right" /></button></div><div className="editor-time"><strong className={recording ? 'recording' : ''}>{recording ? attemptDuration : sessionDuration}</strong></div><div className="editor-toolbar-actions"><button className="prompter-launch" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? t('recorder.locatePrompter') : t('recorder.openPrompter')}</button></div><div className={`save-health ${workspaceFaulted || captureFault ? 'fault' : meter.storage_status === 'warning' ? 'warning' : ''}`}><i />{workspaceFaulted ? t('recorder.healthReadonly') : !captureActive ? t('recorder.healthView') : captureFault ? t('recorder.healthFaultStop', { title: captureFaultCopy.title }) : meter.storage_status === 'warning' ? t('recorder.healthWarning', { minutes: Math.max(0, Math.floor(meter.storage_safe_remaining_seconds / 60)) }) : t('recorder.healthLive')}</div></div>
         <div className="editor-canvas">
-          {(activationFailure || captureFault || discontinuityToast || noiseCheckBlocksAttempt || qualityWarning) && <div className="workspace-toasts" aria-live="polite">
+          {(activationFailure || captureFault || discontinuityToast || qualityWarning) && <div className="workspace-toasts" aria-live="polite">
             {activationFailure && !captureActive && <div className="session-noise-banner failed" role="alert" data-testid="activation-failure-banner"><Icon name="stop" size={16} /><div><strong>{activationErrorCopy(activationFailure.kind).title}</strong><span>{activationErrorCopy(activationFailure.kind).body}</span></div><button className="button" onClick={() => setActivationFailureOpen(true)} disabled={Boolean(busy)}>{t('activationError.openEditor')}</button></div>}
             {captureFault && <div className="capture-fault-banner" role="alert"><Icon name="stop" size={16} /><div><strong>{captureFaultCopy.title}</strong><span>{captureFaultCopy.detail}{snapshot?.device_name ? ` ${t('issues.currentDevice', { name: snapshot.device_name })}` : ' '}{t('issues.stopThenFinish')}</span></div></div>}
             {discontinuityToast && !captureFault && <div className="input-quality-banner workspace-toast" data-testid="discontinuity-toast" role="status"><Icon name="meter" size={16} /><div><strong>{t('discontinuity.bannerTitle')}</strong><span>{discontinuityToast}. {t('discontinuity.bannerHint')}</span></div></div>}
-            {noiseCheckBlocksAttempt && <div className={`session-noise-banner ${currentNoiseGate}`} role="status"><Icon name="meter" size={16} /><div><strong>{currentNoiseGate === 'checking' ? t('noise.bannerChecking') : currentNoiseGate === 'failed' ? t('noise.bannerFailed') : t('noise.bannerNeeded')}</strong><span>{noiseCheckMessage}. {t('noise.bannerHint')}</span></div><button className="button" onClick={() => snapshot && void runSessionNoiseCheck(sessionDir, snapshot)} disabled={noiseCheckRunning || Boolean(busy)}>{noiseCheckRunning ? t('noise.checkingShort') : currentNoiseGate === 'failed' || noiseCheckError ? t('noise.recheck') : t('noise.startCheck')}</button></div>}
             {qualityWarning && <div className="input-quality-banner" role="alert"><Icon name="meter" size={16} /><div><strong>{t('quality.bannerTitle')}</strong><span>{qualityWarning}. {t('quality.bannerHint')}</span></div></div>}
           </div>}
           <section className="script-monitor"><header><span>{t('recorder.currentSentence')}</span><div><span className="studio-cue">{cueLabel}</span><em>{workflowComplete ? t('recorder.itemsCount', { count: items.length }) : `${currentIndex + 1} / ${items.length}`}</em></div></header><div className={`prompt-surface ${captureFault ? 'fault' : cue === 'pending' ? 'pending' : cue === 'recording' ? 'live' : ''}`}>{captureFault ? <span className="label-chip">{t('recorder.stopReadingChip')}</span> : noiseCheckBlocksAttempt ? <span className="label-chip">{t('recorder.envChip')}</span> : (workflowComplete || currentItem?.label) && <span className="label-chip">{workflowComplete ? t('recorder.allDoneChip') : currentItem?.label}</span>}<p>{captureFault ? captureFaultCopy.title : noiseCheckBlocksAttempt ? t('recorder.keepQuiet') : workflowComplete ? t('recorder.scriptFinished') : currentItem?.text ?? t('recorder.noText')}</p><small>{captureFault ? captureFaultCopy.detail : noiseCheckBlocksAttempt ? noiseCheckMessage : workflowComplete ? t('recorder.exportLater') : <>{currentItem?.id}</>}</small></div></section>
@@ -3124,6 +3150,17 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         </div>
       </aside>
     </div>
+    {showNoiseCheckDialog && <NoiseCheckDialog
+      gate={currentNoiseGate}
+      running={noiseCheckRunning}
+      error={noiseCheckError}
+      samples={noiseSamples}
+      liveRmsDbfs={noiseCheckLive?.rms_dbfs ?? null}
+      thresholdDbfs={noiseLimitDbfs}
+      result={snapshot?.noise_check ?? null}
+      busy={Boolean(busy)}
+      onRetry={() => snapshot && void runSessionNoiseCheck(sessionDir, snapshot)}
+    />}
     {pauseConfirmOpen && !captureFault && <div className="dialog-backdrop" role="presentation">
       <section className="studio-dialog" role="dialog" aria-modal="true" aria-labelledby="pause-dialog-title">
         <header><span className="dialog-icon"><Icon name="chevron-left" size={19} /></span><div><h2 id="pause-dialog-title">{recording ? t('pauseDialog.titleRecording') : t('pauseDialog.titleIdle')}</h2></div></header>

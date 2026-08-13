@@ -16,6 +16,8 @@ async function main() {
     idlePrimaryAction,
     isCurrentSessionNoiseCheckOperation,
     isFinalReview,
+    noiseLevelPercent,
+    noiseWindowState,
     resolveRunningItemIndex,
     sessionNoiseGate,
     shouldAutoRunSessionNoiseCheck,
@@ -92,6 +94,13 @@ async function main() {
     false,
     'a request must not settle after the active session directory changes',
   );
+  assert.equal(noiseWindowState([], 0, -42).state, 'sampling');
+  assert.equal(noiseWindowState([-50, -50, -50, -50, -50], 0, -42).state, 'passed');
+  assert.equal(noiseWindowState([-50, -30, -50, -50, -50], 0, -42).state, 'failed');
+  assert.equal(noiseWindowState([-42, -50, -50, -50, -50], 0, -42).state, 'failed');
+  assert.equal(noiseWindowState(Array(10).fill(-55).concat([-30, -55, -55, -55, -55]), 2, -42).state, 'failed');
+  assert.equal(noiseLevelPercent(-72), 0);
+  assert.equal(noiseLevelPercent(-6), 100);
 
   assert.equal(
     inputQualityWarning(true, false, true),

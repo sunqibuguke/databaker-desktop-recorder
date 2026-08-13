@@ -21,6 +21,29 @@ export type SessionNoiseCheckOperation = Readonly<{
   sessionDir: string;
 }>;
 
+export const NOISE_CHECK_STEPS = 15;
+export const NOISE_WINDOW_COUNT = 3;
+export const NOISE_WINDOW_SIZE = 5;
+
+export function noiseLevelPercent(dbfs: number): number {
+  return Math.min(100, Math.max(0, (dbfs + 72) / 66 * 100));
+}
+
+export function noiseWindowState(samples: number[], windowIndex: number, thresholdDbfs: number) {
+  const windowSamples = samples.slice(
+    windowIndex * NOISE_WINDOW_SIZE,
+    windowIndex * NOISE_WINDOW_SIZE + NOISE_WINDOW_SIZE,
+  );
+  const complete = windowSamples.length === NOISE_WINDOW_SIZE;
+  const failed = complete && windowSamples.some((sample) => sample >= thresholdDbfs);
+  return {
+    samples: windowSamples,
+    complete,
+    failed,
+    state: complete ? (failed ? 'failed' : 'passed') : 'sampling',
+  } as const;
+}
+
 export type SafePauseOperations<T> = {
   hasActiveAttempt: boolean;
   closeActiveAttempt: () => Promise<boolean>;
