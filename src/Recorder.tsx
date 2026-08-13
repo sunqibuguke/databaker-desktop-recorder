@@ -57,6 +57,7 @@ import { reportRendererError } from './sentry';
 import { logUserAction } from './debug-log';
 import { translateExportDeliverError } from './export-deliver-i18n';
 import { DISCONTINUITY_TOAST_MS, discontinuityDurationMs, shouldShowDiscontinuityToast } from './discontinuity-toast';
+import { classifyEngineError, userFacingEngineError, type ClassifiedEngineError } from './engine-error';
 import { LogPanel } from './LogPanel';
 import { APP_LOCALES, LOCALE_NATIVE_NAMES, getLocale, t, useI18n } from './i18n';
 import { startDevWebCapture, type DevWebCaptureHandle } from './dev-web-capture';
@@ -135,7 +136,24 @@ const emptyMeter: Meter = {
 };
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return userFacingEngineError(error);
+}
+
+function activationErrorCopy(kind: ClassifiedEngineError['kind']): { title: string; body: string } {
+  switch (kind) {
+    case 'exclusive_busy':
+      return { title: t('activationError.busyTitle'), body: t('activationError.busyBody') };
+    case 'exclusive_format':
+      return { title: t('activationError.formatTitle'), body: t('activationError.formatBody') };
+    case 'exclusive_policy':
+      return { title: t('activationError.policyTitle'), body: t('activationError.policyBody') };
+    case 'exclusive_empty':
+      return { title: t('activationError.emptyTitle'), body: t('activationError.emptyBody') };
+    case 'exclusive_open':
+      return { title: t('activationError.exclusiveTitle'), body: t('activationError.exclusiveBody') };
+    default:
+      return { title: t('activationError.genericTitle'), body: t('activationError.genericBody') };
+  }
 }
 
 function recoveryWarning(label: string, warnings: string[] | undefined): string {
@@ -436,6 +454,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const [taskExportDir, setTaskExportDir] = useState('');
   const [exportFeedback, setExportFeedback] = useState<ExportFeedback | null>(null);
   const [userAlert, setUserAlert] = useState<UserAlert | null>(null);
+  const [activationFailure, setActivationFailure] = useState<ClassifiedEngineError | null>(null);
+  const [activationFailureOpen, setActivationFailureOpen] = useState(false);
+  const [recoveryShareMode, setRecoveryShareMode] = useState<CaptureShareMode>('shared');
+  const [recoverySampleFormat, setRecoverySampleFormat] = useState('i16');
   const [deletingSessionDir, setDeletingSessionDir] = useState('');
   const [openActionsSessionDir, setOpenActionsSessionDir] = useState('');
   const [resumeError, setResumeError] = useState<{ sessionDir: string; message: string } | null>(null);
@@ -511,6 +533,11 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     : maximumInputChannels;
   const formatOptions = captureSampleFormatsForConfiguration(
     modeConfigurations,
+    sampleRate,
+    inputChannel,
+  );
+  const recoveryFormatOptions = captureSampleFormatsForConfiguration(
+    configurationsForShareMode(selectedDevice, recoveryShareMode),
     sampleRate,
     inputChannel,
   );
@@ -605,6 +632,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     ? currentItem.attempts.find((attempt) => attempt.attempt_id === reviewAttemptId)
       ?? latestUsableAttempt(currentItem)
     : undefined;
+  const showReviewWaveform = !captureActive && Boolean(reviewAttempt);
   const showReviewSilenceBill = Boolean(
     !recording
     && currentItem?.status === 'review'
@@ -1645,10 +1673,20 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     }
   }
 
-  async function startSession() {
-    if (!scriptItems.length || scriptErrors.length || !selectedDevice || !outputDir || !captureConfigurationValid) {
-      if (captureConfigurationIssue) setError(captureConfigurationIssue);
-      return;
+  async function startSession(options?: {
+    captureShareMode?: CaptureShareMode;
+    inputSampleFormat?: string;
+    activateAfterCreate?: boolean;
+  }): Promise<boolean> {
+    const nextShareMode = options?.captureShareMode ?? captureShareMode;
+    const nextSampleFormat = options?.inputSampleFormat ?? inputSampleFormat;
+    const nextBitDepth = deliveryBitDepthForCaptureFormat(nextSampleFormat);
+    if (options?.captureShareMode) setCaptureShareMode(nextShareMode);
+    if (options?.inputSampleFormat) setInputSampleFormat(nextSampleFormat);
+    const settingsAlreadyChosen = Boolean(options?.captureShareMode || options?.inputSampleFormat);
+    if (!scriptItems.length || scriptErrors.length || !selectedDevice || !outputDir || (!settingsAlreadyChosen && !captureConfigurationValid)) {
+      if (!settingsAlreadyChosen && captureConfigurationIssue) setError(captureConfigurationIssue);
+      return false;
     }
     const sessionId = `${safeSessionName(sessionName)}-${timestamp()}`;
     const destination = await window.recorder.joinPath(outputDir, sessionId);
@@ -1659,16 +1697,16 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       device_id: selectedDevice.id,
       device_name: selectedDevice.name,
       sample_rate: sampleRate,
-      bit_depth: bitDepth,
-      input_sample_format: inputSampleFormat,
+      bit_depth: nextBitDepth,
+      input_sample_format: nextSampleFormat,
       input_channel: inputChannel,
-      capture_share_mode: captureShareMode,
+      capture_share_mode: nextShareMode,
       silence_duration_ms: silenceDurationMs,
       noise_threshold_dbfs: noiseThresholdDbfs,
       silence_threshold_dbfs: noiseThresholdDbfs,
       items: scriptItems,
     }));
-    if (!result) return;
+    if (!result) return false;
     setDataSafetyAlert('');
     logUserAction('ui.create_session', `已创建录制任务 ${sessionId}`, {
       session_id: sessionId,
@@ -1677,24 +1715,94 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       device_id: selectedDevice.id,
       device_name: selectedDevice.name,
       sample_rate: sampleRate,
-      bit_depth: bitDepth,
-      input_sample_format: inputSampleFormat,
+      bit_depth: nextBitDepth,
+      input_sample_format: nextSampleFormat,
       input_channel: inputChannel,
       item_count: scriptItems.length,
     });
     enterInspectionWorkspace(result);
-    setNotice(t('notice.taskCreated'));
+    setNotice(options?.activateAfterCreate ? t('activationError.recreatedNotice') : t('notice.taskCreated'));
+    if (options?.activateAfterCreate) {
+      return activateCapture(undefined, result.session_dir);
+    }
+    return true;
   }
 
-  async function activateCapture(keepItemId?: string | null): Promise<boolean> {
-    if (!snapshot || !sessionDir || captureActive || workspaceFaulted) return captureActive;
-    const result = await run(t('notice.enablingCard'), () => window.recorder.request<RunningSessionState>('activate_session', {
-      session_dir: sessionDir,
-    }));
-    if (!result) return false;
-    enterRunningSession(result, true, devices, keepItemId);
-    setNotice(t('notice.cardEnabled'));
-    return true;
+  function presentActivationFailure(error: unknown) {
+    const classified = classifyEngineError(error);
+    setActivationFailure(classified);
+    setActivationFailureOpen(classified.canEditCaptureSettings);
+    setRecoveryShareMode(classified.canEditCaptureSettings && exclusiveCaptureAvailable ? 'shared' : captureShareMode);
+    setRecoverySampleFormat(inputSampleFormat);
+  }
+
+  async function activateCapture(keepItemId?: string | null, targetSessionDir?: string): Promise<boolean> {
+    const dir = targetSessionDir || sessionDir;
+    if (!dir || captureActive || workspaceFaulted) return captureActive;
+    setBusy(t('notice.enablingCard'));
+    setError('');
+    lastOperationErrorRef.current = '';
+    logUserAction('ui.operation', t('notice.enablingCard'));
+    const startedAt = performance.now();
+    try {
+      const result = await window.recorder.request<RunningSessionState>('activate_session', {
+        session_dir: dir,
+      });
+      logUserAction('ui.operation.ok', t('notice.completedOk', { label: t('notice.enablingCard') }), {
+        duration_ms: Math.round(performance.now() - startedAt),
+      });
+      setActivationFailure(null);
+      setActivationFailureOpen(false);
+      enterRunningSession(result, true, devices, keepItemId);
+      setNotice(t('notice.cardEnabled'));
+      return true;
+    } catch (caught) {
+      const message = errorMessage(caught);
+      lastOperationErrorRef.current = message;
+      logUserAction('ui.operation.fail', t('notice.completedFail', { label: t('notice.enablingCard'), error: message }), {
+        duration_ms: Math.round(performance.now() - startedAt),
+        error_type: caught instanceof Error ? caught.name : typeof caught,
+      }, 'error');
+      reportRendererError(t('notice.enablingCard'), caught);
+      setError(message);
+      presentActivationFailure(caught);
+      return false;
+    } finally {
+      setBusy('');
+    }
+  }
+
+  function clearActivationFailure() {
+    setActivationFailure(null);
+    setActivationFailureOpen(false);
+  }
+
+  function returnToSetupFromInspection() {
+    unbindTaskLog('return_to_setup');
+    setCaptureShareMode(recoveryShareMode);
+    setInputSampleFormat(recoverySampleFormat);
+    resetForNewSession();
+    clearActivationFailure();
+    setNotice(t('activationError.editSettingsNotice'));
+    logUserAction('ui.edit_capture_settings', '独占开流失败后返回修改采集设置', {
+      capture_share_mode: recoveryShareMode,
+      input_sample_format: recoverySampleFormat,
+    });
+  }
+
+  async function recreateFromActivationFailure() {
+    const created = await startSession({
+      captureShareMode: recoveryShareMode,
+      inputSampleFormat: recoverySampleFormat,
+      activateAfterCreate: true,
+    });
+    if (created) {
+      clearActivationFailure();
+      logUserAction('ui.recreate_capture_settings', '已用新采集设置重新创建任务', {
+        capture_share_mode: recoveryShareMode,
+        input_sample_format: recoverySampleFormat,
+      });
+    }
   }
 
   async function refreshState(): Promise<SessionSnapshot | null> {
@@ -2169,6 +2277,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setAudioUrl('');
     setMeter(emptyMeter);
     clearSessionNoiseCheck();
+    clearActivationFailure();
     setNotice(t('notice.leftTask'));
     unbindTaskLog('leave_inspection');
     logUserAction('ui.leave_task', '已退出任务检查工作区');
@@ -2329,6 +2438,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setAudioUrl('');
     setFinishConfirmOpen(false);
     setPauseConfirmOpen(false);
+    clearActivationFailure();
     setNotice(t('notice.reuseScript'));
   }
 
@@ -2350,6 +2460,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setSealConfirmRecording(null);
     setDeleteConfirmRecording(null);
     setOpenActionsSessionDir('');
+    clearActivationFailure();
     setPhase('home');
     clearSessionNoiseCheck();
     setSnapshot(null);
@@ -2466,17 +2577,17 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   }, [openActionsSessionDir]);
 
   useEffect(() => {
-    if (recording || !reviewAttempt || !sessionDir || !currentItem) {
+    if (captureActive || !reviewAttempt || !sessionDir || !currentItem) {
       setReviewWaveformBins([]);
       return undefined;
     }
     const requestId = reviewWaveformRequestRef.current + 1;
     reviewWaveformRequestRef.current = requestId;
-    const command = captureActive ? 'preview_attempt_waveform' : 'preview_session_waveform';
-    const payload = captureActive
-      ? { item_id: currentItem.id, attempt_id: reviewAttempt.attempt_id }
-      : { session_dir: sessionDir, item_id: currentItem.id, attempt_id: reviewAttempt.attempt_id };
-    void window.recorder.request<{ bins: Array<[number, number]> }>(command, payload).then((result) => {
+    void window.recorder.request<{ bins: Array<[number, number]> }>('preview_session_waveform', {
+      session_dir: sessionDir,
+      item_id: currentItem.id,
+      attempt_id: reviewAttempt.attempt_id,
+    }).then((result) => {
       if (requestId !== reviewWaveformRequestRef.current) return;
       setReviewWaveformBins(Array.isArray(result.bins) ? result.bins : []);
     }).catch(() => {
@@ -2486,7 +2597,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     return () => {
       if (reviewWaveformRequestRef.current === requestId) reviewWaveformRequestRef.current += 1;
     };
-  }, [recording, captureActive, sessionDir, currentItem?.id, reviewAttempt?.attempt_id]);
+  }, [captureActive, sessionDir, currentItem?.id, reviewAttempt?.attempt_id]);
 
   const settingsDialog = settingsOpen && <div className="dialog-backdrop" role="presentation">
     <section className="studio-dialog settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-dialog-title">
@@ -2613,6 +2724,49 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     </section>
   </div>;
 
+  const activationCopy = activationFailure ? activationErrorCopy(activationFailure.kind) : null;
+  const activationFailureDialog = activationFailureOpen && activationFailure && activationCopy && <div className="dialog-backdrop user-alert-backdrop" role="presentation">
+    <section className="studio-dialog activation-failure-dialog" role="dialog" aria-modal="true" aria-labelledby="activation-failure-title" data-testid="activation-failure-dialog">
+      <header>
+        <span className="dialog-icon danger"><Icon name="stop" size={19} /></span>
+        <div>
+          <h2 id="activation-failure-title">{activationCopy.title}</h2>
+        </div>
+      </header>
+      <p>{activationCopy.body}</p>
+      <dl className="dialog-summary activation-failure-summary">
+        <div><dt>{t('setup.inputDevice')}</dt><dd title={deviceName}>{deviceName || t('common.dash')}</dd></div>
+        <div><dt>{t('setup.sampleRate')}</dt><dd>{sampleRate.toLocaleString(locale)} Hz</dd></div>
+        <div><dt>{t('setup.inputChannel')}</dt><dd>{inputChannel}</dd></div>
+      </dl>
+      <div className="activation-failure-settings">
+        <p>{t('activationError.changeHint')}</p>
+        {exclusiveCaptureAvailable && <label className="field"><span>{t('setup.shareMode')}</span><select data-testid="activation-recovery-share-mode" value={recoveryShareMode} onChange={(event) => {
+          const next = normalizeCaptureShareMode(event.target.value);
+          setRecoveryShareMode(next);
+          const formats = captureSampleFormatsForConfiguration(
+            configurationsForShareMode(selectedDevice, next),
+            sampleRate,
+            inputChannel,
+          );
+          if (!formats.some((format) => format === recoverySampleFormat)) {
+            setRecoverySampleFormat(preferredCaptureSampleFormat(formats) ?? recoverySampleFormat);
+          }
+        }}><option value="exclusive">{t('setup.exclusiveRecommended')}</option><option value="shared">{t('setup.sharedMode')}</option></select></label>}
+        <label className="field"><span>{t('setup.bitDepth')}</span><select data-testid="activation-recovery-format" value={recoverySampleFormat} onChange={(event) => setRecoverySampleFormat(event.target.value)}>{!recoveryFormatOptions.some((format) => format === recoverySampleFormat) && <option value={recoverySampleFormat}>{captureSampleFormatLabel(recoverySampleFormat)}</option>}{(recoveryFormatOptions.length ? recoveryFormatOptions : [recoverySampleFormat]).map((format) => <option value={format} key={format}>{captureSampleFormatLabel(format)}</option>)}</select></label>
+      </div>
+      <details className="activation-failure-detail">
+        <summary>{t('activationError.detail')}</summary>
+        <p>{activationFailure.message}</p>
+      </details>
+      <footer>
+        <button className="button" onClick={() => setActivationFailureOpen(false)} disabled={Boolean(busy)}>{t('common.close')}</button>
+        <button data-testid="activation-back-to-setup" className="button" onClick={returnToSetupFromInspection} disabled={Boolean(busy)}>{t('activationError.backToSetup')}</button>
+        <button data-testid="activation-recreate" className="button primary" onClick={() => void recreateFromActivationFailure()} disabled={Boolean(busy)}>{t('activationError.recreateAndEnter')}</button>
+      </footer>
+    </section>
+  </div>;
+
   if (phase === 'home') {
     const filters: Array<{ id: HistoryFilter; label: string }> = [
       { id: 'all', label: t('home.filterAll') },
@@ -2723,6 +2877,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       {settingsDialog}
       {exportFeedbackDialog}
       {userAlertDialog}
+      {activationFailureDialog}
       <LogPanel open={logPanelOpen} onClose={() => setLogPanelOpen(false)} />
     </div>;
   }
@@ -2787,6 +2942,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       {settingsDialog}
       {exportFeedbackDialog}
       {userAlertDialog}
+      {activationFailureDialog}
       <LogPanel open={logPanelOpen} onClose={() => setLogPanelOpen(false)} />
     </div>;
   }
@@ -2805,14 +2961,15 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         <div className="document-tabs"><span className="active"><Icon name="microphone" size={13} /> {workflowComplete ? t('recorder.taskComplete') : currentItem?.id ?? 'Item'} <i>×</i></span></div>
         <div className="editor-toolbar"><div className="editor-nav"><button title={t('recorder.prevItem')} disabled={recording || currentIndex === 0} onClick={() => setCurrentIndex((index) => Math.max(0, index - 1))}><Icon name="chevron-left" /></button><span>{currentIndex + 1} / {items.length}</span><button title={t('recorder.nextItem')} disabled={recording || currentIndex >= items.length - 1} onClick={() => setCurrentIndex((index) => Math.min(items.length - 1, index + 1))}><Icon name="chevron-right" /></button></div><div className="editor-time"><strong className={recording ? 'recording' : ''}>{recording ? attemptDuration : sessionDuration}</strong></div><div className="editor-toolbar-actions"><button className="prompter-launch" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? t('recorder.locatePrompter') : t('recorder.openPrompter')}</button></div><div className={`save-health ${workspaceFaulted || captureFault ? 'fault' : meter.storage_status === 'warning' ? 'warning' : ''}`}><i />{workspaceFaulted ? t('recorder.healthReadonly') : !captureActive ? t('recorder.healthView') : captureFault ? t('recorder.healthFaultStop', { title: captureFaultCopy.title }) : meter.storage_status === 'warning' ? t('recorder.healthWarning', { minutes: Math.max(0, Math.floor(meter.storage_safe_remaining_seconds / 60)) }) : t('recorder.healthLive')}</div></div>
         <div className="editor-canvas">
-          {(captureFault || discontinuityToast || noiseCheckBlocksAttempt || qualityWarning) && <div className="workspace-toasts" aria-live="polite">
+          {(activationFailure || captureFault || discontinuityToast || noiseCheckBlocksAttempt || qualityWarning) && <div className="workspace-toasts" aria-live="polite">
+            {activationFailure && !captureActive && <div className="session-noise-banner failed" role="alert" data-testid="activation-failure-banner"><Icon name="stop" size={16} /><div><strong>{activationErrorCopy(activationFailure.kind).title}</strong><span>{activationErrorCopy(activationFailure.kind).body}</span></div><button className="button" onClick={() => setActivationFailureOpen(true)} disabled={Boolean(busy)}>{t('activationError.openEditor')}</button></div>}
             {captureFault && <div className="capture-fault-banner" role="alert"><Icon name="stop" size={16} /><div><strong>{captureFaultCopy.title}</strong><span>{captureFaultCopy.detail}{snapshot?.device_name ? ` ${t('issues.currentDevice', { name: snapshot.device_name })}` : ' '}{t('issues.stopThenFinish')}</span></div></div>}
             {discontinuityToast && !captureFault && <div className="input-quality-banner workspace-toast" data-testid="discontinuity-toast" role="status"><Icon name="meter" size={16} /><div><strong>{t('discontinuity.bannerTitle')}</strong><span>{discontinuityToast}. {t('discontinuity.bannerHint')}</span></div></div>}
             {noiseCheckBlocksAttempt && <div className={`session-noise-banner ${currentNoiseGate}`} role="status"><Icon name="meter" size={16} /><div><strong>{currentNoiseGate === 'checking' ? t('noise.bannerChecking') : currentNoiseGate === 'failed' ? t('noise.bannerFailed') : t('noise.bannerNeeded')}</strong><span>{noiseCheckMessage}. {t('noise.bannerHint')}</span></div><button className="button" onClick={() => snapshot && void runSessionNoiseCheck(sessionDir, snapshot)} disabled={noiseCheckRunning || Boolean(busy)}>{noiseCheckRunning ? t('noise.checkingShort') : currentNoiseGate === 'failed' || noiseCheckError ? t('noise.recheck') : t('noise.startCheck')}</button></div>}
             {qualityWarning && <div className="input-quality-banner" role="alert"><Icon name="meter" size={16} /><div><strong>{t('quality.bannerTitle')}</strong><span>{qualityWarning}. {t('quality.bannerHint')}</span></div></div>}
           </div>}
           <section className="script-monitor"><header><span>{t('recorder.currentSentence')}</span><div><span className="studio-cue">{cueLabel}</span><em>{workflowComplete ? t('recorder.itemsCount', { count: items.length }) : `${currentIndex + 1} / ${items.length}`}</em></div></header><div className={`prompt-surface ${captureFault ? 'fault' : cue === 'pending' ? 'pending' : cue === 'recording' ? 'live' : ''}`}>{captureFault ? <span className="label-chip">{t('recorder.stopReadingChip')}</span> : noiseCheckBlocksAttempt ? <span className="label-chip">{t('recorder.envChip')}</span> : (workflowComplete || currentItem?.label) && <span className="label-chip">{workflowComplete ? t('recorder.allDoneChip') : currentItem?.label}</span>}<p>{captureFault ? captureFaultCopy.title : noiseCheckBlocksAttempt ? t('recorder.keepQuiet') : workflowComplete ? t('recorder.scriptFinished') : currentItem?.text ?? t('recorder.noText')}</p><small>{captureFault ? captureFaultCopy.detail : noiseCheckBlocksAttempt ? noiseCheckMessage : workflowComplete ? t('recorder.exportLater') : <>{currentItem?.id}</>}</small></div></section>
-          <section className="signal-monitor"><header><div><strong>{t('recorder.waveform')}</strong>{captureActive ? <SilencePairReadout pair={silencePair} /> : reviewAttempt ? <SilencePairReadout pair={reviewSilencePair({ attempt: reviewAttempt, sampleRate: sampleRateForDisplay, requiredMs: effectiveSilenceDurationMs, peak: reviewPeak })} /> : null}</div><div>{captureActive ? <><span>RMS <b>{db(meter.rms)}</b></span><span>PEAK <b className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</b></span></> : <span>{reviewAttempt ? formatDuration(reviewAttempt.end_sample - reviewAttempt.start_sample, sampleRateForDisplay) : t('recorder.noTakeWaveform')}</span>}</div></header><div className="signal-scope"><WebGLWaveform key={reviewAttempt && !recording ? `${sessionDir}:${reviewAttempt.attempt_id}` : `${sessionDir}:${waveformGeneration}`} mode={reviewAttempt && !recording ? 'review' : 'live'} bins={reviewAttempt && !recording ? reviewWaveformBins : (meter.waveform ?? [])} capturedSamples={meter.captured_samples} waveformEndSample={meter.waveform_end_sample} recording={recording && !captureFault} takeStartSample={recording && !captureFault ? attemptStartSample : undefined} sampleRate={sampleRateForDisplay} /><div className="scope-scale"><span>−1.0</span><span>−0.5</span><span>0</span><span>+0.5</span><span>+1.0</span></div></div><div className="horizontal-meter"><i className="meter-rms" style={{ width: `${rmsPercent}%` }} /><i className="meter-peak" style={{ left: `${peakPercent}%` }} /></div></section>
+          <section className="signal-monitor"><header><div><strong>{t('recorder.waveform')}</strong>{captureActive ? <SilencePairReadout pair={silencePair} /> : reviewAttempt ? <SilencePairReadout pair={reviewSilencePair({ attempt: reviewAttempt, sampleRate: sampleRateForDisplay, requiredMs: effectiveSilenceDurationMs, peak: reviewPeak })} /> : null}</div><div>{captureActive ? <><span>RMS <b>{db(meter.rms)}</b></span><span>PEAK <b className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</b></span></> : <span>{reviewAttempt ? formatDuration(reviewAttempt.end_sample - reviewAttempt.start_sample, sampleRateForDisplay) : t('recorder.noTakeWaveform')}</span>}</div></header><div className="signal-scope"><WebGLWaveform key={showReviewWaveform ? `${sessionDir}:${reviewAttempt?.attempt_id}` : `${sessionDir}:${waveformGeneration}`} mode={showReviewWaveform ? 'review' : 'live'} bins={showReviewWaveform ? reviewWaveformBins : (meter.waveform ?? [])} capturedSamples={meter.captured_samples} waveformEndSample={meter.waveform_end_sample} recording={recording && !captureFault} takeStartSample={recording && !captureFault ? attemptStartSample : undefined} sampleRate={sampleRateForDisplay} /><div className="scope-scale"><span>−1.0</span><span>−0.5</span><span>0</span><span>+0.5</span><span>+1.0</span></div></div><div className="horizontal-meter"><i className="meter-rms" style={{ width: `${rmsPercent}%` }} /><i className="meter-peak" style={{ left: `${peakPercent}%` }} /></div></section>
           {audioUrl && <audio ref={audioRef} src={audioUrl} controls className="audio-player" />}
           <section className="transport-panel">
             <div className="transport-secondary">
@@ -2903,6 +3060,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     {settingsDialog}
     {exportFeedbackDialog}
     {userAlertDialog}
+    {activationFailureDialog}
     <LogPanel open={logPanelOpen} onClose={() => setLogPanelOpen(false)} />
   </div>;
 }
