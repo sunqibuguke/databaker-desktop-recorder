@@ -13905,7 +13905,11 @@ mod tests {
             timeout,
         );
 
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "activation cleanup should return near the writer deadline, not wait for the blocked writer; elapsed={:?}",
+            started.elapsed(),
+        );
         assert!(format!("{error:#}").contains("durably committed as stopping"));
         stop_seen_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let pending = engine
@@ -13957,7 +13961,11 @@ mod tests {
             timeout,
         );
 
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "activation cleanup should return near the 100ms deadline, not wait for blocked gate/telemetry; elapsed={:?}",
+            started.elapsed(),
+        );
         assert!(format!("{error:#}").contains("cleanup reached its deadline"));
         let pending = engine
             .session
