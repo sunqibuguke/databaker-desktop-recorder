@@ -427,8 +427,8 @@ html:has(.prompter-shell), body:has(.prompter-shell), body:has(.prompter-shell) 
 .prompter-quality-warning { display: flex; align-items: center; justify-content: center; gap: 9px; min-height: 40px; padding: 7px clamp(20px, 4vw, 30px); border-bottom: 1px solid #745f35; color: #f3d58f; background: #3d3422; font-size: clamp(11px, 1.8vw, 14px); font-weight: 600; text-align: center; }.prompter-quality-warning i { width: 9px; height: 9px; flex: none; border-radius: 50%; background: var(--warning); }
 .prompter-content { min-height: 0; display: flex; flex-direction: column; padding: clamp(24px, 6vh, 42px) clamp(24px, 6vw, 48px) clamp(20px, 4vh, 30px); }
 .prompter-content > p { min-height: 0; display: flex; flex: 1; align-items: center; max-width: 25em; margin: 0; overflow: auto; color: #f3f4f3; font-size: clamp(27px, 5vw, 42px); line-height: 1.55; letter-spacing: .018em; font-weight: 520; text-wrap: pretty; }
-.prompter-content > p.awaiting { color: #3dcc7a; }
-.prompter-content > p.live { color: #e8eeeb; }
+.prompter-content > p.pending { color: #6f7472; }
+.prompter-content > p.live { color: #3dcc7a; }
 .prompter-content > p.long { display: block; font-size: clamp(24px, 4.2vw, 34px); }
 .prompter-content > p.dense { display: block; font-size: clamp(20px, 3.5vw, 28px); line-height: 1.48; }
 .prompter-label { max-height: 6em; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: baseline; gap: 14px; margin-top: clamp(18px, 4vh, 28px); padding-top: 14px; overflow: auto; border-top: 1px solid #2e3230; }
