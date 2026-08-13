@@ -13059,10 +13059,7 @@ mod tests {
         );
         assert!(parse_requested_input_sample_format("").unwrap().is_none());
         assert!(parse_requested_input_sample_format("pcm24").is_err());
-        assert_eq!(
-            delivery_bit_depth_for_sample_format(SampleFormat::I32),
-            32
-        );
+        assert_eq!(delivery_bit_depth_for_sample_format(SampleFormat::I32), 32);
     }
 
     #[test]
