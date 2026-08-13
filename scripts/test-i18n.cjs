@@ -45,6 +45,9 @@ async function main() {
   assert.equal(t('silence.tailEnough', { ms: '1000 ms' }), '尾已够 · 1000 ms');
   assert.equal(t('quality.bannerTitle'), '输入质量强提醒');
   assert.equal(t('issues.discontinuityTitle'), '声卡链路告警 · 未停录');
+  assert.equal(t('exportDialog.resultOkTitle'), '导出完成');
+  assert.equal(t('exportDialog.resultFailedTitle'), '导出失败');
+  assert.equal(t('alertDialog.dataSafetyTitle'), '数据安全提示');
 
   const chineseKeys = new Set(flattenKeys(catalogs['zh-CN']));
   for (const locale of APP_LOCALES) {

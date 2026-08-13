@@ -27,6 +27,12 @@ export function configurationsForShareMode(
   }
   return [];
 }
+
+export function deviceExclusiveAvailable(device: AudioDevice | null | undefined): boolean {
+  if (!device) return false;
+  if (device.exclusive_available === true) return true;
+  return (device.configurations ?? []).some((configuration) => configuration.share_mode === 'exclusive');
+}
 export function inputSampleFormatRepresentationBits(format: string): number | null {
   switch (format.trim().toLowerCase()) {
     case 'i8':

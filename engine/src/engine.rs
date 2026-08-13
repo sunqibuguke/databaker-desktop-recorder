@@ -2972,11 +2972,7 @@ impl Engine {
             forced_without_tail_silence,
             tail_silence_samples,
             required_tail_silence_samples: required_silence_samples,
-            status: if recovered_discontinuity {
-                "needs_rerecord".to_string()
-            } else {
-                "recorded".to_string()
-            },
+            status: "recorded".to_string(),
             created_at: Utc::now().to_rfc3339(),
         };
         let item = session
@@ -2985,13 +2981,13 @@ impl Engine {
             .iter_mut()
             .find(|item| item.id == active.item_id)
             .ok_or_else(|| anyhow!("item disappeared while recording"))?;
+        // Recovered USB/WASAPI jitter is a quality warning, not a delivery
+        // block. Only a clean retake auto-replaces an already accepted take;
+        // a jittered take still goes to review so the operator can confirm.
         let replaces_accepted_version = !recovered_discontinuity
             && item.status == "accepted"
             && item.selected_attempt_id.is_some();
-        let preserves_accepted_version = recovered_discontinuity
-            && item.status == "accepted"
-            && item.selected_attempt_id.is_some();
-        item.status = if replaces_accepted_version || preserves_accepted_version {
+        item.status = if replaces_accepted_version {
             "accepted".to_string()
         } else {
             "review".to_string()
@@ -3003,7 +2999,7 @@ impl Engine {
                 }
             }
             item.selected_attempt_id = Some(attempt.attempt_id.clone());
-        } else if !preserves_accepted_version {
+        } else {
             item.selected_attempt_id = None;
         }
         let mut attempt = attempt;
@@ -9732,8 +9728,8 @@ mod tests {
     }
 
     #[test]
-    fn recovered_discontinuity_rejects_only_the_affected_retake() {
-        let root = test_root("recovered-discontinuity-rejects-retake");
+    fn recovered_discontinuity_keeps_review_and_accept_open() {
+        let root = test_root("recovered-discontinuity-keeps-review");
         let mut session = prepare_metadata_test_session(&root);
         session.snapshot.audio_format.sample_rate = 100;
         session.snapshot.silence_duration_ms = 200;
@@ -9798,18 +9794,20 @@ mod tests {
         let stopped = engine.stop_attempt(false).unwrap();
 
         assert_eq!(stopped["recovered_discontinuity"], true);
-        assert_eq!(stopped["attempt"]["status"], "needs_rerecord");
+        assert_eq!(stopped["attempt"]["status"], "recorded");
         assert_eq!(stopped["auto_selected"], false);
+        let session = engine.session.as_ref().unwrap();
+        assert_eq!(session.snapshot.items[0].status, "review");
+        assert_eq!(session.snapshot.items[0].selected_attempt_id, None);
+        assert_eq!(session.snapshot.items[0].attempts[0].status, "accepted");
+        assert_eq!(session.snapshot.items[0].attempts[1].status, "recorded");
+        let accepted = engine.accept_attempt("001", "001-a2").unwrap();
+        assert_eq!(accepted["attempt_id"], "001-a2");
         let session = engine.session.as_ref().unwrap();
         assert_eq!(session.snapshot.items[0].status, "accepted");
         assert_eq!(
             session.snapshot.items[0].selected_attempt_id.as_deref(),
-            Some("001-a1")
-        );
-        assert_eq!(session.snapshot.items[0].attempts[0].status, "accepted");
-        assert_eq!(
-            session.snapshot.items[0].attempts[1].status,
-            "needs_rerecord"
+            Some("001-a2")
         );
         engine
             .session

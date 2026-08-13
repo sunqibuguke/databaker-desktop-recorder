@@ -889,7 +889,7 @@ impl Device {
                         {
                             continue;
                         }
-                        if let Some(waveformat) = config_to_waveformatextensible(
+                        if let Some(mut waveformat) = config_to_waveformatextensible(
                             StreamConfig {
                                 channels,
                                 sample_rate,
@@ -902,13 +902,32 @@ impl Device {
                             },
                             sample_format,
                         ) {
-                            let usable = is_output
-                                || is_format_supported(
+                            let masks = exclusive_probe_channel_masks(
+                                exclusive,
+                                channels,
+                                waveformat.Format.wFormatTag,
+                                waveformat.dwChannelMask,
+                            );
+                            let mut usable = false;
+                            for mask in masks {
+                                waveformat.dwChannelMask = mask;
+                                match is_format_supported(
                                     client,
                                     &waveformat.Format as *const Audio::WAVEFORMATEX,
                                     exclusive,
-                                )?;
-                            if usable {
+                                ) {
+                                    Ok(true) => {
+                                        usable = true;
+                                        break;
+                                    }
+                                    Ok(false) => {}
+                                    // One rejected candidate must not abort the
+                                    // whole exclusive inventory.
+                                    Err(_) if exclusive && !is_output => {}
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            if is_output || usable {
                                 supported_formats.push(SupportedStreamConfigRange {
                                     channels,
                                     min_sample_rate: sample_rate,
@@ -1545,6 +1564,56 @@ const WAVEFORMATEXTENSIBLE_SAMPLE_FORMATS: [SampleFormat; 7] = [
     SampleFormat::F64,
 ];
 
+fn exclusive_channel_mask(channels: u16) -> u32 {
+    const FRONT_LEFT: u32 = 0x1;
+    const FRONT_RIGHT: u32 = 0x2;
+    const FRONT_CENTER: u32 = 0x4;
+    const LOW_FREQUENCY: u32 = 0x8;
+    const BACK_LEFT: u32 = 0x10;
+    const BACK_RIGHT: u32 = 0x20;
+    const SIDE_LEFT: u32 = 0x200;
+    const SIDE_RIGHT: u32 = 0x400;
+    match channels {
+        1 => FRONT_CENTER,
+        2 => FRONT_LEFT | FRONT_RIGHT,
+        4 => FRONT_LEFT | FRONT_RIGHT | BACK_LEFT | BACK_RIGHT,
+        6 => FRONT_LEFT | FRONT_RIGHT | FRONT_CENTER | LOW_FREQUENCY | BACK_LEFT | BACK_RIGHT,
+        8 => {
+            FRONT_LEFT
+                | FRONT_RIGHT
+                | FRONT_CENTER
+                | LOW_FREQUENCY
+                | BACK_LEFT
+                | BACK_RIGHT
+                | SIDE_LEFT
+                | SIDE_RIGHT
+        }
+        _ => KernelStreaming::KSAUDIO_SPEAKER_DIRECTOUT,
+    }
+}
+
+fn exclusive_probe_channel_masks(
+    exclusive: bool,
+    channels: u16,
+    format_tag: u16,
+    default_mask: u32,
+) -> Vec<u32> {
+    if !exclusive || format_tag == Audio::WAVE_FORMAT_PCM {
+        return vec![default_mask];
+    }
+    let preferred = exclusive_channel_mask(channels);
+    let mut masks = vec![preferred];
+    if default_mask != preferred {
+        masks.push(default_mask);
+    }
+    if KernelStreaming::KSAUDIO_SPEAKER_DIRECTOUT != preferred
+        && KernelStreaming::KSAUDIO_SPEAKER_DIRECTOUT != default_mask
+    {
+        masks.push(KernelStreaming::KSAUDIO_SPEAKER_DIRECTOUT);
+    }
+    masks
+}
+
 // Turns a `Format` into a `WAVEFORMATEXTENSIBLE`.
 //
 // Returns `None` if the WAVEFORMATEXTENSIBLE does not support the given format.
@@ -1591,8 +1660,13 @@ fn config_to_waveformatextensible(
         cbSize: cb_size,
     };
 
-    // CPAL does not care about speaker positions, so pass audio right through.
-    let channel_mask = KernelStreaming::KSAUDIO_SPEAKER_DIRECTOUT;
+    // Shared capture can use DIRECTOUT. Exclusive IsFormatSupported on
+    // Focusrite and similar USB interfaces rejects a zero channel mask.
+    let channel_mask = if config.share_mode == ShareMode::Exclusive {
+        exclusive_channel_mask(channels)
+    } else {
+        KernelStreaming::KSAUDIO_SPEAKER_DIRECTOUT
+    };
 
     let sub_format = match sample_format {
         SampleFormat::U8

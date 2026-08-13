@@ -32,13 +32,14 @@ import {
   savePostTakeSilenceReview,
   type SilencePairView,
 } from './silence-readout';
-import { captureFormatsSupportBitDepth, captureShareModeLabel, configurationsForShareMode, minimumInputRepresentationBits, normalizeCaptureShareMode } from './capture-configuration';
+import { captureFormatsSupportBitDepth, captureShareModeLabel, configurationsForShareMode, deviceExclusiveAvailable, minimumInputRepresentationBits, normalizeCaptureShareMode } from './capture-configuration';
 import { createLatestFrameCommitter } from './latest-frame';
 import type { LatestFrameCommitter } from './latest-frame';
 import type { SessionNoiseCheckOperation } from './recording-workflow';
 import type { Attempt, AudioDevice, CapturePreset, CapturePresetDraft, CapturePresetStore, CaptureShareMode, EngineEvent, ExportArtifact, ExportResult, HeadSilencePhase, InspectedSessionState, ItemState, Meter, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SealInterruptedSessionResult, SessionSnapshot } from './types';
 import { reportRendererError } from './sentry';
 import { logUserAction } from './debug-log';
+import { DISCONTINUITY_TOAST_MS, discontinuityDurationMs, shouldShowDiscontinuityToast } from './discontinuity-toast';
 import { LogPanel } from './LogPanel';
 import { APP_LOCALES, LOCALE_NATIVE_NAMES, getLocale, t, useI18n } from './i18n';
 
@@ -70,6 +71,22 @@ type StoppedSessionState = {
 type CaptureExitMode = 'pause' | 'finish' | 'fault';
 type MonitorPanelTab = 'monitor' | 'detection' | 'task' | 'export' | 'issues';
 type OptionalRunningSessionState = ({ active: true } & RunningSessionState) | { active: false };
+type ExportFeedback = {
+  sessionId: string;
+  sessionDir: string;
+  artifact: ExportArtifact;
+  status: 'working' | 'ok' | 'failed';
+  output: string;
+  exportDir?: string;
+  filePath?: string;
+  warning?: string;
+  error?: string;
+};
+type UserAlert = {
+  kind: 'error' | 'warning';
+  title: string;
+  body: string;
+};
 
 const NOISE_CHECK_PROGRESS_STEPS = 15;
 const NOISE_CHECK_PROGRESS_INTERVAL_MS = 200;
@@ -256,6 +273,25 @@ function formatDateTime(value: string): string {
   }).format(date);
 }
 
+function artifactLabel(artifact: ExportArtifact): string {
+  if (artifact === 'full_track') return t('notice.exportedFull');
+  if (artifact === 'timestamps_json') return t('notice.exportedJson');
+  return t('exportDialog.cuts');
+}
+
+function artifactOutputCopy(artifact: ExportArtifact, exported?: ExportResult): string {
+  if (artifact === 'cuts_zip' && exported) {
+    return t('notice.exportedCuts', { count: exported.exported_count, skipped: exported.skipped_count });
+  }
+  return artifactLabel(artifact);
+}
+
+function artifactFilePath(artifact: ExportArtifact, exported: ExportResult): string | undefined {
+  if (artifact === 'full_track') return exported.master_file;
+  if (artifact === 'timestamps_json') return exported.timestamps_json;
+  return exported.cuts_archive;
+}
+
 function artifactStatusCopy(recording: RecordingHistoryEntry | undefined, artifact: ExportArtifact): string {
   const state = recording?.export_artifacts?.[artifact];
   if (!state || state.state === 'never') return t('exportDialog.never');
@@ -303,6 +339,7 @@ export function RecorderApp() {
   const [attemptRecordingStartedSample, setAttemptRecordingStartedSample] = useState(0);
   const [reviewAttemptId, setReviewAttemptId] = useState<string | null>(null);
   const [reviewPeak, setReviewPeak] = useState(0);
+  const [discontinuityToast, setDiscontinuityToast] = useState('');
   const [showPostTakeSilenceReview, setShowPostTakeSilenceReview] = useState(true);
   const [meter, setMeter] = useState<Meter>(emptyMeter);
   const [noiseThresholdDbfs, setNoiseThresholdDbfs] = useState(-42);
@@ -341,6 +378,8 @@ export function RecorderApp() {
   const [sealConfirmRecording, setSealConfirmRecording] = useState<RecordingHistoryEntry | null>(null);
   const [deleteConfirmRecording, setDeleteConfirmRecording] = useState<RecordingHistoryEntry | null>(null);
   const [exportRecording, setExportRecording] = useState<RecordingHistoryEntry | null>(null);
+  const [exportFeedback, setExportFeedback] = useState<ExportFeedback | null>(null);
+  const [userAlert, setUserAlert] = useState<UserAlert | null>(null);
   const [deletingSessionDir, setDeletingSessionDir] = useState('');
   const [openActionsSessionDir, setOpenActionsSessionDir] = useState('');
   const [resumeError, setResumeError] = useState<{ sessionDir: string; message: string } | null>(null);
@@ -353,6 +392,9 @@ export function RecorderApp() {
   const noiseCheckOperationRef = useRef<SessionNoiseCheckOperation | null>(null);
   const silenceSettingsSaveSequenceRef = useRef(0);
   const hadMonitorIssuesRef = useRef(false);
+  const lastDiscontinuityCountRef = useRef(0);
+  const lastOperationErrorRef = useRef('');
+  const discontinuityToastTimerRef = useRef<number | null>(null);
   const activeSessionDirRef = useRef('');
   const initialPresetAppliedRef = useRef(false);
   const outputDirRef = useRef('');
@@ -549,15 +591,16 @@ export function RecorderApp() {
   const discontinuitySilenceSamples = meter.input_discontinuity_silence_samples
     ?? snapshot?.input_discontinuity_silence_samples
     ?? 0;
-  const discontinuityDurationMs = Math.round(
-    discontinuitySilenceSamples / Math.max(1, sampleRateForDisplay) * 1_000,
-  );
   const discontinuityWarning = discontinuityCount > 0
     ? (discontinuitySilenceSamples > 0
-      ? t('discontinuity.withSilence', { count: discontinuityCount, ms: discontinuityDurationMs })
+      ? t('discontinuity.withSilence', {
+        count: discontinuityCount,
+        ms: discontinuityDurationMs(discontinuitySilenceSamples, sampleRateForDisplay),
+      })
       : t('discontinuity.noSilence', { count: discontinuityCount }))
     : '';
-  const hasMonitorIssues = Boolean(captureFault || workspaceFaulted || qualityWarning || discontinuityWarning || meter.overflow_samples > 0 || meter.storage_status !== 'healthy');
+  const hasBlockingMonitorIssues = Boolean(captureFault || workspaceFaulted || qualityWarning || meter.overflow_samples > 0 || meter.storage_status !== 'healthy');
+  const hasMonitorIssues = Boolean(hasBlockingMonitorIssues || discontinuityWarning);
   const currentNoiseGate = sessionNoiseGate(snapshot?.noise_check, noiseCheckRunning);
   const noiseCheckBlocksAttempt = phase === 'running' && captureActive && !recording && currentNoiseGate !== 'ready';
   const noiseCheckMessage = currentNoiseGate === 'checking'
@@ -606,13 +649,13 @@ export function RecorderApp() {
     silenceDurationMs: effectiveSilenceDurationMs,
     qualityWarning: noiseCheckBlocksAttempt && currentNoiseGate !== 'checking'
       ? t('noise.waitMonitor')
-      : qualityWarning ? t('quality.stopForMonitor')
-        : discontinuityWarning ? t('discontinuity.continueHint') : '',
-  }), [captureFault, captureFaultCopy.detail, captureFaultCopy.title, cue, cueLabel, currentIndex, currentItem?.id, currentItem?.label, currentItem?.text, currentNoiseGate, discontinuityWarning, effectiveSilenceDurationMs, isPendingTake, items.length, liveSilenceMs, noiseCheckBlocksAttempt, noiseCheckMessage, pendingRemainingMs, qualityWarning, sessionName, snapshot?.session_id, tailSilenceMet, t, workflowComplete]);
+      : qualityWarning ? t('quality.stopForMonitor') : '',
+  }), [captureFault, captureFaultCopy.detail, captureFaultCopy.title, cue, cueLabel, currentIndex, currentItem?.id, currentItem?.label, currentItem?.text, currentNoiseGate, effectiveSilenceDurationMs, isPendingTake, items.length, liveSilenceMs, noiseCheckBlocksAttempt, noiseCheckMessage, pendingRemainingMs, qualityWarning, sessionName, snapshot?.session_id, tailSilenceMet, t, workflowComplete]);
 
   async function run<T>(label: string, action: () => Promise<T>): Promise<T | null> {
     setBusy(label);
     setError('');
+    lastOperationErrorRef.current = '';
     logUserAction('ui.operation', label);
     const startedAt = performance.now();
     try {
@@ -620,15 +663,34 @@ export function RecorderApp() {
       logUserAction('ui.operation.ok', t('notice.completedOk', { label }), { duration_ms: Math.round(performance.now() - startedAt) });
       return result;
     } catch (caught) {
-      logUserAction('ui.operation.fail', t('notice.completedFail', { label, error: errorMessage(caught) }), {
+      const message = errorMessage(caught);
+      lastOperationErrorRef.current = message;
+      logUserAction('ui.operation.fail', t('notice.completedFail', { label, error: message }), {
         duration_ms: Math.round(performance.now() - startedAt),
         error_type: caught instanceof Error ? caught.name : typeof caught,
       }, 'error');
       reportRendererError(label, caught);
-      setError(errorMessage(caught));
+      setError(message);
       return null;
     } finally {
       setBusy('');
+    }
+  }
+
+  function showUserAlert(kind: UserAlert['kind'], title: string, body: string) {
+    setUserAlert({ kind, title, body });
+  }
+
+  function showBlockingError(message: string, title = t('alertDialog.errorTitle')) {
+    lastOperationErrorRef.current = message;
+    setError(message);
+    showUserAlert('error', title, message);
+  }
+
+  function raiseDataSafetyAlert(message: string, options?: { popup?: boolean }) {
+    setDataSafetyAlert(message);
+    if (message && options?.popup !== false) {
+      showUserAlert('warning', t('alertDialog.dataSafetyTitle'), message);
     }
   }
 
@@ -963,7 +1025,7 @@ export function RecorderApp() {
       setNotice(t('notice.deletedTask', { id: recording.session_id }));
       await refreshRecordings();
     } catch (caught) {
-      setError(`${t('notice.deleteTaskPrefix')}${errorMessage(caught)}`);
+      showBlockingError(`${t('notice.deleteTaskPrefix')}${errorMessage(caught)}`);
     } finally {
       setDeletingSessionDir('');
       setBusy('');
@@ -1076,7 +1138,7 @@ export function RecorderApp() {
         clearSessionNoiseCheck();
         setBusy('');
         setDataSafetyAlert('');
-        setError(t('notice.recoveryFailed', { error: terminalRecoveryFailure.error }));
+        showBlockingError(t('notice.recoveryFailed', { error: terminalRecoveryFailure.error }));
         setNotice(t('notice.returnedNeedRepair'));
         void refreshRecordings(outputDirRef.current);
       } else if (message.event === 'offline_seal_cleanup_finished') {
@@ -1124,7 +1186,44 @@ export function RecorderApp() {
 
   useEffect(() => {
     setShowPostTakeSilenceReview(loadPostTakeSilenceReview(sessionDir));
+    lastDiscontinuityCountRef.current = 0;
+    setDiscontinuityToast('');
+    if (discontinuityToastTimerRef.current !== null) {
+      window.clearTimeout(discontinuityToastTimerRef.current);
+      discontinuityToastTimerRef.current = null;
+    }
   }, [sessionDir]);
+
+  useEffect(() => {
+    if (!shouldShowDiscontinuityToast(lastDiscontinuityCountRef.current, discontinuityCount) || !discontinuityWarning) {
+      return;
+    }
+    lastDiscontinuityCountRef.current = discontinuityCount;
+    setDiscontinuityToast(discontinuityWarning);
+    if (discontinuityToastTimerRef.current !== null) {
+      window.clearTimeout(discontinuityToastTimerRef.current);
+    }
+    discontinuityToastTimerRef.current = window.setTimeout(() => {
+      setDiscontinuityToast('');
+      discontinuityToastTimerRef.current = null;
+    }, DISCONTINUITY_TOAST_MS);
+  }, [discontinuityCount, discontinuityWarning]);
+
+  useEffect(() => () => {
+    if (discontinuityToastTimerRef.current !== null) {
+      window.clearTimeout(discontinuityToastTimerRef.current);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!exclusiveCaptureAvailable || !selectedDevice) return;
+    if (deviceExclusiveAvailable(selectedDevice)) return;
+    setCaptureShareMode((current) => {
+      if (current !== 'exclusive') return current;
+      setNotice(t('setup.exclusiveFellBack'));
+      return 'shared';
+    });
+  }, [exclusiveCaptureAvailable, selectedDevice]);
 
   useEffect(() => {
     if (!captureFault || !pauseConfirmOpen) return;
@@ -1136,11 +1235,11 @@ export function RecorderApp() {
   }, [captureFault, pauseConfirmOpen]);
 
   useEffect(() => {
-    const issueJustAppeared = hasMonitorIssues && !hadMonitorIssuesRef.current;
-    hadMonitorIssuesRef.current = hasMonitorIssues;
+    const issueJustAppeared = hasBlockingMonitorIssues && !hadMonitorIssuesRef.current;
+    hadMonitorIssuesRef.current = hasBlockingMonitorIssues;
     if (issueJustAppeared && phase === 'running') setMonitorPanelTab('issues');
     else if (!hasMonitorIssues) setMonitorPanelTab((current) => current === 'issues' ? 'monitor' : current);
-  }, [hasMonitorIssues, phase]);
+  }, [hasBlockingMonitorIssues, hasMonitorIssues, phase]);
 
   useEffect(() => {
     if (selectedCapturePreset) return;
@@ -1548,7 +1647,7 @@ export function RecorderApp() {
       setNotice('已封存可恢复的母轨，请结束本次录制并检查原始文件。');
       return true;
     }
-    if (result.recovered_discontinuity || result.attempt.status === 'needs_rerecord') {
+    if (result.attempt.status === 'needs_rerecord') {
       setReviewAttemptId(null);
       try {
         await refreshState();
@@ -1567,9 +1666,11 @@ export function RecorderApp() {
       setError(`${t('notice.sealedRefreshPrefix')}${errorMessage(caught)}`);
       return true;
     }
-    setNotice(result.auto_selected
-      ? t('notice.retakeSaved')
-      : t('notice.takeReady'));
+    setNotice(result.recovered_discontinuity
+      ? t('notice.jitterRetake')
+      : result.auto_selected
+        ? t('notice.retakeSaved')
+        : t('notice.takeReady'));
     return true;
   }
 
@@ -1670,30 +1771,78 @@ export function RecorderApp() {
     task: Pick<RecordingHistoryEntry, 'session_id' | 'session_dir'>,
     artifact: ExportArtifact,
   ) {
+    const failExport = (error: string) => {
+      setExportFeedback({
+        sessionId: task.session_id,
+        sessionDir: task.session_dir,
+        artifact,
+        status: 'failed',
+        output: artifactLabel(artifact),
+        error,
+      });
+    };
+    setUserAlert(null);
+    setExportFeedback({
+      sessionId: task.session_id,
+      sessionDir: task.session_dir,
+      artifact,
+      status: 'working',
+      output: artifactLabel(artifact),
+    });
     if (captureActive && snapshot && sessionDir === task.session_dir) {
-      if (recording && !(await stopAttempt(true))) return;
+      if (recording && !(await stopAttempt(true))) {
+        failExport(lastOperationErrorRef.current || t('exportDialog.resultPauseFailed'));
+        return;
+      }
       const stopped = await stopSessionWithReconciliation(t('notice.pausingToExport'), snapshot.session_id, sessionDir);
-      if (!stopped) return;
+      if (!stopped) {
+        failExport(lastOperationErrorRef.current || t('exportDialog.resultPauseFailed'));
+        return;
+      }
       enterInspectionWorkspace({ snapshot: stopped.snapshot, session_dir: task.session_dir, mode: 'inspect' });
     }
     const exported = await run(t('notice.exportingFiles'), () => window.recorder.request<ExportResult>('export_session_artifact', {
       session_dir: task.session_dir,
       artifact,
     }));
-    if (!exported) return;
+    if (!exported) {
+      failExport(lastOperationErrorRef.current || t('exportDialog.resultFailedGeneric'));
+      return;
+    }
     const warning = recoveryWarning(t('notice.exportStorage'), exported.recovery_warnings);
     if (warning) setDataSafetyAlert(t('notice.exportSpotCheck', { warning }));
-    const output = artifact === 'full_track'
-      ? t('notice.exportedFull')
-      : artifact === 'timestamps_json'
-        ? t('notice.exportedJson')
-        : t('notice.exportedCuts', { count: exported.exported_count, skipped: exported.skipped_count });
+    const output = artifactOutputCopy(artifact, exported);
     setNotice(t('notice.exported', {
       id: task.session_id,
       output,
       note: warning ? t('notice.exportNeedCheck') : '',
     }));
+    setExportFeedback({
+      sessionId: task.session_id,
+      sessionDir: task.session_dir,
+      artifact,
+      status: 'ok',
+      output,
+      exportDir: exported.export_dir,
+      filePath: artifactFilePath(artifact, exported),
+      warning: warning || undefined,
+    });
     await refreshRecordings();
+  }
+
+  async function openExportFeedbackFolder() {
+    if (!exportFeedback) return;
+    const target = exportFeedback.exportDir
+      || await window.recorder.joinPath(exportFeedback.sessionDir, 'export');
+    const opened = await run(t('notice.openingExport'), async () => {
+      await window.recorder.openPath(target);
+      return true;
+    });
+    if (opened) {
+      setNotice(t('notice.openedExport', { id: exportFeedback.sessionId }));
+      return;
+    }
+    showBlockingError(lastOperationErrorRef.current || t('notice.openingExport'));
   }
 
   function showExport(recording: RecordingHistoryEntry) {
@@ -1720,7 +1869,7 @@ export function RecorderApp() {
       );
     } catch (caught) {
       const message = `${t('notice.sealFailedPrefix', { id: recording.session_id })}${errorMessage(caught)}`;
-      setError(message);
+      showBlockingError(message);
       setResumeError({ sessionDir: recording.session_dir, message });
       return;
     } finally {
@@ -1734,12 +1883,12 @@ export function RecorderApp() {
     const warning = recoveryWarning(t('notice.sealStorage'), sealed.warnings);
     const durableDuration = formatDuration(sealed.durable_frames, recording.sample_rate);
     if (sealed.fault_preserved || sealed.snapshot.status === 'faulted') {
-      setDataSafetyAlert(
-        `已保留 ${durableDuration} 可恢复母音频，但任务仍带有采集故障标记；导出后请人工检查原始分段。`,
+      raiseDataSafetyAlert(
+        t('notice.sealedFaulted', { duration: durableDuration }),
       );
       return;
     }
-    if (warning) setDataSafetyAlert(t('notice.sealedSpotCheck', { warning }));
+    if (warning) raiseDataSafetyAlert(t('notice.sealedSpotCheck', { warning }));
     const recovered = sealed.recovered_attempts
       ? t('notice.recoveredTakes', { count: sealed.recovered_attempts })
       : '';
@@ -1756,12 +1905,12 @@ export function RecorderApp() {
     if (current.snapshot.session_id !== recording.session_id
       || !current.session_dir
       || current.session_dir !== recording.session_dir) {
-      setError(t('notice.sessionMismatch'));
+      showBlockingError(t('notice.sessionMismatch'));
       await refreshRecordings();
       return;
     }
     if (current.snapshot.status !== 'recording') {
-      setError(t('notice.stillSealingEnter'));
+      showBlockingError(t('notice.stillSealingEnter'));
       await refreshRecordings();
       return;
     }
@@ -1864,6 +2013,7 @@ export function RecorderApp() {
       });
     } catch (caught) {
       const stopError = errorMessage(caught);
+      lastOperationErrorRef.current = stopError;
       setError(stopError);
       if (!isReconciliableInactiveStopError(stopError)) return null;
 
@@ -1890,7 +2040,9 @@ export function RecorderApp() {
           reconciled_inactive_after_error: true,
         };
       } catch (reconciliationError) {
-        setError(`${stopError}；且无法确认录音引擎已停止：${errorMessage(reconciliationError)}`);
+        const message = `${stopError}；且无法确认录音引擎已停止：${errorMessage(reconciliationError)}`;
+        lastOperationErrorRef.current = message;
+        setError(message);
         return null;
       }
     } finally {
@@ -1949,21 +2101,23 @@ export function RecorderApp() {
         reconciled: Boolean(stopped.reconciled_inactive_after_error),
       });
       if (stopped.reconciled_inactive_after_error) {
-        setDataSafetyAlert('已确认录音引擎不再采集，但本任务尚未安全收尾；请立即执行“检查并修复”，再继续录制或导出。');
+        raiseDataSafetyAlert('已确认录音引擎不再采集，但本任务尚未安全收尾；请立即执行“检查并修复”，再继续录制或导出。');
         setNotice('已返回任务列表，当前任务需要修复。');
       } else if (stoppedWithFault) {
-        setDataSafetyAlert('采集故障已结束：原始母轨和故障证据已保留，请在任务列表先执行“检查并修复”。');
+        raiseDataSafetyAlert('采集故障已结束：原始母轨和故障证据已保留，请在任务列表先执行“检查并修复”。');
         setNotice('故障任务已返回列表，已落盘母轨仍保留。');
       } else if (mode === 'pause') {
-        setDataSafetyAlert(warning ? `${warning}。已落盘母音频仍已封存，继续前请抽检。` : '');
+        if (warning) raiseDataSafetyAlert(`${warning}。已落盘母音频仍已封存，继续前请抽检。`);
+        else setDataSafetyAlert('');
         setNotice(t('notice.pausedSafe'));
       } else {
-        setDataSafetyAlert(warning ? `${warning}。原始母轨已封存，请抽检。` : '');
+        if (warning) raiseDataSafetyAlert(`${warning}。原始母轨已封存，请抽检。`);
+        else setDataSafetyAlert('');
         setNotice(t('notice.captureFinished'));
       }
       await refreshRecordings();
     } catch (caught) {
-      setError(t('notice.stayRetry', { error: `${t('notice.stopFailedPrefix')}${errorMessage(caught)}` }));
+      showBlockingError(t('notice.stayRetry', { error: `${t('notice.stopFailedPrefix')}${errorMessage(caught)}` }));
     } finally {
       pauseOperationRef.current = false;
     }
@@ -2164,6 +2318,63 @@ export function RecorderApp() {
     </section>
   </div>;
 
+  const exportFeedbackDialog = exportFeedback && <div className="dialog-backdrop export-feedback-backdrop" role="presentation">
+    <section className="studio-dialog export-result-dialog" role="dialog" aria-modal="true" aria-labelledby="export-result-title" data-testid="export-result-dialog">
+      <header>
+        <span className={`dialog-icon ${exportFeedback.status === 'failed' ? 'danger' : exportFeedback.status === 'ok' && exportFeedback.warning ? 'warning' : exportFeedback.status === 'ok' ? 'success' : ''}`}>
+          <Icon name={exportFeedback.status === 'failed' ? 'stop' : exportFeedback.status === 'ok' ? 'check' : 'export'} size={19} />
+        </span>
+        <div>
+          <small>{t('exportDialog.resultEyebrow')}</small>
+          <h2 id="export-result-title">
+            {exportFeedback.status === 'working'
+              ? t('exportDialog.resultWorkingTitle')
+              : exportFeedback.status === 'failed'
+                ? t('exportDialog.resultFailedTitle')
+                : t('exportDialog.resultOkTitle')}
+          </h2>
+        </div>
+      </header>
+      <p>
+        {exportFeedback.status === 'working'
+          ? t('exportDialog.resultWorkingBody', { output: exportFeedback.output })
+          : exportFeedback.status === 'failed'
+            ? t('exportDialog.resultFailedBody', { id: exportFeedback.sessionId, output: exportFeedback.output })
+            : t('exportDialog.resultOkBody', { id: exportFeedback.sessionId, output: exportFeedback.output })}
+      </p>
+      {exportFeedback.status === 'failed' && exportFeedback.error && <div className="dialog-warning danger">{exportFeedback.error}</div>}
+      {exportFeedback.status === 'ok' && exportFeedback.warning && <div className="dialog-warning">{t('exportDialog.spotCheck')}<br />{exportFeedback.warning}</div>}
+      {exportFeedback.status === 'ok' && (exportFeedback.filePath || exportFeedback.exportDir) && <div className="export-result-meta">
+        {exportFeedback.filePath && <div><span>{t('exportDialog.resultFile')}</span><code title={exportFeedback.filePath}>{exportFeedback.filePath}</code></div>}
+        {exportFeedback.exportDir && <div><span>{t('exportDialog.resultPath')}</span><code title={exportFeedback.exportDir}>{exportFeedback.exportDir}</code></div>}
+      </div>}
+      <footer>
+        {exportFeedback.status === 'ok' && <button data-testid="export-result-open-folder" className="button" onClick={() => void openExportFeedbackFolder()} disabled={Boolean(busy)}>{t('exportDialog.openFolder')}</button>}
+        <button data-testid="export-result-close" className="button primary" onClick={() => setExportFeedback(null)} disabled={exportFeedback.status === 'working'}>
+          {exportFeedback.status === 'working' ? t('common.loading') : t('common.done')}
+        </button>
+      </footer>
+    </section>
+  </div>;
+
+  const userAlertDialog = userAlert && <div className="dialog-backdrop user-alert-backdrop" role="presentation">
+    <section className="studio-dialog user-alert-dialog" role="dialog" aria-modal="true" aria-labelledby="user-alert-title" data-testid="user-alert-dialog">
+      <header>
+        <span className={`dialog-icon ${userAlert.kind === 'error' ? 'danger' : 'warning'}`}>
+          <Icon name={userAlert.kind === 'error' ? 'stop' : 'meter'} size={19} />
+        </span>
+        <div>
+          <small>{userAlert.kind === 'error' ? t('alertDialog.errorEyebrow') : t('alertDialog.warningEyebrow')}</small>
+          <h2 id="user-alert-title">{userAlert.title}</h2>
+        </div>
+      </header>
+      <p>{userAlert.body}</p>
+      <footer>
+        <button data-testid="user-alert-close" className="button primary" onClick={() => setUserAlert(null)}>{t('common.close')}</button>
+      </footer>
+    </section>
+  </div>;
+
   if (phase === 'home') {
     const filters: Array<{ id: HistoryFilter; label: string }> = [
       { id: 'all', label: t('home.filterAll') },
@@ -2260,6 +2471,8 @@ export function RecorderApp() {
         </section>
       </div>}
       {settingsDialog}
+      {exportFeedbackDialog}
+      {userAlertDialog}
       <LogPanel open={logPanelOpen} onClose={() => setLogPanelOpen(false)} />
     </div>;
   }
@@ -2320,6 +2533,8 @@ export function RecorderApp() {
       </div>
       <StudioStatus engineStatus={engineStatus} message={error || dataSafetyAlert || presetWarning || busy || notice} isError={Boolean(error || dataSafetyAlert)} right="READY · PCM · LOCAL" />
       {settingsDialog}
+      {exportFeedbackDialog}
+      {userAlertDialog}
       <LogPanel open={logPanelOpen} onClose={() => setLogPanelOpen(false)} />
     </div>;
   }
@@ -2338,9 +2553,9 @@ export function RecorderApp() {
         <div className="document-tabs"><span className="active"><Icon name="microphone" size={13} /> {workflowComplete ? t('recorder.taskComplete') : currentItem?.id ?? 'Item'} <i>×</i></span></div>
         <div className="editor-toolbar"><div className="editor-nav"><button title={t('recorder.prevItem')} disabled={recording || currentIndex === 0} onClick={() => setCurrentIndex((index) => Math.max(0, index - 1))}><Icon name="chevron-left" /></button><span>{currentIndex + 1} / {items.length}</span><button title={t('recorder.nextItem')} disabled={recording || currentIndex >= items.length - 1} onClick={() => setCurrentIndex((index) => Math.min(items.length - 1, index + 1))}><Icon name="chevron-right" /></button></div><div className="editor-time"><small>{recording ? 'TAKE' : 'TOTAL'}</small><strong className={recording ? 'recording' : ''}>{recording ? attemptDuration : sessionDuration}</strong></div><div className="editor-toolbar-actions"><button className="prompter-launch" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? t('recorder.locatePrompter') : t('recorder.openPrompter')}</button></div><div className={`save-health ${workspaceFaulted || captureFault ? 'fault' : meter.storage_status === 'warning' ? 'warning' : ''}`}><i />{workspaceFaulted ? t('recorder.healthReadonly') : !captureActive ? t('recorder.healthInspect') : captureFault ? t('recorder.healthFaultStop', { title: captureFaultCopy.title }) : meter.storage_status === 'warning' ? t('recorder.healthWarning', { minutes: Math.max(0, Math.floor(meter.storage_safe_remaining_seconds / 60)) }) : t('recorder.healthLive')}</div></div>
         <div className="editor-canvas">
-          {(captureFault || discontinuityWarning || noiseCheckBlocksAttempt || qualityWarning) && <div className="workspace-toasts" aria-live="polite">
+          {(captureFault || discontinuityToast || noiseCheckBlocksAttempt || qualityWarning) && <div className="workspace-toasts" aria-live="polite">
             {captureFault && <div className="capture-fault-banner" role="alert"><Icon name="stop" size={16} /><div><strong>{captureFaultCopy.title}</strong><span>{captureFaultCopy.detail}{snapshot?.device_name ? ` ${t('issues.currentDevice', { name: snapshot.device_name })}` : ' '}{t('issues.stopThenFinish')}</span></div></div>}
-            {discontinuityWarning && !captureFault && <div className="input-quality-banner" role="status"><Icon name="meter" size={16} /><div><strong>{t('discontinuity.bannerTitle')}</strong><span>{discontinuityWarning}. {t('discontinuity.bannerHint')}</span></div></div>}
+            {discontinuityToast && !captureFault && <div className="input-quality-banner workspace-toast" data-testid="discontinuity-toast" role="status"><Icon name="meter" size={16} /><div><strong>{t('discontinuity.bannerTitle')}</strong><span>{discontinuityToast}. {t('discontinuity.bannerHint')}</span></div></div>}
             {noiseCheckBlocksAttempt && <div className={`session-noise-banner ${currentNoiseGate}`} role="status"><Icon name="meter" size={16} /><div><strong>{currentNoiseGate === 'checking' ? t('noise.bannerChecking') : currentNoiseGate === 'failed' ? t('noise.bannerFailed') : t('noise.bannerNeeded')}</strong><span>{noiseCheckMessage}. {t('noise.bannerHint')}</span></div><button className="button" onClick={() => snapshot && void runSessionNoiseCheck(sessionDir, snapshot)} disabled={noiseCheckRunning || Boolean(busy)}>{noiseCheckRunning ? t('noise.checkingShort') : currentNoiseGate === 'failed' || noiseCheckError ? t('noise.recheck') : t('noise.startCheck')}</button></div>}
             {qualityWarning && <div className="input-quality-banner" role="alert"><Icon name="meter" size={16} /><div><strong>{t('quality.bannerTitle')}</strong><span>{qualityWarning}. {t('quality.bannerHint')}</span></div></div>}
           </div>}
@@ -2429,6 +2644,8 @@ export function RecorderApp() {
     </div>}
     <StudioStatus engineStatus={engineStatus} message={error || dataSafetyAlert || busy || notice} isError={Boolean(error || dataSafetyAlert)} right={`${sampleRateForDisplay.toLocaleString(locale)} HZ · ${bitDepthForDisplay}-BIT · MONO`} />
     {settingsDialog}
+    {exportFeedbackDialog}
+    {userAlertDialog}
     <LogPanel open={logPanelOpen} onClose={() => setLogPanelOpen(false)} />
   </div>;
 }
