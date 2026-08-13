@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "author": "DataBaker",
-  "description": "DataBaker 桌面音频采集工具",
+  "description": "标贝音频采集",
   "main": "dist-electron/main.js",
   "scripts": {
     "build:engine": "node scripts/run-cargo.cjs build --manifest-path engine/Cargo.toml",
@@ -37,7 +37,7 @@
   },
   "build": {
     "appId": "com.databaker.desktop-recorder",
-    "productName": "DataBaker 音频采集",
+    "productName": "标贝音频采集",
     "asar": true,
     "files": [
       "dist/**/*",

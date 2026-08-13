@@ -139,9 +139,9 @@ export function ActivateLicense({
   return <div className="license-gate" data-testid="license-gate">
     <header className="home-header">
       <div className="home-brand">
-        <span className="home-brand-mark"><img src={appLogo} alt="DataBaker" /></span>
+        <span className="home-brand-mark"><img src={appLogo} alt={t('chrome.productName')} /></span>
         <div>
-          <strong>DataBaker Recorder</strong>
+          <strong>{t('chrome.productName')}</strong>
           <small>{t('chrome.appSubtitle')}</small>
         </div>
       </div>

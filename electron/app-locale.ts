@@ -12,6 +12,20 @@ export function normalizeAppLocale(value: unknown): AppLocale {
   return DEFAULT_APP_LOCALE;
 }
 
+export const NATIVE_WINDOW_TITLES: Record<AppLocale, { app: string; prompter: string }> = {
+  'zh-CN': { app: '标贝音频采集', prompter: '标贝音频采集 · 领读' },
+  en: { app: 'DataBaker Audio Capture', prompter: 'DataBaker Audio Capture · Prompter' },
+  th: { app: 'DataBaker Audio Capture', prompter: 'DataBaker Audio Capture · แผงอ่านนำ' },
+  ja: { app: '標貝音声収録', prompter: '標貝音声収録 · プロンプタ' },
+  ko: { app: 'DataBaker Audio Capture', prompter: 'DataBaker Audio Capture · 프롬프터' },
+  es: { app: 'DataBaker Audio Capture', prompter: 'DataBaker Audio Capture · Teleprompter' },
+  pt: { app: 'DataBaker Audio Capture', prompter: 'DataBaker Audio Capture · Prompter' },
+};
+
+export function nativeWindowTitle(locale: unknown, kind: 'app' | 'prompter' = 'app'): string {
+  return NATIVE_WINDOW_TITLES[normalizeAppLocale(locale)][kind];
+}
+
 export class AppLocaleRepository {
   constructor(private readonly filePath: string) {}
 

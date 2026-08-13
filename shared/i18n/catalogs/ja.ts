@@ -20,7 +20,10 @@ const ja: MessageTree = {
     dash: '—',
   },
   chrome: {
-    appSubtitle: 'デスクトップ音声収録',
+    productName: '標貝音声収録',
+    windowTitle: '標貝音声収録',
+    prompterWindowTitle: '標貝音声収録 · プロンプタ',
+    appSubtitle: 'デスクトップ録音',
     previewBadge: 'ブラウザUIプレビュー',
     settingsTitle: 'アプリ設定',
     settingsAria: 'アプリ設定を開く',

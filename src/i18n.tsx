@@ -61,6 +61,8 @@ export function I18nProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     document.documentElement.lang = locale;
+    const prompter = new URLSearchParams(window.location.search).get('view') === 'prompter';
+    document.title = prompter ? t('chrome.prompterWindowTitle') : t('chrome.windowTitle');
   }, [locale]);
 
   const changeLocale = useCallback(async (next: AppLocale) => {

@@ -20,7 +20,10 @@ const ko: MessageTree = {
     dash: '—',
   },
   chrome: {
-    appSubtitle: '데스크톱 오디오 수집',
+    productName: 'DataBaker Audio Capture',
+    windowTitle: 'DataBaker Audio Capture',
+    prompterWindowTitle: 'DataBaker Audio Capture · 프롬프터',
+    appSubtitle: '데스크톱 녹음',
     previewBadge: '브라우저 UI 미리보기',
     settingsTitle: '앱 설정',
     settingsAria: '앱 설정 열기',

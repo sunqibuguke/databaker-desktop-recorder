@@ -31,6 +31,9 @@ async function main() {
     assert.equal(normalizeLocale(locale), locale);
   }
 
+  assert.equal(t('chrome.productName'), '标贝音频采集');
+  assert.equal(t('chrome.windowTitle'), '标贝音频采集');
+  assert.equal(t('chrome.prompterWindowTitle'), '标贝音频采集 · 领读');
   assert.equal(t('settings.title'), '应用设置');
   assert.equal(t('home.newRecording'), '新建录制');
   assert.equal(t('home.emptyTitle'), '开始第一条录制任务');
@@ -66,6 +69,8 @@ async function main() {
   const englishTitle = t('settings.title');
   assert.ok(englishTitle.length > 0);
   assert.notEqual(englishTitle, '应用设置');
+  assert.equal(t('chrome.windowTitle'), 'DataBaker Audio Capture');
+  assert.equal(t('chrome.prompterWindowTitle'), 'DataBaker Audio Capture · Prompter');
   assert.equal(t('home.newRecording'), 'New recording');
   assert.equal(t('notice.importedItems', { count: 12 }), 'Imported 12 lines of text');
   setLocale('missing-key-fallback-test');
@@ -76,7 +81,12 @@ async function main() {
 
   setLocale(DEFAULT_LOCALE);
 
-  const { AppLocaleRepository } = require('../dist-electron/app-locale.js');
+  const { AppLocaleRepository, nativeWindowTitle } = require('../dist-electron/app-locale.js');
+  assert.equal(nativeWindowTitle('zh-CN', 'app'), '标贝音频采集');
+  assert.equal(nativeWindowTitle('zh-CN', 'prompter'), '标贝音频采集 · 领读');
+  assert.equal(nativeWindowTitle('en', 'app'), 'DataBaker Audio Capture');
+  assert.equal(nativeWindowTitle('en', 'prompter'), 'DataBaker Audio Capture · Prompter');
+  assert.equal(nativeWindowTitle('nope', 'app'), '标贝音频采集');
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'databaker-app-locale-'));
   const file = path.join(root, 'app-locale.json');
   try {

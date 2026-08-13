@@ -20,7 +20,10 @@ const th: MessageTree = {
     dash: '—',
   },
   chrome: {
-    appSubtitle: 'เครื่องมือเก็บเสียงเดสก์ท็อป',
+    productName: 'DataBaker Audio Capture',
+    windowTitle: 'DataBaker Audio Capture',
+    prompterWindowTitle: 'DataBaker Audio Capture · แผงอ่านนำ',
+    appSubtitle: 'เครื่องบันทึกเดสก์ท็อป',
     previewBadge: 'ตัวอย่างอินเทอร์เฟซในเบราว์เซอร์',
     settingsTitle: 'การตั้งค่าแอป',
     settingsAria: 'เปิดการตั้งค่าแอป',

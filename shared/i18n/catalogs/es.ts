@@ -20,7 +20,10 @@ const es: MessageTree = {
     dash: '—',
   },
   chrome: {
-    appSubtitle: 'Captura de audio de escritorio',
+    productName: 'DataBaker Audio Capture',
+    windowTitle: 'DataBaker Audio Capture',
+    prompterWindowTitle: 'DataBaker Audio Capture · Teleprompter',
+    appSubtitle: 'Grabadora de escritorio',
     previewBadge: 'Vista previa del navegador',
     settingsTitle: 'Ajustes de la aplicación',
     settingsAria: 'Abrir ajustes de la aplicación',

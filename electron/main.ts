@@ -49,7 +49,7 @@ import {
   OutputRootPreferenceRepository,
   type OutputRootPreference,
 } from './output-root-preference';
-import { AppLocaleRepository, normalizeAppLocale, type AppLocale } from './app-locale';
+import { AppLocaleRepository, nativeWindowTitle, normalizeAppLocale, type AppLocale } from './app-locale';
 import { collectMachineFingerprint, type MachineFingerprint } from './machine-fingerprint';
 import {
   LicenseRepository,
@@ -69,6 +69,22 @@ import {
 
 let mainWindow: BrowserWindow | null = null;
 let prompterWindow: BrowserWindow | null = null;
+let activeWindowLocale: AppLocale = normalizeAppLocale(process.env.DATABAKER_LOCALE);
+
+function currentAppWindowTitle(): string {
+  return nativeWindowTitle(activeWindowLocale, 'app');
+}
+
+function currentPrompterWindowTitle(): string {
+  return nativeWindowTitle(activeWindowLocale, 'prompter');
+}
+
+function applyNativeWindowTitles(): void {
+  if (mainWindow && !mainWindow.isDestroyed()) mainWindow.setTitle(currentAppWindowTitle());
+  if (prompterWindow && !prompterWindow.isDestroyed()) {
+    prompterWindow.setTitle(currentPrompterWindowTitle());
+  }
+}
 let prompterRendererReady = false;
 let latestPrompterState: unknown = null;
 let engine: EngineClient | null = null;
@@ -1941,7 +1957,7 @@ function ensureRecordingTray(requestedStatus?: string): void {
     recordingTray.on('click', () => void showMainWindow());
     recordingTray.on('double-click', () => void showMainWindow());
   }
-  recordingTray.setToolTip(`DataBaker 音频采集 — ${status.replace(/^[●⚠◌]\s*/, '')}`);
+  recordingTray.setToolTip(`${currentAppWindowTitle()} — ${status.replace(/^[●⚠◌]\s*/, '')}`);
   recordingTray.setContextMenu(recordingTrayMenu(status, !isQuitting()));
 }
 
@@ -2037,7 +2053,7 @@ function handleUnsafeEngineStop(
     try {
       window = await showMainWindow();
       if (ownsEngineGeneration(recoveryIntent)) {
-        window.setTitle('DataBaker 音频采集 — 安全封存未确认');
+        window.setTitle(`${currentAppWindowTitle()} — 安全封存未确认`);
         window.setProgressBar(-1);
       }
     } catch (windowError) {
@@ -2104,11 +2120,11 @@ function requestQuitAfterExport(source: string): Promise<void> {
     }
 
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.setTitle('DataBaker 音频采集 — 等待导出完成');
+      mainWindow.setTitle(`${currentAppWindowTitle()} — 等待导出完成`);
       mainWindow.setProgressBar(2);
     }
     if (recordingTray) {
-      recordingTray.setToolTip('DataBaker 音频采集 — 导出完成后退出');
+      recordingTray.setToolTip(`${currentAppWindowTitle()} — 导出完成后退出`);
       recordingTray.setContextMenu(recordingTrayMenu('正在导出，完成后安全退出…', false));
     }
 
@@ -2206,7 +2222,7 @@ async function showCrashSealUnconfirmedGate(
   try {
     window = await showMainWindow();
     if (!window.isDestroyed()) {
-      window.setTitle('DataBaker 音频采集 — 中断任务封存未确认');
+      window.setTitle(`${currentAppWindowTitle()} — 中断任务封存未确认`);
       window.setProgressBar(-1);
     }
   } catch (windowError) {
@@ -2233,11 +2249,11 @@ function performSafeStopAndQuit(source: string): Promise<void> {
   );
   pendingEngineRecovery = null;
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.setTitle('DataBaker 音频采集 — 正在安全停止');
+    mainWindow.setTitle(`${currentAppWindowTitle()} — 正在安全停止`);
     mainWindow.setProgressBar(2);
   }
   if (recordingTray) {
-    recordingTray.setToolTip('DataBaker 音频采集 — 正在安全停止');
+    recordingTray.setToolTip(`${currentAppWindowTitle()} — 正在安全停止`);
     recordingTray.setContextMenu(recordingTrayMenu('正在安全停止并封存母轨…', false));
   }
   console.log(`开始安全退出（${source}）`);
@@ -2284,7 +2300,7 @@ function performSafeStopAndQuit(source: string): Promise<void> {
         return;
       }
       if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.setTitle('DataBaker 音频采集 — 仍在安全封存');
+        mainWindow.setTitle(`${currentAppWindowTitle()} — 仍在安全封存`);
         mainWindow.setProgressBar(2);
       }
       ensureRecordingTray('⚠ 音频仍在安全封存…');
@@ -2519,7 +2535,7 @@ async function ensureMicrophoneAccess(): Promise<void> {
     );
     return;
   }
-  const applicationName = app.isPackaged ? 'DataBaker 音频采集' : 'Electron';
+  const applicationName = app.isPackaged ? currentAppWindowTitle() : 'Electron';
   throw new Error(
     `麦克风权限未开启。开发态请在“系统设置 → 隐私与安全性 → 麦克风”中找「${applicationName}」，不是 DataBaker。找不到时在终端执行 tccutil reset Microphone com.github.Electron 后重启。只测界面可设 DATABAKER_SKIP_MIC_PREFLIGHT=1。`,
   );
@@ -2944,7 +2960,7 @@ async function createWindow(): Promise<BrowserWindow> {
       minWidth: 1080,
       minHeight: 700,
       backgroundColor: '#0a0d14',
-      title: 'DataBaker 音频采集',
+      title: currentAppWindowTitle(),
       webPreferences: {
         preload: path.join(__dirname, 'preload.js'),
         contextIsolation: true,
@@ -3057,7 +3073,7 @@ async function createPrompterWindow(): Promise<BrowserWindow> {
     minWidth: Math.min(520, width),
     minHeight: Math.min(360, height),
     backgroundColor: '#111315',
-    title: '领读面板',
+    title: currentPrompterWindowTitle(),
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -3697,8 +3713,13 @@ function registerIpc(): void {
     if (status.state !== 'valid') throw new LicenseRequiredError(status.reason ?? 'unlicensed');
   };
   let currentAppLocale: AppLocale = normalizeAppLocale(process.env.DATABAKER_LOCALE);
+  activeWindowLocale = currentAppLocale;
   void appLocalePreference.load().then((stored) => {
-    if (!process.env.DATABAKER_LOCALE) currentAppLocale = stored;
+    if (!process.env.DATABAKER_LOCALE) {
+      currentAppLocale = stored;
+      activeWindowLocale = stored;
+      applyNativeWindowTitles();
+    }
   });
   let outputRootRecoveryWarning: string | null = null;
   const bindAndRememberOutputRoot = async (
@@ -4145,6 +4166,7 @@ function registerIpc(): void {
   ipcMain.handle('app:get-locale', async () => {
     if (process.env.DATABAKER_LOCALE) return normalizeAppLocale(process.env.DATABAKER_LOCALE);
     currentAppLocale = await appLocalePreference.load();
+    activeWindowLocale = currentAppLocale;
     return currentAppLocale;
   });
 
@@ -4152,6 +4174,8 @@ function registerIpc(): void {
     currentAppLocale = process.env.DATABAKER_LOCALE
       ? normalizeAppLocale(process.env.DATABAKER_LOCALE)
       : await appLocalePreference.save(locale);
+    activeWindowLocale = currentAppLocale;
+    applyNativeWindowTitles();
     sendToRendererWindows('locale:changed', currentAppLocale);
     return currentAppLocale;
   });

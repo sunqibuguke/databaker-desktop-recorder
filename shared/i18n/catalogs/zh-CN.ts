@@ -18,7 +18,10 @@ const zhCN = {
     dash: '—',
   },
   chrome: {
-    appSubtitle: '桌面音频采集',
+    productName: '标贝音频采集',
+    windowTitle: '标贝音频采集',
+    prompterWindowTitle: '标贝音频采集 · 领读',
+    appSubtitle: '桌面录音',
     previewBadge: '浏览器界面预览',
     settingsTitle: '应用设置',
     settingsAria: '打开应用设置',

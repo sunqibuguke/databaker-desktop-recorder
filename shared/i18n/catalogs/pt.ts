@@ -20,7 +20,10 @@ const pt: MessageTree = {
     dash: '—',
   },
   chrome: {
-    appSubtitle: 'Captura de áudio para ambiente de trabalho',
+    productName: 'DataBaker Audio Capture',
+    windowTitle: 'DataBaker Audio Capture',
+    prompterWindowTitle: 'DataBaker Audio Capture · Prompter',
+    appSubtitle: 'Gravador de desktop',
     previewBadge: 'Pré-visualização no browser',
     settingsTitle: 'Definições da aplicação',
     settingsAria: 'Abrir definições da aplicação',
