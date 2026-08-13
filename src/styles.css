@@ -86,6 +86,26 @@ kbd { min-width: 20px; padding: 1px 5px; border: 1px solid #505050; border-botto
 .home-header { display: flex; align-items: center; justify-content: space-between; padding: 0 clamp(24px, 4vw, 52px); border-bottom: 1px solid #303232; background: #202222; user-select: none; -webkit-app-region: drag; }
 .home-brand { display: flex; align-items: center; gap: 11px; }.home-brand-mark { width: 32px; height: 32px; display: grid; place-items: center; overflow: hidden; border: 1px solid #514039; border-radius: 7px; background: #f4eee9; }.home-brand-mark img { width: 32px; height: 32px; object-fit: contain; transform: scale(1.13); }
 .home-brand strong, .home-brand small { display: block; }.home-brand strong { color: #eceeed; font-size: 12px; font-weight: 600; letter-spacing: -.01em; }.home-brand small { margin-top: 2px; color: #777d7b; font-size: 9px; }
+.license-gate { height: 100%; display: grid; grid-template-rows: 58px minmax(0, 1fr); background: var(--chrome); }
+.license-gate-loading { background: #161616; }
+.license-gate .home-header { -webkit-app-region: drag; }
+.license-locale { margin-right: 4px; -webkit-app-region: no-drag; }
+.license-card { width: min(520px, calc(100% - 64px)); margin: clamp(36px, 8vh, 72px) auto 0; padding: 22px 22px 20px; border: 1px solid #3d3d3d; background: #242424; }
+.license-card > small { display: block; color: #717171; font: 7px var(--mono); letter-spacing: .08em; }
+.license-card h1 { margin: 6px 0 10px; color: #eceeed; font-size: 22px; font-weight: 600; letter-spacing: -.03em; }
+.license-card > p { margin: 0 0 18px; color: #9c9c9c; font-size: 11px; line-height: 1.65; }
+.license-machine, .license-ticket { display: grid; gap: 6px; margin-bottom: 14px; }
+.license-machine > span, .license-ticket > span { color: #8a8a8a; font-size: 9px; }
+.license-machine > div { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
+.license-machine code { min-height: 32px; display: flex; align-items: center; padding: 0 10px; border: 1px solid #434846; color: #d7eeeb; background: #1b1d1c; font: 13px var(--mono); letter-spacing: .08em; }
+.license-ticket textarea { width: 100%; min-height: 110px; padding: 9px 10px; border: 1px solid #434846; border-radius: 2px; color: #d5dad7; background: #1f2221; font: 10px var(--mono); resize: vertical; }
+.license-card > .button.primary { width: 100%; min-height: 34px; }
+.license-pending { margin-top: 18px; padding-top: 14px; border-top: 1px solid #353837; }
+.license-pending strong { display: block; color: #e0c48a; font-size: 10px; }
+.license-pending > p { margin: 6px 0 10px; color: #9e8e6c; font-size: 9px; line-height: 1.55; }
+.license-pending > div { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; margin-top: 8px; }
+.license-pending code { overflow: hidden; color: #c6ccc9; font: 8px var(--mono); white-space: nowrap; text-overflow: ellipsis; }
+.settings-license code { grid-column: 1 / -1; }
 .preview-badge { margin-left: 5px; padding: 3px 6px; border: 1px solid #735f38; border-radius: 3px; color: #c9aa69; background: rgba(215, 166, 74, .08); font: 8px var(--mono); font-style: normal; }
 .home-notice i { width: 6px; height: 6px; flex: none; border-radius: 50%; background: #666c6a; }
 .home-main { width: min(1180px, calc(100% - 64px)); min-height: 0; display: grid; grid-template-rows: auto auto minmax(0, 1fr) auto; align-content: start; margin: 0 auto; padding: clamp(38px, 6vh, 72px) 0 26px; }
@@ -378,6 +398,14 @@ input:disabled { color: #7d7d7d; background: #222; }
 .dialog-summary dd.warning { color: var(--warning); }
 .dialog-warning { margin: -2px 16px 14px; padding: 8px 9px; border-left: 2px solid var(--warning); color: #b7a47d; background: rgba(215, 166, 74, .08); font-size: 9px; line-height: 1.55; }
 .task-detail-dialog, .export-dialog { width: min(520px, calc(100vw - 48px)); }.task-detail-actions { display: flex; flex-wrap: wrap; gap: 7px; padding: 0 16px 16px; }.task-detail-actions .button { gap: 6px; }.export-options { display: grid; gap: 1px; margin: 0 16px 14px; border: 1px solid #3f4341; background: #3f4341; }.export-options > button { min-height: 58px; display: grid; grid-template-columns: 34px minmax(0, 1fr); align-items: center; gap: 10px; padding: 0 12px; border: 0; text-align: left; background: #252827; }.export-options > button:hover:not(:disabled) { background: #2b302e; }.export-options > button:active:not(:disabled) { transform: translateY(1px); }.export-options > button:disabled { opacity: .45; cursor: not-allowed; }.export-options > button > span { width: 30px; height: 30px; display: grid; place-items: center; color: #83b7b3; background: #2b3937; }.export-options strong, .export-options small { display: block; }.export-options strong { color: #d8dddb; font-size: 10px; font-weight: 550; }.export-options small { margin-top: 4px; color: #777d7a; font-size: 8px; line-height: 1.4; }
+.export-destination-block { margin: 0 16px 12px; }
+.export-destination { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; gap: 6px 8px; padding: 8px 9px; border: 1px solid #3a3f3d; background: #222625; }
+.export-destination > span { color: #8a918e; font-size: 8px; }
+.export-destination code { grid-column: 1 / -1; min-width: 0; overflow: hidden; color: #c6ccc9; font: 8px var(--mono); white-space: nowrap; text-overflow: ellipsis; }
+.export-destination-actions { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 6px; }
+.export-destination-actions .button { min-height: 24px; padding: 0 8px; font-size: 8px; }
+.export-destination-hint { margin: 6px 0 0; color: #747b78; font-size: 8px; line-height: 1.45; }
+.monitor-export .export-destination-block { margin: 0 0 10px; }
 .dialog-icon.danger { border-color: #7f464b; color: #f08b92 !important; background: #352426; }.dialog-icon.success { border-color: #4e7f7b; color: #8fd0ca; background: #243130; }.dialog-icon.warning { border-color: #8a7040; color: #e0c48a; background: #322b1e; }.dialog-warning.danger { border-left-color: var(--danger); color: #d9a0a4 !important; background: rgba(224, 91, 100, .08); }
 .export-feedback-backdrop { z-index: 52; }
 .user-alert-backdrop { z-index: 53; }

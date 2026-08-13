@@ -1,6 +1,6 @@
 import type { DebugLogDraft, DebugLogEntry, DebugLogSnapshot } from './debug-log';
 import { formatDebugLogText } from './debug-log';
-import type { Attempt, AudioDevice, CapturePresetDraft, CapturePresetStore, HeadSilencePhase, Meter, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SessionSnapshot } from './types';
+import type { Attempt, AudioDevice, CapturePresetDraft, CapturePresetStore, HeadSilencePhase, LicenseStatus, Meter, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SessionSnapshot } from './types';
 
 type MockActiveAttempt = {
   item_id: string;
@@ -39,6 +39,28 @@ export function installDevRecorderMock() {
   const prompterStatusListeners = new Set<(status: { open: boolean; ready: boolean }) => void>();
   const debugLogListeners = new Set<(entry: DebugLogEntry) => void>();
   const localeListeners = new Set<(locale: string) => void>();
+  const previewLocked = new URLSearchParams(globalThis.location?.search ?? '').get('license') === 'locked';
+  let previewLicense: LicenseStatus = previewLocked
+    ? {
+        state: 'invalid',
+        reason: 'unlicensed',
+        machineCode: 'PREV-VIEW-ONLY',
+        licensee: null,
+        expiresAt: null,
+        daysRemaining: null,
+        issuedAt: null,
+        kid: null,
+      }
+    : {
+        state: 'valid',
+        reason: null,
+        machineCode: 'PREV-VIEW-ONLY',
+        licensee: 'preview',
+        expiresAt: null,
+        daysRemaining: null,
+        issuedAt: null,
+        kid: 'preview',
+      };
   const PREVIEW_LOCALE_KEY = 'databaker-preview-locale';
   let previewLocale = 'zh-CN';
   try {
@@ -649,6 +671,12 @@ export function installDevRecorderMock() {
       request,
       openScript: async () => null,
       chooseOutput: async () => '/tmp/DataBaker Recordings',
+      chooseExportDir: async () => '/tmp/DataBaker Preview Export',
+      deliverExportArtifact: async (sourceFile: string, destinationDir: string) => ({
+        directory: destinationDir,
+        file_path: `${destinationDir.replace(/\/+$/, '')}/${sourceFile.split(/[\\/]/).pop() ?? 'export.bin'}`,
+        copied: true,
+      }),
       defaultOutput: async () => ({ outputRoot: '/tmp/DataBaker Recordings' }),
       getLocale: async () => previewLocale,
       setLocale: async (locale: string) => {
@@ -816,6 +844,24 @@ export function installDevRecorderMock() {
         debugLogListeners.add(listener);
         return () => debugLogListeners.delete(listener);
       },
+      getLicenseStatus: async () => previewLicense,
+      activateLicense: async (ticket: string) => {
+        if (!ticket.trim()) throw new Error('LICENSE_REQUIRED:授权码无效');
+        previewLicense = {
+          state: 'valid',
+          reason: null,
+          machineCode: 'PREV-VIEW-ONLY',
+          licensee: 'preview',
+          expiresAt: null,
+          daysRemaining: null,
+          issuedAt: Math.floor(Date.now() / 1000),
+          kid: 'preview',
+        };
+        return previewLicense;
+      },
+      listPendingLicenseSeals: async () => ({ recordings: [] }),
+      emergencySealRecording: async () => ({ no_op: true }),
+      onLicenseChanged: () => () => undefined,
     },
   });
 }

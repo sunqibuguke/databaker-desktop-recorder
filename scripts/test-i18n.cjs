@@ -47,6 +47,10 @@ async function main() {
   assert.equal(t('issues.discontinuityTitle'), '声卡链路告警 · 未停录');
   assert.equal(t('exportDialog.resultOkTitle'), '导出完成');
   assert.equal(t('exportDialog.resultFailedTitle'), '导出失败');
+  assert.equal(t('exportDialog.destination'), '导出到');
+  assert.equal(t('exportDialog.chooseFolderTitle'), '选择导出目录');
+  assert.equal(t('exportDialog.destMissing'), '所选导出目录不存在，请重新选择');
+  assert.equal(t('notice.copyingExport'), '正在复制到所选导出目录…');
   assert.equal(t('alertDialog.dataSafetyTitle'), '数据安全提示');
 
   const chineseKeys = new Set(flattenKeys(catalogs['zh-CN']));

@@ -3,7 +3,7 @@ export {};
 declare module '*.css';
 
 import type { DebugLogDraft, DebugLogEntry, DebugLogSnapshot } from './debug-log';
-import type { CapturePresetDraft, CapturePresetLoadResult, CapturePresetStore, DefaultOutputResult, PrompterState, RecordingHistoryPage } from './types';
+import type { CapturePresetDraft, CapturePresetLoadResult, CapturePresetStore, DefaultOutputResult, LicenseStatus, PendingLicenseSeal, PrompterState, RecordingHistoryPage } from './types';
 
 declare global {
   interface Window {
@@ -13,7 +13,18 @@ declare global {
       request<T = unknown>(command: string, payload?: unknown): Promise<T>;
       openScript(): Promise<{ filePath: string; name: string; content: string } | null>;
       chooseOutput(): Promise<string | null>;
+      chooseExportDir(defaultPath?: string, title?: string): Promise<string | null>;
+      deliverExportArtifact(sourceFile: string, destinationDir: string): Promise<{
+        directory: string;
+        file_path: string;
+        copied: boolean;
+      }>;
       defaultOutput(): Promise<DefaultOutputResult>;
+      getLicenseStatus?(): Promise<LicenseStatus>;
+      activateLicense?(ticket: string): Promise<LicenseStatus>;
+      listPendingLicenseSeals?(): Promise<{ recordings: PendingLicenseSeal[] }>;
+      emergencySealRecording?(sessionDir: string, sessionId: string): Promise<unknown>;
+      onLicenseChanged?(listener: (status: LicenseStatus) => void): () => void;
       getLocale?(): Promise<string>;
       setLocale?(locale: string): Promise<string>;
       onLocaleChanged?(listener: (locale: string) => void): () => void;

@@ -36,9 +36,11 @@ import { captureFormatsSupportBitDepth, captureShareModeLabel, configurationsFor
 import { createLatestFrameCommitter } from './latest-frame';
 import type { LatestFrameCommitter } from './latest-frame';
 import type { SessionNoiseCheckOperation } from './recording-workflow';
-import type { Attempt, AudioDevice, CapturePreset, CapturePresetDraft, CapturePresetStore, CaptureShareMode, EngineEvent, ExportArtifact, ExportResult, HeadSilencePhase, InspectedSessionState, ItemState, Meter, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SealInterruptedSessionResult, SessionSnapshot } from './types';
+import { licenseSummary } from './ActivateLicense';
+import type { Attempt, AudioDevice, CapturePreset, CapturePresetDraft, CapturePresetStore, CaptureShareMode, EngineEvent, ExportArtifact, ExportResult, HeadSilencePhase, InspectedSessionState, ItemState, LicenseStatus, Meter, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SealInterruptedSessionResult, SessionSnapshot } from './types';
 import { reportRendererError } from './sentry';
 import { logUserAction } from './debug-log';
+import { translateExportDeliverError } from './export-deliver-i18n';
 import { DISCONTINUITY_TOAST_MS, discontinuityDurationMs, shouldShowDiscontinuityToast } from './discontinuity-toast';
 import { LogPanel } from './LogPanel';
 import { APP_LOCALES, LOCALE_NATIVE_NAMES, getLocale, t, useI18n } from './i18n';
@@ -286,6 +288,25 @@ function artifactOutputCopy(artifact: ExportArtifact, exported?: ExportResult): 
   return artifactLabel(artifact);
 }
 
+const EXPORT_DESTINATION_KEY = 'databaker-export-destination';
+
+function loadExportDestination(): string {
+  try {
+    return window.localStorage.getItem(EXPORT_DESTINATION_KEY) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function persistExportDestination(value: string) {
+  try {
+    if (value) window.localStorage.setItem(EXPORT_DESTINATION_KEY, value);
+    else window.localStorage.removeItem(EXPORT_DESTINATION_KEY);
+  } catch {
+    // preview / restricted storage is best-effort
+  }
+}
+
 function artifactFilePath(artifact: ExportArtifact, exported: ExportResult): string | undefined {
   if (artifact === 'full_track') return exported.master_file;
   if (artifact === 'timestamps_json') return exported.timestamps_json;
@@ -306,7 +327,7 @@ function artifactStatusCopy(recording: RecordingHistoryEntry | undefined, artifa
     : t('exportDialog.current');
 }
 
-export function RecorderApp() {
+export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const { locale, setLocale, t } = useI18n();
   const isBrowserPreview = window.recorder.runtime === 'preview';
   const exclusiveCaptureAvailable = window.recorder.platform === 'win32';
@@ -378,6 +399,8 @@ export function RecorderApp() {
   const [sealConfirmRecording, setSealConfirmRecording] = useState<RecordingHistoryEntry | null>(null);
   const [deleteConfirmRecording, setDeleteConfirmRecording] = useState<RecordingHistoryEntry | null>(null);
   const [exportRecording, setExportRecording] = useState<RecordingHistoryEntry | null>(null);
+  const [exportDestination, setExportDestination] = useState(loadExportDestination);
+  const [taskExportDir, setTaskExportDir] = useState('');
   const [exportFeedback, setExportFeedback] = useState<ExportFeedback | null>(null);
   const [userAlert, setUserAlert] = useState<UserAlert | null>(null);
   const [deletingSessionDir, setDeletingSessionDir] = useState('');
@@ -1176,6 +1199,21 @@ export function RecorderApp() {
     outputDirRef.current = outputDir;
   }, [outputDir]);
 
+  useEffect(() => {
+    const session = exportRecording?.session_dir || sessionDir;
+    if (!session) {
+      setTaskExportDir('');
+      return;
+    }
+    let cancelled = false;
+    void window.recorder.joinPath(session, 'export').then((value) => {
+      if (!cancelled) setTaskExportDir(value);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [exportRecording?.session_dir, sessionDir]);
+
   useEffect(() => () => {
     if (audioUrl) URL.revokeObjectURL(audioUrl);
   }, [audioUrl]);
@@ -1809,25 +1847,65 @@ export function RecorderApp() {
       failExport(lastOperationErrorRef.current || t('exportDialog.resultFailedGeneric'));
       return;
     }
+    const sourceFile = artifactFilePath(artifact, exported);
+    let deliveredDir = exported.export_dir;
+    let deliveredFile = sourceFile;
+    let copyWarning = '';
+    const destination = exportDestination || exported.export_dir;
+    if (sourceFile && destination) {
+      const delivered = await run(t('notice.copyingExport'), () => (
+        window.recorder.deliverExportArtifact(sourceFile, destination)
+      ));
+      if (!delivered) {
+        copyWarning = translateExportDeliverError(lastOperationErrorRef.current || t('exportDialog.copyFailed'));
+      } else {
+        deliveredDir = delivered.directory;
+        deliveredFile = delivered.file_path;
+      }
+    }
     const warning = recoveryWarning(t('notice.exportStorage'), exported.recovery_warnings);
     if (warning) setDataSafetyAlert(t('notice.exportSpotCheck', { warning }));
     const output = artifactOutputCopy(artifact, exported);
     setNotice(t('notice.exported', {
       id: task.session_id,
       output,
-      note: warning ? t('notice.exportNeedCheck') : '',
+      note: warning || copyWarning ? t('notice.exportNeedCheck') : '',
     }));
+    const dialogWarning = [
+      warning ? `${t('exportDialog.spotCheck')}\n${warning}` : '',
+      copyWarning,
+    ].filter(Boolean).join('\n');
     setExportFeedback({
       sessionId: task.session_id,
       sessionDir: task.session_dir,
       artifact,
       status: 'ok',
       output,
-      exportDir: exported.export_dir,
-      filePath: artifactFilePath(artifact, exported),
-      warning: warning || undefined,
+      exportDir: deliveredDir,
+      filePath: deliveredFile,
+      warning: dialogWarning || undefined,
     });
     await refreshRecordings();
+  }
+
+  function commitExportDestination(value: string) {
+    setExportDestination(value);
+    persistExportDestination(value);
+  }
+
+  async function chooseExportDestination(defaultPath?: string) {
+    let selected: string | null;
+    try {
+      selected = await window.recorder.chooseExportDir(
+        defaultPath || taskExportDir || undefined,
+        t('exportDialog.chooseFolderTitle'),
+      );
+    } catch (caught) {
+      showBlockingError(translateExportDeliverError(errorMessage(caught)));
+      return;
+    }
+    if (!selected) return;
+    commitExportDestination(selected);
   }
 
   async function openExportFeedbackFolder() {
@@ -1842,7 +1920,7 @@ export function RecorderApp() {
       setNotice(t('notice.openedExport', { id: exportFeedback.sessionId }));
       return;
     }
-    showBlockingError(lastOperationErrorRef.current || t('notice.openingExport'));
+    showBlockingError(translateExportDeliverError(lastOperationErrorRef.current || t('notice.openingExport')));
   }
 
   function showExport(recording: RecordingHistoryEntry) {
@@ -2313,9 +2391,33 @@ export function RecorderApp() {
             <Icon name="log" size={14} />{t('settings.viewLogs')}
           </button>
         </section>
+        {license && <section className="settings-license">
+          <div>
+            <strong>{t('settings.licenseTitle')}</strong>
+            <small>{t('settings.licenseHint')}</small>
+          </div>
+          <span className="settings-engine ready" data-testid="settings-license-status">
+            <i />
+            {license.licensee ? `${t('settings.licenseValid')} · ${license.licensee}` : t('settings.licenseValid')}
+          </span>
+          <code title={license.machineCode}>{licenseSummary(license)} · {license.machineCode || t('license.machineUnavailable')}</code>
+        </section>}
       </div>
       <footer><button className="button primary" onClick={() => setSettingsOpen(false)}>{t('common.done')}</button></footer>
     </section>
+  </div>;
+
+  const shownExportDestination = exportDestination || taskExportDir;
+  const exportDestinationPicker = (defaultPath?: string) => <div className="export-destination-block">
+    <div className="export-destination">
+      <span>{t('exportDialog.destination')}</span>
+      <code title={shownExportDestination}>{shownExportDestination || t('common.dash')}</code>
+      <div className="export-destination-actions">
+        <button type="button" className="button" data-testid="choose-export-dir" onClick={() => void chooseExportDestination(shownExportDestination || defaultPath)} disabled={Boolean(busy)}>{t('exportDialog.changeDestination')}</button>
+        {exportDestination ? <button type="button" className="button" data-testid="reset-export-dir" onClick={() => commitExportDestination('')} disabled={Boolean(busy)}>{t('exportDialog.useTaskFolder')}</button> : null}
+      </div>
+    </div>
+    <p className="export-destination-hint">{t('exportDialog.destinationHint')}</p>
   </div>;
 
   const exportFeedbackDialog = exportFeedback && <div className="dialog-backdrop export-feedback-backdrop" role="presentation">
@@ -2343,7 +2445,7 @@ export function RecorderApp() {
             : t('exportDialog.resultOkBody', { id: exportFeedback.sessionId, output: exportFeedback.output })}
       </p>
       {exportFeedback.status === 'failed' && exportFeedback.error && <div className="dialog-warning danger">{exportFeedback.error}</div>}
-      {exportFeedback.status === 'ok' && exportFeedback.warning && <div className="dialog-warning">{t('exportDialog.spotCheck')}<br />{exportFeedback.warning}</div>}
+      {exportFeedback.status === 'ok' && exportFeedback.warning && <div className="dialog-warning">{exportFeedback.warning}</div>}
       {exportFeedback.status === 'ok' && (exportFeedback.filePath || exportFeedback.exportDir) && <div className="export-result-meta">
         {exportFeedback.filePath && <div><span>{t('exportDialog.resultFile')}</span><code title={exportFeedback.filePath}>{exportFeedback.filePath}</code></div>}
         {exportFeedback.exportDir && <div><span>{t('exportDialog.resultPath')}</span><code title={exportFeedback.exportDir}>{exportFeedback.exportDir}</code></div>}
@@ -2445,6 +2547,7 @@ export function RecorderApp() {
         <section className="studio-dialog export-dialog" role="dialog" aria-modal="true" aria-labelledby="export-dialog-title">
           <header><span className="dialog-icon"><Icon name="export" size={19} /></span><div><small>{t('exportDialog.eyebrow')}</small><h2 id="export-dialog-title">{t('exportDialog.title')}</h2></div></header>
           <p>{t('exportDialog.intro')}</p>
+          {exportDestinationPicker(exportRecording.session_dir)}
           <div className="export-options" aria-label={t('exportDialog.optionsAria')}>
             <button onClick={() => { const task = exportRecording; setExportRecording(null); void exportRecordingArtifact(task, 'full_track'); }} disabled={Boolean(busy)}><span><Icon name="meter" size={16} /></span><div><strong>{t('exportDialog.fullTrack')}</strong><small>full-track.wav · {artifactStatusCopy(exportRecording, 'full_track')}</small></div></button>
             <button onClick={() => { const task = exportRecording; setExportRecording(null); void exportRecordingArtifact(task, 'timestamps_json'); }} disabled={Boolean(busy)}><span><Icon name="file" size={16} /></span><div><strong>{t('exportDialog.timestamps')}</strong><small>timestamps.json · {artifactStatusCopy(exportRecording, 'timestamps_json')}</small></div></button>
@@ -2603,7 +2706,7 @@ export function RecorderApp() {
             </>}
             {monitorPanelTab === 'detection' && <section className="monitor-section detection-settings"><h3>{t('recorder.detectionTitle')}</h3><p>{t('recorder.detectionHelp')}</p><div className="detection-setting"><header><span><strong>{t('recorder.threshold')}</strong><small>{t('recorder.currentRms', { value: liveRmsDbfs <= -96 ? '−∞' : `${liveRmsDbfs.toFixed(1)} dBFS` })}</small></span><output>{silenceThresholdDraftDbfs} <small>dBFS</small></output></header><div className="threshold-track"><i style={{ left: `${liveRmsOnThresholdScale}%` }} title={t('quality.currentRmsTitle', { value: liveRmsDbfs.toFixed(1) })} /><input data-testid="task-silence-threshold" aria-label={t('recorder.threshold')} aria-valuetext={`${silenceThresholdDraftDbfs} dBFS`} type="range" min="-72" max="-12" step="1" value={silenceThresholdDraftDbfs} onChange={(event) => setSilenceThresholdDraftDbfs(Number(event.target.value))} onPointerUp={(event) => void applyTaskSilenceSettings(Number(event.currentTarget.value), silenceDurationDraftMs)} onKeyUp={(event) => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) void applyTaskSilenceSettings(Number(event.currentTarget.value), silenceDurationDraftMs); }} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving} /></div><div className="threshold-labels"><span>{t('recorder.moreSensitive')}</span><span>{t('recorder.moreReject')}</span></div></div><div className="detection-setting"><header><span><strong>{t('recorder.duration')}</strong><small>{t('recorder.sameDuration')}</small></span><output>{(silenceDurationDraftMs / 1_000).toFixed(1)} <small>{t('recorder.seconds')}</small></output></header><input data-testid="task-silence-duration" aria-label={t('recorder.duration')} aria-valuetext={`${(silenceDurationDraftMs / 1_000).toFixed(1)} ${t('recorder.seconds')}`} type="range" min="200" max="5000" step="100" value={silenceDurationDraftMs} onChange={(event) => setSilenceDurationDraftMs(Number(event.target.value))} onPointerUp={(event) => void applyTaskSilenceSettings(silenceThresholdDraftDbfs, Number(event.currentTarget.value))} onKeyUp={(event) => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) void applyTaskSilenceSettings(silenceThresholdDraftDbfs, Number(event.currentTarget.value)); }} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving} /><div className="threshold-labels"><span>0.2 {t('recorder.seconds')}</span><span>5.0 {t('recorder.seconds')}</span></div></div><label className="silence-review-toggle"><input type="checkbox" data-testid="post-take-silence-review" checked={showPostTakeSilenceReview} onChange={(event) => { const enabled = event.target.checked; setShowPostTakeSilenceReview(enabled); savePostTakeSilenceReview(sessionDir, enabled); }} /><span><strong>{t('recorder.showPostTakeReview')}</strong><small>{t('recorder.showPostTakeReviewHint')}</small></span></label><p className={`settings-apply-state ${silenceSettingsError ? 'error' : ''}`}>{silenceSettingsSaving ? t('recorder.applyingSettings') : silenceSettingsError || t('recorder.appliedSettings', { db: noiseThresholdDbfs, seconds: (effectiveSilenceDurationMs / 1_000).toFixed(1) })}</p><button className="restore-settings" onClick={() => void applyTaskSilenceSettings(taskInitialSilenceThresholdDbfs, taskInitialSilenceDurationMs)} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving || (noiseThresholdDbfs === taskInitialSilenceThresholdDbfs && silenceDurationMs === taskInitialSilenceDurationMs)}>{t('recorder.restoreInitial')}</button></section>}
             {monitorPanelTab === 'task' && <section className="monitor-section"><h3>{t('recorder.taskParams')}</h3><dl className="property-list"><div><dt>{t('setup.inputDevice')}</dt><dd title={snapshot?.device_name}>{snapshot?.device_name || t('common.dash')}</dd></div><div><dt>{t('setup.shareMode')}</dt><dd>{captureShareModeLabel(snapshot?.capture_share_mode ?? captureShareMode)}</dd></div><div><dt>{t('setup.inputChannel')}</dt><dd>{snapshot?.audio_format.input_channel ?? 1}</dd></div><div><dt>{t('recorder.exportFormat')}</dt><dd>{sampleRateForDisplay / 1000}k / {snapshot?.audio_format.bit_depth}-bit {snapshot?.audio_format.encoding ?? ''}</dd></div><div><dt>{t('recorder.driverInputFormat')}</dt><dd>{snapshot?.input_sample_format?.toUpperCase() ?? t('common.dash')}</dd></div><div><dt>{t('recorder.envCeiling')}</dt><dd>{snapshot?.noise_threshold_dbfs ?? snapshot?.noise_check?.threshold_dbfs ?? t('common.dash')} dBFS</dd></div><div><dt>{t('recorder.accepted')}</dt><dd>{counts.accepted ?? 0} / {items.length}</dd></div><div><dt>{t('recorder.skipped')}</dt><dd>{counts.skipped ?? 0}</dd></div></dl><button className="button panel-action" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? t('recorder.locatePrompter') : t('recorder.openPrompter')}</button></section>}
-            {monitorPanelTab === 'export' && snapshot && <section className="monitor-section monitor-export"><h3>{t('recorder.exportCurrent')}</h3><p>{captureActive ? recording ? t('recorder.exportWhileRecording') : t('recorder.exportWillPause') : t('recorder.exportIndependent')}</p><div>
+            {monitorPanelTab === 'export' && snapshot && <section className="monitor-section monitor-export"><h3>{t('recorder.exportCurrent')}</h3><p>{captureActive ? recording ? t('recorder.exportWhileRecording') : t('recorder.exportWillPause') : t('recorder.exportIndependent')}</p>{exportDestinationPicker(sessionDir)}<div>
               <button onClick={() => void exportRecordingArtifact({ session_id: snapshot.session_id, session_dir: sessionDir }, 'full_track')} disabled={Boolean(busy) || recording}><Icon name="meter" /><span><strong>{t('recorder.fullTrackShort')}</strong><small>{artifactStatusCopy(workspaceRecording, 'full_track')}</small></span></button>
               <button onClick={() => void exportRecordingArtifact({ session_id: snapshot.session_id, session_dir: sessionDir }, 'timestamps_json')} disabled={Boolean(busy) || recording}><Icon name="file" /><span><strong>{t('recorder.timestampsShort')}</strong><small>{artifactStatusCopy(workspaceRecording, 'timestamps_json')}</small></span></button>
               <button onClick={() => void exportRecordingArtifact({ session_id: snapshot.session_id, session_dir: sessionDir }, 'cuts_zip')} disabled={Boolean(busy) || recording || workspaceFaulted}><Icon name="export" /><span><strong>{t('recorder.cutsShort')}</strong><small>{workspaceFaulted ? t('recorder.cutsAfterRepair') : artifactStatusCopy(workspaceRecording, 'cuts_zip')}</small></span></button>

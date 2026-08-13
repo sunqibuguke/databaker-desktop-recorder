@@ -38,12 +38,27 @@ import {
   captureFaultNoticeFromEngineEvent,
   type CaptureFaultNotice,
 } from './capture-fault';
+import {
+  deliveredExportFilePath,
+  EXPORT_DELIVER_ERROR,
+  exportPathsAreSameDirectory,
+  isAllowedExportArtifactName,
+} from './export-deliver';
 import { CapturePresetRepository, type CapturePresetDraft } from './capture-presets';
 import {
   OutputRootPreferenceRepository,
   type OutputRootPreference,
 } from './output-root-preference';
 import { AppLocaleRepository, normalizeAppLocale, type AppLocale } from './app-locale';
+import { collectMachineFingerprint, type MachineFingerprint } from './machine-fingerprint';
+import {
+  LicenseRepository,
+  LicenseRequiredError,
+  disabledLicenseStatus,
+  isLicenseCheckDisabled,
+  isLicenseExemptEngineCommand,
+  type LicenseStatus,
+} from './license';
 import {
   ENGINE_EVENT_CHANNEL,
   ENGINE_METER_ACK_CHANNEL,
@@ -1213,6 +1228,72 @@ const exportArtifactFiles: Record<ExportArtifactName, { status: string; output: 
   cuts_zip: { status: 'status-cuts-zip.json', output: 'cuts.zip' },
   timestamps_json: { status: 'status-timestamps-json.json', output: 'timestamps.json' },
 };
+const rememberedExportDirectories = new Set<string>();
+
+async function rememberUserExportDirectory(directory: string): Promise<string> {
+  const lexical = path.resolve(directory);
+  let canonical: string;
+  try {
+    canonical = await fs.realpath(lexical);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new Error(EXPORT_DELIVER_ERROR.destMissing);
+    }
+    throw error;
+  }
+  const metadata = await fs.lstat(canonical);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error(EXPORT_DELIVER_ERROR.destNotDirectory);
+  }
+  rememberedExportDirectories.add(canonical);
+  return canonical;
+}
+
+function isInsideRememberedExportDirectory(resolvedTarget: string): boolean {
+  for (const remembered of rememberedExportDirectories) {
+    if (isSameSessionDir(remembered, resolvedTarget) || isWithin(remembered, resolvedTarget)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function deliverExportArtifact(sourceFile: string, destinationDir: string): Promise<{
+  directory: string;
+  file_path: string;
+  copied: boolean;
+}> {
+  const sourceReal = await fs.realpath(path.resolve(sourceFile));
+  if (!(await isInsideKnownSession(sourceReal))) {
+    throw new Error(EXPORT_DELIVER_ERROR.sourceNotInSession);
+  }
+  if (!isAllowedExportArtifactName(sourceReal) || path.basename(path.dirname(sourceReal)) !== 'export') {
+    throw new Error(EXPORT_DELIVER_ERROR.sourceNotInExportDir);
+  }
+  const sourceMeta = await fs.lstat(sourceReal);
+  if (!sourceMeta.isFile() || sourceMeta.isSymbolicLink()) {
+    throw new Error(EXPORT_DELIVER_ERROR.sourceInvalid);
+  }
+  const destCanonical = await rememberUserExportDirectory(destinationDir);
+  const destFile = deliveredExportFilePath(destCanonical, sourceReal);
+  if (exportPathsAreSameDirectory(path.dirname(sourceReal), destCanonical)) {
+    return { directory: destCanonical, file_path: sourceReal, copied: false };
+  }
+  await fs.copyFile(sourceReal, destFile);
+  const destMeta = await fs.lstat(destFile);
+  if (!destMeta.isFile() || destMeta.isSymbolicLink()) {
+    throw new Error(EXPORT_DELIVER_ERROR.copyResultInvalid);
+  }
+  debugLog?.append({
+    level: 'info',
+    source: 'main',
+    category: 'export',
+    event: 'export.deliver',
+    message: `已复制导出文件到所选目录：${path.basename(destFile)}`,
+    data: { source_file: sourceReal, destination_dir: destCanonical },
+  });
+  return { directory: destCanonical, file_path: destFile, copied: true };
+}
 
 function fullTrackExportSourceMatchesSnapshot(
   source: unknown,
@@ -3593,6 +3674,28 @@ function registerIpc(): void {
   const appLocalePreference = new AppLocaleRepository(
     path.join(app.getPath('userData'), 'app-locale.json'),
   );
+  const licenseRepository = new LicenseRepository(
+    path.join(app.getPath('userData'), 'license.json'),
+  );
+  let cachedFingerprint: Promise<MachineFingerprint> | null = null;
+  const machineFingerprint = (): Promise<MachineFingerprint> => {
+    cachedFingerprint ??= collectMachineFingerprint();
+    return cachedFingerprint;
+  };
+  const readLicenseStatus = async (): Promise<LicenseStatus> => {
+    if (isLicenseCheckDisabled()) {
+      const fingerprint = await machineFingerprint().catch(() => ({
+        machineCode: '',
+        componentHashes: [],
+      }));
+      return disabledLicenseStatus(fingerprint.machineCode);
+    }
+    return licenseRepository.evaluate(await machineFingerprint());
+  };
+  const assertAppLicensed = async (): Promise<void> => {
+    const status = await readLicenseStatus();
+    if (status.state !== 'valid') throw new LicenseRequiredError(status.reason ?? 'unlicensed');
+  };
   let currentAppLocale: AppLocale = normalizeAppLocale(process.env.DATABAKER_LOCALE);
   void appLocalePreference.load().then((stored) => {
     if (!process.env.DATABAKER_LOCALE) currentAppLocale = stored;
@@ -3625,9 +3728,86 @@ function registerIpc(): void {
       || event.sender !== mainWindow.webContents) return;
     meterBackpressure.acknowledge(event.sender, deliveryId);
   });
+  ipcMain.handle('license:status', async (event) => {
+    assertMainRenderer(event.sender);
+    return readLicenseStatus();
+  });
+  ipcMain.handle('license:activate', async (event, ticket: unknown) => {
+    assertMainRenderer(event.sender);
+    if (typeof ticket !== 'string') throw new LicenseRequiredError('malformed');
+    const fingerprint = await machineFingerprint();
+    const status = await licenseRepository.activate(ticket, fingerprint);
+    if (status.state !== 'valid') throw new LicenseRequiredError(status.reason ?? 'malformed');
+    sendToMain('license:changed', status);
+    return status;
+  });
+  ipcMain.handle('license:pending-seals', async (event) => {
+    assertMainRenderer(event.sender);
+    const loaded = await outputRootPreference.load();
+    const root = loaded.preference?.outputRoot ?? defaultOutputRoot();
+    try {
+      await bindAndRememberOutputRoot(path.resolve(root), false);
+    } catch {
+      return { recordings: [] };
+    }
+    try {
+      const page = await listRecordings(root, 0, HISTORY_PAGE_MAX_SIZE) as {
+        recordings?: Array<Record<string, unknown>>;
+      };
+      return {
+        recordings: (page.recordings ?? [])
+          .filter((row) => {
+            const status = typeof row.status === 'string' ? row.status : '';
+            const overflow = typeof row.overflow_samples === 'number' ? row.overflow_samples : 0;
+            return status === 'faulted'
+              || overflow > 0
+              || status === 'recording'
+              || status === 'stopping';
+          })
+          .map((row) => ({
+            session_id: String(row.session_id ?? ''),
+            session_dir: String(row.session_dir ?? ''),
+            status: String(row.status ?? ''),
+          }))
+          .filter((row) => row.session_id && row.session_dir),
+      };
+    } catch {
+      return { recordings: [] };
+    }
+  });
+  ipcMain.handle('license:emergency-seal', async (event, payload: unknown) => {
+    assertMainRenderer(event.sender);
+    if (!isRecord(payload)
+      || typeof payload.session_dir !== 'string'
+      || typeof payload.session_id !== 'string'
+      || !payload.session_id.trim()) {
+      throw new Error('封存任务参数无效');
+    }
+    const sessionDir = payload.session_dir;
+    const expectedSessionId = payload.session_id.trim();
+    assertCanStartOrResume(crashSealMatches(sessionDir));
+    const sealIntent = beginEngineIntent('sealing', path.resolve(sessionDir));
+    let canonical: string | null = null;
+    try {
+      const sealed = await executeAuthorizedOfflineSeal(sealIntent, sessionDir, expectedSessionId);
+      canonical = sealed.canonical;
+      transitionEngineIntent(sealIntent, 'idle', null);
+      clearCurrentCaptureFault();
+      rememberKnownSession(canonical, expectedSessionId);
+      clearCrashSealObligation(canonical);
+      return sealed.result;
+    } catch (error) {
+      if (error instanceof AuthorizedSessionBindingError) {
+        const invalidated = canonical ?? await resolveKnownSession(sessionDir);
+        if (invalidated) forgetKnownSession(invalidated);
+      }
+      return await failSealingSession(sealIntent, error);
+    }
+  });
   ipcMain.handle('engine:request', async (event, command: string, payload: unknown) => {
     assertMainRenderer(event.sender);
     if (!allowedCommands.has(command)) throw new Error(`不允许的录音引擎命令：${command}`);
+    if (!isLicenseExemptEngineCommand(command)) await assertAppLicensed();
     if (!engine) throw new Error('录音引擎不可用');
     const activeEngine = engine;
     return withDebugLoggedCommand(command, payload, async () => {
@@ -3896,6 +4076,7 @@ function registerIpc(): void {
   });
 
   ipcMain.handle('dialog:open-script', async () => {
+    await assertAppLicensed();
     const result = await dialog.showOpenDialog(mainWindow!, {
       title: '选择录音脚本',
       properties: ['openFile'],
@@ -3912,6 +4093,7 @@ function registerIpc(): void {
 
   ipcMain.handle('dialog:choose-output', async (event) => {
     assertMainRenderer(event.sender);
+    await assertAppLicensed();
     const result = await dialog.showOpenDialog(mainWindow!, {
       title: '选择录制保存目录',
       properties: ['openDirectory', 'createDirectory'],
@@ -3926,6 +4108,38 @@ function registerIpc(): void {
       return bindAndRememberOutputRoot(selected, false);
     }
     return null;
+  });
+
+  ipcMain.handle('dialog:choose-export-dir', async (event, payload?: unknown) => {
+    assertMainRenderer(event.sender);
+    await assertAppLicensed();
+    const options = typeof payload === 'string' ? { defaultPath: payload } : isRecord(payload) ? payload : {};
+    const defaultPath = typeof options.defaultPath === 'string' && options.defaultPath.trim()
+      ? options.defaultPath
+      : undefined;
+    const title = typeof options.title === 'string' && options.title.trim()
+      ? options.title
+      : '选择导出目录';
+    const result = await dialog.showOpenDialog(mainWindow!, {
+      title,
+      defaultPath,
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    if (result.canceled || !result.filePaths[0]) return null;
+    return rememberUserExportDirectory(result.filePaths[0]);
+  });
+
+  ipcMain.handle('export:deliver-artifact', async (event, payload: unknown) => {
+    assertMainRenderer(event.sender);
+    await assertAppLicensed();
+    if (!isRecord(payload)
+      || typeof payload.source_file !== 'string'
+      || typeof payload.destination_dir !== 'string'
+      || !payload.source_file.trim()
+      || !payload.destination_dir.trim()) {
+      throw new Error(EXPORT_DELIVER_ERROR.payloadInvalid);
+    }
+    return deliverExportArtifact(payload.source_file, payload.destination_dir);
   });
 
   ipcMain.handle('app:get-locale', async () => {
@@ -3944,6 +4158,7 @@ function registerIpc(): void {
 
   ipcMain.handle('app:default-output', async (event) => {
     assertMainRenderer(event.sender);
+    await assertAppLicensed();
     if (outputRootRecoveryWarning) {
       return { outputRoot: '', warning: outputRootRecoveryWarning };
     }
@@ -3987,26 +4202,31 @@ function registerIpc(): void {
     }
     return { outputRoot: selected };
   });
-  ipcMain.handle('capture-presets:load', (event) => {
+  ipcMain.handle('capture-presets:load', async (event) => {
     assertMainRenderer(event.sender);
+    await assertAppLicensed();
     return capturePresets.load();
   });
-  ipcMain.handle('capture-presets:save', (event, preset: unknown) => {
+  ipcMain.handle('capture-presets:save', async (event, preset: unknown) => {
     assertMainRenderer(event.sender);
+    await assertAppLicensed();
     return capturePresets.save(preset as CapturePresetDraft);
   });
-  ipcMain.handle('capture-presets:delete', (event, id: unknown) => {
+  ipcMain.handle('capture-presets:delete', async (event, id: unknown) => {
     assertMainRenderer(event.sender);
+    await assertAppLicensed();
     if (typeof id !== 'string' || !id.trim()) throw new Error('采集预设 ID 无效');
     return capturePresets.delete(id.trim());
   });
-  ipcMain.handle('capture-presets:select', (event, id: unknown) => {
+  ipcMain.handle('capture-presets:select', async (event, id: unknown) => {
     assertMainRenderer(event.sender);
+    await assertAppLicensed();
     if (id !== null && (typeof id !== 'string' || !id.trim())) throw new Error('采集预设 ID 无效');
     return capturePresets.select(typeof id === 'string' ? id.trim() : null);
   });
   ipcMain.handle('prompter:open', async (event) => {
     assertMainRenderer(event.sender);
+    await assertAppLicensed();
     await createPrompterWindow();
     return true;
   });
@@ -4047,14 +4267,14 @@ function registerIpc(): void {
   });
   ipcMain.handle(
     'recordings:list',
-    (_event, root: string, options?: { offset?: unknown; limit?: unknown }) => listRecordings(
-      root,
-      options?.offset,
-      options?.limit,
-    ),
+    async (_event, root: string, options?: { offset?: unknown; limit?: unknown }) => {
+      await assertAppLicensed();
+      return listRecordings(root, options?.offset, options?.limit);
+    },
   );
   ipcMain.handle('recordings:delete', async (event, payload: unknown) => {
     assertMainRenderer(event.sender);
+    await assertAppLicensed();
     if (activeDeleteOperation) throw new Error(operationBusyMessage());
     const operation = deleteRecording(payload);
     const tracked = operation.finally(() => {
@@ -4065,6 +4285,7 @@ function registerIpc(): void {
   });
   ipcMain.handle('path:join', (_event, ...parts: string[]) => path.join(...parts));
   ipcMain.handle('audio:read', async (_event, filePath: string) => {
+    await assertAppLicensed();
     if (!(await isInsideKnownSession(filePath)) || path.extname(filePath).toLowerCase() !== '.wav') {
       throw new Error('只能试听录制目录内的 WAV 文件');
     }
@@ -4072,7 +4293,16 @@ function registerIpc(): void {
     return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
   });
   ipcMain.handle('shell:open-path', async (_event, target: string) => {
-    if (!(await isInsideKnownSession(target))) throw new Error('只能打开已识别的录制目录');
+    await assertAppLicensed();
+    let resolvedTarget = '';
+    try {
+      resolvedTarget = await fs.realpath(path.resolve(target));
+    } catch {
+      resolvedTarget = '';
+    }
+    const allowed = (await isInsideKnownSession(target))
+      || (resolvedTarget !== '' && isInsideRememberedExportDirectory(resolvedTarget));
+    if (!allowed) throw new Error(EXPORT_DELIVER_ERROR.openPathDenied);
     const error = await shell.openPath(target);
     if (error) throw new Error(error);
   });

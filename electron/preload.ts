@@ -40,7 +40,27 @@ contextBridge.exposeInMainWorld('recorder', {
   request: (command: string, payload: unknown = {}) => ipcRenderer.invoke('engine:request', command, payload),
   openScript: () => ipcRenderer.invoke('dialog:open-script'),
   chooseOutput: () => ipcRenderer.invoke('dialog:choose-output'),
+  chooseExportDir: (defaultPath?: string, title?: string) => (
+    ipcRenderer.invoke('dialog:choose-export-dir', { defaultPath, title })
+  ),
+  deliverExportArtifact: (sourceFile: string, destinationDir: string) => (
+    ipcRenderer.invoke('export:deliver-artifact', {
+      source_file: sourceFile,
+      destination_dir: destinationDir,
+    })
+  ),
   defaultOutput: () => ipcRenderer.invoke('app:default-output'),
+  getLicenseStatus: () => ipcRenderer.invoke('license:status'),
+  activateLicense: (ticket: string) => ipcRenderer.invoke('license:activate', ticket),
+  listPendingLicenseSeals: () => ipcRenderer.invoke('license:pending-seals'),
+  emergencySealRecording: (sessionDir: string, sessionId: string) => (
+    ipcRenderer.invoke('license:emergency-seal', { session_dir: sessionDir, session_id: sessionId })
+  ),
+  onLicenseChanged: (listener: (status: unknown) => void) => {
+    const wrapped = (_event: Electron.IpcRendererEvent, status: unknown) => listener(status);
+    ipcRenderer.on('license:changed', wrapped);
+    return () => ipcRenderer.removeListener('license:changed', wrapped);
+  },
   getLocale: () => ipcRenderer.invoke('app:get-locale'),
   setLocale: (locale: string) => ipcRenderer.invoke('app:set-locale', locale),
   onLocaleChanged: (listener: (locale: string) => void) => {

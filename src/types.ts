@@ -1,3 +1,30 @@
+export type LicenseReason =
+  | 'unlicensed'
+  | 'malformed'
+  | 'bad_signature'
+  | 'unknown_kid'
+  | 'wrong_machine'
+  | 'expired'
+  | 'clock_rollback'
+  | 'fingerprint_unavailable';
+
+export type LicenseStatus = {
+  state: 'valid' | 'invalid';
+  reason: LicenseReason | null;
+  machineCode: string;
+  licensee: string | null;
+  expiresAt: number | null;
+  daysRemaining: number | null;
+  issuedAt: number | null;
+  kid: string | null;
+};
+
+export type PendingLicenseSeal = {
+  session_id: string;
+  session_dir: string;
+  status: string;
+};
+
 export type ScriptItem = { id: string; text: string; label: string };
 
 export type Attempt = {
