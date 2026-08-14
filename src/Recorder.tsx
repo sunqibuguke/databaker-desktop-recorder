@@ -3392,7 +3392,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             <span className={`item-state ${item.status}`}>{item.status === 'accepted' ? <Icon name="check" size={12} /> : item.status === 'skipped' ? '—' : String(index + 1).padStart(2, '0')}</span>
             <span><strong>{item.id}</strong><small>{item.text}</small></span>
             <span className="item-meta">
-              <em>{statusLabel(item.status)}</em>
+              <em className={item.status === 'accepted' ? 'accepted' : undefined}>{statusLabel(item.status)}</em>
               <ItemSilenceMarkPills marks={marks} />
             </span>
           </button>;

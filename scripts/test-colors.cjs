@@ -16,7 +16,7 @@ const REQUIRED_TOKENS = [
   'text', 'text-bright', 'text-soft', 'text-2', 'label', 'muted', 'quiet', 'faint',
   'accent', 'accent-fill', 'accent-fill-hover', 'accent-ink', 'accent-muted',
   'accent-tint', 'accent-soft', 'accent-wash', 'accent-line',
-  'record', 'warning', 'ready', 'post-ready', 'danger', 'focus',
+  'record', 'warning', 'ready', 'success', 'success-muted', 'success-fill', 'success-line', 'post-ready', 'danger', 'focus',
   'danger-soft', 'warning-soft', 'shadow', 'shadow-soft', 'highlight', 'scrim', 'brand-tile', 'prompter-live',
 ];
 const NEAR_TOKEN_LIMIT = 8;
