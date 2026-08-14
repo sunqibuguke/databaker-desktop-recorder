@@ -1,0 +1,146 @@
+name: License Issuer
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'tools/license-issuer-exe/**'
+      - 'scripts/test-license-issuer-exe.cjs'
+      - 'scripts/package-license-issuer.cjs'
+      - 'electron/license.ts'
+      - '.github/workflows/license-issuer.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'tools/license-issuer-exe/**'
+      - 'scripts/test-license-issuer-exe.cjs'
+      - 'scripts/package-license-issuer.cjs'
+      - 'electron/license.ts'
+      - '.github/workflows/license-issuer.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: license-issuer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Format, lint, golden ticket
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt clippy
+          rustup default stable
+
+      - name: Use crates.io on the hosted runner
+        run: rm -f .cargo/config.toml
+
+      - name: Cache issuer crates
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: tools/license-issuer-exe
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Compile license module
+        run: npx tsc -p electron/tsconfig.json
+
+      - name: Test native issuer
+        run: node scripts/test-license-issuer-exe.cjs
+
+  windows:
+    name: Windows exe
+    runs-on: windows-latest
+    needs: test
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up stable Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Use crates.io on the hosted runner
+        shell: pwsh
+        run: Remove-Item .cargo/config.toml -ErrorAction SilentlyContinue
+
+      - name: Cache issuer crates
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: tools/license-issuer-exe
+
+      - name: Package issuer
+        run: node scripts/package-license-issuer.cjs
+
+      - name: Upload Windows exe
+        uses: actions/upload-artifact@v6
+        with:
+          name: DataBaker-License-Issuer-Windows-x64
+          path: release/issuer/
+          if-no-files-found: error
+          retention-days: 14
+
+  macos:
+    name: macOS binary
+    runs-on: macos-latest
+    needs: test
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Use crates.io on the hosted runner
+        run: rm -f .cargo/config.toml
+
+      - name: Cache issuer crates
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: tools/license-issuer-exe
+
+      - name: Package issuer
+        run: node scripts/package-license-issuer.cjs
+
+      - name: Upload macOS binary
+        uses: actions/upload-artifact@v6
+        with:
+          name: DataBaker-License-Issuer-macOS
+          path: release/issuer/
+          if-no-files-found: error
+          retention-days: 14

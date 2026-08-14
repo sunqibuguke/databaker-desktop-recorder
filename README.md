@@ -48,19 +48,30 @@ macOS 只用于开发：`npm run dev` 会在点击「启用录音」后走 Elect
 
 新安装默认只显示激活页：本机机器码 + 复制 + 授权码输入。授权过期、换机或系统时间回拨也会回到同一页。
 
-工位操作员把机器码发给项目经理。项目经理使用独立注册机签发绑定该机器的授权码：
+工位操作员把机器码发给项目经理。项目经理使用独立注册机签发绑定该机器的授权码。注册机是原生小工具，不依赖 Electron。
+
+本机打开窗口：
 
 ```bash
 npm run license:issuer
 ```
 
+打出可分发文件（Mac 本地得到 macOS 可执行文件，Windows 得到 `.exe`）：
+
+```bash
+npm run package:issuer
+```
+
+产物在 `release/issuer/`。把正式私钥 `license-2026a.pem` 放到程序同一目录后再发给项目经理。Windows exe 也可在 GitHub Actions 工作流 `License Issuer` 里构建，产物名为 `DataBaker-License-Issuer-Windows-x64`。
+
 技术支持也可用命令行：
 
 ```bash
 npm run license:issue -- --machine A7K2-9M3P-Q4WX --subject "客户A-工位3" --days 365
+./release/issuer/DataBaker-License-Issuer --machine A7K2-9M3P-Q4WX --subject "客户A-工位3" --days 365
 ```
 
-私钥默认放在 `tools/license-issuer/keys/license-2026a.pem`，不进 git，也不打进采集安装包。可用 `DATABAKER_LICENSE_PRIVATE_KEY_FILE` 覆盖路径。可选 `DATABAKER_LICENSE_ISSUER_PASSWORD` 给注册机加一口令。
+私钥默认放在 `tools/license-issuer/keys/license-2026a.pem`，不进 git，也不打进采集安装包或注册机二进制。可用 `DATABAKER_LICENSE_PRIVATE_KEY_FILE` 覆盖路径。可选 `DATABAKER_LICENSE_ISSUER_PASSWORD` 给注册机加一口令。
 
 ## 验证与打包
 

@@ -3,6 +3,7 @@ dist/
 dist-electron/
 release/
 engine/target/
+tools/license-issuer-exe/target/
 build/bin/
 .tooling/
 .DS_Store

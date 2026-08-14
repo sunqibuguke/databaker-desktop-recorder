@@ -1,0 +1,30 @@
+[package]
+name = "databaker-license-issuer"
+version = "0.1.0"
+edition = "2021"
+license = "Proprietary"
+description = "DataBaker offline license issuer"
+publish = false
+
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:rfd"]
+
+[dependencies]
+ed25519-dalek = { version = "2.2", features = ["pkcs8", "pem"] }
+eframe = { version = "0.32", optional = true }
+rfd = { version = "0.15", optional = true }
+unicode-normalization = "0.1"
+uuid = { version = "1.18", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[[bin]]
+name = "databaker-license-issuer"
+path = "src/main.rs"
