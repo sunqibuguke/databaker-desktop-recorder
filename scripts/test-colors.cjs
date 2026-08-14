@@ -81,6 +81,12 @@ function main() {
   assert.match(css, /white-space/);
   assert.match(css, /color:\s*var\(--text\)/);
   assert.match(css, /background:\s*var\(--ink\)/);
+  assert.doesNotMatch(css, /\.prompter-shell\s*\{[^}]*border-(?:top|bottom)\s*:/);
+  assert.doesNotMatch(
+    css,
+    /\.prompter-shell\.(?:checking|pending|recording|ready|fault)\s*\{[^}]*\bbackground\s*:/,
+    'prompter cue states must not wash the page background',
+  );
 
   const tokens = colorTokens(rootBlock(css));
   const names = new Set(tokens.map((token) => token.name));
