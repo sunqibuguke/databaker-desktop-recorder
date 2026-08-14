@@ -1,6 +1,7 @@
 export type AutomationRules = {
   autoStartNext: boolean;
   headTailSilence: boolean;
+  enforceHeadTailSilence: boolean;
   discardEmpty: boolean;
   envCheck: boolean;
   almostSilent: boolean;
@@ -10,6 +11,7 @@ export type AutomationRules = {
 export const DEFAULT_AUTOMATION_RULES: AutomationRules = {
   autoStartNext: true,
   headTailSilence: true,
+  enforceHeadTailSilence: true,
   discardEmpty: true,
   envCheck: true,
   almostSilent: false,
@@ -31,6 +33,10 @@ export function normalizeAutomationRules(value: unknown): AutomationRules {
   return {
     autoStartNext: asBoolean(source.autoStartNext, DEFAULT_AUTOMATION_RULES.autoStartNext),
     headTailSilence: asBoolean(source.headTailSilence, DEFAULT_AUTOMATION_RULES.headTailSilence),
+    enforceHeadTailSilence: asBoolean(
+      source.enforceHeadTailSilence,
+      DEFAULT_AUTOMATION_RULES.enforceHeadTailSilence,
+    ),
     discardEmpty: asBoolean(source.discardEmpty, DEFAULT_AUTOMATION_RULES.discardEmpty),
     envCheck: asBoolean(source.envCheck, DEFAULT_AUTOMATION_RULES.envCheck),
     almostSilent: asBoolean(source.almostSilent, DEFAULT_AUTOMATION_RULES.almostSilent),

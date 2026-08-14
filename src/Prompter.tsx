@@ -14,6 +14,7 @@ import {
   type PrompterAppearance,
 } from './prompter-appearance';
 import { Icon } from './studio-chrome';
+import { prompterShowsSilenceRing } from './prompter-cues';
 import type { PrompterCue, PrompterState } from './types';
 
 const CUE_RING_RADIUS = 7;
@@ -28,7 +29,7 @@ function appearanceStorage(): Storage | null {
 }
 
 function PrompterCueMark({ cue, progress }: { cue: PrompterCue; progress: number }) {
-  if (cue === 'pending' || cue === 'checking') {
+  if (prompterShowsSilenceRing(cue, progress)) {
     const clamped = Math.max(0, Math.min(1, progress));
     return <svg className="prompter-cue-ring" viewBox="0 0 18 18" aria-hidden="true">
       <circle className="prompter-cue-ring-track" cx="9" cy="9" r={CUE_RING_RADIUS} />

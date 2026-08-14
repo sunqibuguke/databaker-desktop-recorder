@@ -643,9 +643,14 @@ export function installDevRecorderMock() {
       }
       const requiredSilence = mockSampleRate * snapshot.silence_duration_ms / 1_000;
       const forcedWithoutTailSilence = silenceSamples < requiredSilence;
+      if (data.force !== true && firstAttemptSignalSample && forcedWithoutTailSilence) {
+        throw new Error('尾静音未满，不能结束本句');
+      }
       const attempt: Attempt = {
         attempt_id: activeAttempt.attempt_id,
-        start_sample: activeAttempt.recording_started_sample,
+        start_sample: data.enforce_silence === true && activeAttempt.head_silence_passed_sample > 0
+          ? activeAttempt.head_silence_passed_sample
+          : activeAttempt.recording_started_sample,
         recording_started_sample: activeAttempt.recording_started_sample,
         head_silence_armed_sample: activeAttempt.head_silence_armed_sample,
         head_silence_passed_sample: activeAttempt.head_silence_passed_sample,

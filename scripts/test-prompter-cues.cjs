@@ -6,6 +6,7 @@ const { pathToFileURL } = require('node:url');
 
 async function main() {
   const {
+    prompterShowsSilenceRing,
     readerCueHasKeyboardHint,
     readerCueKey,
     readerFacingCue,
@@ -17,6 +18,7 @@ async function main() {
   assert.equal(resolveMonitorCue('pending', true), 'pending');
   assert.equal(resolveMonitorCue('fault', true), 'fault');
   assert.equal(readerFacingCue('ready'), 'recording');
+  assert.equal(readerFacingCue('ready', true), 'ready');
   assert.equal(readerFacingCue('recording'), 'recording');
   assert.equal(readerFacingCue('fault'), 'fault');
 
@@ -26,8 +28,13 @@ async function main() {
   assert.equal(readerCueKey('pending'), 'hush');
   assert.equal(readerCueKey('checking'), 'hush');
   assert.equal(readerCueKey('recording'), 'read');
-  assert.equal(readerCueKey('ready'), 'read', 'tail-ready must not tell the reader to stop');
+  assert.equal(readerCueKey('ready'), 'read', 'tail-ready must not tell the reader to stop unless enforced');
+  assert.equal(readerCueKey('ready', true), 'stop');
   assert.equal(readerCueKey('fault'), 'halt');
+  assert.equal(prompterShowsSilenceRing('pending', 0.4), true);
+  assert.equal(prompterShowsSilenceRing('recording', 0.4), true);
+  assert.equal(prompterShowsSilenceRing('recording', 0), false);
+  assert.equal(prompterShowsSilenceRing('ready', 1), false);
 
   assert.equal(readerCueHasKeyboardHint('先别出声'), false);
   assert.equal(readerCueHasKeyboardHint('请朗读'), false);

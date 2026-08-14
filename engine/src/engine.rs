@@ -428,6 +428,8 @@ pub struct StopAttemptPayload {
     pub force: bool,
     #[serde(default = "default_true")]
     pub discard_empty: bool,
+    #[serde(default)]
+    pub enforce_silence: bool,
 }
 
 impl Default for StopAttemptPayload {
@@ -435,6 +437,7 @@ impl Default for StopAttemptPayload {
         Self {
             force: false,
             discard_empty: true,
+            enforce_silence: false,
         }
     }
 }
@@ -3094,7 +3097,12 @@ impl Engine {
         }))
     }
 
-    pub fn stop_attempt(&mut self, force: bool, discard_empty: bool) -> Result<Value> {
+    pub fn stop_attempt(
+        &mut self,
+        force: bool,
+        discard_empty: bool,
+        enforce_silence: bool,
+    ) -> Result<Value> {
         let session = self.active_session_mut()?;
         session.ensure_metadata_mutation_allowed()?;
         let active = session
@@ -3165,13 +3173,15 @@ impl Engine {
                 "forced": true,
             }));
         }
-        let _ = force;
         let head_silence_passed_sample = analysis.head_silence_passed_sample;
         let required_silence_samples = session.required_silence_samples();
         let last_signal_sample = analysis.last_signal_sample.max(content_started_sample);
         let tail_silence_samples =
             captured_boundary.saturating_sub(last_signal_sample.min(captured_boundary));
         let forced_without_tail_silence = tail_silence_samples < required_silence_samples;
+        if !force && content_started_sample > 0 && forced_without_tail_silence {
+            bail!("尾静音未满，不能结束本句");
+        }
         let end_sample = match session.wait_until_committed(captured_boundary) {
             Ok(_) => captured_boundary,
             Err(error) if session.faulted.load(Ordering::Acquire) => {
@@ -3228,7 +3238,11 @@ impl Engine {
             attempt_id: active.attempt_id.clone(),
             // The take begins at the operator click. The pending timer that
             // follows is the configured head pad.
-            start_sample: active.recording_started_sample,
+            start_sample: if enforce_silence && head_silence_passed_sample > 0 {
+                head_silence_passed_sample
+            } else {
+                active.recording_started_sample
+            },
             recording_started_sample: active.recording_started_sample,
             head_silence_armed_sample: analysis.head_silence_armed_sample,
             head_silence_passed_sample,
@@ -9934,7 +9948,7 @@ mod tests {
         engine.session = Some(session);
 
         engine.start_attempt("001").unwrap();
-        let before_pass = engine.stop_attempt(true, true).unwrap();
+        let before_pass = engine.stop_attempt(true, true, false).unwrap();
         assert_eq!(before_pass["discarded"], true);
         assert!(before_pass["attempt"].is_null());
 
@@ -9954,7 +9968,7 @@ mod tests {
                 .phase
                 .store(HEAD_SILENCE_PASSED, Ordering::Release);
         }
-        let before_speech = engine.stop_attempt(true, true).unwrap();
+        let before_speech = engine.stop_attempt(true, true, false).unwrap();
         assert_eq!(before_speech["discarded"], true);
         assert!(before_speech["attempt"].is_null());
         assert!(
@@ -9981,7 +9995,7 @@ mod tests {
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
 
-        let stopped = engine.stop_attempt(true, true).unwrap();
+        let stopped = engine.stop_attempt(true, true, false).unwrap();
 
         assert_eq!(stopped["discarded"], true);
         assert!(stopped["attempt"].is_null());
@@ -10039,7 +10053,7 @@ mod tests {
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
 
-        let stopped = engine.stop_attempt(true, false).unwrap();
+        let stopped = engine.stop_attempt(true, false, false).unwrap();
 
         assert_eq!(stopped["discarded"], Value::Null);
         assert_eq!(stopped["attempt"]["attempt_id"], "001-a1");
@@ -10071,7 +10085,7 @@ mod tests {
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
 
-        assert!(engine.stop_attempt(true, true).is_err());
+        assert!(engine.stop_attempt(true, true, false).is_err());
 
         let session = engine.session.as_ref().unwrap();
         assert!(session.active_attempt.is_some());
@@ -10267,7 +10281,7 @@ mod tests {
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
 
-        let stopped = engine.stop_attempt(true, true).unwrap();
+        let stopped = engine.stop_attempt(true, true, false).unwrap();
 
         assert_eq!(stopped["forced"], true);
         assert_eq!(stopped["attempt"]["attempt_id"], "001-a2");
@@ -10307,8 +10321,8 @@ mod tests {
     }
 
     #[test]
-    fn stop_without_force_keeps_speech_when_tail_silence_is_short() {
-        let root = test_root("ungated-stop-short-tail");
+    fn stop_without_force_rejects_speech_when_tail_silence_is_short() {
+        let root = test_root("gated-stop-short-tail");
         let mut session = prepare_metadata_test_session(&root);
         session.snapshot.audio_format.sample_rate = 100;
         session.snapshot.silence_duration_ms = 200;
@@ -10317,6 +10331,53 @@ mod tests {
         session.committed.store(100, Ordering::Release);
         session.analyzed_samples.store(100, Ordering::Release);
         session.last_signal_sample.store(95, Ordering::Release);
+        session
+            .attempt_signal_start_sample
+            .store(50, Ordering::Release);
+        session
+            .head_silence
+            .armed_sample
+            .store(20, Ordering::Release);
+        session
+            .head_silence
+            .progress_samples
+            .store(20, Ordering::Release);
+        session
+            .head_silence
+            .passed_sample
+            .store(40, Ordering::Release);
+        session
+            .head_silence
+            .phase
+            .store(HEAD_SILENCE_SPEECH_STARTED, Ordering::Release);
+        session.active_attempt = Some(ActiveAttempt {
+            item_id: "001".to_string(),
+            attempt_id: "001-a1".to_string(),
+            start_sample: 20,
+            recording_started_sample: 20,
+            input_discontinuity_count_at_start: 0,
+        });
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+
+        let error = engine.stop_attempt(false, true, false).unwrap_err();
+        assert!(format!("{error:#}").contains("尾静音未满"), "{error:#}");
+        assert!(engine.session.as_ref().unwrap().active_attempt.is_some());
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn enforce_silence_starts_the_take_at_head_silence_pass() {
+        let root = test_root("enforce-silence-start");
+        let mut session = prepare_metadata_test_session(&root);
+        session.snapshot.audio_format.sample_rate = 100;
+        session.snapshot.silence_duration_ms = 200;
+        session.head_silence = HeadSilenceMonitor::new(20);
+        session.captured.store(100, Ordering::Release);
+        session.committed.store(100, Ordering::Release);
+        session.analyzed_samples.store(100, Ordering::Release);
+        session.last_signal_sample.store(80, Ordering::Release);
         session
             .attempt_signal_start_sample
             .store(50, Ordering::Release);
@@ -10353,11 +10414,10 @@ mod tests {
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
 
-        let stopped = engine.stop_attempt(false, true).unwrap();
-
-        assert_eq!(stopped["attempt"]["start_sample"], 20);
-        assert_eq!(stopped["attempt"]["forced_without_tail_silence"], true);
-        assert_eq!(stopped["attempt"]["tail_silence_samples"], 5);
+        let stopped = engine.stop_attempt(true, true, true).unwrap();
+        assert_eq!(stopped["attempt"]["start_sample"], 40);
+        assert_eq!(stopped["attempt"]["recording_started_sample"], 20);
+        assert_eq!(stopped["attempt"]["head_silence_passed_sample"], 40);
         engine
             .session
             .as_mut()
@@ -10435,7 +10495,7 @@ mod tests {
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
 
-        let stopped = engine.stop_attempt(false, true).unwrap();
+        let stopped = engine.stop_attempt(false, true, false).unwrap();
 
         assert_eq!(stopped["recovered_discontinuity"], true);
         assert_eq!(stopped["attempt"]["status"], "recorded");
@@ -10520,7 +10580,7 @@ mod tests {
 
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
-        let stopped = engine.stop_attempt(true, true).unwrap();
+        let stopped = engine.stop_attempt(true, true, false).unwrap();
 
         assert_eq!(stopped["interrupted"], true);
         assert_eq!(stopped["attempt"]["status"], "interrupted");

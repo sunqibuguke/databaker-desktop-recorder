@@ -54,6 +54,8 @@ async function main() {
   assert.equal(t('recorder.showPostTakeReviewHint'), '首是点击到开口，尾是最后有声到停止。等待朗读是定时器，不是首静音。关闭只藏账单，空格照旧。');
   assert.equal(t('recorder.automationRules'), '自动化规则');
   assert.equal(t('recorder.ruleHeadTail'), '首尾静音检查');
+  assert.equal(t('recorder.ruleEnforceHeadTail'), '强制收尾静音');
+  assert.equal(t('recorder.waitTailSilence'), '等待尾静音');
   assert.equal(t('recorder.ruleDiscardEmpty'), '空录丢弃');
   assert.equal(t('recorder.ruleEnvCheck'), '进任务环境检测');
   assert.equal(t('recorder.ruleAlmostSilent'), '几乎无声提示');

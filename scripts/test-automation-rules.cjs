@@ -17,6 +17,7 @@ async function main() {
   assert.deepEqual(DEFAULT_AUTOMATION_RULES, {
     autoStartNext: true,
     headTailSilence: true,
+    enforceHeadTailSilence: true,
     discardEmpty: true,
     envCheck: true,
     almostSilent: false,
@@ -65,6 +66,11 @@ async function main() {
     normalizeAutomationRules({ headTailSilence: false }).autoStartNext,
     true,
     'older saved rules without autoStartNext must default on',
+  );
+  assert.equal(
+    normalizeAutomationRules({ headTailSilence: false }).enforceHeadTailSilence,
+    true,
+    'older saved rules without enforceHeadTailSilence must default on',
   );
 
   assert.deepEqual(

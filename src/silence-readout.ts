@@ -262,6 +262,44 @@ export function liveSilenceHint(input: {
   };
 }
 
+export function canFinishSpokenTake(input: {
+  enforce: boolean;
+  pending: boolean;
+  spoken: boolean;
+  tailMet: boolean;
+}): boolean {
+  if (input.pending || !input.spoken || !input.enforce) return true;
+  return input.tailMet;
+}
+
+export function takeStartSample(input: {
+  enforce: boolean;
+  recordingStartedSample: number;
+  headSilencePassedSample: number;
+}): number {
+  if (input.enforce && input.headSilencePassedSample > 0) {
+    return input.headSilencePassedSample;
+  }
+  return input.recordingStartedSample;
+}
+
+export function liveSilenceProgress(input: {
+  pending: boolean;
+  spoken: boolean;
+  pendingRemainingMs: number;
+  liveSilenceMs: number;
+  requiredMs: number;
+}): number {
+  const required = Math.max(input.requiredMs, 1);
+  if (input.pending) {
+    return Math.max(0, Math.min(1, 1 - Math.max(0, input.pendingRemainingMs) / required));
+  }
+  if (input.spoken) {
+    return Math.max(0, Math.min(1, Math.max(0, input.liveSilenceMs) / required));
+  }
+  return 0;
+}
+
 export function liveHeadMsFromMeter(input: {
   sampleRate: number;
   armedSample: number;

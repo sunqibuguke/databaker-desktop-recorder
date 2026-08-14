@@ -36,10 +36,12 @@ import { WebGLWaveform } from './WebGLWaveform';
 import { PreviewPlayer } from './PreviewPlayer';
 import { inputQualityWarning, shouldHandleLiveMeter } from './input-quality';
 import {
+  canFinishSpokenTake,
   itemSilenceMarks,
   liveHeadMsFromMeter,
   liveSilenceHint,
   liveSilencePair,
+  liveSilenceProgress,
   recordedMonitorSentenceLabel,
   reviewSilencePair,
   shouldUseRecordedSilencePair,
@@ -761,6 +763,23 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   );
   const liveSilenceMs = Math.round((meter.silence_samples ?? 0) / Math.max(sampleRateForDisplay, 1) * 1_000);
   const tailSilenceMet = liveSilenceMs >= effectiveSilenceDurationMs;
+  const enforceHeadTailSilence = automationRules.enforceHeadTailSilence;
+  const canFinishTake = canFinishSpokenTake({
+    enforce: enforceHeadTailSilence,
+    pending: isPendingTake,
+    spoken: Boolean(hasSpoken),
+    tailMet: tailSilenceMet,
+  });
+  const waitingForTailSilence = Boolean(
+    recording && enforceHeadTailSilence && hasSpoken && !tailSilenceMet,
+  );
+  const silenceProgress = liveSilenceProgress({
+    pending: isPendingTake,
+    spoken: Boolean(hasSpoken),
+    pendingRemainingMs,
+    liveSilenceMs,
+    requiredMs: effectiveSilenceDurationMs,
+  });
   const reviewAttempt = !recording && currentItem
     ? currentItem.attempts.find((attempt) => attempt.attempt_id === reviewAttemptId)
       ?? currentItem.attempts.find((attempt) => attempt.attempt_id === currentItem.selected_attempt_id)
@@ -861,7 +880,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           ? 'review'
           : 'idle';
   const cue = resolveMonitorCue(captureFault ? 'fault' : normalCue, tailSilenceMet);
-  const readerCue = readerFacingCue(cue);
+  const readerCue = readerFacingCue(cue, enforceHeadTailSilence);
   const liveCueLabel = captureFault
     ? t('cue.stopRead', { title: captureFaultCopy.title })
     : noiseCheckBlocksAttempt
@@ -880,7 +899,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     itemStatus: currentItem?.status,
     liveLabel: liveCueLabel,
   });
-  const readerCueLabel = t(`readerCue.${readerCueKey(cue)}`);
+  const readerCueLabel = t(`readerCue.${readerCueKey(cue, enforceHeadTailSilence)}`);
   const prompterState = useMemo<PrompterState>(() => ({
     sessionName: snapshot?.session_id ?? sessionName,
     sequence: workflowComplete ? items.length : currentItem ? currentIndex + 1 : 0,
@@ -891,12 +910,12 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     cue: readerCue,
     cueLabel: readerCueLabel,
     readerCueLabel,
-    silenceProgress: isPendingTake
-      ? 1 - pendingRemainingMs / Math.max(effectiveSilenceDurationMs, 1)
+    silenceProgress: isPendingTake || (enforceHeadTailSilence && recording && Boolean(hasSpoken))
+      ? silenceProgress
       : 0,
     silenceDurationMs: effectiveSilenceDurationMs,
     qualityWarning: '',
-  }), [captureFault, cue, currentIndex, currentItem?.id, currentItem?.label, currentItem?.text, effectiveSilenceDurationMs, isPendingTake, items.length, noiseCheckBlocksAttempt, readerCue, readerCueLabel, sessionName, snapshot?.session_id, t, workflowComplete]);
+  }), [captureFault, cue, currentIndex, currentItem?.id, currentItem?.label, currentItem?.text, effectiveSilenceDurationMs, enforceHeadTailSilence, hasSpoken, isPendingTake, items.length, noiseCheckBlocksAttempt, readerCue, readerCueLabel, recording, sessionName, silenceProgress, snapshot?.session_id, t, workflowComplete]);
 
   async function run<T>(label: string, action: () => Promise<T>): Promise<T | null> {
     setBusy(label);
@@ -2120,7 +2139,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     if (!recording) return true;
     if (!currentItem) return false;
     const cancelingPendingTake = isPendingTake;
-    const force = forceOverride ?? true;
+    const force = forceOverride ?? (isPendingTake || !hasSpoken || !enforceHeadTailSilence);
     const result = await run(t('notice.sealingTake'), () => window.recorder.request<{
       item_id: string;
       attempt: Attempt | null;
@@ -2133,6 +2152,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       item_id: currentItem.id,
       force,
       discard_empty: automationRules.discardEmpty,
+      enforce_silence: enforceHeadTailSilence,
     }));
     if (!result) return false;
     setRecording(false);
@@ -2896,7 +2916,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       }
       if (event.code === 'Space') {
         event.preventDefault();
-        if (recording) void stopAttempt();
+        if (recording) {
+          if (!canFinishTake) return;
+          void stopAttempt();
+        }
         else {
           const action = workflowShortcutAction(event.code, event.key, primaryAction, Boolean(currentItem));
           if (action === 'finish') finishSession();
@@ -3408,7 +3431,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
                 : noiseCheckBlocksAttempt && primaryAction === 'start'
                   ? <button data-testid="main-transport" className="main-transport waiting" onClick={() => snapshot && void runSessionNoiseCheck(sessionDir, snapshot)} disabled={noiseCheckRunning || Boolean(busy)}><span><Icon name="meter" /></span><strong>{noiseCheckRunning ? t('recorder.noiseChecking') : t('recorder.finishNoiseFirst')}</strong></button>
                 : recording
-                  ? <button data-testid="main-transport" className={`main-transport ${isPendingTake ? 'waiting' : 'stop'}`} onClick={() => void stopAttempt()} disabled={Boolean(busy)}><span><Icon name="stop" /></span><strong>{isPendingTake ? t('recorder.pendingCancel') : t('recorder.finishSentence')}</strong>{isPendingTake ? <div className="transport-keys"><kbd>ESC</kbd><kbd>SPACE</kbd></div> : <kbd>SPACE</kbd>}</button>
+                  ? <button data-testid="main-transport" className={`main-transport ${isPendingTake || waitingForTailSilence ? 'waiting' : cue === 'ready' ? 'accept' : 'stop'}`} onClick={() => void stopAttempt()} disabled={Boolean(busy) || waitingForTailSilence}><span><Icon name="stop" /></span><strong>{isPendingTake ? t('recorder.pendingCancel') : waitingForTailSilence ? t('recorder.waitTailSilence') : t('recorder.finishSentence')}</strong>{isPendingTake ? <div className="transport-keys"><kbd>ESC</kbd><kbd>SPACE</kbd></div> : waitingForTailSilence ? null : <kbd>SPACE</kbd>}</button>
                 : primaryAction === 'accept'
                   ? <button data-testid="main-transport" className="main-transport accept" onClick={() => void acceptAttempt()} disabled={Boolean(busy)}><span><Icon name="check" /></span><strong>{acceptButtonLabel}</strong><kbd>SPACE</kbd></button>
                   : primaryAction === 'finish'
@@ -3434,7 +3457,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
               <section className="monitor-section"><h3>{t('recorder.currentState')}</h3><dl className="property-list"><div><dt>{t('recorder.sentence')}</dt><dd>{cueLabel}</dd></div><div><dt>{t('recorder.headTail')}</dt><dd><SilencePairReadout pair={silencePair} /></dd></div><div><dt>{t('recorder.disk')}</dt><dd>{meter.storage_status === 'healthy' ? t('recorder.diskHealthy') : meter.storage_status === 'warning' ? t('recorder.diskWarning') : t('recorder.diskCritical')}</dd></div></dl></section>
               <button className="detection-summary" onClick={() => setMonitorPanelTab('detection')}><span><strong>{t('recorder.silenceJudge')}</strong><small>{noiseThresholdDbfs} dBFS / {(effectiveSilenceDurationMs / 1_000).toFixed(1)} {t('recorder.seconds')}</small></span><em>{t('recorder.adjust')}</em></button>
             </>}
-            {monitorPanelTab === 'detection' && <section className="monitor-section detection-settings"><h3>{t('recorder.detectionTitle')}</h3><p>{t('recorder.detectionHelp')}</p><div className="detection-setting"><header><span><strong>{t('recorder.threshold')}</strong><small>{t('recorder.currentRms', { value: liveRmsDbfs <= -96 ? '−∞' : `${liveRmsDbfs.toFixed(1)} dBFS` })}</small></span><output>{silenceThresholdDraftDbfs} <small>dBFS</small></output></header><div className="threshold-track"><i style={{ left: `${liveRmsOnThresholdScale}%` }} title={t('quality.currentRmsTitle', { value: liveRmsDbfs.toFixed(1) })} /><input data-testid="task-silence-threshold" aria-label={t('recorder.threshold')} aria-valuetext={`${silenceThresholdDraftDbfs} dBFS`} type="range" min="-72" max="-12" step="1" value={silenceThresholdDraftDbfs} onChange={(event) => setSilenceThresholdDraftDbfs(Number(event.target.value))} onPointerUp={(event) => void applyTaskSilenceSettings(Number(event.currentTarget.value), silenceDurationDraftMs)} onKeyUp={(event) => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) void applyTaskSilenceSettings(Number(event.currentTarget.value), silenceDurationDraftMs); }} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving} /></div><div className="threshold-labels"><span>{t('recorder.moreSensitive')}</span><span>{t('recorder.moreReject')}</span></div></div><div className="detection-setting"><header><span><strong>{t('recorder.duration')}</strong><small>{t('recorder.sameDuration')}</small></span><output>{(silenceDurationDraftMs / 1_000).toFixed(1)} <small>{t('recorder.seconds')}</small></output></header><input data-testid="task-silence-duration" aria-label={t('recorder.duration')} aria-valuetext={`${(silenceDurationDraftMs / 1_000).toFixed(1)} ${t('recorder.seconds')}`} type="range" min="200" max="5000" step="100" value={silenceDurationDraftMs} onChange={(event) => setSilenceDurationDraftMs(Number(event.target.value))} onPointerUp={(event) => void applyTaskSilenceSettings(silenceThresholdDraftDbfs, Number(event.currentTarget.value))} onKeyUp={(event) => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) void applyTaskSilenceSettings(silenceThresholdDraftDbfs, Number(event.currentTarget.value)); }} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving} /><div className="threshold-labels"><span>0.2 {t('recorder.seconds')}</span><span>5.0 {t('recorder.seconds')}</span></div></div><div className="automation-rules"><header><strong>{t('recorder.automationRules')}</strong><small>{t('recorder.automationRulesHelp')}</small></header><AutomationRuleRow testId="rule-auto-start-next" checked={automationRules.autoStartNext} title={t('recorder.ruleAutoStartNext')} hint={t('recorder.ruleAutoStartNextHint')} onChange={(enabled) => applyAutomationRule('autoStartNext', enabled)} /><AutomationRuleRow testId="rule-head-tail" checked={automationRules.headTailSilence} title={t('recorder.ruleHeadTail')} hint={t('recorder.ruleHeadTailHint')} onChange={(enabled) => applyAutomationRule('headTailSilence', enabled)} /><AutomationRuleRow testId="rule-discard-empty" checked={automationRules.discardEmpty} title={t('recorder.ruleDiscardEmpty')} hint={t('recorder.ruleDiscardEmptyHint')} onChange={(enabled) => applyAutomationRule('discardEmpty', enabled)} /><AutomationRuleRow testId="rule-env-check" checked={automationRules.envCheck} title={t('recorder.ruleEnvCheck')} hint={t('recorder.ruleEnvCheckHint')} onChange={(enabled) => applyAutomationRule('envCheck', enabled)} /><AutomationRuleRow testId="rule-almost-silent" checked={automationRules.almostSilent} title={t('recorder.ruleAlmostSilent')} hint={t('recorder.ruleAlmostSilentHint')} onChange={(enabled) => applyAutomationRule('almostSilent', enabled)} /><AutomationRuleRow testId="rule-peak-high" checked={automationRules.peakHigh} title={t('recorder.rulePeakHigh')} hint={t('recorder.rulePeakHighHint')} onChange={(enabled) => applyAutomationRule('peakHigh', enabled)} /></div><p className={`settings-apply-state ${silenceSettingsError ? 'error' : ''}`}>{silenceSettingsSaving ? t('recorder.applyingSettings') : silenceSettingsError || t('recorder.appliedSettings', { db: noiseThresholdDbfs, seconds: (effectiveSilenceDurationMs / 1_000).toFixed(1) })}</p><button className="restore-settings" onClick={() => void applyTaskSilenceSettings(taskInitialSilenceThresholdDbfs, taskInitialSilenceDurationMs)} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving || (noiseThresholdDbfs === taskInitialSilenceThresholdDbfs && silenceDurationMs === taskInitialSilenceDurationMs)}>{t('recorder.restoreInitial')}</button></section>}
+            {monitorPanelTab === 'detection' && <section className="monitor-section detection-settings"><h3>{t('recorder.detectionTitle')}</h3><p>{t('recorder.detectionHelp')}</p><div className="detection-setting"><header><span><strong>{t('recorder.threshold')}</strong><small>{t('recorder.currentRms', { value: liveRmsDbfs <= -96 ? '−∞' : `${liveRmsDbfs.toFixed(1)} dBFS` })}</small></span><output>{silenceThresholdDraftDbfs} <small>dBFS</small></output></header><div className="threshold-track"><i style={{ left: `${liveRmsOnThresholdScale}%` }} title={t('quality.currentRmsTitle', { value: liveRmsDbfs.toFixed(1) })} /><input data-testid="task-silence-threshold" aria-label={t('recorder.threshold')} aria-valuetext={`${silenceThresholdDraftDbfs} dBFS`} type="range" min="-72" max="-12" step="1" value={silenceThresholdDraftDbfs} onChange={(event) => setSilenceThresholdDraftDbfs(Number(event.target.value))} onPointerUp={(event) => void applyTaskSilenceSettings(Number(event.currentTarget.value), silenceDurationDraftMs)} onKeyUp={(event) => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) void applyTaskSilenceSettings(Number(event.currentTarget.value), silenceDurationDraftMs); }} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving} /></div><div className="threshold-labels"><span>{t('recorder.moreSensitive')}</span><span>{t('recorder.moreReject')}</span></div></div><div className="detection-setting"><header><span><strong>{t('recorder.duration')}</strong><small>{t('recorder.sameDuration')}</small></span><output>{(silenceDurationDraftMs / 1_000).toFixed(1)} <small>{t('recorder.seconds')}</small></output></header><input data-testid="task-silence-duration" aria-label={t('recorder.duration')} aria-valuetext={`${(silenceDurationDraftMs / 1_000).toFixed(1)} ${t('recorder.seconds')}`} type="range" min="200" max="5000" step="100" value={silenceDurationDraftMs} onChange={(event) => setSilenceDurationDraftMs(Number(event.target.value))} onPointerUp={(event) => void applyTaskSilenceSettings(silenceThresholdDraftDbfs, Number(event.currentTarget.value))} onKeyUp={(event) => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) void applyTaskSilenceSettings(silenceThresholdDraftDbfs, Number(event.currentTarget.value)); }} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving} /><div className="threshold-labels"><span>0.2 {t('recorder.seconds')}</span><span>5.0 {t('recorder.seconds')}</span></div></div><div className="automation-rules"><header><strong>{t('recorder.automationRules')}</strong><small>{t('recorder.automationRulesHelp')}</small></header><AutomationRuleRow testId="rule-auto-start-next" checked={automationRules.autoStartNext} title={t('recorder.ruleAutoStartNext')} hint={t('recorder.ruleAutoStartNextHint')} onChange={(enabled) => applyAutomationRule('autoStartNext', enabled)} /><AutomationRuleRow testId="rule-enforce-head-tail" checked={automationRules.enforceHeadTailSilence} title={t('recorder.ruleEnforceHeadTail')} hint={t('recorder.ruleEnforceHeadTailHint')} onChange={(enabled) => applyAutomationRule('enforceHeadTailSilence', enabled)} /><AutomationRuleRow testId="rule-head-tail" checked={automationRules.headTailSilence} title={t('recorder.ruleHeadTail')} hint={t('recorder.ruleHeadTailHint')} onChange={(enabled) => applyAutomationRule('headTailSilence', enabled)} /><AutomationRuleRow testId="rule-discard-empty" checked={automationRules.discardEmpty} title={t('recorder.ruleDiscardEmpty')} hint={t('recorder.ruleDiscardEmptyHint')} onChange={(enabled) => applyAutomationRule('discardEmpty', enabled)} /><AutomationRuleRow testId="rule-env-check" checked={automationRules.envCheck} title={t('recorder.ruleEnvCheck')} hint={t('recorder.ruleEnvCheckHint')} onChange={(enabled) => applyAutomationRule('envCheck', enabled)} /><AutomationRuleRow testId="rule-almost-silent" checked={automationRules.almostSilent} title={t('recorder.ruleAlmostSilent')} hint={t('recorder.ruleAlmostSilentHint')} onChange={(enabled) => applyAutomationRule('almostSilent', enabled)} /><AutomationRuleRow testId="rule-peak-high" checked={automationRules.peakHigh} title={t('recorder.rulePeakHigh')} hint={t('recorder.rulePeakHighHint')} onChange={(enabled) => applyAutomationRule('peakHigh', enabled)} /></div><p className={`settings-apply-state ${silenceSettingsError ? 'error' : ''}`}>{silenceSettingsSaving ? t('recorder.applyingSettings') : silenceSettingsError || t('recorder.appliedSettings', { db: noiseThresholdDbfs, seconds: (effectiveSilenceDurationMs / 1_000).toFixed(1) })}</p><button className="restore-settings" onClick={() => void applyTaskSilenceSettings(taskInitialSilenceThresholdDbfs, taskInitialSilenceDurationMs)} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving || (noiseThresholdDbfs === taskInitialSilenceThresholdDbfs && silenceDurationMs === taskInitialSilenceDurationMs)}>{t('recorder.restoreInitial')}</button></section>}
             {monitorPanelTab === 'task' && <section className="monitor-section"><h3>{t('recorder.taskParams')}</h3><dl className="property-list"><div><dt>{t('setup.inputDevice')}</dt><dd title={snapshot?.device_name}>{snapshot?.device_name || t('common.dash')}</dd></div><div><dt>{t('setup.shareMode')}</dt><dd>{captureShareModeLabel(snapshot?.capture_share_mode ?? captureShareMode)}</dd></div><div><dt>{t('setup.inputChannel')}</dt><dd>{snapshot?.audio_format.input_channel ?? 1}</dd></div><div><dt>{t('recorder.exportFormat')}</dt><dd>{sampleRateForDisplay / 1000}k / {snapshot?.audio_format.bit_depth}-bit {snapshot?.audio_format.encoding ?? ''}</dd></div><div><dt>{t('recorder.driverInputFormat')}</dt><dd>{snapshot?.input_sample_format?.toUpperCase() ?? t('common.dash')}</dd></div><div><dt>{t('recorder.envCeiling')}</dt><dd>{snapshot?.noise_threshold_dbfs ?? snapshot?.noise_check?.threshold_dbfs ?? t('common.dash')} dBFS</dd></div><div><dt>{t('recorder.accepted')}</dt><dd>{counts.accepted ?? 0} / {items.length}</dd></div><div><dt>{t('recorder.skipped')}</dt><dd>{counts.skipped ?? 0}</dd></div></dl><button className="button panel-action" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? t('recorder.locatePrompter') : t('recorder.openPrompter')}</button></section>}
             {monitorPanelTab === 'export' && snapshot && <section className="monitor-section monitor-export"><h3>{t('recorder.exportCurrent')}</h3><p>{captureActive ? recording ? t('recorder.exportWhileRecording') : t('recorder.exportWillPause') : t('recorder.exportIndependent')}</p>{exportDestinationPicker(sessionDir)}<div>
               <button onClick={() => void exportRecordingArtifact({ session_id: snapshot.session_id, session_dir: sessionDir }, 'full_track')} disabled={Boolean(busy) || recording}><Icon name="meter" /><span><strong>{t('recorder.fullTrackShort')}</strong><small>{artifactStatusCopy(workspaceRecording, 'full_track')}</small></span></button>

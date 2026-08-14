@@ -5,7 +5,10 @@ const { pathToFileURL } = require('node:url');
 async function main() {
   const {
     actualHeadSilenceMs,
+    canFinishSpokenTake,
     itemSilenceMarks,
+    liveSilenceProgress,
+    takeStartSample,
     liveSilenceHint,
     liveSilencePair,
     peakFromWaveformBins,
@@ -340,6 +343,40 @@ async function main() {
     itemStatus: 'accepted',
     liveLabel: '立即停止朗读 · 输入中断',
   }), '立即停止朗读 · 输入中断');
+
+  assert.equal(canFinishSpokenTake({ enforce: true, pending: true, spoken: false, tailMet: false }), true);
+  assert.equal(canFinishSpokenTake({ enforce: true, pending: false, spoken: false, tailMet: false }), true);
+  assert.equal(canFinishSpokenTake({ enforce: true, pending: false, spoken: true, tailMet: false }), false);
+  assert.equal(canFinishSpokenTake({ enforce: true, pending: false, spoken: true, tailMet: true }), true);
+  assert.equal(canFinishSpokenTake({ enforce: false, pending: false, spoken: true, tailMet: false }), true);
+
+  assert.equal(takeStartSample({
+    enforce: true,
+    recordingStartedSample: 0,
+    headSilencePassedSample: 48_000,
+  }), 48_000);
+  assert.equal(takeStartSample({
+    enforce: false,
+    recordingStartedSample: 0,
+    headSilencePassedSample: 48_000,
+  }), 0);
+
+  const headProgress = liveSilenceProgress({
+    pending: true,
+    spoken: false,
+    pendingRemainingMs: 250,
+    liveSilenceMs: 0,
+    requiredMs: 500,
+  });
+  assert.equal(headProgress, 0.5);
+  const tailProgress = liveSilenceProgress({
+    pending: false,
+    spoken: true,
+    pendingRemainingMs: 0,
+    liveSilenceMs: 400,
+    requiredMs: 500,
+  });
+  assert.equal(tailProgress, 0.8);
 
   console.log('silence readout tests passed');
 }
