@@ -62,16 +62,19 @@ npm run license:issuer
 npm run package:issuer
 ```
 
-产物在 `release/issuer/`。把正式私钥 `license-2026a.pem` 放到程序同一目录后再发给项目经理。Windows exe 也可在 GitHub Actions 工作流 `License Issuer` 里构建，产物名为 `DataBaker-License-Issuer-Windows-x64`。
+产物在 `release/issuer/`，会把 `tools/license-issuer/keys/license-2026a.pem` 一并放进同一目录，打开后自动签发。Windows exe 走 GitHub Actions 工作流 `License Issuer`：私钥不进 git，必须在仓库 secret 配置 `DATABAKER_LICENSE_PRIVATE_KEY`（PEM 全文），否则打包会失败。
 
 技术支持也可用命令行：
 
 ```bash
 npm run license:issue -- --machine A7K2-9M3P-Q4WX --subject "客户A-工位3" --days 365
 ./release/issuer/DataBaker-License-Issuer --machine A7K2-9M3P-Q4WX --subject "客户A-工位3" --days 365
+./release/issuer/DataBaker-License-Issuer --clear-local
 ```
 
-私钥默认放在 `tools/license-issuer/keys/license-2026a.pem`，不进 git，也不打进采集安装包或注册机二进制。可用 `DATABAKER_LICENSE_PRIVATE_KEY_FILE` 覆盖路径。可选 `DATABAKER_LICENSE_ISSUER_PASSWORD` 给注册机加一口令。
+窗口底部可以清空本机采集软件已激活的授权（`userData/license.json` 及其损坏备份）。请先退出采集软件。可用 `--license-file` 或 `DATABAKER_LICENSE_FILE` 指定文件。
+
+私钥默认放在 `tools/license-issuer/keys/license-2026a.pem`，不进 git，也不打进采集安装包。注册机打包会复制到程序旁并自动使用，窗口里不用选私钥，也不再要口令。
 
 ## 验证与打包
 

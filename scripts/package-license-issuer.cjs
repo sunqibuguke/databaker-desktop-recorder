@@ -30,6 +30,31 @@ function packagedName() {
   return 'DataBaker-License-Issuer';
 }
 
+function defaultKeyPath() {
+  return process.env.DATABAKER_LICENSE_PRIVATE_KEY_FILE
+    || path.join(ROOT, 'tools', 'license-issuer', 'keys', 'license-2026a.pem');
+}
+
+function stagePrivateKey() {
+  const dest = path.join(OUT_DIR, 'license-2026a.pem');
+  const source = defaultKeyPath();
+  if (fs.existsSync(source)) {
+    fs.copyFileSync(source, dest);
+    fs.chmodSync(dest, 0o600);
+    return dest;
+  }
+
+  const inline = process.env.DATABAKER_LICENSE_PRIVATE_KEY;
+  if (inline && /BEGIN [A-Z ]*PRIVATE KEY/.test(inline)) {
+    fs.writeFileSync(dest, `${inline.replace(/\r\n/g, '\n').trim()}\n`, { mode: 0o600 });
+    return dest;
+  }
+
+  throw new Error(
+    `找不到签发私钥：${source}。本地请放好 PEM；GitHub Actions 请在仓库 secret 里配置 DATABAKER_LICENSE_PRIVATE_KEY（PEM 全文）`,
+  );
+}
+
 function main() {
   cargo(['build', '--release', '--manifest-path', MANIFEST]);
   const source = path.join(ROOT, 'tools', 'license-issuer-exe', 'target', 'release', binName());
@@ -40,22 +65,21 @@ function main() {
   const target = path.join(OUT_DIR, packagedName());
   fs.copyFileSync(source, target);
   fs.chmodSync(target, 0o755);
+  const key = stagePrivateKey();
   fs.writeFileSync(path.join(OUT_DIR, '使用说明.txt'), `DataBaker 授权注册机
 
-把正式私钥 license-2026a.pem 放到本程序同一目录后再打开。
-不要把私钥打进采集安装包，也不要提交 git。
+双击打开，输入机器码和客户/工位名即可生成授权码。私钥已随程序打包。
+底部「清空本机授权」会删除本机采集软件已激活的授权，请先退出采集软件。
+不要把本目录随采集安装包分发，也不要提交 git。
 
-窗口：双击打开，输入机器码和客户/工位名，生成授权码。
 命令行：
   ${packagedName()} --machine A7K2-9M3P-Q4WX --subject 客户A-工位3 --days 365
-
-可选环境变量：
-  DATABAKER_LICENSE_PRIVATE_KEY_FILE   私钥路径
-  DATABAKER_LICENSE_ISSUER_PASSWORD    打开注册机前的口令
+  ${packagedName()} --clear-local
 `, 'utf8');
 
   const stats = fs.statSync(target);
-  console.log(`packed ${target} (${Math.ceil(stats.size / 1024)} KB)`);
+  const keyNote = key ? ` + ${path.basename(key)}` : '';
+  console.log(`packed ${target} (${Math.ceil(stats.size / 1024)} KB${keyNote})`);
 }
 
 main();

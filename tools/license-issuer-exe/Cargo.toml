@@ -8,12 +8,11 @@ publish = false
 
 [features]
 default = ["gui"]
-gui = ["dep:eframe", "dep:rfd"]
+gui = ["dep:eframe"]
 
 [dependencies]
 ed25519-dalek = { version = "2.2", features = ["pkcs8", "pem"] }
 eframe = { version = "0.32", optional = true }
-rfd = { version = "0.15", optional = true }
 unicode-normalization = "0.1"
 uuid = { version = "1.18", features = ["v4"] }
 

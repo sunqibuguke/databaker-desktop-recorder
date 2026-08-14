@@ -70,16 +70,6 @@ function main() {
   const ticket = issued.stdout.trim();
   assert.equal(ticket, GOLDEN);
 
-  const denied = runIssuer([
-    '--key', key,
-    '--kid', 'test1',
-    '--machine', 'A7K2-9M3P-Q4WX',
-    '--subject', '客户A-工位3',
-    '--password', 'wrong',
-  ], { DATABAKER_LICENSE_ISSUER_PASSWORD: 'secret' });
-  assert.notEqual(denied.status, 0);
-  assert.match(denied.stderr, /注册机口令不正确/);
-
   const license = loadLicenseModule();
   const publicKey = fs.readFileSync(path.join(ROOT, 'scripts', 'fixtures', 'license-test-only-test1.pub.pem'), 'utf8');
   const verified = license.verifyLicenseTicket(ticket, {
@@ -106,6 +96,24 @@ function main() {
   });
   assert.equal('claims' in freshVerified, true, JSON.stringify(freshVerified));
   assert.equal(freshVerified.claims.exp, null);
+
+  const tempRoot = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'databaker-issuer-clear-'));
+  const licenseFile = path.join(tempRoot, 'license.json');
+  const sidecar = path.join(tempRoot, 'license.json.corrupt-1');
+  const keep = path.join(tempRoot, 'output-root.json');
+  fs.writeFileSync(licenseFile, '{"schemaVersion":1,"ticket":"x"}\n');
+  fs.writeFileSync(sidecar, 'broken\n');
+  fs.writeFileSync(keep, '{}\n');
+  const cleared = runIssuer(['--clear-local', '--license-file', licenseFile]);
+  assert.equal(cleared.status, 0, cleared.stderr || cleared.stdout);
+  assert.match(cleared.stdout, /已删除 2 个授权文件/);
+  assert.equal(fs.existsSync(licenseFile), false);
+  assert.equal(fs.existsSync(sidecar), false);
+  assert.equal(fs.existsSync(keep), true);
+  const alreadyClear = runIssuer(['--clear-local', '--license-file', licenseFile]);
+  assert.equal(alreadyClear.status, 0, alreadyClear.stderr || alreadyClear.stdout);
+  assert.match(alreadyClear.stdout, /本机没有授权记录/);
+  fs.rmSync(tempRoot, { recursive: true, force: true });
 
   console.log('license issuer exe tests passed');
 }

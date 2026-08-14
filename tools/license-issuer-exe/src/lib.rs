@@ -1,8 +1,12 @@
 mod crockford;
+mod local;
 mod ticket;
 
 use std::path::{Path, PathBuf};
 
+pub use local::{
+    clear_local_license, probe_local_license, ClearLocalLicenseResult, LocalLicenseProbe,
+};
 pub use ticket::{
     inspect_license_ticket, issue_license, normalize_machine_code, IssueLicenseInput,
     LicenseClaims, DEFAULT_KID, LICENSE_TICKET_PREFIX,
@@ -61,13 +65,10 @@ pub fn resolve_private_key_path(explicit: Option<&Path>) -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
-pub fn issuer_password_ok(provided: Option<&str>) -> Result<(), IssueError> {
-    let expected = std::env::var("DATABAKER_LICENSE_ISSUER_PASSWORD").ok();
-    let Some(expected) = expected.filter(|value| !value.is_empty()) else {
-        return Ok(());
-    };
-    if provided.unwrap_or_default() != expected {
-        return Err(IssueError::from("注册机口令不正确"));
-    }
-    Ok(())
+pub fn load_private_key_pem(explicit: Option<&Path>) -> Result<String, IssueError> {
+    let path = resolve_private_key_path(explicit).ok_or_else(|| {
+        IssueError::from("找不到签发私钥。请把 license-2026a.pem 和程序放在同一目录。")
+    })?;
+    std::fs::read_to_string(&path)
+        .map_err(|_| IssueError::from(format!("读不到签发私钥：{}", path.display())))
 }

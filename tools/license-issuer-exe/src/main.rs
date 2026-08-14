@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use databaker_license_issuer::{
-    issue_license, issuer_password_ok, resolve_private_key_path, IssueLicenseInput, DEFAULT_KID,
+    clear_local_license, issue_license, load_private_key_pem, IssueLicenseInput, DEFAULT_KID,
 };
 
 #[cfg(feature = "gui")]
@@ -50,9 +50,10 @@ fn wants_cli(args: &[String]) -> bool {
                 | "--perpetual"
                 | "--key"
                 | "--kid"
-                | "--password"
                 | "--jti"
                 | "--now-ms"
+                | "--clear-local"
+                | "--license-file"
                 | "--help"
                 | "-h"
         )
@@ -65,12 +66,21 @@ fn run_cli(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let parsed = parse_args(args)?;
-    issuer_password_ok(parsed.password.as_deref()).map_err(|error| error.to_string())?;
-    let key_path = resolve_private_key_path(parsed.key.as_deref()).ok_or_else(|| {
-        "读不到签发私钥。请用 --key 指定 PEM，或把 license-2026a.pem 放到程序同一目录。".to_string()
-    })?;
-    let private_key_pem = std::fs::read_to_string(&key_path)
-        .map_err(|_| format!("读不到签发私钥：{}", key_path.display()))?;
+    if parsed.clear_local {
+        let result = clear_local_license(parsed.license_file.as_deref())
+            .map_err(|error| error.to_string())?;
+        if result.removed.is_empty() {
+            println!("本机没有授权记录。");
+        } else {
+            println!("已删除 {} 个授权文件：", result.removed.len());
+            for path in result.removed {
+                println!("{}", path.display());
+            }
+        }
+        return Ok(());
+    }
+    let private_key_pem =
+        load_private_key_pem(parsed.key.as_deref()).map_err(|error| error.to_string())?;
     let ticket = issue_license(IssueLicenseInput {
         private_key_pem: &private_key_pem,
         kid: parsed.kid.as_deref().unwrap_or(DEFAULT_KID),
@@ -93,9 +103,10 @@ struct Cli {
     perpetual: bool,
     kid: Option<String>,
     key: Option<PathBuf>,
-    password: Option<String>,
     jti: Option<String>,
     now_ms: Option<u64>,
+    clear_local: bool,
+    license_file: Option<PathBuf>,
 }
 
 fn parse_args(argv: &[String]) -> Result<Cli, String> {
@@ -106,17 +117,19 @@ fn parse_args(argv: &[String]) -> Result<Cli, String> {
         perpetual: false,
         kid: None,
         key: None,
-        password: None,
         jti: None,
         now_ms: None,
+        clear_local: false,
+        license_file: None,
     };
     let mut index = 0;
     while index < argv.len() {
         let token = argv[index].as_str();
         match token {
             "--perpetual" => cli.perpetual = true,
-            "--machine" | "--subject" | "--days" | "--kid" | "--key" | "--password" | "--jti"
-            | "--now-ms" => {
+            "--clear-local" => cli.clear_local = true,
+            "--machine" | "--subject" | "--days" | "--kid" | "--key" | "--jti" | "--now-ms"
+            | "--license-file" => {
                 let value = argv
                     .get(index + 1)
                     .ok_or_else(|| format!("缺少 {token} 的值"))?;
@@ -135,7 +148,6 @@ fn parse_args(argv: &[String]) -> Result<Cli, String> {
                     }
                     "--kid" => cli.kid = Some(value.clone()),
                     "--key" => cli.key = Some(PathBuf::from(value)),
-                    "--password" => cli.password = Some(value.clone()),
                     "--jti" => cli.jti = Some(value.clone()),
                     "--now-ms" => {
                         cli.now_ms = Some(
@@ -144,6 +156,7 @@ fn parse_args(argv: &[String]) -> Result<Cli, String> {
                                 .map_err(|_| "签发时间无效".to_string())?,
                         );
                     }
+                    "--license-file" => cli.license_file = Some(PathBuf::from(value)),
                     _ => {}
                 }
                 index += 1;
@@ -162,15 +175,14 @@ fn usage() -> String {
 不带参数时打开窗口。命令行：
 
   databaker-license-issuer --machine A7K2-9M3P-Q4WX --subject 客户A-工位3 [--days 365|--perpetual]
+  databaker-license-issuer --clear-local
 
 选项：
   --machine <CODE>   工位机器码
   --subject <NAME>   客户或工位名
   --days <N>         有效天数，默认 365
   --perpetual        永久授权
-  --key <PEM>        签发私钥，默认同目录 license-2026a.pem
-  --kid <ID>         密钥编号，默认 2026a
-  --password <PWD>   注册机口令（若设置了 DATABAKER_LICENSE_ISSUER_PASSWORD）
+  --clear-local      删除本机采集软件里的授权记录
 "
     .to_string()
 }

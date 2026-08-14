@@ -40,10 +40,6 @@ ipcMain.handle('issuer:issue', (_event, payload) => {
   if (!fs.existsSync(keyPath)) {
     throw new Error(`读不到签发私钥：${keyPath}`);
   }
-  const expectedPassword = process.env.DATABAKER_LICENSE_ISSUER_PASSWORD;
-  if (expectedPassword && payload?.password !== expectedPassword) {
-    throw new Error('注册机口令不正确');
-  }
   return issueLicense({
     privateKeyPem: fs.readFileSync(keyPath, 'utf8'),
     kid: typeof payload?.kid === 'string' && payload.kid.trim() ? payload.kid.trim() : '2026a',

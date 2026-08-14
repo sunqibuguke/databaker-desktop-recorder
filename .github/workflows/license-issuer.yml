@@ -97,6 +97,8 @@ jobs:
 
       - name: Package issuer
         run: node scripts/package-license-issuer.cjs
+        env:
+          DATABAKER_LICENSE_PRIVATE_KEY: ${{ secrets.DATABAKER_LICENSE_PRIVATE_KEY }}
 
       - name: Upload Windows exe
         uses: actions/upload-artifact@v6
@@ -136,6 +138,8 @@ jobs:
 
       - name: Package issuer
         run: node scripts/package-license-issuer.cjs
+        env:
+          DATABAKER_LICENSE_PRIVATE_KEY: ${{ secrets.DATABAKER_LICENSE_PRIVATE_KEY }}
 
       - name: Upload macOS binary
         uses: actions/upload-artifact@v6

@@ -1,11 +1,10 @@
-use std::path::PathBuf;
-
 use eframe::egui::{
     self, Color32, FontData, FontDefinitions, FontFamily, RichText, ViewportBuilder,
 };
 
 use databaker_license_issuer::{
-    issue_license, issuer_password_ok, resolve_private_key_path, IssueLicenseInput, DEFAULT_KID,
+    clear_local_license, issue_license, load_private_key_pem, probe_local_license,
+    IssueLicenseInput, LocalLicenseProbe, DEFAULT_KID,
 };
 
 const CJK_FONT_CANDIDATES: &[&str] = &[
@@ -24,8 +23,8 @@ const CJK_FONT_CANDIDATES: &[&str] = &[
 pub fn run() -> Result<(), eframe::Error> {
     let options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
-            .with_inner_size([560.0, 640.0])
-            .with_min_inner_size([480.0, 560.0])
+            .with_inner_size([520.0, 620.0])
+            .with_min_inner_size([460.0, 520.0])
             .with_title("DataBaker 授权注册机"),
         ..Default::default()
     };
@@ -40,52 +39,44 @@ pub fn run() -> Result<(), eframe::Error> {
 }
 
 struct IssuerApp {
-    password: String,
     machine: String,
     subject: String,
     days: String,
     perpetual: bool,
-    key_path: String,
     ticket: String,
     error: String,
+    notice: String,
     copied: bool,
+    local: LocalLicenseProbe,
+    confirm_clear: bool,
 }
 
 impl IssuerApp {
     fn new() -> Self {
-        let key_path = resolve_private_key_path(None)
-            .map(|path| path.display().to_string())
-            .unwrap_or_default();
         Self {
-            password: String::new(),
             machine: String::new(),
             subject: String::new(),
             days: "365".to_string(),
             perpetual: false,
-            key_path,
             ticket: String::new(),
             error: String::new(),
+            notice: String::new(),
             copied: false,
+            local: probe_local_license(None),
+            confirm_clear: false,
         }
     }
 
     fn issue(&mut self) {
         self.copied = false;
+        self.confirm_clear = false;
         self.ticket.clear();
         self.error.clear();
-        if let Err(error) = issuer_password_ok(Some(&self.password)) {
-            self.error = error.to_string();
-            return;
-        }
-        let key_path = self.key_path.trim();
-        if key_path.is_empty() {
-            self.error = "请选择签发私钥 PEM".to_string();
-            return;
-        }
-        let private_key_pem = match std::fs::read_to_string(key_path) {
+        self.notice.clear();
+        let private_key_pem = match load_private_key_pem(None) {
             Ok(value) => value,
-            Err(_) => {
-                self.error = format!("读不到签发私钥：{key_path}");
+            Err(error) => {
+                self.error = error.to_string();
                 return;
             }
         };
@@ -115,113 +106,188 @@ impl IssuerApp {
         }
     }
 
-    fn browse_key(&mut self) {
-        if let Some(path) = rfd::FileDialog::new()
-            .add_filter("PEM", &["pem"])
-            .set_title("选择签发私钥")
-            .pick_file()
-        {
-            self.key_path = path.display().to_string();
+    fn clear_local(&mut self) {
+        self.ticket.clear();
+        self.error.clear();
+        self.notice.clear();
+        self.local = probe_local_license(None);
+        if self.local.files.is_empty() {
+            self.confirm_clear = false;
+            self.notice = "本机没有授权记录。".to_string();
+            return;
         }
+        if !self.confirm_clear {
+            self.confirm_clear = true;
+            return;
+        }
+        match clear_local_license(None) {
+            Ok(result) if result.removed.is_empty() => {
+                self.confirm_clear = false;
+                self.notice = "本机没有授权记录。".to_string();
+            }
+            Ok(result) => {
+                self.confirm_clear = false;
+                self.notice = format!(
+                    "已删除 {} 个授权文件。请重新打开采集软件。",
+                    result.removed.len()
+                );
+            }
+            Err(error) => {
+                self.confirm_clear = false;
+                self.error = error.to_string();
+            }
+        }
+        self.local = probe_local_license(None);
     }
 }
 
 impl eframe::App for IssuerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(10.0);
-            ui.label(RichText::new("DataBaker 授权注册机").size(22.0).strong());
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new("输入工位机器码和客户名称，生成绑定该机器的离线授权码。私钥只放在本机，不要随采集安装包分发。")
-                    .size(14.0)
-                    .color(Color32::from_rgb(0x9a, 0x9a, 0x9a)),
-            );
-            ui.add_space(16.0);
-
-            labeled_field(ui, "注册机口令（若公司设置了口令）", |ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.password).password(true).desired_width(f32::INFINITY));
-            });
-            labeled_field(ui, "私钥 PEM", |ui| {
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.key_path).desired_width(ui.available_width() - 88.0));
-                    if ui.button("浏览").clicked() {
-                        self.browse_key();
-                    }
-                });
-            });
-            labeled_field(ui, "机器码", |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.machine)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("A7K2-9M3P-Q4WX"),
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.add_space(10.0);
+                ui.label(RichText::new("DataBaker 授权注册机").size(22.0).strong());
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("输入工位机器码和客户名称，生成绑定该机器的离线授权码。")
+                        .size(14.0)
+                        .color(Color32::from_rgb(0x9a, 0x9a, 0x9a)),
                 );
-            });
-            labeled_field(ui, "客户 / 工位名", |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.subject)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("客户A-工位3"),
-                );
-            });
+                ui.add_space(16.0);
 
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("有效天数").color(Color32::from_rgb(0xb9, 0xb9, 0xb9)));
-                    ui.add_enabled(
-                        !self.perpetual,
-                        egui::TextEdit::singleline(&mut self.days).desired_width(180.0),
+                labeled_field(ui, "机器码", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.machine)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("A7K2-9M3P-Q4WX"),
                     );
                 });
-                ui.add_space(16.0);
-                ui.vertical(|ui| {
-                    ui.add_space(22.0);
-                    ui.checkbox(&mut self.perpetual, "永久");
+                labeled_field(ui, "客户 / 工位名", |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.subject)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("客户A-工位3"),
+                    );
                 });
-            });
 
-            ui.add_space(14.0);
-            let issue = egui::Button::new(RichText::new("生成授权码").color(Color32::from_rgb(0x0c, 0x20, 0x1f)).strong())
-                .fill(Color32::from_rgb(0x67, 0xbd, 0xb8))
-                .min_size(egui::vec2(120.0, 34.0));
-            if ui.add(issue).clicked() {
-                self.issue();
-            }
-
-            if !self.error.is_empty() {
-                ui.add_space(10.0);
-                ui.label(RichText::new(&self.error).color(Color32::from_rgb(0xef, 0x6a, 0x72)));
-            }
-
-            if !self.ticket.is_empty() {
-                ui.add_space(16.0);
-                ui.label("授权码");
-                egui::Frame::NONE
-                    .fill(Color32::from_rgb(0x1b, 0x1d, 0x1c))
-                    .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(0x3a, 0x3a, 0x3a)))
-                    .inner_margin(10.0)
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::Label::new(RichText::new(&self.ticket).monospace().color(Color32::from_rgb(0xe6, 0xe6, 0xe6)))
-                                .wrap(),
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("有效天数").color(Color32::from_rgb(0xb9, 0xb9, 0xb9)),
+                        );
+                        ui.add_enabled(
+                            !self.perpetual,
+                            egui::TextEdit::singleline(&mut self.days).desired_width(180.0),
                         );
                     });
-                ui.add_space(10.0);
-                let copy_label = if self.copied { "已复制" } else { "复制授权码" };
-                if ui.button(copy_label).clicked() {
-                    ctx.copy_text(self.ticket.clone());
-                    self.copied = true;
-                }
-            }
+                    ui.add_space(16.0);
+                    ui.vertical(|ui| {
+                        ui.add_space(22.0);
+                        ui.checkbox(&mut self.perpetual, "永久");
+                    });
+                });
 
-            if PathBuf::from(self.key_path.trim()).is_file() {
-                ui.add_space(18.0);
+                ui.add_space(14.0);
+                let issue = egui::Button::new(
+                    RichText::new("生成授权码")
+                        .color(Color32::from_rgb(0x0c, 0x20, 0x1f))
+                        .strong(),
+                )
+                .fill(Color32::from_rgb(0x67, 0xbd, 0xb8))
+                .min_size(egui::vec2(120.0, 34.0));
+                if ui.add(issue).clicked() {
+                    self.issue();
+                }
+
+                if !self.error.is_empty() {
+                    ui.add_space(10.0);
+                    ui.label(RichText::new(&self.error).color(Color32::from_rgb(0xef, 0x6a, 0x72)));
+                }
+
+                if !self.ticket.is_empty() {
+                    ui.add_space(16.0);
+                    ui.label("授权码");
+                    egui::Frame::NONE
+                        .fill(Color32::from_rgb(0x1b, 0x1d, 0x1c))
+                        .stroke(egui::Stroke::new(
+                            1.0_f32,
+                            Color32::from_rgb(0x3a, 0x3a, 0x3a),
+                        ))
+                        .inner_margin(10.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&self.ticket)
+                                        .monospace()
+                                        .color(Color32::from_rgb(0xe6, 0xe6, 0xe6)),
+                                )
+                                .wrap(),
+                            );
+                        });
+                    ui.add_space(10.0);
+                    let copy_label = if self.copied {
+                        "已复制"
+                    } else {
+                        "复制授权码"
+                    };
+                    if ui.button(copy_label).clicked() {
+                        ctx.copy_text(self.ticket.clone());
+                        self.copied = true;
+                    }
+                }
+
+                ui.add_space(22.0);
+                ui.separator();
+                ui.add_space(12.0);
+                ui.label(RichText::new("本机授权").strong());
+                ui.add_space(4.0);
                 ui.label(
-                    RichText::new("已找到私钥，可以签发。")
-                        .small()
-                        .color(Color32::from_rgb(0x67, 0xbd, 0xb8)),
+                    RichText::new("清空后采集软件会回到激活页。请先退出采集软件再操作。")
+                        .color(Color32::from_rgb(0x9a, 0x9a, 0x9a)),
                 );
-            }
+                ui.add_space(8.0);
+                if self.local.files.is_empty() {
+                    ui.label(
+                        RichText::new("本机没有找到授权记录。")
+                            .color(Color32::from_rgb(0xb9, 0xb9, 0xb9)),
+                    );
+                } else {
+                    if let Some(claims) = &self.local.claims {
+                        ui.label(format!("当前授权：{}", claims.sub));
+                    }
+                    for path in &self.local.files {
+                        ui.label(
+                            RichText::new(path.display().to_string())
+                                .monospace()
+                                .small()
+                                .color(Color32::from_rgb(0xb9, 0xb9, 0xb9)),
+                        );
+                    }
+                }
+                ui.add_space(10.0);
+                let clear_label = if self.confirm_clear {
+                    "再点一次确认清空"
+                } else {
+                    "清空本机授权"
+                };
+                let clear = egui::Button::new(
+                    RichText::new(clear_label)
+                        .color(Color32::from_rgb(0xff, 0xf0, 0xf0))
+                        .strong(),
+                )
+                .fill(Color32::from_rgb(0xef, 0x6a, 0x72))
+                .min_size(egui::vec2(140.0, 34.0));
+                if ui.add(clear).clicked() {
+                    self.clear_local();
+                }
+                if !self.notice.is_empty() {
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new(&self.notice).color(Color32::from_rgb(0x67, 0xbd, 0xb8)),
+                    );
+                }
+                ui.add_space(16.0);
+            });
         });
     }
 }

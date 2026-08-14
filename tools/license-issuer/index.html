@@ -45,8 +45,7 @@
 <body>
   <main>
     <h1>DataBaker 授权注册机</h1>
-    <p>输入工位机器码和客户名称，生成绑定该机器的离线授权码。私钥只放在本机，不要随采集安装包分发。</p>
-    <label>注册机口令（若公司设置了口令）<input id="password" type="password" autocomplete="off" /></label>
+    <p>输入工位机器码和客户名称，生成绑定该机器的离线授权码。</p>
     <label>机器码<input id="machine" placeholder="A7K2-9M3P-Q4WX" /></label>
     <label>客户 / 工位名<input id="subject" placeholder="客户A-工位3" /></label>
     <div class="row">
@@ -71,7 +70,6 @@
       $('result').hidden = true;
       try {
         const ticket = await window.issuer.issue({
-          password: $('password').value,
           machineCode: $('machine').value,
           subject: $('subject').value,
           days: Number($('days').value || 365),
