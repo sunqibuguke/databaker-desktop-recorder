@@ -55,6 +55,7 @@ export function installDevRecorderMock() {
   let silenceSamples = 0;
   let lastSignalSample = 0;
   let firstAttemptSignalSample = 0;
+  let enforceSilence = false;
   let currentSessionDir = '';
   let currentExportExists = false;
   let captureActive = false;
@@ -287,24 +288,32 @@ export function installDevRecorderMock() {
     previousCapturedSamples = capturedSamples;
     const requiredHeadSilence = activeAttempt?.required_head_silence_samples ?? 0;
     if (activeAttempt?.head_silence_phase === 'waiting_for_head_silence') {
-      activeAttempt.head_silence_progress_samples = Math.min(
-        requiredHeadSilence,
-        Math.max(0, capturedSamples - activeAttempt.head_silence_armed_sample),
-      );
+      if (enforceSilence) {
+        activeAttempt.head_silence_progress_samples = Math.min(
+          requiredHeadSilence,
+          (activeAttempt.head_silence_progress_samples ?? 0) + newSamples,
+        );
+      } else {
+        activeAttempt.head_silence_progress_samples = Math.min(
+          requiredHeadSilence,
+          Math.max(0, capturedSamples - activeAttempt.head_silence_armed_sample),
+        );
+      }
       if (activeAttempt.head_silence_progress_samples >= requiredHeadSilence) {
-        activeAttempt.head_silence_passed_sample = activeAttempt.head_silence_armed_sample + requiredHeadSilence;
+        activeAttempt.head_silence_passed_sample = enforceSilence
+          ? capturedSamples
+          : activeAttempt.head_silence_armed_sample + requiredHeadSilence;
         activeAttempt.head_silence_phase = firstAttemptSignalSample ? 'speech_started' : 'ready_for_speech';
       }
     }
     const mockSpeechDelay = Math.round(mockSampleRate * 0.4);
     const mockSpeechSamples = Math.round(mockSampleRate * 1.5);
     if (activeAttempt && !activeAttempt.content_started_sample
+      && activeAttempt.head_silence_phase !== 'waiting_for_head_silence'
       && capturedSamples >= activeAttempt.recording_started_sample + mockSpeechDelay) {
       activeAttempt.content_started_sample = activeAttempt.recording_started_sample + mockSpeechDelay;
       firstAttemptSignalSample = activeAttempt.content_started_sample;
-      if (activeAttempt.head_silence_phase !== 'waiting_for_head_silence') {
-        activeAttempt.head_silence_phase = 'speech_started';
-      }
+      activeAttempt.head_silence_phase = 'speech_started';
     }
     const speaking = Boolean(activeAttempt?.content_started_sample)
       && capturedSamples < (activeAttempt?.content_started_sample ?? 0) + mockSpeechSamples;
@@ -601,6 +610,7 @@ export function installDevRecorderMock() {
         lastSignalSample = capturedSamples;
       }
       silenceSamples = 0;
+      if (typeof data.enforce_silence === 'boolean') enforceSilence = data.enforce_silence;
       snapshot.silence_threshold_dbfs = thresholdDbfs;
       snapshot.silence_duration_ms = silenceDurationMs;
       snapshot.updated_at = new Date().toISOString();
@@ -614,6 +624,7 @@ export function installDevRecorderMock() {
       } as T;
     }
     if (command === 'start_attempt') {
+      enforceSilence = data.enforce_silence === true;
       const required = mockSampleRate * snapshot.silence_duration_ms / 1_000;
       const item = snapshot.items.find((candidate) => candidate.id === data.item_id)!;
       activeAttempt = {

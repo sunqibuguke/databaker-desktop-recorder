@@ -23,6 +23,8 @@ use std::path::PathBuf;
 #[derive(Deserialize)]
 struct ItemPayload {
     item_id: String,
+    #[serde(default)]
+    enforce_silence: bool,
 }
 
 #[derive(Deserialize)]
@@ -279,7 +281,7 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
         }
         "start_attempt" => {
             let payload: ItemPayload = parse(command.payload)?;
-            engine.start_attempt(&payload.item_id)
+            engine.start_attempt(&payload.item_id, payload.enforce_silence)
         }
         "stop_attempt" => {
             // Older protocol clients omitted the payload entirely, which

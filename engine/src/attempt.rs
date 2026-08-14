@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 pub(crate) const HEAD_SILENCE_IDLE: u32 = 0;
 pub(crate) const HEAD_SILENCE_WAITING: u32 = 1;
@@ -13,6 +13,7 @@ pub(crate) struct HeadSilenceMonitor {
     pub(crate) progress_samples: Arc<AtomicU64>,
     pub(crate) passed_sample: Arc<AtomicU64>,
     pub(crate) required_samples: Arc<AtomicU64>,
+    pub(crate) enforce: Arc<AtomicBool>,
 }
 
 impl HeadSilenceMonitor {
@@ -23,7 +24,12 @@ impl HeadSilenceMonitor {
             progress_samples: Arc::new(AtomicU64::new(0)),
             passed_sample: Arc::new(AtomicU64::new(0)),
             required_samples: Arc::new(AtomicU64::new(required_samples)),
+            enforce: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub(crate) fn set_enforce(&self, enforce: bool) {
+        self.enforce.store(enforce, Ordering::Release);
     }
 
     pub(crate) fn required_samples(&self) -> u64 {
@@ -74,11 +80,15 @@ pub(crate) fn annotate_attempt_block(
     let armed_sample = head_silence.armed_sample.load(Ordering::Acquire);
     let mut phase = head_silence.phase.load(Ordering::Acquire);
 
+    let enforce = head_silence.enforce.load(Ordering::Acquire);
     if rms <= threshold_linear {
         let _ = silence_samples.fetch_add(frames, Ordering::AcqRel);
     } else {
         silence_samples.store(0, Ordering::Release);
-        if phase != HEAD_SILENCE_IDLE && block_end > armed_sample {
+        let count_as_content = phase != HEAD_SILENCE_IDLE
+            && block_end > armed_sample
+            && !(enforce && phase == HEAD_SILENCE_WAITING);
+        if count_as_content {
             let candidate = block_start.max(armed_sample).max(1);
             let _ = attempt_signal_start_sample.compare_exchange(
                 0,
@@ -92,13 +102,28 @@ pub(crate) fn annotate_attempt_block(
 
     if phase == HEAD_SILENCE_WAITING && block_end > armed_sample {
         let required_samples = head_silence.required_samples();
-        let elapsed = block_end.saturating_sub(armed_sample);
-        let updated = elapsed.min(required_samples);
+        let updated = if enforce {
+            if rms > threshold_linear {
+                0
+            } else {
+                head_silence
+                    .progress_samples
+                    .load(Ordering::Acquire)
+                    .saturating_add(frames)
+                    .min(required_samples)
+            }
+        } else {
+            block_end.saturating_sub(armed_sample).min(required_samples)
+        };
         head_silence
             .progress_samples
             .store(updated, Ordering::Release);
         if updated >= required_samples {
-            let passed_sample = armed_sample.saturating_add(required_samples);
+            let passed_sample = if enforce {
+                block_end
+            } else {
+                armed_sample.saturating_add(required_samples)
+            };
             head_silence
                 .passed_sample
                 .store(passed_sample, Ordering::Release);

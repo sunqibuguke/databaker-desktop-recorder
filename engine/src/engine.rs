@@ -378,6 +378,8 @@ pub struct NoiseCheckPayload {
 pub struct SetSilenceSettingsPayload {
     pub threshold_dbfs: f32,
     pub silence_duration_ms: u32,
+    #[serde(default)]
+    pub enforce_silence: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -3001,6 +3003,9 @@ impl Engine {
             bail!("音频写盘异常，请结束并恢复当前录制");
         }
 
+        if let Some(enforce_silence) = payload.enforce_silence {
+            session.head_silence.set_enforce(enforce_silence);
+        }
         let (analysis_boundary, reset_kind) =
             session.apply_silence_settings(payload.threshold_dbfs, payload.silence_duration_ms);
         session.snapshot.silence_threshold_dbfs = payload.threshold_dbfs;
@@ -3025,7 +3030,7 @@ impl Engine {
         }))
     }
 
-    pub fn start_attempt(&mut self, item_id: &str) -> Result<Value> {
+    pub fn start_attempt(&mut self, item_id: &str, enforce_silence: bool) -> Result<Value> {
         let session = self.active_session_mut()?;
         session.ensure_metadata_mutation_allowed()?;
         if session.faulted.load(Ordering::Acquire) {
@@ -3052,8 +3057,10 @@ impl Engine {
             }
             sequence += 1;
         };
-        // Clicking start arms a fixed pending timer. Room tone from before the
-        // click does not count; elapsed time after the click always does.
+        // Clicking start arms a pending window. Room tone from before the
+        // click does not count. Non-enforced takes still count elapsed time;
+        // enforced takes require consecutive silence after the click.
+        session.head_silence.set_enforce(enforce_silence);
         let recording_started_sample = session.arm_attempt_analysis();
         let start_sample = recording_started_sample;
         session.active_attempt = Some(ActiveAttempt {
@@ -9761,7 +9768,7 @@ mod tests {
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
 
-        let started = engine.start_attempt("001").unwrap();
+        let started = engine.start_attempt("001", false).unwrap();
 
         assert_eq!(started["attempt_id"], "001-a1");
         assert_eq!(started["head_silence_phase"], "waiting_for_head_silence");
@@ -9782,7 +9789,7 @@ mod tests {
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
 
-        let started = engine.start_attempt("001").unwrap();
+        let started = engine.start_attempt("001", false).unwrap();
 
         assert_eq!(started["recording_started_sample"], 12_345);
         assert_eq!(started["head_silence_armed_sample"], 12_345);
@@ -9839,6 +9846,68 @@ mod tests {
                 .passed_sample
                 .load(Ordering::Acquire),
             104
+        );
+    }
+
+    #[test]
+    fn enforced_pending_resets_when_noise_breaks_silence() {
+        let harness = AttemptAnalysisHarness::armed_at(100, 4);
+        harness.silence.head_silence.set_enforce(true);
+        harness.publish(vec![0.0; 3]);
+        assert_eq!(
+            harness
+                .silence
+                .head_silence
+                .progress_samples
+                .load(Ordering::Acquire),
+            3
+        );
+        assert_eq!(
+            harness.silence.head_silence.phase.load(Ordering::Acquire),
+            HEAD_SILENCE_WAITING
+        );
+
+        harness.publish(vec![0.1]);
+        assert_eq!(
+            harness
+                .silence
+                .head_silence
+                .progress_samples
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            harness.silence.head_silence.phase.load(Ordering::Acquire),
+            HEAD_SILENCE_WAITING
+        );
+        assert_eq!(
+            harness
+                .silence
+                .attempt_signal_start_sample
+                .load(Ordering::Acquire),
+            0
+        );
+
+        harness.publish(vec![0.0; 4]);
+        assert_eq!(
+            harness
+                .silence
+                .head_silence
+                .progress_samples
+                .load(Ordering::Acquire),
+            4
+        );
+        assert_eq!(
+            harness.silence.head_silence.phase.load(Ordering::Acquire),
+            HEAD_SILENCE_PASSED
+        );
+        assert_eq!(
+            harness
+                .silence
+                .head_silence
+                .passed_sample
+                .load(Ordering::Acquire),
+            108
         );
     }
 
@@ -9947,12 +10016,12 @@ mod tests {
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
 
-        engine.start_attempt("001").unwrap();
+        engine.start_attempt("001", false).unwrap();
         let before_pass = engine.stop_attempt(true, true, false).unwrap();
         assert_eq!(before_pass["discarded"], true);
         assert!(before_pass["attempt"].is_null());
 
-        engine.start_attempt("001").unwrap();
+        engine.start_attempt("001", false).unwrap();
         {
             let session = engine.session.as_ref().unwrap();
             session

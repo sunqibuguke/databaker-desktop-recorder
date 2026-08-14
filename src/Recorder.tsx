@@ -971,6 +971,13 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setAutomationRules(next);
     saveAutomationRules(sessionDir, next);
     setWorkstationRules(next);
+    if (key === 'enforceHeadTailSilence' && captureActive && !workspaceFaulted && !captureFault) {
+      void window.recorder.request('set_silence_settings', {
+        threshold_dbfs: snapshot?.silence_threshold_dbfs ?? noiseThresholdDbfs,
+        silence_duration_ms: snapshot?.silence_duration_ms ?? silenceDurationMs,
+        enforce_silence: enabled,
+      }).catch(() => undefined);
+    }
     if (key !== 'envCheck') return;
     if (!enabled) {
       noiseCheckOperationRef.current = null;
@@ -1914,7 +1921,11 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         silence_duration_ms: number;
         reset_kind: 'idle' | 'head_silence' | 'tail_silence';
         snapshot: SessionSnapshot;
-      }>('set_silence_settings', { threshold_dbfs: threshold, silence_duration_ms: durationMs });
+      }>('set_silence_settings', {
+        threshold_dbfs: threshold,
+        silence_duration_ms: durationMs,
+        enforce_silence: automationRules.enforceHeadTailSilence,
+      });
       if (request !== silenceSettingsSaveSequenceRef.current) return;
       setSnapshot(result.snapshot);
       setNoiseThresholdDbfs(result.threshold_dbfs);
@@ -2111,7 +2122,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       required_head_silence_samples?: number;
       head_silence_phase?: HeadSilencePhase;
       content_started_sample?: number;
-    }>('start_attempt', { item_id: item.id }));
+    }>('start_attempt', {
+      item_id: item.id,
+      enforce_silence: automationRules.enforceHeadTailSilence,
+    }));
     if (!result) return;
     takePeakRef.current = 0;
     setReviewPeak(0);
