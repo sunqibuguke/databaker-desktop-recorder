@@ -3370,7 +3370,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
                 : noiseCheckBlocksAttempt && primaryAction === 'start'
                   ? <button data-testid="main-transport" className="main-transport waiting" onClick={() => snapshot && void runSessionNoiseCheck(sessionDir, snapshot)} disabled={noiseCheckRunning || Boolean(busy)}><span><Icon name="meter" /></span><strong>{noiseCheckRunning ? t('recorder.noiseChecking') : t('recorder.finishNoiseFirst')}</strong></button>
                 : recording
-                  ? <button data-testid="main-transport" className={`main-transport ${isPendingTake ? 'waiting' : 'stop'}`} onClick={() => void stopAttempt()} disabled={Boolean(busy)}><span><Icon name="stop" /></span><strong>{isPendingTake ? t('recorder.pendingCancel') : t('recorder.finishSentence')}</strong>{isPendingTake ? <><kbd>ESC</kbd><kbd>SPACE</kbd></> : <kbd>SPACE</kbd>}</button>
+                  ? <button data-testid="main-transport" className={`main-transport ${isPendingTake ? 'waiting' : 'stop'}`} onClick={() => void stopAttempt()} disabled={Boolean(busy)}><span><Icon name="stop" /></span><strong>{isPendingTake ? t('recorder.pendingCancel') : t('recorder.finishSentence')}</strong>{isPendingTake ? <div className="transport-keys"><kbd>ESC</kbd><kbd>SPACE</kbd></div> : <kbd>SPACE</kbd>}</button>
                 : primaryAction === 'accept'
                   ? <button data-testid="main-transport" className="main-transport accept" onClick={() => void acceptAttempt()} disabled={Boolean(busy)}><span><Icon name="check" /></span><strong>{acceptButtonLabel}</strong><kbd>SPACE</kbd></button>
                   : primaryAction === 'finish'
