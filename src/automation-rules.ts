@@ -85,10 +85,9 @@ export function loadAutomationRules(sessionDir: string): AutomationRules {
   return { ...DEFAULT_AUTOMATION_RULES, headTailSilence: legacyHeadTail };
 }
 
-export function saveAutomationRules(sessionDir: string, rules: AutomationRules): void {
-  const normalized = normalizeAutomationRules(rules);
-  saveWorkstationAutomationRules(normalized);
+export function saveSessionAutomationRules(sessionDir: string, rules: AutomationRules): void {
   if (!sessionDir) return;
+  const normalized = normalizeAutomationRules(rules);
   try {
     localStorage.setItem(`${RULES_STORAGE_PREFIX}${sessionDir}`, JSON.stringify(normalized));
     localStorage.setItem(
@@ -98,4 +97,17 @@ export function saveAutomationRules(sessionDir: string, rules: AutomationRules):
   } catch {
     // Preference is workstation-local; a blocked store must not stop capture.
   }
+}
+
+export function saveAutomationRules(sessionDir: string, rules: AutomationRules): void {
+  const normalized = normalizeAutomationRules(rules);
+  saveWorkstationAutomationRules(normalized);
+  saveSessionAutomationRules(sessionDir, normalized);
+}
+
+/** Turn off env check for this task only. New-task drafts keep the workstation default. */
+export function skipSessionEnvCheck(sessionDir: string, rules: AutomationRules): AutomationRules {
+  const next = normalizeAutomationRules({ ...rules, envCheck: false });
+  saveSessionAutomationRules(sessionDir, next);
+  return next;
 }

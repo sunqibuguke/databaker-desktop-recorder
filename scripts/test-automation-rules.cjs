@@ -11,6 +11,7 @@ async function main() {
     saveAutomationRules,
     saveWorkstationAutomationRules,
     showsPostTakeQualityBill,
+    skipSessionEnvCheck,
   } = await import(pathToFileURL(path.join(__dirname, '..', 'src', 'automation-rules.ts')).href);
 
   assert.deepEqual(DEFAULT_AUTOMATION_RULES, {
@@ -104,6 +105,25 @@ async function main() {
     loadAutomationRules('session-a').envCheck,
     false,
     'session-a still has its own earlier save',
+  );
+
+  saveWorkstationAutomationRules(DEFAULT_AUTOMATION_RULES);
+  const skipped = skipSessionEnvCheck('session-skip', {
+    ...DEFAULT_AUTOMATION_RULES,
+    discardEmpty: false,
+  });
+  assert.equal(skipped.envCheck, false);
+  assert.equal(skipped.discardEmpty, false, 'skip keeps the rest of the current task rules');
+  assert.equal(loadAutomationRules('session-skip').envCheck, false);
+  assert.equal(
+    loadWorkstationAutomationRules().envCheck,
+    true,
+    'skipping env check must not rewrite the workstation default',
+  );
+  assert.equal(
+    loadAutomationRules('').envCheck,
+    true,
+    'a new-task draft still uses the workstation default after a session skip',
   );
 
   console.log('automation rules tests passed');

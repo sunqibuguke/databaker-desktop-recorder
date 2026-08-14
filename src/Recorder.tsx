@@ -51,6 +51,7 @@ import {
   saveAutomationRules,
   saveWorkstationAutomationRules,
   showsPostTakeQualityBill,
+  skipSessionEnvCheck,
   type AutomationRules,
   type TaskDetectionPolicyKey,
 } from './automation-rules.ts';
@@ -952,6 +953,13 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     if (snapshot && !snapshot.noise_check?.passed && captureActive && !workspaceFaulted && !captureFault) {
       void runSessionNoiseCheck(sessionDir, snapshot);
     }
+  }
+
+  function skipCurrentSessionEnvCheck() {
+    setAutomationRules(skipSessionEnvCheck(sessionDir, automationRules));
+    noiseCheckOperationRef.current = null;
+    setNoiseCheckRunning(false);
+    setNoiseCheckError('');
   }
 
   function applyWorkstationDetectionPolicy(key: TaskDetectionPolicyKey, enabled: boolean) {
@@ -3430,7 +3438,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       busy={Boolean(busy)}
       onRetry={() => snapshot && void runSessionNoiseCheck(sessionDir, snapshot)}
       onLeave={requestSafePause}
-      onSkip={() => applyAutomationRule('envCheck', false)}
+      onSkip={skipCurrentSessionEnvCheck}
     />}
     {pauseConfirmOpen && !captureFault && <div className="dialog-backdrop" role="presentation">
       <section className="studio-dialog" role="dialog" aria-modal="true" aria-labelledby="pause-dialog-title">
