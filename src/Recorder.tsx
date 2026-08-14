@@ -372,12 +372,32 @@ function recordingMatchesFilter(recording: RecordingHistoryEntry, filter: Histor
   return filter === 'completed' ? kind === 'completed' : kind !== 'completed';
 }
 
+function pad2(value: number): string {
+  return String(value).padStart(2, '0');
+}
+
 function formatDateTime(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return t('common.dash');
   return new Intl.DateTimeFormat(getLocale(), {
     month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
   }).format(date);
+}
+
+function formatListDateTime(value: string): { date: string; time: string; full: string; dateTime: string } {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    const dash = t('common.dash');
+    return { date: dash, time: '', full: dash, dateTime: '' };
+  }
+  const datePart = `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+  const timePart = `${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+  return {
+    date: datePart,
+    time: timePart,
+    full: `${datePart} ${timePart}`,
+    dateTime: date.toISOString(),
+  };
 }
 
 function artifactLabel(artifact: ExportArtifact): string {
@@ -3082,6 +3102,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             const state = recordingState(recording);
             const handled = recording.accepted_items + recording.skipped_items;
             const progress = recording.total_items ? handled / recording.total_items * 100 : 0;
+            const updated = formatListDateTime(recording.updated_at);
             const isSealing = sealingSessionDir === recording.session_dir;
             const isDeleting = deletingSessionDir === recording.session_dir;
             const isResetting = resettingSessionDir === recording.session_dir;
@@ -3100,7 +3121,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             return <article key={recording.session_dir} className={`home-recording-row ${rowResumeError ? 'has-error' : ''} ${actionsOpen ? 'menu-open' : ''}`}>
               <button className="home-recording-name" onClick={() => showTaskDetails(recording)} aria-label={t('home.openTaskAria', { id: recording.session_id })}><i className={`recording-dot ${state.kind}`} /><div><strong>{recording.session_id}</strong><small title={recording.history_issue}>{recording.history_issue || <>{recording.script_name || t('home.unknownSource')} · {recording.sample_rate ? `${recording.sample_rate.toLocaleString(locale)} Hz / ${recording.bit_depth}-bit` : t('home.unknownFormat')}</>}</small></div></button>
               <div className="home-recording-progress"><span><b>{handled}</b><small> / {recording.total_items}</small></span><i><em style={{ width: `${progress}%` }} /></i></div>
-              <time>{formatDateTime(recording.updated_at)}</time>
+              <time className="home-recording-time" dateTime={updated.dateTime || undefined} title={updated.full}><strong>{updated.date}</strong>{updated.time ? <small>{updated.time}</small> : null}</time>
               <span><em className={`recording-status ${state.kind}`}>{state.label}</em></span>
               <div className="home-row-actions">
                 {listEntry.kind === 'continue-stop'
@@ -3111,10 +3132,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
                       <button data-testid="view-recording" className={listViewIsPrimary(listEntry) ? 'row-primary' : 'row-secondary'} onClick={() => showTaskDetails(recording)} disabled={Boolean(busy)} aria-label={t('home.viewTaskAria', { id: recording.session_id })}>{t('home.viewTask')}</button>
                       <button data-testid="record-recording" className={listRecordEnabled(listEntry) && !listViewIsPrimary(listEntry) ? 'row-primary' : 'row-secondary'} onClick={() => void openHistoricalRecording(recording, { activate: true })} disabled={Boolean(busy) || Boolean(sealingSessionDir) || !listRecordEnabled(listEntry)} title={recordDisabledCopy} aria-label={t('home.recordTaskAria', { id: recording.session_id })}>{t('home.recordTask')}</button>
                     </>}
-                <button className="row-folder" title={t('home.openFolder')} aria-label={t('home.openFolderAria', { id: recording.session_id })} onClick={() => void openRecordingDirectory(recording)} disabled={Boolean(busy)}><Icon name="folder" size={15} /></button>
                 <div className="home-actions-menu-wrap">
                   <button data-testid="recording-actions-menu" className="row-more" title={t('common.moreActions')} aria-label={t('home.moreAria', { id: recording.session_id })} aria-haspopup="menu" aria-expanded={actionsOpen} onClick={() => setOpenActionsSessionDir(actionsOpen ? '' : recording.session_dir)} disabled={Boolean(busy) || Boolean(deletingSessionDir) || Boolean(resettingSessionDir)}><Icon name="more" size={16} /></button>
                   {actionsOpen && <div className="home-actions-menu" role="menu" aria-label={t('home.actionsAria', { id: recording.session_id })}>
+                    <button data-testid="open-recording-folder" role="menuitem" aria-label={t('home.openFolderAria', { id: recording.session_id })} onClick={() => { setOpenActionsSessionDir(''); void openRecordingDirectory(recording); }} disabled={Boolean(busy)}><Icon name="folder" size={14} /><span>{t('home.openFolder')}</span></button>
                     {!recording.is_active && recording.export_exists && <button role="menuitem" onClick={() => { setOpenActionsSessionDir(''); void openRecordingExport(recording); }}><Icon name="export" size={14} /><span>{t('home.openExportDir')}</span></button>}
                     {!recording.is_active && (recoveryPlan.secondary === 'seal' || recoveryPlan.primary === 'seal') && <button data-testid="seal-recording" role="menuitem" onClick={() => { setOpenActionsSessionDir(''); setSealConfirmRecording(recording); }} disabled={Boolean(busy) || Boolean(sealingSessionDir)}><Icon name="history" size={14} /><span>{isSealing ? t('common.checking') : t('home.inspectAndRepair')}</span></button>}
                     {!recording.is_active && <><i className="home-actions-divider" /><button data-testid="reset-recording" className="danger" role="menuitem" aria-busy={isResetting} onClick={() => { setOpenActionsSessionDir(''); setResetConfirmRecording(recording); }} disabled={Boolean(busy) || Boolean(sealingSessionDir) || Boolean(deletingSessionDir) || Boolean(resettingSessionDir)}><Icon name="refresh" size={14} /><span>{t('home.resetTask')}</span></button><button data-testid="delete-recording" className="danger" role="menuitem" aria-busy={isDeleting} onClick={() => { setOpenActionsSessionDir(''); setDeleteConfirmRecording(recording); }} disabled={Boolean(busy) || Boolean(sealingSessionDir) || Boolean(deletingSessionDir) || Boolean(resettingSessionDir)}><Icon name="trash" size={14} /><span>{t('home.deleteTask')}</span></button></>}
