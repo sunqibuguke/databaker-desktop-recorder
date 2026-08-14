@@ -87,6 +87,31 @@ function main() {
     /\.prompter-shell\.(?:checking|pending|recording|ready|fault)\s*\{[^}]*\bbackground\s*:/,
     'prompter cue states must not wash the page background',
   );
+  assert.match(css, /\.silence-review-toggle\s*\{[^}]*cursor:\s*pointer/, 'rule rows must show a pointer');
+  assert.match(css, /\.silence-review-toggle input\s*\{[^}]*cursor:\s*pointer/, 'the hidden checkbox must keep the pointer');
+  assert.match(
+    css,
+    /\.silence-review-toggle:hover:not\(:has\(input:disabled\)\):not\(:has\(input:checked\)\) \.rule-check/,
+    'empty-box hover must not apply to a checked rule',
+  );
+  assert.match(
+    css,
+    /\.silence-review-toggle:hover:has\(input:checked\):not\(:has\(input:disabled\)\) \.rule-check[^}]*background:\s*var\(--accent-fill-hover\)/,
+    'checked hover must stay filled',
+  );
+  assert.doesNotMatch(
+    css,
+    /\.silence-review-toggle:hover:not\(:has\(input:disabled\)\) \.rule-check/,
+    'checked hover must not reuse the empty-box fill',
+  );
+  assert.match(css, /button:not\(:disabled\),\s*select:not\(:disabled\)/, 'clickable controls must share a pointer');
+  assert.match(css, /input:not\(:disabled\):is\([^{]*\[type="text"\]/, 'text fields must keep a text cursor');
+  assert.match(
+    css,
+    /input:not\(\[type="checkbox"\]\):not\(\[type="radio"\]\):not\(\[type="range"\]\)/,
+    'range inputs must not inherit text-field chrome',
+  );
+  assert.match(css, /input\[type="range"\]::-webkit-slider-thumb\s*\{[^}]*-webkit-appearance:\s*none/, 'range thumbs must be real custom controls');
 
   const tokens = colorTokens(rootBlock(css));
   const names = new Set(tokens.map((token) => token.name));
