@@ -360,6 +360,11 @@ const ko: MessageTree = {
     hintBoth: '앞뒤가 {required}보다 짧습니다. 확인하거나 재녹음할 수 있습니다',
     hintHead: '앞이 {required}보다 짧습니다. 확인하거나 재녹음할 수 있습니다',
     hintTail: '뒤가 {required}보다 짧습니다. 확인하거나 재녹음할 수 있습니다',
+    markHead: '앞짧음',
+    markTail: '뒤짧음',
+    markHeadTitle: '앞 무음 {ms}, {required}보다 짧음',
+    markTailTitle: '뒤 무음 {ms}, {required}보다 짧음',
+    markBothTitle: '앞 {head}, 뒤 {tail}, 모두 {required}보다 짧음',
   },
   itemStatus: {
     pending: '대기',
@@ -508,7 +513,7 @@ const ko: MessageTree = {
     ruleAlmostSilentHint: '이 테이크의 실제 피크로 판단합니다. 짧은 문장 오탐을 피하려고 기본은 꺼져 있습니다.',
     rulePeakHigh: '피크 과다 안내',
     rulePeakHighHint: '피크가 풀스케일에 가까울 때만 표시합니다. 기본은 꺼져 있습니다.',
-    headTail: '앞 / 뒤',
+    headTail: '앞뒤 무음',
   },
   pauseDialog: {
     titleRecording: '현재 문장을 끝낸 뒤 나갈까요?',

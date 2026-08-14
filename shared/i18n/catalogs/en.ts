@@ -360,6 +360,11 @@ const en: MessageTree = {
     hintBoth: 'Head and tail are shorter than {required}. You can still confirm or retake',
     hintHead: 'Head is shorter than {required}. You can still confirm or retake',
     hintTail: 'Tail is shorter than {required}. You can still confirm or retake',
+    markHead: 'Head short',
+    markTail: 'Tail short',
+    markHeadTitle: 'Head silence {ms}, shorter than {required}',
+    markTailTitle: 'Tail silence {ms}, shorter than {required}',
+    markBothTitle: 'Head {head}, tail {tail}, both shorter than {required}',
   },
   itemStatus: {
     pending: 'Pending',
@@ -508,7 +513,7 @@ const en: MessageTree = {
     ruleAlmostSilentHint: 'Uses this take’s true peak. Off by default so short phrases are not false-flagged.',
     rulePeakHigh: 'High-peak hint',
     rulePeakHighHint: 'Hint when the peak is near full scale. Off by default.',
-    headTail: 'Head / tail',
+    headTail: 'Head/tail silence',
   },
   pauseDialog: {
     titleRecording: 'Finish the current sentence before leaving?',

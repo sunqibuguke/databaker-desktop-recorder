@@ -1,15 +1,40 @@
 import { t } from '../shared/i18n/index.ts';
 import { loadAutomationRules, saveAutomationRules } from './automation-rules.ts';
-import type { Attempt, HeadSilencePhase } from './types';
+import type { Attempt, HeadSilencePhase, ItemState } from './types';
+
+export type SilencePadStatus = 'unknown' | 'short' | 'met';
 
 export type SilencePairView = {
   headText: string;
   tailText: string;
   headWarn: boolean;
   tailMet: boolean;
+  headStatus: SilencePadStatus;
+  tailStatus: SilencePadStatus;
   hint: string;
   extra: string;
 };
+
+export type ItemSilenceMarks = {
+  headShort: boolean;
+  tailShort: boolean;
+  title: string;
+};
+
+const EMPTY_SILENCE_MARKS: ItemSilenceMarks = { headShort: false, tailShort: false, title: '' };
+
+function emptySilencePair(): SilencePairView {
+  return {
+    headText: t('silence.headDash'),
+    tailText: t('silence.tailDash'),
+    headWarn: false,
+    tailMet: false,
+    headStatus: 'unknown',
+    tailStatus: 'unknown',
+    hint: '',
+    extra: '',
+  };
+}
 
 export function samplesToMs(samples: number, sampleRate: number): number {
   if (!Number.isFinite(samples) || samples <= 0) return 0;
@@ -41,6 +66,69 @@ export function isTailSilenceShort(tailMs: number | null, requiredMs: number): b
   return tailMs !== null && requiredMs > 0 && tailMs < requiredMs;
 }
 
+export function silenceReadoutClass(status: SilencePadStatus): string {
+  if (status === 'met') return 'silence-readout met';
+  if (status === 'short') return 'silence-readout short';
+  return 'silence-readout';
+}
+
+export function padStatus(measuredMs: number | null, requiredMs: number): SilencePadStatus {
+  if (measuredMs === null) return 'unknown';
+  if (requiredMs <= 0) return 'unknown';
+  return measuredMs < requiredMs ? 'short' : 'met';
+}
+
+function isUsableAttempt(attempt: Attempt): boolean {
+  return !['interrupted', 'needs_rerecord'].includes(attempt.status)
+    && attempt.end_sample > attempt.start_sample;
+}
+
+export function selectedOrLatestUsableAttempt(item: ItemState): Attempt | undefined {
+  const selected = item.selected_attempt_id
+    ? item.attempts.find((attempt) => attempt.attempt_id === item.selected_attempt_id)
+    : undefined;
+  if (selected && isUsableAttempt(selected)) return selected;
+  for (let index = item.attempts.length - 1; index >= 0; index -= 1) {
+    if (isUsableAttempt(item.attempts[index])) return item.attempts[index];
+  }
+  return undefined;
+}
+
+function attemptTailMs(attempt: Attempt, sampleRate: number): number | null {
+  return attempt.tail_silence_samples === undefined
+    ? null
+    : samplesToMs(attempt.tail_silence_samples, sampleRate);
+}
+
+function attemptTailIsShort(attempt: Attempt, tailMs: number | null, requiredMs: number): boolean {
+  return attempt.forced_without_tail_silence === true || isTailSilenceShort(tailMs, requiredMs);
+}
+
+export function itemSilenceMarks(
+  item: ItemState | null | undefined,
+  sampleRate: number,
+  requiredMs: number,
+): ItemSilenceMarks {
+  if (!item || (item.status !== 'review' && item.status !== 'accepted')) return EMPTY_SILENCE_MARKS;
+  const attempt = selectedOrLatestUsableAttempt(item);
+  if (!attempt) return EMPTY_SILENCE_MARKS;
+  const start = attempt.recording_started_sample || attempt.start_sample || 0;
+  const headMs = actualHeadSilenceMs(start, attempt.content_started_sample, sampleRate);
+  const tailMs = attemptTailMs(attempt, sampleRate);
+  const headShort = isHeadSilenceShort(headMs, requiredMs);
+  const tailShort = attemptTailIsShort(attempt, tailMs, requiredMs);
+  if (!headShort && !tailShort) return EMPTY_SILENCE_MARKS;
+  const requiredLabel = `${(Math.max(0, requiredMs) / 1_000).toFixed(1)} s`;
+  const headLabel = headMs === null ? t('common.dash') : formatSilenceMs(headMs);
+  const tailLabel = tailMs === null ? t('common.dash') : formatSilenceMs(tailMs);
+  const title = headShort && tailShort
+    ? t('silence.markBothTitle', { head: headLabel, tail: tailLabel, required: requiredLabel })
+    : headShort
+      ? t('silence.markHeadTitle', { ms: headLabel, required: requiredLabel })
+      : t('silence.markTailTitle', { ms: tailLabel, required: requiredLabel });
+  return { headShort, tailShort, title };
+}
+
 export function peakNoteFromLevel(peak: number | undefined): 'clip' | 'quiet' | null {
   if (peak === undefined || !Number.isFinite(peak) || peak <= 0) return null;
   if (peak > 0.92) return 'clip';
@@ -58,47 +146,33 @@ export function liveSilencePair(input: {
   headMs: number | null;
 }): SilencePairView {
   const required = Math.max(0, input.requiredMs);
-  if (!input.recording) {
-    return {
-      headText: t('silence.headDash'),
-      tailText: t('silence.tailDash'),
-      headWarn: false,
-      tailMet: false,
-      hint: '',
-      extra: '',
-    };
-  }
+  if (!input.recording) return emptySilencePair();
   if (input.spoken) {
     const tailMs = Math.max(0, input.liveSilenceMs);
-    const met = required > 0 && tailMs >= required;
+    const tailStatus = padStatus(tailMs, required);
+    const headStatus = padStatus(input.headMs, required);
     return {
       headText: input.headMs === null ? t('silence.headDash') : t('silence.headMs', { ms: formatSilenceMs(input.headMs) }),
-      tailText: met
+      tailText: tailStatus === 'met'
         ? t('silence.tailEnough', { ms: formatSilenceMs(tailMs) })
         : t('silence.tailProgress', { ms: formatSilenceMs(tailMs), required: formatSilenceMs(required) }),
-      headWarn: isHeadSilenceShort(input.headMs, required),
-      tailMet: met,
+      headWarn: headStatus === 'short',
+      tailMet: tailStatus === 'met',
+      headStatus,
+      tailStatus,
       hint: '',
       extra: '',
     };
   }
   if (input.pending) {
     return {
+      ...emptySilencePair(),
       headText: t('silence.waiting', { seconds: formatWaitSeconds(input.pendingRemainingMs) }),
-      tailText: t('silence.tailDash'),
-      headWarn: false,
-      tailMet: false,
-      hint: '',
-      extra: '',
     };
   }
   return {
+    ...emptySilencePair(),
     headText: t('silence.pleaseRead'),
-    tailText: t('silence.tailDash'),
-    headWarn: false,
-    tailMet: false,
-    hint: '',
-    extra: '',
   };
 }
 
@@ -135,27 +209,17 @@ export function reviewSilencePair(input: {
 }): SilencePairView {
   const required = Math.max(0, input.requiredMs);
   const attempt = input.attempt;
-  if (!attempt) {
-    return {
-      headText: t('silence.headDash'),
-      tailText: t('silence.tailDash'),
-      headWarn: false,
-      tailMet: false,
-      hint: '',
-      extra: '',
-    };
-  }
+  if (!attempt) return emptySilencePair();
   const start = attempt.recording_started_sample || attempt.start_sample || 0;
   const headMs = actualHeadSilenceMs(start, attempt.content_started_sample, input.sampleRate);
-  const tailMs = attempt.tail_silence_samples === undefined
-    ? null
-    : samplesToMs(attempt.tail_silence_samples, input.sampleRate);
+  const tailMs = attemptTailMs(attempt, input.sampleRate);
+  const headStatus = padStatus(headMs, required);
+  const tailStatus = attempt.forced_without_tail_silence === true
+    ? 'short'
+    : padStatus(tailMs, required);
   const showHeadTailHints = input.showHeadTailHints !== false;
-  const headShort = showHeadTailHints && isHeadSilenceShort(headMs, required);
-  const tailShort = showHeadTailHints && (
-    attempt.forced_without_tail_silence === true
-    || isTailSilenceShort(tailMs, required)
-  );
+  const headShort = showHeadTailHints && headStatus === 'short';
+  const tailShort = showHeadTailHints && tailStatus === 'short';
   const note = peakNoteFromLevel(input.peak);
   const extra = note === 'clip' && input.showPeakHigh
     ? t('silence.peakHigh')
@@ -171,7 +235,9 @@ export function reviewSilencePair(input: {
     headText: headMs === null ? t('silence.headDash') : t('silence.headMs', { ms: formatSilenceMs(headMs) }),
     tailText: tailMs === null ? t('silence.tailDash') : t('silence.tailMs', { ms: formatSilenceMs(tailMs) }),
     headWarn: headShort,
-    tailMet: !tailShort && tailMs !== null,
+    tailMet: tailStatus === 'met',
+    headStatus,
+    tailStatus,
     hint,
     extra,
   };

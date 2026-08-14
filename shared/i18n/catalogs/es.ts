@@ -360,6 +360,11 @@ const es: MessageTree = {
     hintBoth: 'Inicio y final más cortos que {required}. Aún puede confirmar o repetir',
     hintHead: 'El inicio es más corto que {required}. Aún puede confirmar o repetir',
     hintTail: 'El final es más corto que {required}. Aún puede confirmar o repetir',
+    markHead: 'Inicio corto',
+    markTail: 'Final corto',
+    markHeadTitle: 'Silencio inicial {ms}, menor que {required}',
+    markTailTitle: 'Silencio final {ms}, menor que {required}',
+    markBothTitle: 'Inicio {head}, final {tail}, ambos menores que {required}',
   },
   itemStatus: {
     pending: 'Pendiente',
@@ -508,7 +513,7 @@ const es: MessageTree = {
     ruleAlmostSilentHint: 'Usa el pico real de esta toma. Viene apagado para no marcar frases cortas por error.',
     rulePeakHigh: 'Aviso de pico alto',
     rulePeakHighHint: 'Avisa si el pico está cerca de escala completa. Viene apagado.',
-    headTail: 'Inicio / final',
+    headTail: 'Silencio de cabeza/cola',
   },
   pauseDialog: {
     titleRecording: '¿Terminar la frase actual antes de salir?',

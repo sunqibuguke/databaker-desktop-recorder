@@ -36,13 +36,16 @@ import { WebGLWaveform } from './WebGLWaveform';
 import { PreviewPlayer } from './PreviewPlayer';
 import { inputQualityWarning, shouldHandleLiveMeter } from './input-quality';
 import {
+  itemSilenceMarks,
   liveHeadMsFromMeter,
   liveSilenceHint,
   liveSilencePair,
   recordedMonitorSentenceLabel,
   reviewSilencePair,
   shouldUseRecordedSilencePair,
+  silenceReadoutClass,
   takeReviewPeak,
+  type ItemSilenceMarks,
   type SilencePairView,
 } from './silence-readout';
 import {
@@ -343,10 +346,18 @@ function AutomationRuleRow(props: {
 
 function SilencePairReadout({ pair, hint }: { pair: SilencePairView; hint?: boolean }) {
   return <span className="silence-pair">
-    <span className={pair.headWarn ? 'silence-readout short' : 'silence-readout'}>{pair.headText}</span>
-    <span className={pair.tailMet ? 'silence-readout met' : 'silence-readout'}>{pair.tailText}</span>
+    <span className={silenceReadoutClass(pair.headStatus)}>{pair.headText}</span>
+    <span className={silenceReadoutClass(pair.tailStatus)}>{pair.tailText}</span>
     {pair.extra ? <span className="silence-readout note">{pair.extra}</span> : null}
     {hint && pair.hint ? <small className="silence-hint" title={pair.hint}>{pair.hint}</small> : null}
+  </span>;
+}
+
+function ItemSilenceMarkPills({ marks }: { marks: ItemSilenceMarks }) {
+  if (!marks.headShort && !marks.tailShort) return null;
+  return <span className="item-silence-marks">
+    {marks.headShort ? <i className="silence-readout short">{t('silence.markHead')}</i> : null}
+    {marks.tailShort ? <i className="silence-readout short">{t('silence.markTail')}</i> : null}
   </span>;
 }
 
@@ -3345,7 +3356,26 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         <div className="panel-tabs"><button className="active">{t('recorder.tabScript')}</button><button>{t('recorder.tabMarks')}</button></div>
         <div className="browser-summary"><span>{t('recorder.completedOf', { done: completed, total: items.length })}</span><div className="mini-progress"><i style={{ width: `${items.length ? completed / items.length * 100 : 0}%` }} /></div></div>
         <div className="item-filter"><span>{t('recorder.allItems')}</span><em>{items.length}</em></div>
-        <div className="professional-item-list">{items.map((item, index) => <button key={item.id} className={`professional-item ${index === currentIndex ? 'active' : ''}`} disabled={recording || captureFault} onClick={() => { setCurrentIndex(index); setReviewAttemptId(null); }}><span className={`item-state ${item.status}`}>{item.status === 'accepted' ? <Icon name="check" size={12} /> : item.status === 'skipped' ? '—' : String(index + 1).padStart(2, '0')}</span><span><strong>{item.id}</strong><small>{item.text}</small></span><em>{statusLabel(item.status)}</em></button>)}</div>
+        <div className="professional-item-list">{items.map((item, index) => {
+          const marks = recording && index === currentIndex
+            ? { headShort: false, tailShort: false, title: '' }
+            : itemSilenceMarks(item, sampleRateForDisplay, effectiveSilenceDurationMs);
+          const flagged = marks.headShort || marks.tailShort;
+          return <button
+            key={item.id}
+            className={`professional-item${index === currentIndex ? ' active' : ''}${flagged ? ' has-silence-issue' : ''}`}
+            disabled={recording || captureFault}
+            title={marks.title || undefined}
+            onClick={() => { setCurrentIndex(index); setReviewAttemptId(null); }}
+          >
+            <span className={`item-state ${item.status}`}>{item.status === 'accepted' ? <Icon name="check" size={12} /> : item.status === 'skipped' ? '—' : String(index + 1).padStart(2, '0')}</span>
+            <span><strong>{item.id}</strong><small>{item.text}</small></span>
+            <span className="item-meta">
+              <em>{statusLabel(item.status)}</em>
+              <ItemSilenceMarkPills marks={marks} />
+            </span>
+          </button>;
+        })}</div>
       </aside>
       <main id="main" className="editor-document">
         <div className="document-tabs"><span className="active"><Icon name="microphone" size={13} /> {workflowComplete ? t('recorder.taskComplete') : currentItem?.id ?? 'Item'} <i>×</i></span></div>

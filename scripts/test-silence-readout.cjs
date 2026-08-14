@@ -5,6 +5,7 @@ const { pathToFileURL } = require('node:url');
 async function main() {
   const {
     actualHeadSilenceMs,
+    itemSilenceMarks,
     liveSilenceHint,
     liveSilencePair,
     peakFromWaveformBins,
@@ -32,6 +33,8 @@ async function main() {
   });
   assert.equal(pendingPair.headText, '等待 0.6 s');
   assert.equal(pendingPair.tailText, '尾 —');
+  assert.equal(pendingPair.headStatus, 'unknown');
+  assert.equal(pendingPair.tailStatus, 'unknown');
 
   const spokenEarly = liveSilencePair({
     recording: true,
@@ -44,6 +47,8 @@ async function main() {
   });
   assert.equal(spokenEarly.headText, '首 120 ms');
   assert.equal(spokenEarly.headWarn, true);
+  assert.equal(spokenEarly.headStatus, 'short');
+  assert.equal(spokenEarly.tailStatus, 'short');
   assert.match(spokenEarly.tailText, /尾 50 ms \/ 1000 ms/);
 
   const tailReady = liveSilencePair({
@@ -57,6 +62,8 @@ async function main() {
   });
   assert.equal(tailReady.tailText, '尾已够 · 1000 ms');
   assert.equal(tailReady.tailMet, true);
+  assert.equal(tailReady.headStatus, 'met');
+  assert.equal(tailReady.tailStatus, 'met');
 
   assert.equal(peakFromWaveformBins([[-0.2, 0.31], [-0.05, 0.08]]), 0.31);
   assert.equal(takeReviewPeak({ livePeak: 0.02, waveformBins: [[-0.2, 0.31]] }), 0.31);
@@ -86,8 +93,31 @@ async function main() {
   assert.equal(bill.tailText, '尾 200 ms');
   assert.equal(bill.headWarn, true);
   assert.equal(bill.tailMet, false);
+  assert.equal(bill.headStatus, 'short');
+  assert.equal(bill.tailStatus, 'short');
   assert.match(bill.hint, /首尾都短于 1.0 s/);
   assert.equal(bill.extra, '');
+
+  const reviewHeadMetTailShort = reviewSilencePair({
+    attempt: {
+      attempt_id: '001-a5',
+      start_sample: 0,
+      recording_started_sample: 0,
+      content_started_sample: 48_000,
+      end_sample: 96_000,
+      tail_silence_samples: 9_600,
+      required_tail_silence_samples: 48_000,
+      status: 'recorded',
+      created_at: '2026-08-13T00:00:00Z',
+    },
+    sampleRate: 48_000,
+    requiredMs: 1_000,
+    peak: 0.3,
+  });
+  assert.equal(reviewHeadMetTailShort.headStatus, 'met');
+  assert.equal(reviewHeadMetTailShort.tailStatus, 'short');
+  assert.equal(reviewHeadMetTailShort.headWarn, false);
+  assert.equal(reviewHeadMetTailShort.tailMet, false);
 
   const quietDecayed = reviewSilencePair({
     attempt: {
@@ -144,6 +174,109 @@ async function main() {
   });
   assert.equal(hiddenHeadTail.headWarn, false);
   assert.equal(hiddenHeadTail.hint, '');
+  assert.equal(hiddenHeadTail.headStatus, 'short');
+  assert.equal(hiddenHeadTail.tailStatus, 'short');
+
+  const missingTail = reviewSilencePair({
+    attempt: {
+      attempt_id: '001-legacy',
+      start_sample: 0,
+      recording_started_sample: 0,
+      content_started_sample: 4_800,
+      end_sample: 48_000,
+      status: 'recorded',
+      created_at: '2026-08-13T00:00:00Z',
+    },
+    sampleRate: 48_000,
+    requiredMs: 1_000,
+  });
+  assert.equal(missingTail.headStatus, 'short');
+  assert.equal(missingTail.tailStatus, 'unknown');
+
+  function scriptItem(overrides) {
+    return {
+      id: '001',
+      text: '你好',
+      label: '',
+      status: 'review',
+      selected_attempt_id: null,
+      attempts: [],
+      ...overrides,
+    };
+  }
+
+  const shortHeadAttempt = {
+    attempt_id: '001-a2',
+    start_sample: 2_400_000,
+    recording_started_sample: 2_400_000,
+    content_started_sample: 2_409_600,
+    end_sample: 2_496_000,
+    tail_silence_samples: 48_000,
+    required_tail_silence_samples: 48_000,
+    status: 'recorded',
+    created_at: '2026-08-13T00:00:00Z',
+  };
+  const forcedTailAttempt = {
+    ...shortHeadAttempt,
+    attempt_id: '001-a6',
+    content_started_sample: 2_448_000,
+    tail_silence_samples: 9_600,
+    forced_without_tail_silence: true,
+  };
+  const goodAttempt = {
+    ...shortHeadAttempt,
+    attempt_id: '001-a7',
+    content_started_sample: 2_448_000,
+    tail_silence_samples: 48_000,
+  };
+
+  const pendingMarks = itemSilenceMarks(scriptItem({ status: 'pending', attempts: [shortHeadAttempt] }), 48_000, 1_000);
+  assert.equal(pendingMarks.headShort, false);
+  assert.equal(pendingMarks.tailShort, false);
+  assert.equal(pendingMarks.title, '');
+
+  const skippedMarks = itemSilenceMarks(scriptItem({ status: 'skipped', attempts: [shortHeadAttempt] }), 48_000, 1_000);
+  assert.equal(skippedMarks.headShort, false);
+  assert.equal(skippedMarks.tailShort, false);
+
+  const noTakeMarks = itemSilenceMarks(scriptItem({ status: 'review' }), 48_000, 1_000);
+  assert.equal(noTakeMarks.headShort, false);
+
+  const headOnlyMarks = itemSilenceMarks(scriptItem({ attempts: [shortHeadAttempt] }), 48_000, 1_000);
+  assert.equal(headOnlyMarks.headShort, true);
+  assert.equal(headOnlyMarks.tailShort, false);
+  assert.match(headOnlyMarks.title, /首静音 200 ms/);
+
+  const forcedTailMarks = itemSilenceMarks(scriptItem({
+    status: 'accepted',
+    selected_attempt_id: forcedTailAttempt.attempt_id,
+    attempts: [goodAttempt, forcedTailAttempt],
+  }), 48_000, 1_000);
+  assert.equal(forcedTailMarks.headShort, false);
+  assert.equal(forcedTailMarks.tailShort, true);
+
+  const goodMarks = itemSilenceMarks(scriptItem({
+    status: 'accepted',
+    selected_attempt_id: goodAttempt.attempt_id,
+    attempts: [goodAttempt],
+  }), 48_000, 1_000);
+  assert.equal(goodMarks.headShort, false);
+  assert.equal(goodMarks.tailShort, false);
+  assert.equal(goodMarks.title, '');
+
+  const legacyTailMarks = itemSilenceMarks(scriptItem({
+    attempts: [{
+      attempt_id: '001-legacy',
+      start_sample: 0,
+      recording_started_sample: 0,
+      content_started_sample: 48_000,
+      end_sample: 96_000,
+      status: 'recorded',
+      created_at: '2026-08-13T00:00:00Z',
+    }],
+  }), 48_000, 1_000);
+  assert.equal(legacyTailMarks.headShort, false);
+  assert.equal(legacyTailMarks.tailShort, false);
 
   const rising = liveSilenceHint({ liveMs: 320, requiredMs: 1_000 });
   assert.equal(rising.text, '静音 320 / 1000 ms');

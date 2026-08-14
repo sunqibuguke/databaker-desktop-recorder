@@ -358,6 +358,11 @@ const zhCN = {
     hintBoth: '首尾都短于 {required}，仍可确认或重录',
     hintHead: '首短于 {required}，仍可确认或重录',
     hintTail: '尾短于 {required}，仍可确认或重录',
+    markHead: '首短',
+    markTail: '尾短',
+    markHeadTitle: '首静音 {ms}，短于 {required}',
+    markTailTitle: '尾静音 {ms}，短于 {required}',
+    markBothTitle: '首 {head}、尾 {tail}，均短于 {required}',
   },
   itemStatus: {
     pending: '待录',
@@ -506,7 +511,7 @@ const zhCN = {
     ruleAlmostSilentHint: '用本句真实峰值判断是否过低。默认关闭，避免短句误报。',
     rulePeakHigh: '峰值偏高提示',
     rulePeakHighHint: '峰值接近满幅时提示。默认关闭。',
-    headTail: '首 / 尾',
+    headTail: '首尾静音',
   },
   pauseDialog: {
     titleRecording: '先结束当前句，再退出任务？',

@@ -49,7 +49,7 @@ async function main() {
   assert.equal(t('recorder.enterCapture'), '进入录制');
   assert.equal(t('recorder.leaveView'), '退出查看');
   assert.equal(t('notice.importedItems', { count: 12 }), '已导入 12 条文本');
-  assert.equal(t('recorder.headTail'), '首 / 尾');
+  assert.equal(t('recorder.headTail'), '首尾静音');
   assert.equal(t('recorder.showPostTakeReview'), '停句后显示首尾检查');
   assert.equal(t('recorder.showPostTakeReviewHint'), '首是点击到开口，尾是最后有声到停止。等待朗读是定时器，不是首静音。关闭只藏账单，空格照旧。');
   assert.equal(t('recorder.automationRules'), '自动化规则');

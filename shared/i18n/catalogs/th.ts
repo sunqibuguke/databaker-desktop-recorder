@@ -360,6 +360,11 @@ const th: MessageTree = {
     hintBoth: 'หัวและท้ายสั้นกว่า {required} ยังยืนยันหรืออัดใหม่ได้',
     hintHead: 'หัวสั้นกว่า {required} ยังยืนยันหรืออัดใหม่ได้',
     hintTail: 'ท้ายสั้นกว่า {required} ยังยืนยันหรืออัดใหม่ได้',
+    markHead: 'หัวสั้น',
+    markTail: 'ท้ายสั้น',
+    markHeadTitle: 'ความเงียบหัว {ms} สั้นกว่า {required}',
+    markTailTitle: 'ความเงียบท้าย {ms} สั้นกว่า {required}',
+    markBothTitle: 'หัว {head} ท้าย {tail} สั้นกว่า {required} ทั้งคู่',
   },
   itemStatus: {
     pending: 'รออัด',
@@ -508,7 +513,7 @@ const th: MessageTree = {
     ruleAlmostSilentHint: 'ใช้พีคจริงของเทกนี้ ค่าเริ่มต้นปิด เพื่อไม่ให้ประโยคสั้นถูกทำเครื่องหมายผิด',
     rulePeakHigh: 'ใบ้พีคสูง',
     rulePeakHighHint: 'ใบ้เมื่อพีคใกล้เต็มสเกล ค่าเริ่มต้นปิด',
-    headTail: 'หัว / ท้าย',
+    headTail: 'ความเงียบหัว/ท้าย',
   },
   pauseDialog: {
     titleRecording: 'จบประโยคปัจจุบันก่อนออกจากงานหรือไม่?',

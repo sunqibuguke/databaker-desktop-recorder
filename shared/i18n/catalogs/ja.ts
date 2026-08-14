@@ -360,6 +360,11 @@ const ja: MessageTree = {
     hintBoth: '頭と尾が {required} より短いですが、確認またはリテイクできます',
     hintHead: '頭が {required} より短いですが、確認またはリテイクできます',
     hintTail: '尾が {required} より短いですが、確認またはリテイクできます',
+    markHead: '頭短',
+    markTail: '尾短',
+    markHeadTitle: '頭の無音 {ms}、{required} より短い',
+    markTailTitle: '尾の無音 {ms}、{required} より短い',
+    markBothTitle: '頭 {head}、尾 {tail}、どちらも {required} より短い',
   },
   itemStatus: {
     pending: '未収録',
@@ -508,7 +513,7 @@ const ja: MessageTree = {
     ruleAlmostSilentHint: 'このテイクの実ピークで判定します。短い語の誤判定を避けるため、既定はオフです。',
     rulePeakHigh: 'ピーク過高ヒント',
     rulePeakHighHint: 'ピークがフルスケールに近いときだけ表示します。既定はオフです。',
-    headTail: '頭 / 尾',
+    headTail: '前後無音',
   },
   pauseDialog: {
     titleRecording: '今の文を終えてからタスクを出ますか？',
