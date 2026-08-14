@@ -31,7 +31,7 @@ import {
   systemPreferences,
   Tray,
 } from 'electron';
-import { copyFileSync, chmodSync, promises as fs, statSync } from 'node:fs';
+import { constants as fsConstants, copyFileSync, chmodSync, promises as fs, statSync } from 'node:fs';
 import path from 'node:path';
 import {
   EngineClient,
@@ -49,7 +49,9 @@ import {
   deliveredExportFilePath,
   EXPORT_DELIVER_ERROR,
   exportPathsAreSameDirectory,
+  formatExportDeliverStamp,
   isAllowedExportArtifactName,
+  MAX_EXPORT_DELIVER_NAME_ATTEMPTS,
 } from './export-deliver';
 import { CapturePresetRepository, type CapturePresetDraft } from './capture-presets';
 import {
@@ -1324,11 +1326,25 @@ async function deliverExportArtifact(sourceFile: string, destinationDir: string)
     throw new Error(EXPORT_DELIVER_ERROR.sourceInvalid);
   }
   const destCanonical = await rememberUserExportDirectory(destinationDir);
-  const destFile = deliveredExportFilePath(destCanonical, sourceReal);
   if (exportPathsAreSameDirectory(path.dirname(sourceReal), destCanonical)) {
     return { directory: destCanonical, file_path: sourceReal, copied: false };
   }
-  await fs.copyFile(sourceReal, destFile);
+  const stamp = formatExportDeliverStamp();
+  let destFile = '';
+  let copied = false;
+  for (let collision = 0; collision < MAX_EXPORT_DELIVER_NAME_ATTEMPTS; collision += 1) {
+    destFile = deliveredExportFilePath(destCanonical, sourceReal, stamp, collision);
+    try {
+      await fs.copyFile(sourceReal, destFile, fsConstants.COPYFILE_EXCL);
+      copied = true;
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+  }
+  if (!copied || !destFile) {
+    throw new Error(EXPORT_DELIVER_ERROR.copyResultInvalid);
+  }
   const destMeta = await fs.lstat(destFile);
   if (!destMeta.isFile() || destMeta.isSymbolicLink()) {
     throw new Error(EXPORT_DELIVER_ERROR.copyResultInvalid);

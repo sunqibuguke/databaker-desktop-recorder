@@ -7,9 +7,12 @@ const { pathToFileURL } = require('node:url');
 async function main() {
   const modulePath = path.join(__dirname, '..', 'electron', 'export-deliver.ts');
   const {
+    deliveredExportBasename,
     deliveredExportFilePath,
     EXPORT_DELIVER_ERROR,
     exportPathsAreSameDirectory,
+    exportSessionNameFromSource,
+    formatExportDeliverStamp,
     isAllowedExportArtifactName,
   } = await import(pathToFileURL(modulePath).href);
   const i18nPath = path.join(__dirname, '..', 'src', 'export-deliver-i18n.ts');
@@ -22,9 +25,20 @@ async function main() {
   assert.equal(isAllowedExportArtifactName('session.json'), false);
   assert.equal(isAllowedExportArtifactName('full-track.wav.bak'), false);
 
+  assert.equal(formatExportDeliverStamp(new Date(2026, 7, 14, 15, 30, 45)), '20260814-153045');
+  assert.equal(exportSessionNameFromSource('/sessions/task-a/export/full-track.wav'), 'task-a');
+  assert.equal(exportSessionNameFromSource('/sessions/bad:name/export/cuts.zip'), 'bad_name');
   assert.equal(
-    deliveredExportFilePath('/tmp/delivery', '/sessions/task/export/full-track.wav'),
-    path.join(path.resolve('/tmp/delivery'), 'full-track.wav'),
+    deliveredExportBasename('/sessions/task-a/export/full-track.wav', '20260814-153045'),
+    'task-a-full-track-20260814-153045.wav',
+  );
+  assert.equal(
+    deliveredExportBasename('/sessions/task-a/export/cuts.zip', '20260814-153045', 1),
+    'task-a-cuts-20260814-153045-2.zip',
+  );
+  assert.equal(
+    deliveredExportFilePath('/tmp/delivery', '/sessions/task/export/full-track.wav', '20260814-153045'),
+    path.join(path.resolve('/tmp/delivery'), 'task-full-track-20260814-153045.wav'),
   );
   assert.equal(
     exportPathsAreSameDirectory('/tmp/delivery/', '/tmp/delivery'),

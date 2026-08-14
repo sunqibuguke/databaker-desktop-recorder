@@ -716,11 +716,23 @@ export function installDevRecorderMock() {
       openScript: async () => null,
       chooseOutput: async () => '/tmp/DataBaker Recordings',
       chooseExportDir: async () => '/tmp/DataBaker Preview Export',
-      deliverExportArtifact: async (sourceFile: string, destinationDir: string) => ({
-        directory: destinationDir,
-        file_path: `${destinationDir.replace(/\/+$/, '')}/${sourceFile.split(/[\\/]/).pop() ?? 'export.bin'}`,
-        copied: true,
-      }),
+      deliverExportArtifact: async (sourceFile: string, destinationDir: string) => {
+        const artifact = sourceFile.split(/[\\/]/).pop() ?? 'export.bin';
+        const extIndex = artifact.lastIndexOf('.');
+        const stem = extIndex > 0 ? artifact.slice(0, extIndex) : artifact;
+        const ext = extIndex > 0 ? artifact.slice(extIndex) : '';
+        const parts = sourceFile.split(/[\\/]/).filter(Boolean);
+        const exportIndex = parts.lastIndexOf('export');
+        const session = exportIndex > 0 ? parts[exportIndex - 1] : 'recording';
+        const now = new Date();
+        const pad = (value: number) => String(value).padStart(2, '0');
+        const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+        return {
+          directory: destinationDir,
+          file_path: `${destinationDir.replace(/\/+$/, '')}/${session}-${stem}-${stamp}${ext}`,
+          copied: true,
+        };
+      },
       defaultOutput: async () => ({ outputRoot: '/tmp/DataBaker Recordings' }),
       getLocale: async () => previewLocale,
       setLocale: async (locale: string) => {

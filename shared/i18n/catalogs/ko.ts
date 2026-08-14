@@ -155,7 +155,7 @@ const ko: MessageTree = {
     destination: '내보내기 위치',
     changeDestination: '변경',
     useTaskFolder: '작업 폴더 사용',
-    destinationHint: '작업 폴더에도 기록이 남습니다. 다른 폴더를 고르면 그곳으로도 복사합니다.',
+    destinationHint: '작업 폴더에도 기록이 남습니다. 다른 폴더를 고르면 작업 이름과 내보내기 시각을 붙인 파일로 복사하므로, 같은 폴더의 이전 내보내기를 덮어쓰지 않습니다.',
     copyFailed: '작업 폴더에는 내보냈지만 선택한 폴더로 복사하지 못했습니다.',
     chooseFolderTitle: '내보내기 폴더 선택',
     destMissing: '선택한 내보내기 폴더가 없습니다. 다시 선택하세요.',

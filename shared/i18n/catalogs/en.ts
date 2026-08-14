@@ -155,7 +155,7 @@ const en: MessageTree = {
     destination: 'Export to',
     changeDestination: 'Change',
     useTaskFolder: 'Use task folder',
-    destinationHint: 'A copy stays in the task folder. Choosing another folder also copies the file there.',
+    destinationHint: 'A copy stays in the task folder. Choosing another folder also copies the file there, with the task name and export time in the filename so earlier copies are kept.',
     copyFailed: 'The task folder has the export, but it could not be copied to the chosen folder.',
     chooseFolderTitle: 'Choose export folder',
     destMissing: 'The chosen export folder does not exist. Choose it again.',

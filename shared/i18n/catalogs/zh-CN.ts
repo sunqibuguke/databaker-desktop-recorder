@@ -153,7 +153,7 @@ const zhCN = {
     destination: '导出到',
     changeDestination: '更改',
     useTaskFolder: '用任务目录',
-    destinationHint: '任务目录内会保留一份导出记录。选择其他文件夹时，会再复制一份到那里。',
+    destinationHint: '任务目录内会保留一份导出记录。选择其他文件夹时，会再复制一份到那里，文件名会带上任务名和导出时间，不会覆盖同目录里已有的导出。',
     copyFailed: '任务目录内已导出，但未能复制到所选目录。',
     chooseFolderTitle: '选择导出目录',
     destMissing: '所选导出目录不存在，请重新选择',

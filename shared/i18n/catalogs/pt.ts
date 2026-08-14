@@ -155,7 +155,7 @@ const pt: MessageTree = {
     destination: 'Exportar para',
     changeDestination: 'Alterar',
     useTaskFolder: 'Usar pasta da tarefa',
-    destinationHint: 'Fica uma cópia na pasta da tarefa. Se escolher outra pasta, o ficheiro também é copiado para lá.',
+    destinationHint: 'Fica uma cópia na pasta da tarefa. Se escolher outra pasta, o ficheiro é copiado com o nome da tarefa e a hora da exportação, sem substituir cópias anteriores.',
     copyFailed: 'A exportação está na pasta da tarefa, mas não foi possível copiar para a pasta escolhida.',
     chooseFolderTitle: 'Escolher pasta de exportação',
     destMissing: 'A pasta de exportação escolhida não existe. Escolha outra vez.',

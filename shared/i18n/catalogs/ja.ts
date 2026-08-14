@@ -155,7 +155,7 @@ const ja: MessageTree = {
     destination: '書き出し先',
     changeDestination: '変更',
     useTaskFolder: 'タスクフォルダを使う',
-    destinationHint: 'タスクフォルダにも記録が残ります。別のフォルダを選ぶと、そこへもコピーします。',
+    destinationHint: 'タスクフォルダにも記録が残ります。別のフォルダを選ぶと、タスク名と書き出し時刻を付けてコピーするので、同じ場所の以前の書き出しは上書きしません。',
     copyFailed: 'タスクフォルダへの書き出しは完了しましたが、指定フォルダへコピーできませんでした。',
     chooseFolderTitle: '書き出しフォルダを選択',
     destMissing: '指定した書き出しフォルダがありません。もう一度選んでください。',

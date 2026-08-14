@@ -155,7 +155,7 @@ const es: MessageTree = {
     destination: 'Exportar a',
     changeDestination: 'Cambiar',
     useTaskFolder: 'Usar carpeta de la tarea',
-    destinationHint: 'Queda una copia en la carpeta de la tarea. Si elige otra carpeta, también se copia allí.',
+    destinationHint: 'Queda una copia en la carpeta de la tarea. Si elige otra carpeta, el archivo se copia con el nombre de la tarea y la hora de exportación, sin sobrescribir copias anteriores.',
     copyFailed: 'La exportación está en la carpeta de la tarea, pero no se pudo copiar a la carpeta elegida.',
     chooseFolderTitle: 'Elegir carpeta de exportación',
     destMissing: 'La carpeta de exportación elegida no existe. Vuelva a elegirla.',
