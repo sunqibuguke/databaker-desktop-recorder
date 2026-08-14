@@ -9,6 +9,13 @@ export type ViewShortcutAction = 'preview' | 'enter-capture' | 'none';
 export type WorkspacePosture = 'home' | 'setup' | 'view' | 'record';
 export type CaptureExitAction = 'pause' | 'complete' | 'fault';
 export type CaptureExitDialog = 'pause' | 'finish';
+export type CaptureStopDestination = 'home' | 'inspect';
+export type InspectorFooterLeaveKind = 'view' | 'task' | 'fault';
+export type InspectorFooterModel = {
+  showEnterCapture: boolean;
+  showPauseCapture: boolean;
+  leaveKind: InspectorFooterLeaveKind;
+};
 export type SessionNoiseGate = 'pending' | 'checking' | 'failed' | 'ready';
 export type NoiseCheckShortcutAction = 'leave' | 'retry' | 'none';
 export type AcceptContinuation =
@@ -80,6 +87,31 @@ export function captureExitDialog(
   // close through the safe-pause flow instead of presenting a terminal finish
   // dialog that cannot close the live sentence.
   return isRecording || action === 'pause' ? 'pause' : 'finish';
+}
+
+export function shouldStayInTaskAfterStop(
+  destination: CaptureStopDestination,
+  mode: 'pause' | 'finish' | 'fault',
+  stoppedWithFault: boolean,
+): boolean {
+  if (destination !== 'inspect') return false;
+  // A healthy "finish capture" lands in view. If the seal is faulted or only
+  // reconciled as inactive, repair still lives on the task list.
+  if (mode === 'finish' && stoppedWithFault) return false;
+  return true;
+}
+
+export function inspectorFooterModel(
+  captureActive: boolean,
+  hasCaptureFault: boolean,
+): InspectorFooterModel {
+  if (!captureActive) {
+    return { showEnterCapture: true, showPauseCapture: false, leaveKind: 'view' };
+  }
+  if (hasCaptureFault) {
+    return { showEnterCapture: false, showPauseCapture: false, leaveKind: 'fault' };
+  }
+  return { showEnterCapture: false, showPauseCapture: true, leaveKind: 'task' };
 }
 
 export function findNextActionableItemIndex(

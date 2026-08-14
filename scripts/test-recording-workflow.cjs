@@ -10,6 +10,8 @@ async function main() {
     areAllItemsHandled,
     captureExitAction,
     captureExitDialog,
+    inspectorFooterModel,
+    shouldStayInTaskAfterStop,
     continuationAfterAccept,
     executeSafePause,
     findNextActionableItemIndex,
@@ -221,6 +223,51 @@ async function main() {
   );
   assert.equal(captureExitDialog(false, false, 'complete'), 'finish');
   assert.equal(captureExitDialog(true, true, 'fault'), 'finish');
+  assert.deepEqual(
+    inspectorFooterModel(false, false),
+    { showEnterCapture: true, showPauseCapture: false, leaveKind: 'view' },
+    'view mode must offer enter-capture and leave-view, not pause',
+  );
+  assert.deepEqual(
+    inspectorFooterModel(true, false),
+    { showEnterCapture: false, showPauseCapture: true, leaveKind: 'task' },
+    'live capture must split pause-in-place from leaving the task',
+  );
+  assert.deepEqual(
+    inspectorFooterModel(true, true),
+    { showEnterCapture: false, showPauseCapture: false, leaveKind: 'fault' },
+    'a capture fault must not offer a healthy pause; only the fault-aware finish/leave path remains',
+  );
+  assert.deepEqual(
+    inspectorFooterModel(false, true),
+    { showEnterCapture: true, showPauseCapture: false, leaveKind: 'view' },
+    'a stale fault flag in view mode must not hide enter-capture or invent a pause button',
+  );
+  assert.equal(
+    shouldStayInTaskAfterStop('inspect', 'finish', false),
+    true,
+    'a healthy finish-capture must stay in view instead of bouncing to the list',
+  );
+  assert.equal(
+    shouldStayInTaskAfterStop('inspect', 'finish', true),
+    false,
+    'a finish-capture whose seal is faulted or only reconciled must return to the list for repair',
+  );
+  assert.equal(
+    shouldStayInTaskAfterStop('home', 'finish', false),
+    false,
+    'an explicit leave destination must still return home after a healthy seal',
+  );
+  assert.equal(
+    shouldStayInTaskAfterStop('inspect', 'pause', true),
+    true,
+    'pause-in-place keeps its own stay policy even when the stopped snapshot is faulted',
+  );
+  assert.equal(
+    shouldStayInTaskAfterStop('inspect', 'fault', true),
+    true,
+    'fault stays are decided by the destination, not by this finish-only override',
+  );
   assert.equal(areAllItemsHandled(threeComplete), true, 'three handled rows must enter the terminal state');
   assert.equal(idlePrimaryAction(threeComplete, 2), 'finish', 'the last handled row must offer finish, not another take');
   assert.equal(

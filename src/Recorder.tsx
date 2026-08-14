@@ -15,6 +15,8 @@ import {
   areAllItemsHandled,
   captureExitAction,
   captureExitDialog,
+  inspectorFooterModel,
+  shouldStayInTaskAfterStop,
   continuationAfterAccept,
   executeSafePause,
   findNextActionableItemIndex,
@@ -119,6 +121,8 @@ type StoppedSessionState = {
   reconciled_inactive_after_error?: boolean;
 };
 type CaptureExitMode = 'pause' | 'finish' | 'fault';
+type CaptureStopDestination = 'home' | 'inspect';
+type PauseDestination = 'stay' | 'leave';
 type MonitorPanelTab = 'monitor' | 'detection' | 'task' | 'export' | 'issues';
 type OptionalRunningSessionState = ({ active: true } & RunningSessionState) | { active: false };
 type ExportFeedback = {
@@ -358,9 +362,14 @@ function SilencePairReadout({ pair, hint }: { pair: SilencePairView; hint?: bool
 function ItemSilenceMarkPills({ marks }: { marks: ItemSilenceMarks }) {
   if (!marks.headShort && !marks.tailShort) return null;
   return <span className="item-silence-marks">
-    {marks.headShort ? <i className="silence-readout short">{t('silence.markHead')}</i> : null}
-    {marks.tailShort ? <i className="silence-readout short">{t('silence.markTail')}</i> : null}
+    {marks.headShort ? <i className="item-silence-mark">{t('silence.markHead')}</i> : null}
+    {marks.tailShort ? <i className="item-silence-mark">{t('silence.markTail')}</i> : null}
   </span>;
+}
+
+function itemStatusMetaClass(status: string): string | undefined {
+  if (status === 'accepted' || status === 'review' || status === 'skipped') return status;
+  return undefined;
 }
 
 function LiveSilenceHint({ liveMs, requiredMs }: { liveMs: number; requiredMs: number }) {
@@ -565,6 +574,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const [previewingAttemptId, setPreviewingAttemptId] = useState('');
   const [finishConfirmOpen, setFinishConfirmOpen] = useState(false);
   const [pauseConfirmOpen, setPauseConfirmOpen] = useState(false);
+  const [pauseDestination, setPauseDestination] = useState<PauseDestination>('leave');
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [logPanelOpen, setLogPanelOpen] = useState(false);
   const [capturePresetStore, setCapturePresetStore] = useState<CapturePresetStore>({ schemaVersion: 1, lastSelectedPresetId: null, presets: [] });
@@ -743,6 +753,12 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     : Math.max(-96, Math.min(0, 20 * Math.log10(meter.rms)));
   const liveRmsOnThresholdScale = Math.min(100, Math.max(0, (liveRmsDbfs + 72) / 60 * 100));
   const effectiveSilenceDurationMs = snapshot?.silence_duration_ms ?? silenceDurationMs;
+  const itemSilenceViews = items.map((item, index) => (
+    recording && index === currentIndex
+      ? { headShort: false, tailShort: false, title: '' }
+      : itemSilenceMarks(item, sampleRateForDisplay, effectiveSilenceDurationMs)
+  ));
+  const flaggedSilenceCount = itemSilenceViews.filter((marks) => marks.headShort || marks.tailShort).length;
   const requiredSilenceSamples = sampleRateForDisplay * effectiveSilenceDurationMs / 1_000;
   const headSilenceRequiredSamples = Math.max(1, meter.required_head_silence_samples ?? requiredSilenceSamples);
   const headSilenceProgressSamples = Math.min(
@@ -826,6 +842,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const captureFaultKind = effectiveCaptureFaultKind(phase === 'running' && captureActive, engineStatus, meter);
   const captureFault = captureFaultKind !== null;
   const exitAction = captureExitAction(items, captureFault);
+  const footerActions = inspectorFooterModel(captureActive, Boolean(captureFault));
   const captureFaultCopy = captureFaultKind
     ? describeEffectiveCaptureFault(captureFaultKind, meter)
     : describeCaptureFault(meter);
@@ -2591,22 +2608,32 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     if (opened) setNotice(t('notice.openedDir', { id: recording.session_id }));
   }
 
+  function openPauseConfirm(destination: PauseDestination) {
+    setPauseDestination(destination);
+    setPauseConfirmOpen(true);
+  }
+
   function finishSession() {
     if (!sessionDir) return;
     if (!captureActive) {
       leaveInspectionWorkspace();
       return;
     }
-    const dialog = captureExitDialog(recording, captureFault, exitAction);
-    if (dialog === 'finish') {
+    if (captureFault) {
       setPauseConfirmOpen(false);
       setFinishConfirmOpen(true);
-    } else {
-      // This entry point must stay usable during a take. The confirmation
-      // flow closes/cancels the active sentence first and only returns to the
-      // task list after stop_session has durably sealed the continuous track.
-      setPauseConfirmOpen(true);
+      return;
     }
+    // Leave-task never borrows the finish-capture dialog, even after every
+    // sentence is handled. The completion ritual belongs to the main button.
+    openPauseConfirm('leave');
+  }
+
+  function requestFinishCapture() {
+    if (!sessionDir || !captureActive || busy) return;
+    if (captureExitDialog(recording, captureFault, exitAction) !== 'finish') return;
+    setPauseConfirmOpen(false);
+    setFinishConfirmOpen(true);
   }
 
   function requestSafePause() {
@@ -2619,8 +2646,18 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       setPauseConfirmOpen(false);
       setFinishConfirmOpen(true);
     } else {
-      setPauseConfirmOpen(true);
+      openPauseConfirm('leave');
     }
+  }
+
+  function requestPauseCapture() {
+    if (phase !== 'running' || busy || !sessionDir || !captureActive) return;
+    if (captureFault) {
+      setPauseConfirmOpen(false);
+      setFinishConfirmOpen(true);
+      return;
+    }
+    openPauseConfirm('stay');
   }
 
   function leaveInspectionWorkspace() {
@@ -2694,12 +2731,52 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     }
   }
 
-  async function safeStopAndReturn(mode: CaptureExitMode) {
+  function stayInPausedWorkspace(stopped: StoppedSessionState, keepItemId?: string) {
+    const nextSnapshot = stopped.snapshot;
+    clearAudioPreview();
+    meterFrameCommitterRef.current?.invalidate();
+    setResumeError(null);
+    setSealConfirmRecording(null);
+    setSnapshot(nextSnapshot);
+    setRecording(false);
+    setCaptureActive(false);
+    const faulted = Boolean(
+      stopped.reconciled_inactive_after_error
+      || nextSnapshot.status === 'faulted'
+      || nextSnapshot.overflow_samples > 0,
+    );
+    setWorkspaceFaulted(faulted);
+    setAttemptStartSample(0);
+    setAttemptRecordingStartedSample(0);
+    const keepIndex = keepItemId
+      ? nextSnapshot.items.findIndex((item) => item.id === keepItemId)
+      : -1;
+    const nextIndex = keepIndex >= 0
+      ? keepIndex
+      : resolveRunningItemIndex(nextSnapshot.items, null, keepItemId);
+    setCurrentIndex(nextIndex);
+    const item = nextSnapshot.items[nextIndex];
+    setReviewAttemptId(item?.selected_attempt_id ?? (item ? latestUsableAttempt(item)?.attempt_id : null) ?? null);
+    setMeter({
+      ...emptyMeter,
+      captured_samples: nextSnapshot.captured_samples,
+      committed_samples: nextSnapshot.committed_samples,
+      overflow_samples: nextSnapshot.overflow_samples,
+    });
+    clearSessionNoiseCheck();
+    setWaveformGeneration((generation) => generation + 1);
+    setFinishConfirmOpen(false);
+    setPauseConfirmOpen(false);
+  }
+
+  async function safeStopAndReturn(mode: CaptureExitMode, destination: CaptureStopDestination = 'home') {
     if (pauseOperationRef.current || phase !== 'running' || !sessionDir || !snapshot) return;
     pauseOperationRef.current = true;
     setPauseConfirmOpen(false);
     setFinishConfirmOpen(false);
     const faultAtRequest = mode === 'fault' || captureFault;
+    const stayInTask = destination === 'inspect';
+    const keepItemId = currentItem?.id;
     try {
       const stopped = await executeSafePause<StoppedSessionState>({
         // A capture fault seals an active take as interrupted inside
@@ -2707,7 +2784,9 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         hasActiveAttempt: recording && !faultAtRequest,
         closeActiveAttempt: () => stopAttempt(true),
         stopSession: () => stopSessionWithReconciliation(
-          mode === 'pause' ? t('notice.pauseSealing') : t('notice.finishSealing'),
+          stayInTask
+            ? mode === 'finish' ? t('notice.finishSealingStay') : t('notice.pauseSealingStay')
+            : mode === 'pause' ? t('notice.pauseSealing') : t('notice.finishSealing'),
           snapshot.session_id,
           sessionDir,
         ),
@@ -2719,44 +2798,52 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         || stopped.reconciled_inactive_after_error
         || stopped.snapshot.status === 'faulted'
         || stopped.snapshot.overflow_samples > 0;
+      const stayAfterStop = shouldStayInTaskAfterStop(destination, mode, stoppedWithFault);
       const warning = recoveryWarning(mode === 'pause' ? t('notice.pauseWarning') : t('notice.finishWarning'), stopped.warnings);
-      clearAudioPreview();
-      meterFrameCommitterRef.current?.invalidate();
-      setResumeError(null);
-      setSealConfirmRecording(null);
-      setPhase('home');
-      clearSessionNoiseCheck();
-      setSnapshot(null);
-      setSessionDir('');
-      setCaptureActive(false);
-      setWorkspaceFaulted(false);
-      setRecording(false);
-      setAttemptStartSample(0);
-      setAttemptRecordingStartedSample(0);
-      setReviewAttemptId(null);
-      setMeter(emptyMeter);
-      setFinishConfirmOpen(false);
-      setPauseConfirmOpen(false);
-      unbindTaskLog(mode);
-      logUserAction('ui.safe_stop', mode === 'pause' ? '已安全暂停并返回任务列表' : '已安全结束并返回任务列表', {
+      if (stayAfterStop) {
+        stayInPausedWorkspace(stopped, keepItemId);
+      } else {
+        clearAudioPreview();
+        meterFrameCommitterRef.current?.invalidate();
+        setResumeError(null);
+        setSealConfirmRecording(null);
+        setPhase('home');
+        clearSessionNoiseCheck();
+        setSnapshot(null);
+        setSessionDir('');
+        setCaptureActive(false);
+        setWorkspaceFaulted(false);
+        setRecording(false);
+        setAttemptStartSample(0);
+        setAttemptRecordingStartedSample(0);
+        setReviewAttemptId(null);
+        setMeter(emptyMeter);
+        setFinishConfirmOpen(false);
+        setPauseConfirmOpen(false);
+        unbindTaskLog(mode);
+      }
+      logUserAction('ui.safe_stop', stayAfterStop
+        ? mode === 'finish' ? '已安全结束并进入查看模式' : '已安全暂停并留在当前任务'
+        : mode === 'pause' ? '已安全暂停并返回任务列表' : '已安全结束并返回任务列表', {
         mode,
+        destination,
         fault: Boolean(stoppedWithFault),
         reconciled: Boolean(stopped.reconciled_inactive_after_error),
       });
       if (stopped.reconciled_inactive_after_error) {
         raiseDataSafetyAlert('已确认录音引擎不再采集，但本任务尚未安全收尾；请立即执行“检查并修复”，再继续录制或导出。');
-        setNotice('已返回任务列表，当前任务需要修复。');
+        setNotice(stayAfterStop ? '采集已暂停，当前任务需要修复。' : '已返回任务列表，当前任务需要修复。');
       } else if (stoppedWithFault) {
         raiseDataSafetyAlert('采集故障已结束：原始母轨和故障证据已保留，请在任务列表先执行“检查并修复”。');
-        setNotice('故障任务已返回列表，已落盘母轨仍保留。');
+        setNotice(stayAfterStop ? '采集已暂停，已落盘母轨仍保留；当前任务需要修复。' : '故障任务已返回列表，已落盘母轨仍保留。');
       } else if (mode === 'pause') {
         if (warning) raiseDataSafetyAlert(`${warning}。已落盘母音频仍已封存，继续前请抽检。`);
         else setDataSafetyAlert('');
-        setNotice(t('notice.pausedSafe'));
+        setNotice(stayAfterStop ? t('notice.pausedSafeStay') : t('notice.pausedSafe'));
       } else {
         if (warning) raiseDataSafetyAlert(`${warning}。原始母轨已封存，请抽检。`);
         else setDataSafetyAlert('');
-        setNotice(t('notice.captureFinished'));
+        setNotice(stayAfterStop ? t('notice.captureFinishedStay') : t('notice.captureFinished'));
       }
       await refreshRecordings();
     } catch (caught) {
@@ -2767,12 +2854,15 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   }
 
   async function safePauseAndReturn() {
-    await safeStopAndReturn(captureFault ? 'fault' : 'pause');
+    await safeStopAndReturn(captureFault ? 'fault' : 'pause', pauseDestination === 'stay' ? 'inspect' : 'home');
   }
 
   async function confirmFinishSession() {
     if ((recording && !captureFault) || !sessionDir) return;
-    await safeStopAndReturn(captureFault ? 'fault' : 'finish');
+    await safeStopAndReturn(
+      captureFault ? 'fault' : 'finish',
+      captureFault ? 'home' : 'inspect',
+    );
   }
 
   function resetForNewSession() {
@@ -2934,7 +3024,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         }
         else {
           const action = workflowShortcutAction(event.code, event.key, primaryAction, Boolean(currentItem));
-          if (action === 'finish') finishSession();
+          if (action === 'finish') requestFinishCapture();
           else if (action === 'accept') void acceptAttempt();
           else if (action === 'start') void startAttempt();
         }
@@ -3389,24 +3479,29 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       <aside className="tool-rail" aria-label={t('recorder.toolsAria')} />
       <aside className="panel item-browser">
         <div className="panel-tabs"><button className="active">{t('recorder.tabScript')}</button><button>{t('recorder.tabMarks')}</button></div>
-        <div className="browser-summary"><span>{t('recorder.completedOf', { done: completed, total: items.length })}</span><div className="mini-progress"><i style={{ width: `${items.length ? completed / items.length * 100 : 0}%` }} /></div></div>
-        <div className="item-filter"><span>{t('recorder.allItems')}</span><em>{items.length}</em></div>
+        <div className="browser-summary">
+          <div className="browser-summary-line">
+            <span>{t('recorder.completedOf', { done: completed, total: items.length })}</span>
+            {flaggedSilenceCount > 0 ? <em className="browser-flags">{t('recorder.silenceFlagged', { count: flaggedSilenceCount })}</em> : null}
+          </div>
+          <div className="mini-progress"><i style={{ width: `${items.length ? completed / items.length * 100 : 0}%` }} /></div>
+        </div>
         <div className="professional-item-list">{items.map((item, index) => {
-          const marks = recording && index === currentIndex
-            ? { headShort: false, tailShort: false, title: '' }
-            : itemSilenceMarks(item, sampleRateForDisplay, effectiveSilenceDurationMs);
+          const marks = itemSilenceViews[index] ?? { headShort: false, tailShort: false, title: '' };
           const flagged = marks.headShort || marks.tailShort;
+          const statusClass = itemStatusMetaClass(item.status);
           return <button
             key={item.id}
-            className={`professional-item${index === currentIndex ? ' active' : ''}${flagged ? ' has-silence-issue' : ''}`}
+            className={`professional-item${index === currentIndex ? ' active' : ''}${item.status === 'skipped' ? ' skipped' : ''}${flagged ? ' has-silence-issue' : ''}`}
             disabled={recording || captureFault}
+            aria-current={index === currentIndex ? 'true' : undefined}
             title={marks.title || undefined}
             onClick={() => { setCurrentIndex(index); setReviewAttemptId(null); }}
           >
             <span className={`item-state ${item.status}`}>{item.status === 'accepted' ? <Icon name="check" size={12} /> : item.status === 'skipped' ? '—' : String(index + 1).padStart(2, '0')}</span>
             <span><strong>{item.id}</strong><small>{item.text}</small></span>
             <span className="item-meta">
-              <em className={item.status === 'accepted' ? 'accepted' : undefined}>{statusLabel(item.status)}</em>
+              <em className={statusClass}>{statusLabel(item.status)}</em>
               <ItemSilenceMarkPills marks={marks} />
             </span>
           </button>;
@@ -3447,7 +3542,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
                 : primaryAction === 'accept'
                   ? <button data-testid="main-transport" className="main-transport accept" onClick={() => void acceptAttempt()} disabled={Boolean(busy)}><span><Icon name="check" /></span><strong>{acceptButtonLabel}</strong><kbd>SPACE</kbd></button>
                   : primaryAction === 'finish'
-                    ? <button data-testid="main-transport" className="main-transport complete" onClick={finishSession} disabled={Boolean(busy)}><span><Icon name="check" /></span><strong>{t('recorder.finishAll')}</strong><kbd>SPACE</kbd></button>
+                    ? <button data-testid="main-transport" className="main-transport complete" onClick={requestFinishCapture} disabled={Boolean(busy)}><span><Icon name="check" /></span><strong>{t('recorder.finishAll')}</strong><kbd>SPACE</kbd></button>
                     : primaryAction === 'start'
                       ? <button data-testid="main-transport" className="main-transport start" onClick={() => void startAttempt()} disabled={Boolean(busy)}><span><Icon name="record" /></span><strong>{t('recorder.startRecording')}</strong><kbd>SPACE</kbd></button>
                       : <button data-testid="main-transport" className="main-transport handled" disabled><span><Icon name="check" /></span><strong>{t('recorder.itemHandled')}</strong><kbd>R</kbd></button>}
@@ -3487,8 +3582,13 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           </nav>
         </div>
         <div className="inspector-footer">
-          {!captureActive && <button data-testid="enter-capture" className="button finish-session enter-capture" title={t('recorder.enterCaptureKey')} onClick={() => void activateCapture(currentItem?.id)} disabled={Boolean(busy) || workspaceFaulted}><Icon name="microphone" size={14} />{t('recorder.enterCapture')}<kbd>R</kbd></button>}
-          <button data-testid="finish-session" className={`button finish-session ${captureActive ? '' : 'leave-task'}`} onClick={() => void finishSession()} disabled={Boolean(busy)}><Icon name={captureActive ? 'stop' : 'chevron-left'} size={14} />{!captureActive ? t('recorder.leaveView') : exitAction === 'fault' ? t('recorder.finishAndLeave') : t('recorder.pauseAndLeave')}</button>
+          {footerActions.showEnterCapture && <button data-testid="enter-capture" className="button finish-session enter-capture" title={t('recorder.enterCaptureKey')} onClick={() => void activateCapture(currentItem?.id)} disabled={Boolean(busy) || workspaceFaulted}><Icon name="microphone" size={14} />{t('recorder.enterCapture')}<kbd>R</kbd></button>}
+          {footerActions.showPauseCapture
+            ? <div className="inspector-exits">
+              <button data-testid="pause-capture" className="button inspector-exit" onClick={requestPauseCapture} disabled={Boolean(busy)}><Icon name="pause" size={12} />{t('recorder.pauseCapture')}</button>
+              <button data-testid="finish-session" className="button inspector-exit" onClick={() => void finishSession()} disabled={Boolean(busy)}><Icon name="chevron-left" size={12} />{t('recorder.leaveTask')}</button>
+            </div>
+            : <button data-testid="finish-session" className={`button finish-session ${footerActions.leaveKind === 'fault' ? '' : 'leave-task'}`} onClick={() => void finishSession()} disabled={Boolean(busy)}><Icon name={footerActions.leaveKind === 'view' ? 'chevron-left' : 'stop'} size={14} />{footerActions.leaveKind === 'view' ? t('recorder.leaveView') : t('recorder.finishAndLeave')}</button>}
         </div>
       </aside>
     </div>
@@ -3507,15 +3607,21 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     />}
     {pauseConfirmOpen && !captureFault && <div className="dialog-backdrop" role="presentation">
       <section className="studio-dialog" role="dialog" aria-modal="true" aria-labelledby="pause-dialog-title">
-        <header><span className="dialog-icon"><Icon name="chevron-left" size={19} /></span><div><h2 id="pause-dialog-title">{recording ? t('pauseDialog.titleRecording') : t('pauseDialog.titleIdle')}</h2></div></header>
-        <p>{recording
-          ? hasSpoken
-            ? t('pauseDialog.spoken')
-            : t('pauseDialog.silent')
-          : t('pauseDialog.idle')}</p>
+        <header><span className="dialog-icon"><Icon name={pauseDestination === 'stay' ? 'pause' : 'chevron-left'} size={19} /></span><div><h2 id="pause-dialog-title">{pauseDestination === 'stay'
+          ? recording ? t('pauseDialog.titleRecordingStay') : t('pauseDialog.titleIdleStay')
+          : recording ? t('pauseDialog.titleRecording') : t('pauseDialog.titleIdle')}</h2></div></header>
+        <p>{pauseDestination === 'stay'
+          ? recording
+            ? hasSpoken ? t('pauseDialog.spokenStay') : t('pauseDialog.silentStay')
+            : t('pauseDialog.idleStay')
+          : recording
+            ? hasSpoken ? t('pauseDialog.spoken') : t('pauseDialog.silent')
+            : t('pauseDialog.idle')}</p>
         <dl className="dialog-summary"><div><dt>{t('recorder.accepted')}</dt><dd>{counts.accepted ?? 0}</dd></div><div><dt>{t('recorder.skipped')}</dt><dd>{counts.skipped ?? 0}</dd></div><div><dt>{t('recorder.pending')}</dt><dd className={(counts.pending ?? 0) + (counts.review ?? 0) ? 'warning' : ''}>{(counts.pending ?? 0) + (counts.review ?? 0)}</dd></div></dl>
-        <div className="dialog-warning">{t('pauseDialog.warning')}</div>
-        <footer><button data-testid="pause-cancel" className="button" onClick={() => setPauseConfirmOpen(false)} disabled={Boolean(busy)}>{t('pauseDialog.keepRecording')}</button><button data-testid="pause-confirm" className="button primary" onClick={() => void safePauseAndReturn()} disabled={Boolean(busy)}><Icon name="stop" size={14} />{recording ? t('pauseDialog.endAndLeave') : t('pauseDialog.pauseAndLeave')}</button></footer>
+        <div className="dialog-warning">{pauseDestination === 'stay' ? t('pauseDialog.warningStay') : t('pauseDialog.warning')}</div>
+        <footer><button data-testid="pause-cancel" className="button" onClick={() => setPauseConfirmOpen(false)} disabled={Boolean(busy)}>{t('pauseDialog.keepRecording')}</button><button data-testid="pause-confirm" className="button primary" onClick={() => void safePauseAndReturn()} disabled={Boolean(busy)}><Icon name={pauseDestination === 'stay' ? 'pause' : 'stop'} size={14} />{pauseDestination === 'stay'
+          ? recording ? t('pauseDialog.endAndStay') : t('pauseDialog.pauseStay')
+          : recording ? t('pauseDialog.endAndLeave') : t('pauseDialog.pauseAndLeave')}</button></footer>
       </section>
     </div>}
     {previewOpen && audioUrl && <PreviewPlayer
@@ -3533,7 +3639,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         <header><span className="dialog-icon"><Icon name="stop" size={19} /></span><div><h2 id="finish-dialog-title">{captureFault ? t('finishDialog.titleFault') : t('finishDialog.titleNormal')}</h2></div></header>
         <p>{captureFault ? t('finishDialog.bodyFault') : t('finishDialog.bodyNormal')}</p>
         <dl className="dialog-summary"><div><dt>{t('recorder.accepted')}</dt><dd>{counts.accepted ?? 0}</dd></div><div><dt>{t('recorder.skipped')}</dt><dd>{counts.skipped ?? 0}</dd></div><div><dt>{t('recorder.pending')}</dt><dd className={(counts.pending ?? 0) + (counts.review ?? 0) ? 'warning' : ''}>{(counts.pending ?? 0) + (counts.review ?? 0)}</dd></div></dl>
-        <footer><button data-testid="finish-cancel" className="button" onClick={() => setFinishConfirmOpen(false)}>{captureFault ? t('finishDialog.stayFault') : t('common.cancel')}</button><button data-testid="finish-confirm" className="button primary" onClick={() => void confirmFinishSession()} disabled={Boolean(busy)}><Icon name="stop" size={14} />{captureFault ? t('finishDialog.confirmFault') : t('finishDialog.confirmNormal')}</button></footer>
+        <footer><button data-testid="finish-cancel" className="button" onClick={() => setFinishConfirmOpen(false)}>{captureFault ? t('finishDialog.stayFault') : t('common.cancel')}</button><button data-testid="finish-confirm" className="button primary" onClick={() => void confirmFinishSession()} disabled={Boolean(busy)}><Icon name={captureFault ? 'stop' : 'check'} size={14} />{captureFault ? t('finishDialog.confirmFault') : t('finishDialog.confirmNormal')}</button></footer>
       </section>
     </div>}
     <StudioStatus engineStatus={engineStatus} message={error || dataSafetyAlert || busy || notice} isError={Boolean(error || dataSafetyAlert)} />
