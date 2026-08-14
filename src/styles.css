@@ -90,12 +90,12 @@
   --warning-edge: rgba(184, 154, 86, .28);
   --warning-soft: rgba(215, 166, 74, .08);
   --warning-banner: rgba(38, 33, 22, .68);
-  --success: #6eae7c;
-  --success-muted: #8fbe99;
-  --success-fill: #2a4232;
-  --success-line: #4d7a58;
-  --success-soft: rgba(110, 174, 124, .12);
-  --success-wash: rgba(110, 174, 124, .08);
+  --success: #5eb86a;
+  --success-muted: #84c48e;
+  --success-fill: #283e2b;
+  --success-line: #4a8254;
+  --success-soft: rgba(94, 184, 106, .14);
+  --success-wash: rgba(94, 184, 106, .09);
 
   /* Chrome */
   --dot: #686868;
