@@ -314,7 +314,7 @@ const zhCN = {
     storageHelp: '创建独立目录保存母音频、进度和导出文件',
     sessionName: '录制名称',
     localLocation: '本地保存位置',
-    createHint: '创建后会打开声卡并尽量打开领读面板。环境检测通过后即可开录。',
+    createHint: '创建后会打开声卡。环境检测通过后即可开录。需要时再打开领读面板。',
     createTask: '创建录制任务',
     inspector: '检查器',
     summary: '录制摘要',

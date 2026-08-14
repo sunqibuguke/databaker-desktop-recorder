@@ -815,8 +815,8 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     sequence: workflowComplete ? items.length : currentItem ? currentIndex + 1 : 0,
     total: items.length,
     id: workflowComplete ? '' : currentItem?.id ?? '',
-    text: captureFault ? t('readerCue.halt') : noiseCheckBlocksAttempt ? t('readerCue.hush') : workflowComplete ? t('recorder.scriptFinished') : currentItem?.text ?? '',
-    label: captureFault ? '' : noiseCheckBlocksAttempt ? '' : workflowComplete ? '' : currentItem?.label ?? '',
+    text: workflowComplete || !currentItem ? t('recorder.scriptFinished') : currentItem.text,
+    label: workflowComplete || !currentItem ? '' : currentItem.label ?? '',
     cue: readerCue,
     cueLabel: readerCueLabel,
     readerCueLabel,
@@ -1899,7 +1899,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     enterInspectionWorkspace(result);
     setNotice(options?.activateAfterCreate ? t('activationError.recreatedNotice') : t('notice.taskCreated'));
     if (options?.activateAfterCreate) {
-      return activateCaptureAndPrompter(undefined, result.session_dir);
+      return activateCapture(undefined, result.session_dir);
     }
     return true;
   }
@@ -1946,15 +1946,6 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     } finally {
       setBusy('');
     }
-  }
-
-  async function activateCaptureAndPrompter(
-    keepItemId?: string | null,
-    targetSessionDir?: string,
-  ): Promise<boolean> {
-    const ok = await activateCapture(keepItemId, targetSessionDir);
-    if (ok) void openPrompterPanel();
-    return ok;
   }
 
   function clearActivationFailure() {
@@ -2252,7 +2243,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     }));
     if (!inspected) return;
     enterInspectionWorkspace(inspected);
-    if (options.activate) await activateCaptureAndPrompter();
+    if (options.activate) await activateCapture();
   }
 
   async function exportRecordingArtifact(
@@ -2805,7 +2796,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           void previewAttempt();
         } else if (viewAction === 'enter-capture' && !workspaceFaulted) {
           event.preventDefault();
-          void activateCaptureAndPrompter(currentItem?.id);
+          void activateCapture(currentItem?.id);
         } else if (event.key === 'ArrowLeft') {
           setCurrentIndex((index) => Math.max(0, index - 1));
           setReviewAttemptId(null);
@@ -3263,8 +3254,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         <div className="document-tabs"><span className="active"><Icon name="microphone" size={13} /> {workflowComplete ? t('recorder.taskComplete') : currentItem?.id ?? 'Item'} <i>×</i></span></div>
         <div className="editor-toolbar"><div className="editor-nav"><button title={t('recorder.prevItem')} disabled={recording || currentIndex === 0} onClick={() => setCurrentIndex((index) => Math.max(0, index - 1))}><Icon name="chevron-left" /></button><span>{currentIndex + 1} / {items.length}</span><button title={t('recorder.nextItem')} disabled={recording || currentIndex >= items.length - 1} onClick={() => setCurrentIndex((index) => Math.min(items.length - 1, index + 1))}><Icon name="chevron-right" /></button></div><div className="editor-time"><strong className={recording ? 'recording' : ''}>{recording ? attemptDuration : sessionDuration}</strong></div><div className="editor-toolbar-actions"><button className="prompter-launch" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? t('recorder.locatePrompter') : t('recorder.openPrompter')}</button></div><div className={`save-health ${workspaceFaulted || captureFault ? 'fault' : meter.storage_status === 'warning' ? 'warning' : ''}`}><i />{workspaceFaulted ? t('recorder.healthReadonly') : !captureActive ? t('recorder.healthView') : captureFault ? t('recorder.healthFaultStop', { title: captureFaultCopy.title }) : meter.storage_status === 'warning' ? t('recorder.healthWarning', { minutes: Math.max(0, Math.floor(meter.storage_safe_remaining_seconds / 60)) }) : t('recorder.healthLive')}</div></div>
         <div className="editor-canvas">
-          {(activationFailure || captureFault || discontinuityToast || qualityWarning || (captureActive && !prompterStatus.ready && !workspaceFaulted)) && <div className="workspace-toasts" aria-live="polite">
-            {captureActive && !prompterStatus.ready && !workspaceFaulted && !captureFault && <div className="session-noise-banner" role="status" data-testid="prompter-missing-banner"><Icon name="play" size={16} /><div><strong>{t('recorder.prompterMissingTitle')}</strong><span>{t('recorder.prompterMissingBody')}</span></div><button className="button" onClick={() => void openPrompterPanel()} disabled={Boolean(busy)}>{t('recorder.openPrompter')}</button></div>}
+          {(activationFailure || captureFault || discontinuityToast || qualityWarning) && <div className="workspace-toasts" aria-live="polite">
             {activationFailure && !captureActive && <div className="session-noise-banner failed" role="alert" data-testid="activation-failure-banner"><Icon name="stop" size={16} /><div><strong>{activationErrorCopy(activationFailure.kind).title}</strong><span>{activationErrorCopy(activationFailure.kind).body}</span></div><button className="button" onClick={() => setActivationFailureOpen(true)} disabled={Boolean(busy)}>{t('activationError.openEditor')}</button></div>}
             {captureFault && <div className="capture-fault-banner" role="alert"><Icon name="stop" size={16} /><div><strong>{captureFaultCopy.title}</strong><span>{captureFaultCopy.detail}{snapshot?.device_name ? ` ${t('issues.currentDevice', { name: snapshot.device_name })}` : ' '}{t('issues.stopThenFinish')}</span></div></div>}
             {discontinuityToast && !captureFault && <div className="input-quality-banner workspace-toast" data-testid="discontinuity-toast" role="status"><Icon name="meter" size={16} /><div><strong>{t('discontinuity.bannerTitle')}</strong><span>{discontinuityToast}. {t('discontinuity.bannerHint')}</span></div></div>}
@@ -3335,7 +3325,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           </nav>
         </div>
         <div className="inspector-footer">
-          {!captureActive && <button data-testid="enter-capture" className="button finish-session enter-capture" title={t('recorder.enterCaptureKey')} onClick={() => void activateCaptureAndPrompter(currentItem?.id)} disabled={Boolean(busy) || workspaceFaulted}><Icon name="microphone" size={14} />{t('recorder.enterCapture')}<kbd>R</kbd></button>}
+          {!captureActive && <button data-testid="enter-capture" className="button finish-session enter-capture" title={t('recorder.enterCaptureKey')} onClick={() => void activateCapture(currentItem?.id)} disabled={Boolean(busy) || workspaceFaulted}><Icon name="microphone" size={14} />{t('recorder.enterCapture')}<kbd>R</kbd></button>}
           <button data-testid="finish-session" className={`button finish-session ${captureActive ? '' : 'leave-task'}`} onClick={() => void finishSession()} disabled={Boolean(busy)}><Icon name={captureActive ? 'stop' : 'chevron-left'} size={14} />{!captureActive ? t('recorder.leaveView') : exitAction === 'fault' ? t('recorder.finishAndLeave') : t('recorder.pauseAndLeave')}</button>
         </div>
       </aside>

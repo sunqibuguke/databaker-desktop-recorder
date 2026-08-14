@@ -316,7 +316,7 @@ const es: MessageTree = {
     storageHelp: 'Crea una carpeta independiente para el máster, el progreso y las exportaciones',
     sessionName: 'Nombre de la grabación',
     localLocation: 'Ubicación local de guardado',
-    createHint: 'Al crear se abre la interfaz y se intenta abrir el teleprompter. Grabe tras la comprobación de ruido.',
+    createHint: 'Al crear se abre la interfaz. Grabe tras la comprobación de ruido. Abra el teleprompter solo si lo necesita.',
     createTask: 'Crear tarea de grabación',
     inspector: 'Inspector',
     summary: 'Resumen de la grabación',

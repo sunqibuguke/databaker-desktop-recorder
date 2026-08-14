@@ -316,7 +316,7 @@ const ja: MessageTree = {
     storageHelp: 'マスター、進捗、書き出し用の独立フォルダを作ります',
     sessionName: '収録名',
     localLocation: 'ローカル保存先',
-    createHint: '作成後にインターフェースを開き、領読パネルも開きます。環境検査のあと収録できます。',
+    createHint: '作成後にインターフェースを開きます。環境検査のあと収録できます。領読が必要なら後から開きます。',
     createTask: '収録タスクを作成',
     inspector: 'インスペクタ',
     summary: '収録概要',

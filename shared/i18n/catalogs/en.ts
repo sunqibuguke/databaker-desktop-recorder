@@ -316,7 +316,7 @@ const en: MessageTree = {
     storageHelp: 'Creates a standalone folder for master audio, progress, and exports',
     sessionName: 'Recording name',
     localLocation: 'Local save location',
-    createHint: 'Creating a task opens the interface and tries to open the prompter. Record after the room-noise check.',
+    createHint: 'Creating a task opens the interface. Record after the room-noise check. Open the prompter only if you need it.',
     createTask: 'Create recording task',
     inspector: 'Inspector',
     summary: 'Recording summary',

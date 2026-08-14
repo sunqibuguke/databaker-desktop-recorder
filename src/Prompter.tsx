@@ -117,7 +117,7 @@ export function PrompterView() {
     </header>
     {qualityWarning && <div className="prompter-quality-warning" role="alert"><i />{qualityWarning}</div>}
     <article className="prompter-content">
-      <p ref={copyRef} className={`${copyDensity} ${cue === 'pending' || cue === 'checking' ? 'pending' : cue === 'ready' ? 'ready' : cue === 'recording' ? 'live' : ''}`.trim()}>{state?.text || t('prompter.noText')}</p>
+      <p ref={copyRef} className={`${copyDensity} ${cue === 'recording' ? 'live' : ''}`.trim()}>{state?.text || t('prompter.noText')}</p>
       <aside ref={labelRef} className={`prompter-label ${state?.label ? '' : 'empty'}`}><span>{t('prompter.labelTitle')}</span><strong>{state?.label || t('prompter.none')}</strong></aside>
     </article>
     <footer className="prompter-footer">

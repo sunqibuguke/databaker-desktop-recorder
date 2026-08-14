@@ -316,7 +316,7 @@ const ko: MessageTree = {
     storageHelp: '마스터, 진행, 내보내기용 독립 폴더를 만듭니다',
     sessionName: '녹음 이름',
     localLocation: '로컬 저장 위치',
-    createHint: '만들면 인터페이스를 열고 프롬프터도 엽니다. 환경 검사 후 녹음할 수 있습니다.',
+    createHint: '만들면 인터페이스를 엽니다. 환경 검사 후 녹음할 수 있습니다. 프롬프터는 필요할 때 엽니다.',
     createTask: '녹음 작업 만들기',
     inspector: '검사기',
     summary: '녹음 요약',

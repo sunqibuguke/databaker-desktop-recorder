@@ -316,7 +316,7 @@ const pt: MessageTree = {
     storageHelp: 'Cria uma pasta independente para o master, o progresso e as exportações',
     sessionName: 'Nome da gravação',
     localLocation: 'Local de gravação local',
-    createHint: 'Ao criar, a interface abre e tenta abrir o teleponto. Grave após a verificação de ruído.',
+    createHint: 'Ao criar, a interface abre. Grave após a verificação de ruído. Abra o teleponto só se precisar.',
     createTask: 'Criar tarefa de gravação',
     inspector: 'Inspetor',
     summary: 'Resumo da gravação',
