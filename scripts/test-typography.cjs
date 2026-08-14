@@ -50,6 +50,10 @@ function main() {
   assert.match(prompter, /prompterFontSizeRem\(appearance\.fontSize\)/);
   assert.doesNotMatch(prompter, /--prompter-copy-size['"]?\s*as string\]:\s*`\$\{appearance\.fontSize\}px`/);
 
+  assert.match(css, /\.settings-dialog\s*\{[^}]*max-height:\s*calc\(100d?vh - 71px\)/);
+  assert.match(css, /\.settings-dialog\s*\{[^}]*grid-template-rows:\s*auto minmax\(0,\s*1fr\) auto/);
+  assert.match(css, /\.settings-content\s*\{[^}]*overflow:\s*auto/);
+
   console.log('typography tests passed');
 }
 

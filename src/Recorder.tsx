@@ -3132,7 +3132,13 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           <code title={license.machineCode}>{licenseSummary(license)} · {license.machineCode || t('license.machineUnavailable')}</code>
         </section>}
         <section className="settings-advanced">
-          <details data-testid="settings-detection-advanced">
+          <details data-testid="settings-detection-advanced" onToggle={(event) => {
+            if (!event.currentTarget.open) return;
+            const node = event.currentTarget;
+            requestAnimationFrame(() => {
+              node.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+            });
+          }}>
             <summary>
               <div>
                 <strong>{t('settings.detectionAdvanced')}</strong>
