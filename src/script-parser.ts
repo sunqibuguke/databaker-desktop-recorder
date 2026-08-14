@@ -4,8 +4,8 @@ export type ParseResult = { items: ScriptItem[]; errors: string[]; delimiter: ',
 
 const headerAliases = {
   id: new Set(['id', '编号', '序号', '文本id', 'text_id', 'item_id']),
-  text: new Set(['text', '文本', '内容', '正文', '文案', 'sentence', '句子', '句子正文']),
-  label: new Set(['label', '标签', '要求', '备注', '语气', '强调', 'tag']),
+  text: new Set(['text', '文本', '内容', '正文', '文案', 'sentence', '句子', '句子正文', '唤醒词', 'wake', 'wakeword', 'wake_word']),
+  label: new Set(['label', '标签', '要求', '备注', '备注标签', '语气', '强调', 'tag']),
 };
 
 function parseRow(line: string, delimiter: ',' | '\t'): string[] {
@@ -36,26 +36,8 @@ function findColumn(headers: string[], aliases: Set<string>): number {
   return headers.findIndex((header) => aliases.has(header.trim().toLowerCase()));
 }
 
-export function parseScript(content: string): ParseResult {
-  const lines = content.replace(/^\uFEFF/, '').split(/\r?\n/).filter((line) => line.trim());
-  const delimiter: ',' | '\t' = (lines[0]?.match(/\t/g)?.length ?? 0) > (lines[0]?.match(/,/g)?.length ?? 0) ? '\t' : ',';
+function parseDelimited(lines: string[], delimiter: ',' | '\t'): ParseResult {
   const errors: string[] = [];
-  if (!lines.length) return { items: [], errors: ['脚本为空'], delimiter };
-
-  const isPlainText = !lines.some((line) => line.includes(',') || line.includes('\t'));
-  if (isPlainText) {
-    const idWidth = Math.max(4, String(lines.length).length);
-    return {
-      items: lines.map((line, index) => ({
-        id: String(index + 1).padStart(idWidth, '0'),
-        text: line.trim(),
-        label: '',
-      })),
-      errors,
-      delimiter,
-    };
-  }
-
   const first = parseRow(lines[0], delimiter);
   const idHeader = findColumn(first, headerAliases.id);
   const textHeader = findColumn(first, headerAliases.text);
@@ -85,4 +67,55 @@ export function parseScript(content: string): ParseResult {
   }
   if (!items.length && !errors.length) errors.push('脚本没有可用数据行');
   return { items, errors, delimiter };
+}
+
+function fieldContainsTab(value: string): boolean {
+  return value.includes('\t');
+}
+
+function leftoverTabCount(result: ParseResult): number {
+  return result.items.filter((item) => (
+    fieldContainsTab(item.id) || fieldContainsTab(item.text) || fieldContainsTab(item.label)
+  )).length;
+}
+
+function commaParseNeedsTabFallback(result: ParseResult): boolean {
+  if (result.errors.length > 0 || !result.items.length) return true;
+  return leftoverTabCount(result) > 0;
+}
+
+function preferParseResult(primary: ParseResult, fallback: ParseResult): ParseResult {
+  if (!fallback.items.length) return primary;
+  if (!primary.items.length) return fallback;
+  const leftoverTabs = leftoverTabCount(fallback) - leftoverTabCount(primary);
+  if (leftoverTabs < 0) return fallback;
+  if (leftoverTabs > 0) return primary;
+  if (fallback.errors.length < primary.errors.length) return fallback;
+  if (fallback.errors.length === primary.errors.length && fallback.items.length > primary.items.length) {
+    return fallback;
+  }
+  return primary;
+}
+
+export function parseScript(content: string): ParseResult {
+  const lines = content.replace(/^\uFEFF/, '').split(/\r?\n/).filter((line) => line.trim());
+  if (!lines.length) return { items: [], errors: ['脚本为空'], delimiter: ',' };
+
+  const isPlainText = !lines.some((line) => line.includes(',') || line.includes('\t'));
+  if (isPlainText) {
+    const idWidth = Math.max(4, String(lines.length).length);
+    return {
+      items: lines.map((line, index) => ({
+        id: String(index + 1).padStart(idWidth, '0'),
+        text: line.trim(),
+        label: '',
+      })),
+      errors: [],
+      delimiter: ',',
+    };
+  }
+
+  const comma = parseDelimited(lines, ',');
+  if (!commaParseNeedsTabFallback(comma)) return comma;
+  return preferParseResult(comma, parseDelimited(lines, '\t'));
 }
