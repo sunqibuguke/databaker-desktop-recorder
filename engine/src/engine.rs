@@ -1576,12 +1576,9 @@ impl Engine {
         }
 
         let now = Utc::now().to_rfc3339();
-        let segment_frames = existing
-            .segment_frames
-            .map(Ok)
-            .unwrap_or_else(|| {
-                storage_layout_v1_default_segment_frames(existing.audio_format.sample_rate)
-            })?;
+        let segment_frames = existing.segment_frames.map(Ok).unwrap_or_else(|| {
+            storage_layout_v1_default_segment_frames(existing.audio_format.sample_rate)
+        })?;
         let snapshot = SessionSnapshot {
             schema_version: 1,
             journal_seq: 0,
@@ -4363,9 +4360,7 @@ fn ensure_real_directory(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             durable_create_directory(path)
         }
-        Err(error) => {
-            Err(error).with_context(|| format!("inspect directory {}", path.display()))
-        }
+        Err(error) => Err(error).with_context(|| format!("inspect directory {}", path.display())),
     }
 }
 
@@ -4395,9 +4390,7 @@ fn empty_real_directory(path: &Path) -> Result<()> {
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         bail!("{} must be a real directory", path.display());
     }
-    for entry in std::fs::read_dir(path)
-        .with_context(|| format!("list {}", path.display()))?
-    {
+    for entry in std::fs::read_dir(path).with_context(|| format!("list {}", path.display()))? {
         remove_existing_leaf(&entry?.path())?;
     }
     Ok(())
@@ -12965,7 +12958,11 @@ mod tests {
         std::fs::write(root.join("audio/segments/master-000001.wav"), b"AUDIO").unwrap();
         std::fs::write(root.join("export/full-track.wav"), b"EXPORT").unwrap();
         std::fs::write(root.join("preview/001-a1.wav"), b"PREVIEW").unwrap();
-        std::fs::write(root.join(AUDIO_FAULT_MARKER), b"{\"reason\":\"overflow\"}\n").unwrap();
+        std::fs::write(
+            root.join(AUDIO_FAULT_MARKER),
+            b"{\"reason\":\"overflow\"}\n",
+        )
+        .unwrap();
         let mut snapshot = test_snapshot();
         snapshot.status = "faulted".to_string();
         snapshot.journal_seq = 8;
@@ -13003,7 +13000,10 @@ mod tests {
         write_journal(&root, &[sequenced_event("attempt_accepted", &snapshot)]);
         std::fs::write(
             root.join("session.json"),
-            format!("{}\n", serde_json::to_string(&session_summary_value(&snapshot)).unwrap()),
+            format!(
+                "{}\n",
+                serde_json::to_string(&session_summary_value(&snapshot)).unwrap()
+            ),
         )
         .unwrap();
 
@@ -13033,7 +13033,12 @@ mod tests {
         assert_eq!(reset["snapshot"]["items"][0]["id"], "001");
         assert_eq!(reset["snapshot"]["items"][0]["text"], "测试文本");
         assert_eq!(reset["snapshot"]["items"][0]["status"], "pending");
-        assert!(reset["snapshot"]["items"][0]["attempts"].as_array().unwrap().is_empty());
+        assert!(
+            reset["snapshot"]["items"][0]["attempts"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         assert!(reset["snapshot"]["items"][0]["selected_attempt_id"].is_null());
         assert!(!root.join("audio/segments/master-000001.wav").exists());
         assert!(!root.join("export/full-track.wav").exists());
