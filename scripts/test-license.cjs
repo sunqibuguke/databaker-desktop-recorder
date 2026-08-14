@@ -12,6 +12,8 @@ async function main() {
     issueLicense,
     verifyLicenseTicket,
     inspectLicenseTicket,
+    parseExpiryDate,
+    formatExpiryDate,
     isLicenseExemptEngineCommand,
     isLicenseCheckDisabled,
     LicenseRequiredError,
@@ -84,6 +86,34 @@ async function main() {
     now: now + 366 * 86_400 * 1000,
     machineCode: fingerprint.machineCode,
   }).reason, 'expired');
+
+  assert.equal(parseExpiryDate('2026-08-14'), 1_786_752_000);
+  assert.equal(formatExpiryDate(1_786_752_000), '2026-08-14');
+  assert.throws(() => parseExpiryDate('2026-02-29'));
+  const calendar = issue({
+    jti: 'calendar-day',
+    days: undefined,
+    expiresAt: parseExpiryDate('2026-08-14'),
+  });
+  assert.equal(inspectLicenseTicket(calendar).exp, 1_786_752_000);
+  assert.equal('claims' in verifyLicenseTicket(calendar, {
+    publicKeys,
+    now: Date.parse('2026-08-14T23:59:59Z'),
+    machineCode: fingerprint.machineCode,
+  }), true);
+  assert.equal(verifyLicenseTicket(calendar, {
+    publicKeys,
+    now: Date.parse('2026-08-15T00:00:00Z'),
+    machineCode: fingerprint.machineCode,
+  }).reason, 'expired');
+
+  const unnamed = issue({ subject: '   ', jti: 'no-subject' });
+  assert.equal(inspectLicenseTicket(unnamed).sub, '');
+  assert.equal('claims' in verifyLicenseTicket(unnamed, {
+    publicKeys,
+    now,
+    machineCode: fingerprint.machineCode,
+  }), true);
 
   const perpetual = issue({ perpetual: true, jti: 'forever' });
   assert.equal(inspectLicenseTicket(perpetual).exp, null);

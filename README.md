@@ -67,8 +67,8 @@ npm run package:issuer
 技术支持也可用命令行：
 
 ```bash
-npm run license:issue -- --machine A7K2-9M3P-Q4WX --subject "客户A-工位3" --days 365
-./release/issuer/DataBaker-License-Issuer --machine A7K2-9M3P-Q4WX --subject "客户A-工位3" --days 365
+npm run license:issue -- --machine A7K2-9M3P-Q4WX --days 365
+./release/issuer/DataBaker-License-Issuer --machine A7K2-9M3P-Q4WX --days 365
 ./release/issuer/DataBaker-License-Issuer --clear-local
 ```
 

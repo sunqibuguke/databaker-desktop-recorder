@@ -68,12 +68,12 @@ function main() {
   const key = stagePrivateKey();
   fs.writeFileSync(path.join(OUT_DIR, '使用说明.txt'), `DataBaker 授权注册机
 
-双击打开，输入机器码和客户/工位名即可生成授权码。私钥已随程序打包。
+双击打开，输入机器码和到期日即可生成授权码。工位名称选填。私钥已随程序打包。
 底部「清空本机授权」会删除本机采集软件已激活的授权，请先退出采集软件。
 不要把本目录随采集安装包分发，也不要提交 git。
 
 命令行：
-  ${packagedName()} --machine A7K2-9M3P-Q4WX --subject 客户A-工位3 --days 365
+  ${packagedName()} --machine A7K2-9M3P-Q4WX --days 365
   ${packagedName()} --clear-local
 `, 'utf8');
 

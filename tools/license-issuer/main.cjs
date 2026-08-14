@@ -34,6 +34,12 @@ function createWindow() {
   void window.loadFile(path.join(__dirname, 'index.html'));
 }
 
+function issuerExpiresAt(value) {
+  if (value == null) return value;
+  if (typeof value === 'string') return licenseModule().parseExpiryDate(value);
+  return value;
+}
+
 ipcMain.handle('issuer:issue', (_event, payload) => {
   const { issueLicense } = licenseModule();
   const keyPath = defaultKeyPath();
@@ -45,8 +51,9 @@ ipcMain.handle('issuer:issue', (_event, payload) => {
     kid: typeof payload?.kid === 'string' && payload.kid.trim() ? payload.kid.trim() : '2026a',
     subject: String(payload?.subject ?? ''),
     machineCode: String(payload?.machineCode ?? ''),
-    days: payload?.perpetual ? undefined : Number(payload?.days || 365),
+    days: payload?.perpetual || payload?.expiresAt ? undefined : Number(payload?.days || 365),
     perpetual: Boolean(payload?.perpetual),
+    expiresAt: payload?.perpetual ? null : issuerExpiresAt(payload?.expiresAt),
   });
 });
 

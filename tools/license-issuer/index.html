@@ -6,74 +6,152 @@
   <style>
     :root {
       color-scheme: dark;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
-      --ink: #161616;
-      --text: #e6e6e6;
-      --text-2: #b9b9b9;
-      --text-soft: #d6d6d6;
-      --label: #9a9a9a;
-      --line: #3a3a3a;
-      --line-field: #434846;
-      --panel-raised: #2b2b2b;
-      --library-well: #1b1d1c;
-      --library-input: #1f2221;
-      --accent-fill: #67bdb8;
-      --accent-ink: #0c201f;
-      --danger: #ef6a72;
+      font-family: "SF Pro Display", "PingFang SC", "Segoe UI", sans-serif;
+      --ink: #111110;
+      --surface: #181816;
+      --well: #141413;
+      --line: #2c2c28;
+      --text: #e8e6e3;
+      --muted: #8a8780;
+      --soft: #b6b3ac;
+      --cream: #f2efe8;
+      --cream-ink: #161513;
+      --accent: #5ca8a3;
+      --danger: #c45c62;
       --text-xs: 0.625rem;
       --text-md: 0.75rem;
       --text-lg: 0.8125rem;
-      --text-title: 1.25rem;
+      --text-title: 1.75rem;
     }
+    * { box-sizing: border-box; }
     html { font-size: 16px; }
-    body { margin: 0; background: var(--ink); color: var(--text); font-size: var(--text-md); }
-    main { max-width: 520px; margin: 0 auto; padding: 28px 22px 32px; }
-    h1 { margin: 0 0 6px; font-size: var(--text-title); }
-    p { margin: 0 0 18px; color: var(--label); font-size: var(--text-lg); line-height: 1.55; }
-    label { display: grid; gap: 6px; margin-bottom: 12px; font-size: var(--text-md); color: var(--text-2); }
-    input, textarea { padding: 8px 10px; border: 1px solid var(--line-field); border-radius: 2px; color: var(--text-soft); background: var(--library-input); font: var(--text-lg) ui-monospace, SFMono-Regular, Consolas, monospace; }
-    textarea { min-height: 92px; resize: vertical; }
-    .row { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: end; }
-    button { min-height: 34px; padding: 0 14px; border: 1px solid var(--accent-fill); background: var(--accent-fill); color: var(--accent-ink); font-weight: 600; font-size: var(--text-md); }
-    button.secondary { border-color: var(--line-field); background: var(--panel-raised); color: var(--text-soft); }
-    .error { margin: 10px 0 0; color: var(--danger); font-size: var(--text-md); }
-    .ok { margin-top: 16px; }
-    .ok code { display: block; margin-top: 8px; padding: 10px; border: 1px solid var(--line); background: var(--library-well); white-space: pre-wrap; word-break: break-all; }
-    .check { display: flex; align-items: center; gap: 8px; margin: 4px 0 14px; color: var(--text-2); font-size: var(--text-lg); }
+    body { margin: 0; background: var(--ink); color: var(--text); }
+    main { max-width: 520px; margin: 0 auto; padding: 28px 24px 36px; }
+    h1 { margin: 0; font-size: var(--text-title); letter-spacing: -0.03em; font-weight: 650; }
+    .lede { margin: 8px 0 22px; color: var(--muted); font-size: var(--text-lg); line-height: 1.55; }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 20px;
+    }
+    label { display: grid; gap: 6px; margin-bottom: 16px; color: var(--soft); font-size: var(--text-md); }
+    .label-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .optional { color: var(--muted); font-size: var(--text-xs); }
+    input[type="text"], input[type="date"] {
+      width: 100%;
+      min-height: 38px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      color: var(--text);
+      background: var(--well);
+      font: var(--text-lg) ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    }
+    input:disabled { opacity: 0.45; }
+    .hint { margin: -10px 0 16px; color: var(--muted); font-size: var(--text-xs); }
+    .check { display: flex; align-items: center; gap: 8px; color: var(--soft); font-size: var(--text-lg); }
+    button {
+      width: 100%;
+      min-height: 40px;
+      padding: 0 16px;
+      border: 0;
+      border-radius: 6px;
+      background: var(--cream);
+      color: var(--cream-ink);
+      font-weight: 650;
+      font-size: var(--text-lg);
+    }
+    button.secondary {
+      width: auto;
+      min-height: 32px;
+      border: 1px solid var(--line);
+      background: var(--well);
+      color: var(--text);
+      font-weight: 500;
+    }
+    .error { margin: 12px 0 0; color: var(--danger); font-size: var(--text-md); }
+    .result { margin-top: 16px; }
+    .result-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+    .result code {
+      display: block;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--well);
+      color: var(--cream);
+      white-space: pre-wrap;
+      word-break: break-all;
+      font-size: var(--text-md);
+    }
   </style>
 </head>
 <body>
   <main>
-    <h1>DataBaker 授权注册机</h1>
-    <p>输入工位机器码和客户名称，生成绑定该机器的离线授权码。</p>
-    <label>机器码<input id="machine" placeholder="A7K2-9M3P-Q4WX" /></label>
-    <label>客户 / 工位名<input id="subject" placeholder="客户A-工位3" /></label>
-    <div class="row">
-      <label>有效天数<input id="days" type="number" min="1" value="365" /></label>
-      <label class="check"><input id="perpetual" type="checkbox" />永久</label>
+    <h1>授权注册机</h1>
+    <p class="lede">输入机器码和到期日，生成绑定该机器的离线授权。</p>
+    <div class="card">
+      <label>机器码<input id="machine" placeholder="A7K2-9M3P-Q4WX" /></label>
+      <label>
+        <span class="label-row">
+          授权日期
+          <span class="check"><input id="perpetual" type="checkbox" />永久</span>
+        </span>
+        <input id="expiry" type="date" />
+      </label>
+      <p id="expiryHint" class="hint">填写到期日，或勾选永久。</p>
+      <label>
+        <span class="label-row">工位名称<span class="optional">选填</span></span>
+        <input id="subject" placeholder="客户A-工位3" />
+      </label>
+      <p class="hint">只作备忘，不影响激活。</p>
+      <button id="issue" type="button">生成授权码</button>
     </div>
-    <button id="issue" type="button">生成授权码</button>
     <div id="error" class="error" hidden></div>
-    <div id="result" class="ok" hidden>
-      <div>授权码</div>
+    <div id="result" class="card result" hidden>
+      <div class="result-head">
+        <div>授权码</div>
+        <button id="copy" class="secondary" type="button">复制授权码</button>
+      </div>
       <code id="ticket"></code>
-      <button id="copy" class="secondary" type="button" style="margin-top:10px">复制授权码</button>
     </div>
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
+    const defaultExpiry = new Date(Date.now() + 365 * 86_400_000 - 1).toISOString().slice(0, 10);
+    $('expiry').value = defaultExpiry;
+
+    function refreshHint() {
+      if ($('perpetual').checked) {
+        $('expiryHint').textContent = '永久有效，不设到期日。';
+        return;
+      }
+      const value = $('expiry').value;
+      $('expiryHint').textContent = value ? `到期日 ${value}` : '填写到期日，或勾选永久。';
+    }
+
     $('perpetual').addEventListener('change', () => {
-      $('days').disabled = $('perpetual').checked;
+      $('expiry').disabled = $('perpetual').checked;
+      refreshHint();
     });
+    $('expiry').addEventListener('input', refreshHint);
+    refreshHint();
+
     $('issue').addEventListener('click', async () => {
       $('error').hidden = true;
       $('result').hidden = true;
       try {
+        const perpetual = $('perpetual').checked;
+        const expiry = $('expiry').value;
+        if (!perpetual && !/^\d{4}-\d{2}-\d{2}$/.test(expiry)) {
+          throw new Error('授权日期格式无效，请使用 YYYY-MM-DD');
+        }
+        const expiresAt = perpetual ? null : expiry;
         const ticket = await window.issuer.issue({
           machineCode: $('machine').value,
           subject: $('subject').value,
-          days: Number($('days').value || 365),
-          perpetual: $('perpetual').checked,
+          perpetual,
+          expiresAt,
         });
         $('ticket').textContent = ticket;
         $('result').hidden = false;

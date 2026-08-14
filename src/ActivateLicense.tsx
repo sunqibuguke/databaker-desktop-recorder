@@ -220,7 +220,7 @@ export function ActivateLicense({
 
 export function licenseSummary(status: LicenseStatus): string {
   if (status.expiresAt === null) return t('settings.licensePerpetual');
-  const date = new Date(status.expiresAt * 1_000).toISOString().slice(0, 10);
+  const date = new Date((status.expiresAt - 1) * 1_000).toISOString().slice(0, 10);
   if (status.daysRemaining !== null && status.daysRemaining <= 7) {
     return t('settings.licenseDays', { days: String(status.daysRemaining), date });
   }

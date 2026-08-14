@@ -5,7 +5,7 @@ const path = require('node:path');
 
 function printUsage() {
   console.log(`Usage:
-  node scripts/issue-license.cjs issue --machine <CODE> --subject <NAME> [--days 365|--perpetual] [--kid 2026a]
+  node scripts/issue-license.cjs issue --machine <CODE> [--days 365|--perpetual] [--subject <NAME>] [--kid 2026a]
   node scripts/issue-license.cjs verify --ticket <TICKET>
 
 Environment:
@@ -42,7 +42,7 @@ async function main() {
   const ticket = license.issueLicense({
     privateKeyPem: loadPrivateKey(),
     kid: args.kid || '2026a',
-    subject: required(args, 'subject'),
+    subject: typeof args.subject === 'string' ? args.subject : '',
     machineCode: required(args, 'machine'),
     days: args.days ? Number(args.days) : undefined,
     perpetual: Boolean(args.perpetual),

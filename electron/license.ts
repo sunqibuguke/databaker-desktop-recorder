@@ -456,9 +456,24 @@ function resolveExpiry(input: IssueLicenseInput, now: number): number | null {
   return now + days * 86_400;
 }
 
+/** Exclusive unix instant after the last valid UTC second of `YYYY-MM-DD`. */
+export function parseExpiryDate(value: string): number {
+  const trimmed = value.trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) throw new Error('授权日期格式无效，请使用 YYYY-MM-DD');
+  const startMs = Date.parse(`${trimmed}T00:00:00Z`);
+  if (!Number.isFinite(startMs)) throw new Error('授权日期无效');
+  if (new Date(startMs).toISOString().slice(0, 10) !== trimmed) throw new Error('授权日期无效');
+  return startMs / 1_000 + 86_400;
+}
+
+/** Last valid UTC calendar day for an exclusive expiry instant. */
+export function formatExpiryDate(exclusiveUnixSeconds: number): string {
+  return new Date((exclusiveUnixSeconds - 1) * 1_000).toISOString().slice(0, 10);
+}
+
 function normalizeSubject(value: string): string {
   const subject = value.normalize('NFKC').trim();
-  if (!subject || subject.length > MAX_SUBJECT_LENGTH) throw new Error('客户或工位名称无效');
+  if (subject.length > MAX_SUBJECT_LENGTH) throw new Error('客户或工位名称无效');
   return subject;
 }
 

@@ -84,12 +84,13 @@ fn run_cli(args: &[String]) -> Result<(), String> {
     let ticket = issue_license(IssueLicenseInput {
         private_key_pem: &private_key_pem,
         kid: parsed.kid.as_deref().unwrap_or(DEFAULT_KID),
-        subject: parsed.subject.as_deref().ok_or("缺少 --subject")?,
+        subject: parsed.subject.as_deref().unwrap_or(""),
         machine_code: parsed.machine.as_deref().ok_or("缺少 --machine")?,
         now_ms: parsed.now_ms,
         jti: parsed.jti.as_deref(),
         days: parsed.days,
         perpetual: parsed.perpetual,
+        expires_at: None,
     })
     .map_err(|error| error.to_string())?;
     println!("{ticket}");
@@ -174,14 +175,14 @@ fn usage() -> String {
 
 不带参数时打开窗口。命令行：
 
-  databaker-license-issuer --machine A7K2-9M3P-Q4WX --subject 客户A-工位3 [--days 365|--perpetual]
+  databaker-license-issuer --machine A7K2-9M3P-Q4WX [--days 365|--perpetual] [--subject 工位名]
   databaker-license-issuer --clear-local
 
 选项：
   --machine <CODE>   工位机器码
-  --subject <NAME>   客户或工位名
   --days <N>         有效天数，默认 365
   --perpetual        永久授权
+  --subject <NAME>   工位名称，选填
   --clear-local      删除本机采集软件里的授权记录
 "
     .to_string()

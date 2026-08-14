@@ -81,6 +81,20 @@ function main() {
   assert.equal(verified.claims.sub, '客户A-工位3');
   assert.equal(verified.claims.mid, 'A7K2-9M3P-Q4WX');
 
+  const unnamed = runIssuer([
+    '--key', key,
+    '--kid', 'test1',
+    '--machine', 'A7K2-9M3P-Q4WX',
+    '--days', '30',
+  ]);
+  assert.equal(unnamed.status, 0, unnamed.stderr || unnamed.stdout);
+  const unnamedVerified = license.verifyLicenseTicket(unnamed.stdout.trim(), {
+    publicKeys: { test1: publicKey },
+    machineCode: 'A7K2-9M3P-Q4WX',
+  });
+  assert.equal('claims' in unnamedVerified, true, JSON.stringify(unnamedVerified));
+  assert.equal(unnamedVerified.claims.sub, '');
+
   const fresh = runIssuer([
     '--key', key,
     '--kid', 'test1',

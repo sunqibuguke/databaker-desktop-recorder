@@ -8,8 +8,9 @@ pub use local::{
     clear_local_license, probe_local_license, ClearLocalLicenseResult, LocalLicenseProbe,
 };
 pub use ticket::{
-    inspect_license_ticket, issue_license, normalize_machine_code, IssueLicenseInput,
-    LicenseClaims, DEFAULT_KID, LICENSE_TICKET_PREFIX,
+    default_expiry_date, format_expiry_date, inspect_license_ticket, issue_license,
+    normalize_machine_code, parse_expiry_date, IssueLicenseInput, LicenseClaims, DEFAULT_KID,
+    LICENSE_TICKET_PREFIX,
 };
 
 #[derive(Debug)]

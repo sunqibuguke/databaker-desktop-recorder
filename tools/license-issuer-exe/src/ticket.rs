@@ -35,17 +35,18 @@ pub struct IssueLicenseInput<'a> {
     pub jti: Option<&'a str>,
     pub days: Option<u32>,
     pub perpetual: bool,
+    pub expires_at: Option<i64>,
 }
 
 pub fn issue_license(input: IssueLicenseInput<'_>) -> Result<String, IssueError> {
-    let now = unix_seconds(input.now_ms.unwrap_or_else(now_ms));
+    let now = unix_seconds(input.now_ms.unwrap_or_else(system_now_ms));
     let mid = normalize_machine_code(input.machine_code)?;
     let sub = normalize_subject(input.subject)?;
     let kid = input.kid.trim();
     if kid.is_empty() {
         return Err(IssueError::from("密钥编号无效"));
     }
-    let exp = resolve_expiry(input.perpetual, input.days, now)?;
+    let exp = resolve_expiry(input.perpetual, input.days, input.expires_at, now)?;
     let claims = LicenseClaims {
         v: 1,
         kid: kid.to_string(),
@@ -121,21 +122,109 @@ pub fn normalize_machine_code(value: &str) -> Result<String, IssueError> {
 
 fn normalize_subject(value: &str) -> Result<String, IssueError> {
     let subject: String = value.nfkc().collect::<String>().trim().to_string();
-    if subject.is_empty() || utf16_len(&subject) > MAX_SUBJECT_LENGTH {
+    if utf16_len(&subject) > MAX_SUBJECT_LENGTH {
         return Err(IssueError::from("客户或工位名称无效"));
     }
     Ok(subject)
 }
 
-fn resolve_expiry(perpetual: bool, days: Option<u32>, now: i64) -> Result<Option<i64>, IssueError> {
+fn resolve_expiry(
+    perpetual: bool,
+    days: Option<u32>,
+    expires_at: Option<i64>,
+    now: i64,
+) -> Result<Option<i64>, IssueError> {
     if perpetual {
         return Ok(None);
+    }
+    if let Some(exp) = expires_at {
+        if exp <= now {
+            return Err(IssueError::from("授权日期必须晚于今天"));
+        }
+        let span_days = (exp - now + 86_399) / 86_400;
+        if !(1..=i64::from(MAX_DAYS)).contains(&span_days) {
+            return Err(IssueError::from("授权日期超出允许范围"));
+        }
+        return Ok(Some(exp));
     }
     let days = days.unwrap_or(365);
     if !(1..=MAX_DAYS).contains(&days) {
         return Err(IssueError::from("授权天数无效"));
     }
     Ok(Some(now + i64::from(days) * 86_400))
+}
+
+pub fn default_expiry_date(now_ms: Option<u64>) -> String {
+    let millis = now_ms.unwrap_or_else(system_now_ms);
+    format_expiry_date(unix_seconds(millis) + i64::from(365) * 86_400)
+}
+
+pub fn format_expiry_date(exclusive_unix_seconds: i64) -> String {
+    let last_valid = exclusive_unix_seconds.saturating_sub(1);
+    let (year, month, day) = civil_from_days(last_valid.div_euclid(86_400));
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+pub fn parse_expiry_date(value: &str) -> Result<i64, IssueError> {
+    let value = value.trim();
+    let mut parts = value.split('-');
+    let year = parse_date_part(parts.next(), "授权日期格式无效，请使用 YYYY-MM-DD")?;
+    let month = parse_date_part(parts.next(), "授权日期格式无效，请使用 YYYY-MM-DD")?;
+    let day = parse_date_part(parts.next(), "授权日期格式无效，请使用 YYYY-MM-DD")?;
+    if parts.next().is_some() {
+        return Err(IssueError::from("授权日期格式无效，请使用 YYYY-MM-DD"));
+    }
+    if !(1970..=2100).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(IssueError::from("授权日期无效"));
+    }
+    let days = days_from_civil(year, month as u32, day as u32);
+    let (roundtrip_year, roundtrip_month, roundtrip_day) = civil_from_days(days);
+    if i64::from(roundtrip_year) != year
+        || i64::from(roundtrip_month) != month
+        || i64::from(roundtrip_day) != day
+    {
+        return Err(IssueError::from("授权日期无效"));
+    }
+    // Labeled 到期日 is the last valid UTC day; exp is the exclusive next midnight.
+    Ok((days + 1) * 86_400)
+}
+
+fn parse_date_part(value: Option<&str>, error: &str) -> Result<i64, IssueError> {
+    let value = value
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| IssueError::from(error))?;
+    value.parse::<i64>().map_err(|_| IssueError::from(error))
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let mut year = year;
+    let month = i64::from(month);
+    let day = i64::from(day);
+    if month <= 2 {
+        year -= 1;
+    }
+    let era = if year >= 0 { year } else { year - 399 }.div_euclid(400);
+    let yoe = year - era * 400;
+    let shifted_month = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * shifted_month + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    if month <= 2 {
+        year += 1;
+    }
+    (year as i32, month as u32, day as u32)
 }
 
 fn normalize_ticket(ticket: &str) -> Result<String, IssueError> {
@@ -266,7 +355,7 @@ fn unix_seconds(now_ms: u64) -> i64 {
     (now_ms / 1_000) as i64
 }
 
-fn now_ms() -> u64 {
+fn system_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
@@ -300,6 +389,7 @@ mod tests {
             jti: Some("ticket-1"),
             days: Some(365),
             perpetual: false,
+            expires_at: None,
         })
         .unwrap();
         assert_eq!(ticket, GOLDEN_DAYS);
@@ -316,6 +406,7 @@ mod tests {
             jti: Some("forever"),
             days: None,
             perpetual: true,
+            expires_at: None,
         })
         .unwrap();
         assert_eq!(ticket, GOLDEN_PERPETUAL);
@@ -343,5 +434,60 @@ mod tests {
         assert_eq!(claims.mid, "A7K2-9M3P-Q4WX");
         assert_eq!(claims.iat, 1_786_377_600);
         assert_eq!(claims.exp, Some(1_817_913_600));
+    }
+
+    #[test]
+    fn allows_empty_subject() {
+        let ticket = issue_license(IssueLicenseInput {
+            private_key_pem: &fixture_key(),
+            kid: "test1",
+            subject: "   ",
+            machine_code: "A7K2-9M3P-Q4WX",
+            now_ms: Some(1_786_377_600_000),
+            jti: Some("no-subject"),
+            days: None,
+            perpetual: false,
+            expires_at: Some(1_817_913_600),
+        })
+        .unwrap();
+        let claims = inspect_license_ticket(&ticket).unwrap();
+        assert_eq!(claims.sub, "");
+        assert_eq!(claims.exp, Some(1_817_913_600));
+    }
+
+    #[test]
+    fn parses_and_formats_expiry_dates() {
+        assert_eq!(parse_expiry_date("1970-01-01").unwrap(), 86_400);
+        assert_eq!(parse_expiry_date("2000-01-01").unwrap(), 946_771_200);
+        assert_eq!(parse_expiry_date("2026-08-14").unwrap(), 1_786_752_000);
+        assert_eq!(format_expiry_date(1_786_752_000), "2026-08-14");
+        assert_eq!(
+            format_expiry_date(parse_expiry_date("2026-08-14").unwrap()),
+            "2026-08-14"
+        );
+        assert_eq!(default_expiry_date(Some(1_786_320_000_000)), "2027-08-09");
+        assert_eq!(default_expiry_date(Some(1_786_377_600_000)), "2027-08-10");
+        assert!(parse_expiry_date("2026-02-29").is_err());
+        assert!(parse_expiry_date("14/08/2026").is_err());
+    }
+
+    #[test]
+    fn calendar_expiry_covers_the_labeled_utc_day() {
+        let exp = parse_expiry_date("2026-08-14").unwrap();
+        let ticket = issue_license(IssueLicenseInput {
+            private_key_pem: &fixture_key(),
+            kid: "test1",
+            subject: "",
+            machine_code: "A7K2-9M3P-Q4WX",
+            now_ms: Some(1_786_377_600_000),
+            jti: Some("calendar-day"),
+            days: None,
+            perpetual: false,
+            expires_at: Some(exp),
+        })
+        .unwrap();
+        let claims = inspect_license_ticket(&ticket).unwrap();
+        assert_eq!(claims.exp, Some(1_786_752_000));
+        assert_eq!(format_expiry_date(claims.exp.unwrap()), "2026-08-14");
     }
 }
