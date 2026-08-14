@@ -24,6 +24,7 @@ export function NoiseCheckDialog({
   result,
   busy,
   onRetry,
+  onLeave,
 }: {
   gate: SessionNoiseGate;
   running: boolean;
@@ -34,6 +35,7 @@ export function NoiseCheckDialog({
   result: NoiseCheckResult | null;
   busy: boolean;
   onRetry: () => void;
+  onLeave: () => void;
 }) {
   const { t } = useI18n();
   const phase = running
@@ -119,8 +121,17 @@ export function NoiseCheckDialog({
         {phase === 'failed' && result && <div className="noise-result fail"><Icon name="meter" size={16} /><div><strong>{t('noise.resultFailTitle')}</strong><span>{t('noise.resultFailDetail', { failed: result.failing_windows })}</span></div></div>}
         {phase === 'error' && <div className="noise-result fail"><Icon name="meter" size={16} /><div><strong>{t('noise.resultErrorTitle')}</strong><span>{error || t('noise.resultErrorDetail')}</span></div></div>}
       </div>
-      {phase !== 'sampling' && <footer>
+      <footer>
         <button
+          data-testid="noise-leave"
+          className="button"
+          onClick={onLeave}
+          disabled={busy}
+        >
+          <Icon name="chevron-left" size={14} />
+          {t('noise.leave')}
+        </button>
+        {phase !== 'sampling' && <button
           data-testid="noise-retry"
           className="button primary"
           onClick={onRetry}
@@ -128,8 +139,8 @@ export function NoiseCheckDialog({
         >
           <Icon name="refresh" size={14} />
           {phase === 'idle' ? t('noise.startCheck') : t('noise.recheck')}
-        </button>
-      </footer>}
+        </button>}
+      </footer>
     </section>
   </div>;
 }

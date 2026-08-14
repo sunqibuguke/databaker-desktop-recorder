@@ -570,6 +570,7 @@ const es: MessageTree = {
     resultFailDetail: '{failed}/3 ventanas por encima del límite. Silencie la sala, ajuste la ganancia o mueva el micrófono y reintente.',
     resultErrorTitle: 'La comprobación no terminó',
     resultErrorDetail: 'La grabadora no devolvió un resultado válido. Vuelva a comprobar.',
+    leave: 'Salir de la tarea',
   },
   discontinuity: {
     withSilence: 'La ruta de audio tembló {count} vez(ces). La captura siguió y se insertaron unos {ms} ms de silencio para conservar la línea de tiempo. No detenga toda la tarea; escuche y luego acepte o repita',

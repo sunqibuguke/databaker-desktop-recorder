@@ -570,6 +570,7 @@ const ko: MessageTree = {
     resultFailDetail: '{failed}/3개 창이 초과했습니다. 소음원을 끄고 게인을 조절하거나 위치를 바꾼 뒤 다시 시도하세요.',
     resultErrorTitle: '검사가 끝나지 않았습니다',
     resultErrorDetail: '레코더가 유효한 결과를 반환하지 않았습니다. 다시 검사하세요.',
+    leave: '작업 나가기',
   },
   discontinuity: {
     withSilence: '오디오 경로가 {count}번 짧게 흔들렸습니다. 녹음은 이어졌고 타임라인을 위해 약 {ms}ms 무음이 삽입되었습니다. 전체 작업은 멈추지 말고, 들어본 뒤 확인하거나 다시 녹음하세요',

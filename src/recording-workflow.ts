@@ -10,6 +10,7 @@ export type WorkspacePosture = 'home' | 'setup' | 'view' | 'record';
 export type CaptureExitAction = 'pause' | 'complete' | 'fault';
 export type CaptureExitDialog = 'pause' | 'finish';
 export type SessionNoiseGate = 'pending' | 'checking' | 'failed' | 'ready';
+export type NoiseCheckShortcutAction = 'leave' | 'retry' | 'none';
 export type AcceptContinuation =
   | { kind: 'start'; nextIndex: number }
   | { kind: 'review'; nextIndex: number }
@@ -215,6 +216,24 @@ export function isCurrentSessionNoiseCheckOperation(
     && activeOperation.sessionDir === candidate.sessionDir
     && candidate.activation === activeActivation
     && candidate.sessionDir === activeSessionDir;
+}
+
+export function shouldShowSessionNoiseCheckDialog(
+  blocksAttempt: boolean,
+  hasCaptureFault: boolean,
+  overlayOpen = false,
+): boolean {
+  return blocksAttempt && !hasCaptureFault && !overlayOpen;
+}
+
+export function noiseCheckShortcutAction(
+  key: string,
+  code: string,
+  running: boolean,
+): NoiseCheckShortcutAction {
+  if (key === 'Escape') return 'leave';
+  if (code === 'Space' && !running) return 'retry';
+  return 'none';
 }
 
 export async function executeSafePause<T>(operations: SafePauseOperations<T>): Promise<T | null> {

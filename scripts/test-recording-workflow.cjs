@@ -16,11 +16,13 @@ async function main() {
     idlePrimaryAction,
     isCurrentSessionNoiseCheckOperation,
     isFinalReview,
+    noiseCheckShortcutAction,
     noiseLevelPercent,
     noiseWindowState,
     resolveRunningItemIndex,
     sessionNoiseGate,
     shouldAutoRunSessionNoiseCheck,
+    shouldShowSessionNoiseCheckDialog,
     previewShortcutAction,
     shouldAutoStartAfterAccept,
     viewShortcutAction,
@@ -103,6 +105,27 @@ async function main() {
     false,
     'a request must not settle after the active session directory changes',
   );
+  assert.equal(
+    shouldShowSessionNoiseCheckDialog(true, false),
+    true,
+    'a blocked ambient-noise gate must keep the modal until the room passes',
+  );
+  assert.equal(
+    shouldShowSessionNoiseCheckDialog(true, false, true),
+    false,
+    'the leave-confirm dialog must replace the noise modal so the operator can exit',
+  );
+  assert.equal(shouldShowSessionNoiseCheckDialog(true, true), false);
+  assert.equal(shouldShowSessionNoiseCheckDialog(false, false), false);
+  assert.equal(noiseCheckShortcutAction('Escape', 'Escape', false), 'leave');
+  assert.equal(noiseCheckShortcutAction('Escape', 'Escape', true), 'leave');
+  assert.equal(noiseCheckShortcutAction(' ', 'Space', false), 'retry');
+  assert.equal(
+    noiseCheckShortcutAction(' ', 'Space', true),
+    'none',
+    'space must not restart an in-flight room check',
+  );
+
   assert.equal(noiseWindowState([], 0, -42).state, 'sampling');
   assert.equal(noiseWindowState([-50, -50, -50, -50, -50], 0, -42).state, 'passed');
   assert.equal(noiseWindowState([-50, -30, -50, -50, -50], 0, -42).state, 'failed');

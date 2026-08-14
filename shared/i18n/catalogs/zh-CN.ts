@@ -568,6 +568,7 @@ const zhCN = {
     resultFailDetail: '{failed}/3 窗口超限。请关闭噪声源、调整麦克风增益或更换位置后重试。',
     resultErrorTitle: '检测未完成',
     resultErrorDetail: '录音引擎未返回有效结果，请重新检测。',
+    leave: '退出任务',
   },
   discontinuity: {
     withSilence: '声卡链路发生 {count} 次短暂抖动，录音已自动续接并用静音补齐约 {ms} 毫秒时间轴。无需停止整个任务，可试听后确认或重录',

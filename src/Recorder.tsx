@@ -21,11 +21,13 @@ import {
   idlePrimaryAction,
   isCurrentSessionNoiseCheckOperation,
   isFinalReview,
+  noiseCheckShortcutAction,
   NOISE_CHECK_STEPS,
   previewShortcutAction,
   resolveRunningItemIndex,
   sessionNoiseGate,
   shouldAutoRunSessionNoiseCheck,
+  shouldShowSessionNoiseCheckDialog,
   shouldAutoStartAfterAccept,
   viewShortcutAction,
   workflowShortcutAction,
@@ -784,7 +786,11 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const hasMonitorIssues = Boolean(hasBlockingMonitorIssues || discontinuityWarning);
   const currentNoiseGate = sessionNoiseGate(snapshot?.noise_check, noiseCheckRunning, automationRules.envCheck);
   const noiseCheckBlocksAttempt = phase === 'running' && captureActive && !recording && currentNoiseGate !== 'ready';
-  const showNoiseCheckDialog = noiseCheckBlocksAttempt && !captureFault;
+  const showNoiseCheckDialog = shouldShowSessionNoiseCheckDialog(
+    noiseCheckBlocksAttempt,
+    Boolean(captureFault),
+    pauseConfirmOpen || finishConfirmOpen,
+  );
   const noiseLimitDbfs = snapshot?.noise_threshold_dbfs
     ?? snapshot?.noise_check?.threshold_dbfs
     ?? noiseThresholdDbfs;
@@ -2762,6 +2768,11 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         if (event.key === 'Escape' && !pauseOperationRef.current) setPauseConfirmOpen(false);
         return;
       }
+      if (showNoiseCheckDialog && event.key === 'Escape') {
+        event.preventDefault();
+        requestSafePause();
+        return;
+      }
       if (openActionsSessionDir && event.key === 'Escape') {
         setOpenActionsSessionDir('');
         return;
@@ -2837,7 +2848,11 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         return;
       }
       if (showNoiseCheckDialog) {
-        if (event.code === 'Space' && !noiseCheckRunning && snapshot) {
+        const noiseAction = noiseCheckShortcutAction(event.key, event.code, noiseCheckRunning);
+        if (noiseAction === 'leave') {
+          event.preventDefault();
+          requestSafePause();
+        } else if (noiseAction === 'retry' && snapshot) {
           event.preventDefault();
           void runSessionNoiseCheck(sessionDir, snapshot);
         }
@@ -3361,6 +3376,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       result={snapshot?.noise_check ?? null}
       busy={Boolean(busy)}
       onRetry={() => snapshot && void runSessionNoiseCheck(sessionDir, snapshot)}
+      onLeave={requestSafePause}
     />}
     {pauseConfirmOpen && !captureFault && <div className="dialog-backdrop" role="presentation">
       <section className="studio-dialog" role="dialog" aria-modal="true" aria-labelledby="pause-dialog-title">

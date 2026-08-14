@@ -570,6 +570,7 @@ const ja: MessageTree = {
     resultFailDetail: '{failed}/3 窓が超過。ノイズ源を止め、ゲインを調整するか位置を変えて再試行してください。',
     resultErrorTitle: '確認が完了しませんでした',
     resultErrorDetail: 'レコーダーが有効な結果を返しませんでした。再確認してください。',
+    leave: 'タスクを終了',
   },
   discontinuity: {
     withSilence: '音声経路が {count} 回短く乱れました。収録は継続し、タイムライン維持のため約 {ms} ミリ秒の無音を挿入しました。タスク全体は止めず、試聴して確定またはリテイクできます',

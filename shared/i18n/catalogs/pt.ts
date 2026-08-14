@@ -570,6 +570,7 @@ const pt: MessageTree = {
     resultFailDetail: '{failed}/3 janelas acima do limite. Silencie a sala, ajuste o ganho ou mude o microfone e tente de novo.',
     resultErrorTitle: 'A verificação não terminou',
     resultErrorDetail: 'O gravador não devolveu um resultado válido. Verifique de novo.',
+    leave: 'Sair da tarefa',
   },
   discontinuity: {
     withSilence: 'O percurso de áudio tremeu {count} vez(es). A captura continuou e foram inseridos cerca de {ms} ms de silêncio para manter a linha temporal. Não pare a tarefa inteira; ouça e depois aceite ou volte a gravar',

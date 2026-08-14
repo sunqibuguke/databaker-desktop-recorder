@@ -570,6 +570,7 @@ const en: MessageTree = {
     resultFailDetail: '{failed}/3 windows over the limit. Quiet the room, adjust gain, or move the mic, then try again.',
     resultErrorTitle: 'Check did not finish',
     resultErrorDetail: 'The recorder did not return a valid result. Please check again.',
+    leave: 'Leave task',
   },
   discontinuity: {
     withSilence: 'The audio path jittered {count} time(s). Capture continued and about {ms} ms of silence was inserted to keep the timeline. Do not stop the whole task; preview, then accept or retake',

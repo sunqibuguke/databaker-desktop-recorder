@@ -581,6 +581,7 @@ input:disabled { color: var(--quiet); background: var(--library-header); }
 .dialog-backdrop { position: fixed; z-index: var(--z-dialog); inset: 0 0 23px; display: grid; place-items: center; padding: 24px; background: var(--scrim); backdrop-filter: blur(6px); }
 .noise-backdrop { z-index: 51; }
 .noise-check-dialog { width: min(590px, calc(100vw - 48px)); }
+.noise-check-dialog > footer { justify-content: space-between; }
 .noise-check-dialog.failed, .noise-check-dialog.error { border-top-color: var(--danger-line); }
 .noise-check-dialog > header { min-height: 61px; }
 .noise-check-dialog > header small { display: block; color: var(--muted); font: var(--text-xs) var(--mono); letter-spacing: .06em; }
