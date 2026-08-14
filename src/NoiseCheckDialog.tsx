@@ -25,6 +25,7 @@ export function NoiseCheckDialog({
   busy,
   onRetry,
   onLeave,
+  onSkip,
 }: {
   gate: SessionNoiseGate;
   running: boolean;
@@ -36,6 +37,7 @@ export function NoiseCheckDialog({
   busy: boolean;
   onRetry: () => void;
   onLeave: () => void;
+  onSkip?: () => void;
 }) {
   const { t } = useI18n();
   const phase = running
@@ -131,6 +133,14 @@ export function NoiseCheckDialog({
           <Icon name="chevron-left" size={14} />
           {t('noise.leave')}
         </button>
+        {onSkip && (phase === 'failed' || phase === 'error') && <button
+          data-testid="noise-skip-check"
+          className="button"
+          onClick={onSkip}
+          disabled={busy}
+        >
+          {t('noise.skipCheck')}
+        </button>}
         {phase !== 'sampling' && <button
           data-testid="noise-retry"
           className="button primary"

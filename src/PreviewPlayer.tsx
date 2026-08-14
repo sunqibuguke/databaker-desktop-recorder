@@ -1,14 +1,8 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Icon } from './studio-chrome';
 import { WebGLWaveform } from './WebGLWaveform';
 import { formatPlaybackClock, playbackProgress, seekTimeFromClientX } from './preview-player';
 import { useI18n } from './i18n';
-
-export type PreviewPlayerHandle = {
-  toggle(): void;
-  replay(): void;
-  nudge(seconds: number): void;
-};
 
 function disposeAudioElement(audio: HTMLAudioElement | null) {
   if (!audio) return;
@@ -28,7 +22,7 @@ type Props = {
   onClose: () => void;
 };
 
-export const PreviewPlayer = forwardRef<PreviewPlayerHandle, Props>(function PreviewPlayer({
+export function PreviewPlayer({
   url,
   attemptId,
   itemId,
@@ -37,7 +31,7 @@ export const PreviewPlayer = forwardRef<PreviewPlayerHandle, Props>(function Pre
   bins,
   sampleRate,
   onClose,
-}, ref) {
+}: Props) {
   const { t } = useI18n();
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const onCloseRef = useRef(onClose);
@@ -84,15 +78,6 @@ export const PreviewPlayer = forwardRef<PreviewPlayerHandle, Props>(function Pre
     setCurrentTime(0);
     void audio.play();
   };
-
-  useImperativeHandle(ref, () => ({
-    toggle,
-    replay,
-    nudge: (seconds) => {
-      const audio = audioRef.current;
-      seekTo((audio?.currentTime ?? currentTime) + seconds);
-    },
-  }), [currentTime, duration]);
 
   useEffect(() => {
     const audio = new Audio(url);
@@ -176,7 +161,6 @@ export const PreviewPlayer = forwardRef<PreviewPlayerHandle, Props>(function Pre
         <div
           className="preview-player-scope"
           role="slider"
-          tabIndex={0}
           aria-label={t('recorder.previewSeekAria')}
           aria-valuemin={0}
           aria-valuemax={Math.max(0, Math.round(duration * 10))}
@@ -240,15 +224,12 @@ export const PreviewPlayer = forwardRef<PreviewPlayerHandle, Props>(function Pre
           <button className="button primary preview-player-toggle" type="button" onClick={toggle} data-testid="preview-player-toggle">
             <Icon name={playing ? 'pause' : 'play'} size={15} />
             <strong>{playing ? t('recorder.previewPause') : t('recorder.previewPlay')}</strong>
-            <kbd>SPACE</kbd>
           </button>
           <button className="button" type="button" onClick={onClose}>
             <span>{t('recorder.previewClose')}</span>
-            <kbd>ESC</kbd>
           </button>
         </div>
-        <p className="preview-player-hint">{t('recorder.previewHint')}</p>
       </div>
     </section>
   </div>;
-});
+}

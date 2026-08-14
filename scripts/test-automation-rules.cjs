@@ -6,8 +6,10 @@ async function main() {
   const {
     DEFAULT_AUTOMATION_RULES,
     loadAutomationRules,
+    loadWorkstationAutomationRules,
     normalizeAutomationRules,
     saveAutomationRules,
+    saveWorkstationAutomationRules,
     showsPostTakeQualityBill,
   } = await import(pathToFileURL(path.join(__dirname, '..', 'src', 'automation-rules.ts')).href);
 
@@ -62,6 +64,46 @@ async function main() {
     normalizeAutomationRules({ headTailSilence: false }).autoStartNext,
     true,
     'older saved rules without autoStartNext must default on',
+  );
+
+  assert.deepEqual(
+    loadWorkstationAutomationRules(),
+    { ...DEFAULT_AUTOMATION_RULES, envCheck: false, almostSilent: true },
+    'saving a task also remembers the last-used workstation defaults',
+  );
+  assert.equal(
+    loadAutomationRules('').envCheck,
+    false,
+    'a new-task draft reads workstation defaults, not the product default',
+  );
+  assert.equal(
+    loadAutomationRules('session-unsaved').envCheck,
+    true,
+    'an existing task without saved rules keeps the product default, not the workstation override',
+  );
+
+  saveWorkstationAutomationRules({
+    ...DEFAULT_AUTOMATION_RULES,
+    discardEmpty: false,
+  });
+  assert.equal(loadWorkstationAutomationRules().discardEmpty, false);
+  assert.equal(
+    loadAutomationRules('session-a').discardEmpty,
+    true,
+    'workstation defaults must not rewrite an already saved task',
+  );
+
+  saveAutomationRules('', {
+    ...DEFAULT_AUTOMATION_RULES,
+    envCheck: false,
+    discardEmpty: false,
+  });
+  assert.equal(loadWorkstationAutomationRules().envCheck, false);
+  assert.equal(loadWorkstationAutomationRules().discardEmpty, false);
+  assert.equal(
+    loadAutomationRules('session-a').envCheck,
+    false,
+    'session-a still has its own earlier save',
   );
 
   console.log('automation rules tests passed');

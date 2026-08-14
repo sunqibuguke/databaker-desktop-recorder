@@ -18,6 +18,9 @@ export const DEFAULT_AUTOMATION_RULES: AutomationRules = {
 
 const RULES_STORAGE_PREFIX = 'databaker:automation-rules:';
 const POST_TAKE_STORAGE_PREFIX = 'databaker:post-take-silence:';
+const WORKSTATION_RULES_KEY = 'databaker:automation-rules:workstation';
+
+export type TaskDetectionPolicyKey = 'envCheck' | 'discardEmpty';
 
 function asBoolean(value: unknown, fallback: boolean): boolean {
   return typeof value === 'boolean' ? value : fallback;
@@ -51,8 +54,26 @@ function readLegacyHeadTailSilence(sessionDir: string): boolean | null {
   return null;
 }
 
+export function loadWorkstationAutomationRules(): AutomationRules {
+  try {
+    const stored = localStorage.getItem(WORKSTATION_RULES_KEY);
+    if (stored) return normalizeAutomationRules(JSON.parse(stored));
+  } catch {
+    // Fall through to product defaults when the store is missing or corrupt.
+  }
+  return { ...DEFAULT_AUTOMATION_RULES };
+}
+
+export function saveWorkstationAutomationRules(rules: AutomationRules): void {
+  try {
+    localStorage.setItem(WORKSTATION_RULES_KEY, JSON.stringify(normalizeAutomationRules(rules)));
+  } catch {
+    // Preference is workstation-local; a blocked store must not stop capture.
+  }
+}
+
 export function loadAutomationRules(sessionDir: string): AutomationRules {
-  if (!sessionDir) return { ...DEFAULT_AUTOMATION_RULES };
+  if (!sessionDir) return loadWorkstationAutomationRules();
   try {
     const stored = localStorage.getItem(`${RULES_STORAGE_PREFIX}${sessionDir}`);
     if (stored) return normalizeAutomationRules(JSON.parse(stored));
@@ -65,8 +86,9 @@ export function loadAutomationRules(sessionDir: string): AutomationRules {
 }
 
 export function saveAutomationRules(sessionDir: string, rules: AutomationRules): void {
-  if (!sessionDir) return;
   const normalized = normalizeAutomationRules(rules);
+  saveWorkstationAutomationRules(normalized);
+  if (!sessionDir) return;
   try {
     localStorage.setItem(`${RULES_STORAGE_PREFIX}${sessionDir}`, JSON.stringify(normalized));
     localStorage.setItem(

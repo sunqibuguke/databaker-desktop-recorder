@@ -23,7 +23,6 @@ async function main() {
     sessionNoiseGate,
     shouldAutoRunSessionNoiseCheck,
     shouldShowSessionNoiseCheckDialog,
-    previewShortcutAction,
     shouldAutoStartAfterAccept,
     viewShortcutAction,
     workflowShortcutAction,
@@ -315,10 +314,6 @@ async function main() {
   assert.equal(viewShortcutAction('KeyP', 'p'), 'preview');
   assert.equal(viewShortcutAction('KeyR', 'r'), 'enter-capture');
   assert.equal(viewShortcutAction('KeyS', 's'), 'none');
-  assert.equal(previewShortcutAction('Space', ' '), 'confirm');
-  assert.equal(previewShortcutAction('Escape', 'Escape'), 'close');
-  assert.equal(previewShortcutAction('KeyP', 'p'), 'pause');
-  assert.equal(previewShortcutAction('ArrowLeft', 'ArrowLeft'), 'nudge-left');
   assert.equal(
     resolveRunningItemIndex(
       [{ id: 'a', status: 'accepted' }, { id: 'b', status: 'accepted' }, { id: 'c', status: 'accepted' }],
