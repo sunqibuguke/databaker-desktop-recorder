@@ -29,7 +29,7 @@ function appearanceStorage(): Storage | null {
 }
 
 function PrompterCueMark({ cue, progress }: { cue: PrompterCue; progress: number }) {
-  if (prompterShowsSilenceRing(cue, progress)) {
+  if (prompterShowsSilenceRing(cue)) {
     const clamped = Math.max(0, Math.min(1, progress));
     return <svg className="prompter-cue-ring" viewBox="0 0 18 18" aria-hidden="true">
       <circle className="prompter-cue-ring-track" cx="9" cy="9" r={CUE_RING_RADIUS} />

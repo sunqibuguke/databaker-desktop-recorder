@@ -880,7 +880,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           ? 'review'
           : 'idle';
   const cue = resolveMonitorCue(captureFault ? 'fault' : normalCue, tailSilenceMet);
-  const readerCue = readerFacingCue(cue, enforceHeadTailSilence);
+  const readerCue = readerFacingCue(cue);
   const liveCueLabel = captureFault
     ? t('cue.stopRead', { title: captureFaultCopy.title })
     : noiseCheckBlocksAttempt
@@ -899,7 +899,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     itemStatus: currentItem?.status,
     liveLabel: liveCueLabel,
   });
-  const readerCueLabel = t(`readerCue.${readerCueKey(cue, enforceHeadTailSilence)}`);
+  const readerCueLabel = t(`readerCue.${readerCueKey(cue)}`);
   const prompterState = useMemo<PrompterState>(() => ({
     sessionName: snapshot?.session_id ?? sessionName,
     sequence: workflowComplete ? items.length : currentItem ? currentIndex + 1 : 0,
@@ -910,12 +910,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     cue: readerCue,
     cueLabel: readerCueLabel,
     readerCueLabel,
-    silenceProgress: isPendingTake || (enforceHeadTailSilence && recording && Boolean(hasSpoken))
-      ? silenceProgress
-      : 0,
+    silenceProgress: isPendingTake ? silenceProgress : 0,
     silenceDurationMs: effectiveSilenceDurationMs,
     qualityWarning: '',
-  }), [captureFault, cue, currentIndex, currentItem?.id, currentItem?.label, currentItem?.text, effectiveSilenceDurationMs, enforceHeadTailSilence, hasSpoken, isPendingTake, items.length, noiseCheckBlocksAttempt, readerCue, readerCueLabel, recording, sessionName, silenceProgress, snapshot?.session_id, t, workflowComplete]);
+  }), [captureFault, cue, currentIndex, currentItem?.id, currentItem?.label, currentItem?.text, effectiveSilenceDurationMs, isPendingTake, items.length, noiseCheckBlocksAttempt, readerCue, readerCueLabel, sessionName, silenceProgress, snapshot?.session_id, t, workflowComplete]);
 
   async function run<T>(label: string, action: () => Promise<T>): Promise<T | null> {
     setBusy(label);

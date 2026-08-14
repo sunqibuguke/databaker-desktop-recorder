@@ -7,20 +7,18 @@ export function resolveMonitorCue(cue: PrompterCue, tailSilenceMet: boolean): Pr
   return cue;
 }
 
-export function readerFacingCue(cue: PrompterCue, showTailReady = false): PrompterCue {
-  if (cue === 'ready' && !showTailReady) return 'recording';
-  return cue;
+export function readerFacingCue(cue: PrompterCue): PrompterCue {
+  return cue === 'ready' ? 'recording' : cue;
 }
 
-export function readerCueKey(cue: PrompterCue, showTailReady = false): ReaderCueKey {
-  switch (readerFacingCue(cue, showTailReady)) {
+export function readerCueKey(cue: PrompterCue): ReaderCueKey {
+  switch (readerFacingCue(cue)) {
     case 'checking':
     case 'pending':
       return 'hush';
     case 'recording':
-      return 'read';
     case 'ready':
-      return 'stop';
+      return 'read';
     case 'fault':
       return 'halt';
     default:
@@ -28,9 +26,8 @@ export function readerCueKey(cue: PrompterCue, showTailReady = false): ReaderCue
   }
 }
 
-export function prompterShowsSilenceRing(cue: PrompterCue, progress: number): boolean {
-  if (cue === 'pending' || cue === 'checking') return true;
-  return cue === 'recording' && progress > 0 && progress < 1;
+export function prompterShowsSilenceRing(cue: PrompterCue): boolean {
+  return cue === 'pending' || cue === 'checking';
 }
 
 export function readerCueHasKeyboardHint(label: string): boolean {
