@@ -9,7 +9,9 @@ async function main() {
     liveSilencePair,
     peakFromWaveformBins,
     peakNoteFromLevel,
+    recordedMonitorSentenceLabel,
     reviewSilencePair,
+    shouldUseRecordedSilencePair,
     takeReviewPeak,
   } = await import(pathToFileURL(path.join(__dirname, '..', 'src', 'silence-readout.ts')).href);
 
@@ -160,6 +162,51 @@ async function main() {
   const unset = liveSilenceHint({ liveMs: 800, requiredMs: 0 });
   assert.equal(unset.met, false);
   assert.equal(unset.progress, 0);
+
+  const acceptedAttempt = {
+    attempt_id: '001-a1',
+    start_sample: 0,
+    recording_started_sample: 0,
+    content_started_sample: 4_800,
+    end_sample: 48_000,
+    tail_silence_samples: 9_600,
+    status: 'accepted',
+    created_at: '2026-08-13T00:00:00Z',
+  };
+  assert.equal(shouldUseRecordedSilencePair(true, acceptedAttempt), false);
+  assert.equal(shouldUseRecordedSilencePair(false, undefined), false);
+  assert.equal(shouldUseRecordedSilencePair(false, acceptedAttempt), true);
+
+  assert.equal(recordedMonitorSentenceLabel({
+    liveCue: 'idle',
+    itemStatus: 'accepted',
+    liveLabel: '请等待开始',
+  }), '已确认');
+  assert.equal(recordedMonitorSentenceLabel({
+    liveCue: 'idle',
+    itemStatus: 'skipped',
+    liveLabel: '请等待开始',
+  }), '已跳过');
+  assert.equal(recordedMonitorSentenceLabel({
+    liveCue: 'review',
+    itemStatus: 'review',
+    liveLabel: '本句已录制',
+  }), '本句已录制');
+  assert.equal(recordedMonitorSentenceLabel({
+    liveCue: 'idle',
+    itemStatus: 'pending',
+    liveLabel: '请等待开始',
+  }), '请等待开始');
+  assert.equal(recordedMonitorSentenceLabel({
+    liveCue: 'recording',
+    itemStatus: 'accepted',
+    liveLabel: '请朗读',
+  }), '请朗读');
+  assert.equal(recordedMonitorSentenceLabel({
+    liveCue: 'fault',
+    itemStatus: 'accepted',
+    liveLabel: '立即停止朗读 · 输入中断',
+  }), '立即停止朗读 · 输入中断');
 
   console.log('silence readout tests passed');
 }

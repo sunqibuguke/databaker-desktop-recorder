@@ -38,7 +38,9 @@ import {
   liveHeadMsFromMeter,
   liveSilenceHint,
   liveSilencePair,
+  recordedMonitorSentenceLabel,
   reviewSilencePair,
+  shouldUseRecordedSilencePair,
   takeReviewPeak,
   type SilencePairView,
 } from './silence-readout';
@@ -694,6 +696,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const tailSilenceMet = liveSilenceMs >= effectiveSilenceDurationMs;
   const reviewAttempt = !recording && currentItem
     ? currentItem.attempts.find((attempt) => attempt.attempt_id === reviewAttemptId)
+      ?? currentItem.attempts.find((attempt) => attempt.attempt_id === currentItem.selected_attempt_id)
       ?? latestUsableAttempt(currentItem)
     : undefined;
   const showReviewWaveform = !captureActive && Boolean(reviewAttempt);
@@ -717,22 +720,23 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     showAlmostSilent: automationRules.almostSilent,
     showPeakHigh: automationRules.peakHigh,
   });
-  const silencePair = showReviewSilenceBill
+  const livePair = liveSilencePair({
+    recording,
+    pending: isPendingTake,
+    spoken: Boolean(hasSpoken),
+    pendingRemainingMs,
+    requiredMs: effectiveSilenceDurationMs,
+    liveSilenceMs,
+    headMs: liveHeadMsFromMeter({
+      sampleRate: sampleRateForDisplay,
+      armedSample: meter.head_silence_armed_sample || attemptRecordingStartedSample,
+      contentStartedSample: meter.content_started_sample ?? 0,
+      phase: meter.head_silence_phase,
+    }),
+  });
+  const silencePair = shouldUseRecordedSilencePair(recording, reviewAttempt)
     ? reviewBillPair
-    : liveSilencePair({
-      recording,
-      pending: isPendingTake,
-      spoken: Boolean(hasSpoken),
-      pendingRemainingMs,
-      requiredMs: effectiveSilenceDurationMs,
-      liveSilenceMs,
-      headMs: liveHeadMsFromMeter({
-        sampleRate: sampleRateForDisplay,
-        armedSample: meter.head_silence_armed_sample || attemptRecordingStartedSample,
-        contentStartedSample: meter.content_started_sample ?? 0,
-        phase: meter.head_silence_phase,
-      }),
-    });
+    : livePair;
   const captureFaultKind = effectiveCaptureFaultKind(phase === 'running' && captureActive, engineStatus, meter);
   const captureFault = captureFaultKind !== null;
   const exitAction = captureExitAction(items, captureFault);
@@ -787,7 +791,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           : 'idle';
   const cue = resolveMonitorCue(captureFault ? 'fault' : normalCue, tailSilenceMet);
   const readerCue = readerFacingCue(cue);
-  const cueLabel = captureFault
+  const liveCueLabel = captureFault
     ? t('cue.stopRead', { title: captureFaultCopy.title })
     : noiseCheckBlocksAttempt
       ? noiseCheckMessage
@@ -800,6 +804,11 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     review: t('cue.recorded'),
     complete: t('cue.allHandled'),
       } as const)[cue === 'ready' ? 'ready' : normalCue];
+  const cueLabel = recordedMonitorSentenceLabel({
+    liveCue: captureFault ? 'fault' : cue,
+    itemStatus: currentItem?.status,
+    liveLabel: liveCueLabel,
+  });
   const readerCueLabel = t(`readerCue.${readerCueKey(cue)}`);
   const prompterState = useMemo<PrompterState>(() => ({
     sessionName: snapshot?.session_id ?? sessionName,
@@ -3262,7 +3271,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             {qualityWarning && <div className="input-quality-banner" role="alert"><Icon name="meter" size={16} /><div><strong>{t('quality.bannerTitle')}</strong><span>{qualityWarning}. {t('quality.bannerHint')}</span></div></div>}
           </div>}
           <section className="script-monitor"><header><span>{t('recorder.currentSentence')}</span><div><span className="studio-cue">{cueLabel}</span><em>{workflowComplete ? t('recorder.itemsCount', { count: items.length }) : `${currentIndex + 1} / ${items.length}`}</em></div></header><div className={`prompt-surface ${captureFault ? 'fault' : cue === 'pending' || cue === 'checking' ? 'pending' : cue === 'ready' ? 'ready' : cue === 'recording' ? 'live' : ''}`}>{captureFault ? <span className="label-chip">{t('recorder.stopReadingChip')}</span> : noiseCheckBlocksAttempt ? <span className="label-chip">{t('recorder.envChip')}</span> : (workflowComplete || currentItem?.label) && <span className="label-chip">{workflowComplete ? t('recorder.allDoneChip') : currentItem?.label}</span>}<p>{captureFault ? captureFaultCopy.title : noiseCheckBlocksAttempt ? t('recorder.keepQuiet') : workflowComplete ? t('recorder.scriptFinished') : currentItem?.text ?? t('recorder.noText')}</p><small>{captureFault ? captureFaultCopy.detail : noiseCheckBlocksAttempt ? noiseCheckMessage : workflowComplete ? t('recorder.exportLater') : <>{currentItem?.id}</>}</small></div></section>
-          <section className="signal-monitor"><header><div><strong>{t('recorder.waveform')}</strong>{captureActive ? <SilencePairReadout pair={silencePair} /> : showInspectSilenceBill ? <SilencePairReadout pair={reviewBillPair} /> : null}</div><div>{captureActive ? <><span>RMS <b>{db(meter.rms)}</b></span><span>PEAK <b className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</b></span></> : <span>{reviewAttempt ? formatDuration(reviewAttempt.end_sample - reviewAttempt.start_sample, sampleRateForDisplay) : t('recorder.noTakeWaveform')}</span>}</div></header><div className="signal-scope"><WebGLWaveform key={showReviewWaveform ? `${sessionDir}:${reviewAttempt?.attempt_id}` : `${sessionDir}:${waveformGeneration}`} mode={showReviewWaveform ? 'review' : 'live'} bins={showReviewWaveform ? reviewWaveformBins : (meter.waveform ?? [])} capturedSamples={meter.captured_samples} waveformEndSample={meter.waveform_end_sample} recording={waveformTakeIsActive(recording && !captureFault, hasSpoken)} takeStartSample={recording && !captureFault ? attemptStartSample : undefined} sampleRate={sampleRateForDisplay} />{captureActive ? <LiveSilenceHint liveMs={liveSilenceMs} requiredMs={effectiveSilenceDurationMs} /> : null}<div className="scope-scale"><span>−1.0</span><span>−0.5</span><span>0</span><span>+0.5</span><span>+1.0</span></div></div><div className="horizontal-meter"><i className="meter-rms" style={{ width: `${rmsPercent}%` }} /><i className="meter-peak" style={{ left: `${peakPercent}%` }} /></div></section>
+          <section className="signal-monitor"><header><div><strong>{t('recorder.waveform')}</strong>{captureActive || shouldUseRecordedSilencePair(recording, reviewAttempt) ? <SilencePairReadout pair={silencePair} /> : null}</div><div>{captureActive ? <><span>RMS <b>{db(meter.rms)}</b></span><span>PEAK <b className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</b></span></> : <span>{reviewAttempt ? formatDuration(reviewAttempt.end_sample - reviewAttempt.start_sample, sampleRateForDisplay) : t('recorder.noTakeWaveform')}</span>}</div></header><div className="signal-scope"><WebGLWaveform key={showReviewWaveform ? `${sessionDir}:${reviewAttempt?.attempt_id}` : `${sessionDir}:${waveformGeneration}`} mode={showReviewWaveform ? 'review' : 'live'} bins={showReviewWaveform ? reviewWaveformBins : (meter.waveform ?? [])} capturedSamples={meter.captured_samples} waveformEndSample={meter.waveform_end_sample} recording={waveformTakeIsActive(recording && !captureFault, hasSpoken)} takeStartSample={recording && !captureFault ? attemptStartSample : undefined} sampleRate={sampleRateForDisplay} />{captureActive ? <LiveSilenceHint liveMs={liveSilenceMs} requiredMs={effectiveSilenceDurationMs} /> : null}<div className="scope-scale"><span>−1.0</span><span>−0.5</span><span>0</span><span>+0.5</span><span>+1.0</span></div></div><div className="horizontal-meter"><i className="meter-rms" style={{ width: `${rmsPercent}%` }} /><i className="meter-peak" style={{ left: `${peakPercent}%` }} /></div></section>
           <section className="transport-panel">
             <div className="transport-review">
               {showReviewSilenceBill && <span className={`silence-bill${silencePair.hint || silencePair.extra ? ' has-issue' : ''}`} data-testid="review-silence-bill"><SilencePairReadout pair={silencePair} hint /></span>}

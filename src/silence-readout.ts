@@ -206,6 +206,25 @@ export function liveHeadMsFromMeter(input: {
   return actualHeadSilenceMs(input.armedSample, input.contentStartedSample, input.sampleRate);
 }
 
+export function shouldUseRecordedSilencePair(
+  recording: boolean,
+  attempt: Attempt | null | undefined,
+): boolean {
+  return !recording && Boolean(attempt);
+}
+
+export function recordedMonitorSentenceLabel(input: {
+  liveCue: string;
+  itemStatus?: string | null;
+  liveLabel: string;
+}): string {
+  if (input.liveCue !== 'idle' && input.liveCue !== 'review') return input.liveLabel;
+  if (input.itemStatus === 'accepted') return t('itemStatus.accepted');
+  if (input.itemStatus === 'skipped') return t('itemStatus.skipped');
+  if (input.itemStatus === 'review') return t('cue.recorded');
+  return input.liveLabel;
+}
+
 export function loadPostTakeSilenceReview(sessionDir: string): boolean {
   return loadAutomationRules(sessionDir).headTailSilence;
 }
