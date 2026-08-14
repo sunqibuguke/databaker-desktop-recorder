@@ -5,6 +5,8 @@ const { pathToFileURL } = require('node:url');
 async function main() {
   const {
     actualHeadSilenceMs,
+    headSilencePadStartSample,
+    liveHeadMsFromMeter,
     canFinishSpokenTake,
     itemSilenceMarks,
     liveSilenceProgress,
@@ -21,6 +23,19 @@ async function main() {
 
   assert.equal(actualHeadSilenceMs(1_000, 1_480, 48_000), 10);
   assert.equal(actualHeadSilenceMs(1_000, 0, 48_000), null);
+  assert.equal(headSilencePadStartSample({
+    recordingStartedSample: 0,
+    headSilencePassedSample: 192_000,
+    requiredHeadSilenceSamples: 48_000,
+  }), 144_000);
+  assert.equal(liveHeadMsFromMeter({
+    sampleRate: 48_000,
+    armedSample: 0,
+    contentStartedSample: 192_000,
+    passedSample: 192_000,
+    requiredSamples: 48_000,
+    phase: 'speech_started',
+  }), 1_000);
   assert.equal(peakNoteFromLevel(0.96), 'clip');
   assert.equal(peakNoteFromLevel(0.02), 'quiet');
   assert.equal(peakNoteFromLevel(0.4), null);
@@ -117,6 +132,29 @@ async function main() {
     requiredMs: 1_000,
     peak: 0.3,
   });
+  const noisyWaitThenOneSecondPad = reviewSilencePair({
+    attempt: {
+      attempt_id: '001-a7',
+      start_sample: 0,
+      recording_started_sample: 0,
+      head_silence_armed_sample: 0,
+      head_silence_passed_sample: 192_000,
+      required_head_silence_samples: 48_000,
+      content_started_sample: 192_000,
+      end_sample: 288_000,
+      tail_silence_samples: 48_000,
+      required_tail_silence_samples: 48_000,
+      status: 'recorded',
+      created_at: '2026-08-13T00:00:00Z',
+    },
+    sampleRate: 48_000,
+    requiredMs: 1_000,
+    peak: 0.3,
+  });
+  assert.equal(noisyWaitThenOneSecondPad.headText, '首 1000 ms');
+  assert.equal(noisyWaitThenOneSecondPad.headStatus, 'met');
+  assert.equal(noisyWaitThenOneSecondPad.headWarn, false);
+
   assert.equal(reviewHeadMetTailShort.headStatus, 'met');
   assert.equal(reviewHeadMetTailShort.tailStatus, 'short');
   assert.equal(reviewHeadMetTailShort.headWarn, false);

@@ -833,6 +833,8 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       sampleRate: sampleRateForDisplay,
       armedSample: meter.head_silence_armed_sample || attemptRecordingStartedSample,
       contentStartedSample: meter.content_started_sample ?? 0,
+      passedSample: meter.head_silence_passed_sample,
+      requiredSamples: meter.required_head_silence_samples,
       phase: meter.head_silence_phase,
     }),
   });

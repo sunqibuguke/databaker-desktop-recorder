@@ -58,6 +58,21 @@ export function actualHeadSilenceMs(
   return samplesToMs(Math.max(0, contentStartedSample - Math.max(0, startSample)), sampleRate);
 }
 
+/** Start of the qualifying head-silence pad, not the operator click. */
+export function headSilencePadStartSample(input: {
+  recordingStartedSample: number;
+  headSilencePassedSample?: number;
+  requiredHeadSilenceSamples?: number;
+}): number {
+  const armed = Math.max(0, input.recordingStartedSample);
+  const passed = Math.max(0, input.headSilencePassedSample ?? 0);
+  const required = Math.max(0, input.requiredHeadSilenceSamples ?? 0);
+  if (passed > 0 && required > 0 && passed >= required) {
+    return Math.max(armed, passed - required);
+  }
+  return armed;
+}
+
 export function isHeadSilenceShort(headMs: number | null, requiredMs: number): boolean {
   return headMs !== null && requiredMs > 0 && headMs < requiredMs;
 }
@@ -112,7 +127,11 @@ export function itemSilenceMarks(
   if (!item || (item.status !== 'review' && item.status !== 'accepted')) return EMPTY_SILENCE_MARKS;
   const attempt = selectedOrLatestUsableAttempt(item);
   if (!attempt) return EMPTY_SILENCE_MARKS;
-  const start = attempt.recording_started_sample || attempt.start_sample || 0;
+  const start = headSilencePadStartSample({
+    recordingStartedSample: attempt.recording_started_sample || attempt.start_sample || 0,
+    headSilencePassedSample: attempt.head_silence_passed_sample,
+    requiredHeadSilenceSamples: attempt.required_head_silence_samples,
+  });
   const headMs = actualHeadSilenceMs(start, attempt.content_started_sample, sampleRate);
   const tailMs = attemptTailMs(attempt, sampleRate);
   const headShort = isHeadSilenceShort(headMs, requiredMs);
@@ -210,7 +229,11 @@ export function reviewSilencePair(input: {
   const required = Math.max(0, input.requiredMs);
   const attempt = input.attempt;
   if (!attempt) return emptySilencePair();
-  const start = attempt.recording_started_sample || attempt.start_sample || 0;
+  const start = headSilencePadStartSample({
+    recordingStartedSample: attempt.recording_started_sample || attempt.start_sample || 0,
+    headSilencePassedSample: attempt.head_silence_passed_sample,
+    requiredHeadSilenceSamples: attempt.required_head_silence_samples,
+  });
   const headMs = actualHeadSilenceMs(start, attempt.content_started_sample, input.sampleRate);
   const tailMs = attemptTailMs(attempt, input.sampleRate);
   const headStatus = padStatus(headMs, required);
@@ -304,10 +327,20 @@ export function liveHeadMsFromMeter(input: {
   sampleRate: number;
   armedSample: number;
   contentStartedSample: number;
+  passedSample?: number;
+  requiredSamples?: number;
   phase?: HeadSilencePhase;
 }): number | null {
   if ((input.contentStartedSample ?? 0) <= 0 && input.phase !== 'speech_started') return null;
-  return actualHeadSilenceMs(input.armedSample, input.contentStartedSample, input.sampleRate);
+  return actualHeadSilenceMs(
+    headSilencePadStartSample({
+      recordingStartedSample: input.armedSample,
+      headSilencePassedSample: input.passedSample,
+      requiredHeadSilenceSamples: input.requiredSamples,
+    }),
+    input.contentStartedSample,
+    input.sampleRate,
+  );
 }
 
 export function shouldUseRecordedSilencePair(
