@@ -101,9 +101,14 @@ async function main() {
   assert.equal(t('activationError.exclusiveTitle'), '无法以独占模式打开声卡');
   assert.equal(t('activationError.recreateAndEnter'), '重新创建并进入录制');
   assert.equal(t('prompter.settings'), '显示设置');
-  assert.equal(t('prompter.fontSize'), '字号');
+  assert.equal(t('prompter.fontSize'), '正文字号');
   assert.equal(t('prompter.liveColor'), '可朗读颜色');
   assert.equal(t('prompter.fontSizeValue', { size: 36 }), '36 px');
+  assert.equal(t('prompter.fontSizeSmaller'), '减小正文字号');
+  assert.equal(t('prompter.fontSizeLarger'), '增大正文字号');
+  assert.equal(t('prompter.labelFontSize'), '标签字号');
+  assert.equal(t('prompter.labelFontSizeSmaller'), '减小标签字号');
+  assert.equal(t('prompter.labelFontSizeLarger'), '增大标签字号');
 
   const chineseKeys = new Set(flattenKeys(catalogs['zh-CN']));
   for (const locale of APP_LOCALES) {

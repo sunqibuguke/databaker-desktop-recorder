@@ -3,30 +3,25 @@ import { useI18n } from './i18n';
 import {
   DEFAULT_PROMPTER_LIVE_COLOR,
   MAX_PROMPTER_FONT_SIZE,
+  MAX_PROMPTER_LABEL_FONT_SIZE,
   MIN_PROMPTER_FONT_SIZE,
+  MIN_PROMPTER_LABEL_FONT_SIZE,
   PROMPTER_LIVE_COLOR_PRESETS,
   defaultPrompterAppearance,
-  loadPrompterAppearance,
   normalizePrompterFontSize,
+  normalizePrompterLabelFontSize,
   normalizePrompterLiveColor,
   prompterFontSizeRem,
-  savePrompterAppearance,
-  type PrompterAppearance,
+  prompterLabelFontSizeRem,
 } from './prompter-appearance';
+import { PrompterFontSizeControl } from './PrompterFontSizeControl';
 import { Icon } from './studio-chrome';
 import { prompterShowsSilenceRing } from './prompter-cues';
+import { usePrompterAppearance } from './usePrompterAppearance';
 import type { PrompterCue, PrompterState } from './types';
 
 const CUE_RING_RADIUS = 7;
 const CUE_RING_CIRCUMFERENCE = 2 * Math.PI * CUE_RING_RADIUS;
-
-function appearanceStorage(): Storage | null {
-  try {
-    return window.localStorage;
-  } catch {
-    return null;
-  }
-}
 
 function PrompterCueMark({ cue, progress }: { cue: PrompterCue; progress: number }) {
   if (prompterShowsSilenceRing(cue)) {
@@ -55,14 +50,11 @@ function PrompterCueMark({ cue, progress }: { cue: PrompterCue; progress: number
 export function PrompterView() {
   const { t } = useI18n();
   const [state, setState] = useState<PrompterState | null>(null);
-  const [appearance, setAppearance] = useState<PrompterAppearance>(defaultPrompterAppearance);
+  const { appearance, commitAppearance, nudgeFontSize, nudgeLabelFontSize } = usePrompterAppearance();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const copyRef = useRef<HTMLParagraphElement>(null);
   const labelRef = useRef<HTMLElement>(null);
   const settingsRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    setAppearance(loadPrompterAppearance(appearanceStorage()));
-  }, []);
   useEffect(() => {
     const unsubscribe = window.recorder.onPrompterState(setState);
     void window.recorder.getPrompterState().then(setState).catch(() => undefined);
@@ -87,9 +79,6 @@ export function PrompterView() {
       document.removeEventListener('keydown', onKeyDown);
     };
   }, [settingsOpen]);
-  function commitAppearance(next: PrompterAppearance) {
-    setAppearance(savePrompterAppearance(next, appearanceStorage()));
-  }
   const cue = state?.cue ?? 'idle';
   const readerLabel = state?.readerCueLabel || state?.cueLabel || t('prompter.waitTask');
   const qualityWarning = cue === 'fault' ? '' : state?.qualityWarning ?? '';
@@ -102,6 +91,7 @@ export function PrompterView() {
     aria-label={readerLabel}
     style={{
       ['--prompter-copy-size' as string]: prompterFontSizeRem(appearance.fontSize),
+      ['--prompter-label-size' as string]: prompterLabelFontSizeRem(appearance.labelFontSize),
       ['--prompter-live-color' as string]: appearance.liveColor,
     }}
   >
@@ -122,6 +112,25 @@ export function PrompterView() {
       <aside ref={labelRef} className={`prompter-label ${state?.label ? '' : 'empty'}`}><span>{t('prompter.labelTitle')}</span><strong>{state?.label || t('prompter.none')}</strong></aside>
     </article>
     <footer className="prompter-footer">
+      <PrompterFontSizeControl
+        size={appearance.fontSize}
+        min={MIN_PROMPTER_FONT_SIZE}
+        max={MAX_PROMPTER_FONT_SIZE}
+        onNudge={nudgeFontSize}
+        caption={t('prompter.fontSize')}
+        smallerLabel={t('prompter.fontSizeSmaller')}
+        largerLabel={t('prompter.fontSizeLarger')}
+      />
+      <PrompterFontSizeControl
+        size={appearance.labelFontSize}
+        min={MIN_PROMPTER_LABEL_FONT_SIZE}
+        max={MAX_PROMPTER_LABEL_FONT_SIZE}
+        onNudge={nudgeLabelFontSize}
+        caption={t('prompter.labelFontSize')}
+        testId="prompter-label-font-size"
+        smallerLabel={t('prompter.labelFontSizeSmaller')}
+        largerLabel={t('prompter.labelFontSizeLarger')}
+      />
       <div className="prompter-settings" ref={settingsRef}>
         {settingsOpen && <section className="prompter-settings-panel" role="dialog" aria-labelledby="prompter-settings-title">
           <header>
@@ -143,6 +152,24 @@ export function PrompterView() {
               onChange={(event) => commitAppearance({
                 ...appearance,
                 fontSize: normalizePrompterFontSize(event.currentTarget.value),
+              })}
+            />
+          </label>
+          <label className="prompter-settings-field">
+            <span>
+              {t('prompter.labelFontSize')}
+              <output>{t('prompter.fontSizeValue', { size: appearance.labelFontSize })}</output>
+            </span>
+            <input
+              type="range"
+              min={MIN_PROMPTER_LABEL_FONT_SIZE}
+              max={MAX_PROMPTER_LABEL_FONT_SIZE}
+              step={1}
+              value={appearance.labelFontSize}
+              aria-valuetext={t('prompter.fontSizeValue', { size: appearance.labelFontSize })}
+              onChange={(event) => commitAppearance({
+                ...appearance,
+                labelFontSize: normalizePrompterLabelFontSize(event.currentTarget.value),
               })}
             />
           </label>

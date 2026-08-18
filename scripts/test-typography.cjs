@@ -48,7 +48,15 @@ function main() {
 
   const prompter = fs.readFileSync(path.join(ROOT, 'src', 'Prompter.tsx'), 'utf8');
   assert.match(prompter, /prompterFontSizeRem\(appearance\.fontSize\)/);
+  assert.match(prompter, /prompterLabelFontSizeRem\(appearance\.labelFontSize\)/);
   assert.doesNotMatch(prompter, /--prompter-copy-size['"]?\s*as string\]:\s*`\$\{appearance\.fontSize\}px`/);
+  assert.doesNotMatch(prompter, /--prompter-label-size['"]?\s*as string\]:\s*`\$\{appearance\.labelFontSize\}px`/);
+  const recorder = fs.readFileSync(path.join(ROOT, 'src', 'Recorder.tsx'), 'utf8');
+  assert.match(recorder, /prompterFontSizeRem\(appearance\.fontSize\)/);
+  assert.match(recorder, /prompterLabelFontSizeRem\(appearance\.labelFontSize\)/);
+  assert.doesNotMatch(recorder, /--prompter-copy-size['"]?\s*as string\]:\s*`\$\{appearance\.fontSize\}px`/);
+  assert.match(css, /\.prompt-surface p\s*\{[^}]*font-size:\s*var\(--prompter-copy-size/);
+  assert.match(css, /\.prompter-label strong\s*\{[^}]*font-size:\s*var\(--prompter-label-size/);
 
   assert.match(css, /\.settings-dialog\s*\{[^}]*max-height:\s*calc\(100d?vh - 71px\)/);
   assert.match(css, /\.settings-dialog\s*\{[^}]*grid-template-rows:\s*auto minmax\(0,\s*1fr\) auto/);

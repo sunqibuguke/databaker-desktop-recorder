@@ -560,9 +560,9 @@ input[type="range"]:focus-visible::-moz-range-thumb { box-shadow: 0 0 0 2px var(
 .script-monitor > header > div { display: flex; align-items: center; gap: 10px; }.script-monitor > header em { color: var(--quiet); font: var(--text-xs) var(--mono); font-style: normal; }
 .studio-cue { display: flex; align-items: center; gap: 6px; color: var(--label); font-size: var(--text-xs); }
 .take-state { padding: 3px 5px; border: 1px solid var(--line-control); color: var(--muted); font: var(--text-xs) var(--mono); }
-.prompt-surface { flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: flex-start; justify-content: center; padding: 20px clamp(25px, 5vw, 65px) 22px; background: var(--chrome); }
-.label-chip { padding: 3px 7px; border: 1px solid var(--accent-deep-line); border-radius: 1px; color: var(--accent-muted); background: var(--accent-wash); font-size: var(--text-xs); }
-.prompt-surface p { max-width: 850px; margin: 13px 0 16px; color: var(--text-bright); font-size: var(--text-prompt); line-height: 1.55; letter-spacing: .018em; font-weight: 500; text-wrap: pretty; }
+.prompt-surface { flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: flex-start; justify-content: center; overflow: auto; padding: 20px clamp(25px, 5vw, 65px) 22px; background: var(--chrome); }
+.label-chip { padding: 3px 7px; border: 1px solid var(--accent-deep-line); border-radius: 1px; color: var(--accent-muted); background: var(--accent-wash); font-size: var(--prompter-label-size, var(--text-xs)); }
+.prompt-surface p { max-width: 850px; margin: 13px 0 16px; color: var(--text-bright); font-size: var(--prompter-copy-size, var(--text-prompt)); line-height: 1.55; letter-spacing: .018em; font-weight: 500; text-wrap: pretty; }
 .prompt-surface.pending p { color: var(--warning); }
 .prompt-surface.live p { color: var(--accent-tint); }
 .prompt-surface.ready p { color: var(--post-ready); }
@@ -801,8 +801,8 @@ input[type="range"]:focus-visible::-moz-range-thumb { box-shadow: 0 0 0 2px var(
 
 /* Reader prompter: stable canvas. Cue color lives in the chip; live copy is the go signal. */
 html:has(.prompter-shell), body:has(.prompter-shell), body:has(.prompter-shell) #root { min-width: 0; }
-.prompter-shell { --cue-color: var(--quiet); --prompter-copy-size: 2.25rem; --prompter-live-color: var(--prompter-live); min-width: 0; height: 100%; display: grid; grid-template-rows: 52px minmax(0, 1fr) 36px; overflow: hidden; color: var(--text-bright); background: var(--canvas); user-select: none; }
-.prompter-shell.has-quality-warning { grid-template-rows: 52px auto minmax(0, 1fr) 36px; }
+.prompter-shell { --cue-color: var(--quiet); --prompter-copy-size: 2.25rem; --prompter-label-size: 1rem; --prompter-live-color: var(--prompter-live); min-width: 0; height: 100%; display: grid; grid-template-rows: 52px minmax(0, 1fr) auto; overflow: hidden; color: var(--text-bright); background: var(--canvas); user-select: none; }
+.prompter-shell.has-quality-warning { grid-template-rows: 52px auto minmax(0, 1fr) auto; }
 .prompter-shell.idle, .prompter-shell.review, .prompter-shell.complete { --cue-color: var(--quiet); }
 .prompter-shell.checking, .prompter-shell.pending { --cue-color: var(--warning); }
 .prompter-shell.recording { --cue-color: var(--prompter-rec); }
@@ -834,7 +834,16 @@ html:has(.prompter-shell), body:has(.prompter-shell), body:has(.prompter-shell) 
 .prompter-ready-dot { width: 10px; height: 10px; flex: none; border-radius: 50%; background: var(--post-ready); box-shadow: 0 0 0 3px var(--accent-soft); }
 .prompter-content > p.long { display: block; font-size: calc(var(--prompter-copy-size) * .85); }
 .prompter-content > p.dense { display: block; font-size: calc(var(--prompter-copy-size) * .72); line-height: 1.48; }
-.prompter-footer { display: flex; align-items: center; justify-content: flex-end; padding: 0 10px; border-top: 1px solid var(--library-row-hover); background: var(--ink); }
+.prompter-footer { min-height: 36px; display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; padding: 4px 10px; border-top: 1px solid var(--library-row-hover); background: var(--ink); }
+.prompter-type-size { display: inline-flex; flex: none; align-items: center; gap: 3px; }
+.prompter-type-size-caption { margin-right: 2px; color: var(--quiet); font-size: var(--text-xs); }
+.prompter-type-size button { min-width: 22px; height: 22px; padding: 0 5px; border: 1px solid var(--line-field); border-radius: 3px; color: var(--text-2); background: var(--surface); font-weight: 650; line-height: 1; }
+.prompter-type-size button:first-of-type { font-size: var(--text-xs); }
+.prompter-type-size button:last-of-type { font-size: var(--text-lg); }
+.prompter-type-size button:hover:not(:disabled) { border-color: var(--faint); color: var(--text-soft); background: var(--line); }
+.prompter-type-size button:disabled { opacity: .38; cursor: not-allowed; }
+.prompter-type-size output { min-width: 3.4em; color: var(--quiet); font: 600 var(--text-xs) var(--mono); font-variant-numeric: tabular-nums; text-align: center; }
+.prompter-type-size.compact button { min-width: 20px; height: 20px; padding: 0 4px; }
 .prompter-settings { position: relative; }
 .prompter-settings-button { width: 28px; height: 28px; display: grid; place-items: center; border: 0; border-radius: 4px; color: var(--muted); background: transparent; }
 .prompter-settings-button:hover, .prompter-settings-button.open { color: var(--text-soft); background: var(--dialog); }
@@ -855,9 +864,9 @@ html:has(.prompter-shell), body:has(.prompter-shell), body:has(.prompter-shell) 
 .prompter-color-swatch.active { box-shadow: 0 0 0 2px var(--library-input), 0 0 0 4px var(--accent-muted); }
 .prompter-color-custom { width: 22px; height: 22px; overflow: hidden; border: 1px dashed var(--faint); border-radius: 50%; background: conic-gradient(var(--danger), var(--warning), var(--ready), var(--post-ready), var(--danger)); }
 .prompter-color-custom input { width: 150%; height: 150%; margin: -25%; padding: 0; border: 0; background: transparent; cursor: pointer; }
-.prompter-label { max-height: 6em; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: baseline; gap: 14px; margin-top: clamp(18px, 4vh, 28px); padding-top: 14px; overflow: auto; border-top: 1px solid var(--line-soft); }
+.prompter-label { max-height: min(12em, 34vh); display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: baseline; gap: 14px; margin-top: clamp(18px, 4vh, 28px); padding-top: 14px; overflow: auto; border-top: 1px solid var(--line-soft); }
 .prompter-label span { color: var(--dot); font-size: var(--text-xs); white-space: nowrap; }
-.prompter-label strong { color: var(--text-2); font-size: clamp(0.8125rem, 2.2vw, 1rem); line-height: 1.55; font-weight: 500; }
+.prompter-label strong { color: var(--text-2); font-size: var(--prompter-label-size, 1rem); line-height: 1.55; font-weight: 500; }
 .prompter-label.empty strong { color: var(--dot); font-weight: 400; }
 
 @media (max-width: 600px) {
@@ -865,8 +874,8 @@ html:has(.prompter-shell), body:has(.prompter-shell), body:has(.prompter-shell) 
 }
 
 @media (max-height: 420px) {
-  .prompter-shell { grid-template-rows: 36px minmax(0, 1fr) 32px; }
-  .prompter-shell.has-quality-warning { grid-template-rows: 36px auto minmax(0, 1fr) 32px; }
+  .prompter-shell { grid-template-rows: 36px minmax(0, 1fr) auto; }
+  .prompter-shell.has-quality-warning { grid-template-rows: 36px auto minmax(0, 1fr) auto; }
   .prompter-content { padding-top: 17px; padding-bottom: 16px; }
   .prompter-label { margin-top: 12px; padding-top: 10px; }
 }
@@ -878,7 +887,6 @@ html:has(.prompter-shell), body:has(.prompter-shell), body:has(.prompter-shell) 
   .setup-workspace { grid-template-columns: minmax(0, 1fr); }
   .recording-workspace { grid-template-columns: 220px minmax(470px, 1fr) 286px; }
   .property-group { grid-template-columns: 150px minmax(0, 1fr); }
-  .prompt-surface p { font-size: var(--text-4xl); }
 }
 
 @media (max-height: 760px) {
@@ -886,7 +894,7 @@ html:has(.prompter-shell), body:has(.prompter-shell), body:has(.prompter-shell) 
   .transport-panel { grid-template-rows: 18px minmax(42px, 1fr); gap: 3px; padding: 5px 9px 6px; }
   .transport-review { min-height: 18px; }
   .prompt-surface { padding-top: 14px; padding-bottom: 14px; }
-  .prompt-surface p { margin: 9px 0 11px; font-size: var(--text-4xl); }
+  .prompt-surface p { margin: 9px 0 11px; }
   .property-group { padding-top: 12px; padding-bottom: 13px; }
   .inspector-section { padding-top: 9px; padding-bottom: 10px; }
   .settings-content > section { min-height: 0; padding: 11px 16px; }

@@ -96,7 +96,15 @@ import { LogPanel } from './LogPanel';
 import { NoiseCheckDialog } from './NoiseCheckDialog';
 import { APP_LOCALES, LOCALE_NATIVE_NAMES, getLocale, t, useI18n } from './i18n';
 import { startDevWebCapture, type DevWebCaptureHandle } from './dev-web-capture';
+import {
+  MAX_PROMPTER_FONT_SIZE,
+  MIN_PROMPTER_FONT_SIZE,
+  prompterFontSizeRem,
+  prompterLabelFontSizeRem,
+} from './prompter-appearance';
+import { PrompterFontSizeControl } from './PrompterFontSizeControl';
 import { readerCueKey, readerFacingCue, resolveMonitorCue } from './prompter-cues';
+import { usePrompterAppearance } from './usePrompterAppearance';
 
 type HistoryFilter = 'all' | 'completed' | 'unfinished';
 type RecordingStateKind = 'completed' | 'unfinished' | 'attention';
@@ -539,6 +547,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const [workspaceFaulted, setWorkspaceFaulted] = useState(false);
   const [monitorPanelTab, setMonitorPanelTab] = useState<MonitorPanelTab>('monitor');
   const [prompterStatus, setPrompterStatus] = useState({ open: false, ready: false });
+  const { appearance, nudgeFontSize } = usePrompterAppearance();
   const [sessionDir, setSessionDir] = useState('');
   const [waveformGeneration, setWaveformGeneration] = useState(0);
   const [reviewWaveformBins, setReviewWaveformBins] = useState<Array<[number, number]>>([]);
@@ -3528,7 +3537,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             {discontinuityToast && !captureFault && <div className="input-quality-banner workspace-toast" data-testid="discontinuity-toast" role="status"><Icon name="meter" size={16} /><div><strong>{t('discontinuity.bannerTitle')}</strong><span>{discontinuityToast}. {t('discontinuity.bannerHint')}</span></div></div>}
             {qualityWarning && <div className="input-quality-banner" role="alert"><Icon name="meter" size={16} /><div><strong>{t('quality.bannerTitle')}</strong><span>{qualityWarning}. {t('quality.bannerHint')}</span></div></div>}
           </div>}
-          <section className="script-monitor"><header><span>{t('recorder.currentSentence')}</span><div><span className="studio-cue">{cueLabel}</span><em>{workflowComplete ? t('recorder.itemsCount', { count: items.length }) : `${currentIndex + 1} / ${items.length}`}</em></div></header><div className={`prompt-surface ${captureFault ? 'fault' : cue === 'pending' || cue === 'checking' ? 'pending' : cue === 'ready' ? 'ready' : cue === 'recording' ? 'live' : ''}`}>{captureFault ? <span className="label-chip">{t('recorder.stopReadingChip')}</span> : noiseCheckBlocksAttempt ? <span className="label-chip">{t('recorder.envChip')}</span> : (workflowComplete || currentItem?.label) && <span className="label-chip">{workflowComplete ? t('recorder.allDoneChip') : currentItem?.label}</span>}<p>{captureFault ? captureFaultCopy.title : noiseCheckBlocksAttempt ? t('recorder.keepQuiet') : workflowComplete ? t('recorder.scriptFinished') : currentItem?.text ?? t('recorder.noText')}</p><small>{captureFault ? captureFaultCopy.detail : noiseCheckBlocksAttempt ? noiseCheckMessage : workflowComplete ? t('recorder.exportLater') : <>{currentItem?.id}</>}</small></div></section>
+          <section className="script-monitor" style={{ ['--prompter-copy-size' as string]: prompterFontSizeRem(appearance.fontSize), ['--prompter-label-size' as string]: prompterLabelFontSizeRem(appearance.labelFontSize) }}><header><span>{t('recorder.currentSentence')}</span><div><PrompterFontSizeControl size={appearance.fontSize} min={MIN_PROMPTER_FONT_SIZE} max={MAX_PROMPTER_FONT_SIZE} onNudge={nudgeFontSize} compact smallerLabel={t('prompter.fontSizeSmaller')} largerLabel={t('prompter.fontSizeLarger')} /><span className="studio-cue">{cueLabel}</span><em>{workflowComplete ? t('recorder.itemsCount', { count: items.length }) : `${currentIndex + 1} / ${items.length}`}</em></div></header><div className={`prompt-surface ${captureFault ? 'fault' : cue === 'pending' || cue === 'checking' ? 'pending' : cue === 'ready' ? 'ready' : cue === 'recording' ? 'live' : ''}`}>{captureFault ? <span className="label-chip">{t('recorder.stopReadingChip')}</span> : noiseCheckBlocksAttempt ? <span className="label-chip">{t('recorder.envChip')}</span> : (workflowComplete || currentItem?.label) && <span className="label-chip">{workflowComplete ? t('recorder.allDoneChip') : currentItem?.label}</span>}<p>{captureFault ? captureFaultCopy.title : noiseCheckBlocksAttempt ? t('recorder.keepQuiet') : workflowComplete ? t('recorder.scriptFinished') : currentItem?.text ?? t('recorder.noText')}</p><small>{captureFault ? captureFaultCopy.detail : noiseCheckBlocksAttempt ? noiseCheckMessage : workflowComplete ? t('recorder.exportLater') : <>{currentItem?.id}</>}</small></div></section>
           <section className="signal-monitor"><header><div><strong>{t('recorder.waveform')}</strong>{captureActive || shouldUseRecordedSilencePair(recording, reviewAttempt) ? <SilencePairReadout pair={silencePair} /> : null}</div><div>{captureActive ? <><span>RMS <b>{db(meter.rms)}</b></span><span>PEAK <b className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</b></span></> : <span>{reviewAttempt ? formatDuration(reviewAttempt.end_sample - reviewAttempt.start_sample, sampleRateForDisplay) : t('recorder.noTakeWaveform')}</span>}</div></header><div className="signal-scope"><WebGLWaveform key={showReviewWaveform ? `${sessionDir}:${reviewAttempt?.attempt_id}` : `${sessionDir}:${waveformGeneration}`} mode={showReviewWaveform ? 'review' : 'live'} bins={showReviewWaveform ? reviewWaveformBins : (meter.waveform ?? [])} capturedSamples={meter.captured_samples} waveformEndSample={meter.waveform_end_sample} recording={waveformTakeIsActive(recording && !captureFault, hasSpoken)} takeStartSample={recording && !captureFault ? attemptStartSample : undefined} sampleRate={sampleRateForDisplay} />{captureActive ? <LiveSilenceHint liveMs={liveSilenceMs} requiredMs={effectiveSilenceDurationMs} /> : null}<div className="scope-scale"><span>−1.0</span><span>−0.5</span><span>0</span><span>+0.5</span><span>+1.0</span></div></div><div className="horizontal-meter"><i className="meter-rms" style={{ width: `${rmsPercent}%` }} /><i className="meter-peak" style={{ left: `${peakPercent}%` }} /></div></section>
           <section className="transport-panel">
             <div className="transport-review">
