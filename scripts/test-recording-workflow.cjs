@@ -36,6 +36,9 @@ async function main() {
     shouldHandleLiveMeter,
   } = await import(pathToFileURL(inputQualityModulePath).href);
   const {
+    classifyInputDevice,
+    preferredInputDevice,
+    productionSampleRates,
     captureFormatsSupportBitDepth,
     captureSampleFormatFromBitDepth,
     captureSampleFormatLabel,
@@ -197,7 +200,18 @@ async function main() {
   assert.equal(captureSampleFormatFromBitDepth(32), 'f32');
   assert.equal(deliveryBitDepthForCaptureFormat('i24'), 24);
   assert.equal(deliveryBitDepthForCaptureFormat('i32'), 32);
-  assert.equal(preferredCaptureSampleFormat(['f32', 'i16']), 'i16');
+  assert.equal(preferredCaptureSampleFormat(['f32', 'i16']), 'f32');
+  assert.equal(preferredCaptureSampleFormat(['i16', 'i24']), 'i24');
+  assert.equal(classifyInputDevice({ name: 'Analogue 1 + 2 (2- Focusrite USB Audio)' }), 'production');
+  assert.equal(classifyInputDevice({ name: '麦克风阵列 (Senary Audio)' }), 'rejected');
+  assert.equal(classifyInputDevice({ name: 'Headset (Bluetooth)' }), 'rejected');
+  assert.equal(classifyInputDevice({ name: 'Microphone Array (Realtek)' }), 'rejected');
+  const picked = preferredInputDevice([
+    { id: 'senary', name: '麦克风阵列 (Senary Audio)', is_default: true },
+    { id: 'focusrite', name: 'Analogue 1 + 2 (Focusrite USB Audio)' },
+  ], 'senary');
+  assert.equal(picked?.id, 'focusrite', 'must not auto-select a rejected laptop array even if it is the Windows default');
+  assert.deepEqual(productionSampleRates([16_000, 44_100, 48_000]), [44_100, 48_000]);
   assert.deepEqual(
     captureSampleFormatsForConfiguration(dualModeDevice.configurations, 48_000, 1),
     ['i24', 'f32'],

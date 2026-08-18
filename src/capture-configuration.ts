@@ -80,7 +80,37 @@ export function captureFormatsSupportBitDepth(
 export const CAPTURE_SAMPLE_FORMATS = ['i16', 'i24', 'i32', 'f32'] as const;
 export type CaptureSampleFormat = (typeof CAPTURE_SAMPLE_FORMATS)[number];
 
-const PREFERRED_CAPTURE_SAMPLE_FORMATS: readonly CaptureSampleFormat[] = ['i16', 'i24', 'f32', 'i32'];
+const PREFERRED_CAPTURE_SAMPLE_FORMATS: readonly CaptureSampleFormat[] = ['i24', 'f32', 'i32', 'i16'];
+
+const REJECTED_INPUT_DEVICE = /阵列|array|senary|bluetooth|hands-?free|headset|communications|立体声混音|stereo mix|what u hear|wave out/i;
+const DISCOURAGED_INPUT_DEVICE = /built-?in|internal microphone|内置|realtek/i;
+
+export type InputDeviceKind = 'production' | 'discouraged' | 'rejected';
+
+export function classifyInputDevice(device: { name?: string } | null | undefined): InputDeviceKind {
+  const name = device?.name?.trim() ?? '';
+  if (!name) return 'discouraged';
+  if (REJECTED_INPUT_DEVICE.test(name)) return 'rejected';
+  if (DISCOURAGED_INPUT_DEVICE.test(name)) return 'discouraged';
+  return 'production';
+}
+
+export function preferredInputDevice<T extends { id: string; name: string; is_default?: boolean }>(
+  devices: readonly T[],
+  defaultId?: string | null,
+): T | null {
+  if (!devices.length) return null;
+  const production = devices.filter((device) => classifyInputDevice(device) === 'production');
+  const usable = production.length
+    ? production
+    : devices.filter((device) => classifyInputDevice(device) !== 'rejected');
+  const pool = usable.length ? usable : [...devices];
+  return pool.find((device) => device.id === defaultId) ?? pool[0] ?? null;
+}
+
+export function productionSampleRates(rates: readonly number[]): number[] {
+  return rates.filter((rate) => rate >= 44_100);
+}
 
 export function normalizeCaptureSampleFormat(value: unknown): CaptureSampleFormat | null {
   if (typeof value !== 'string') return null;

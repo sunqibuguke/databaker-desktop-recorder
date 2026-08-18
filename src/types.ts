@@ -110,6 +110,8 @@ export type NoiseCheckResult = {
   failing_windows: number;
   samples: number[];
   completed_at: string;
+  fail_reason?: string | null;
+  bandwidth_ratio_db?: number | null;
 };
 
 export type NoiseCheckProgress = {

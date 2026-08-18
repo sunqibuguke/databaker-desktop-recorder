@@ -1,4 +1,6 @@
 mod attempt;
+mod bandwidth;
+mod capture_select;
 mod durable_fs;
 mod engine;
 mod protocol;

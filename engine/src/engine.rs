@@ -315,6 +315,10 @@ pub struct NoiseCheckResult {
     pub failing_windows: usize,
     pub samples: Vec<f32>,
     pub completed_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bandwidth_ratio_db: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -632,6 +636,7 @@ struct SilenceMonitor {
     threshold_bits: Arc<AtomicU32>,
     capture_heartbeat: Arc<AtomicU64>,
     head_silence: HeadSilenceMonitor,
+    bandwidth: crate::bandwidth::BandwidthProbe,
 }
 
 #[derive(Clone)]
@@ -1350,6 +1355,7 @@ pub struct RecordingSession {
     silence_threshold_bits: Arc<AtomicU32>,
     silence_duration_ms: Arc<AtomicU32>,
     head_silence: HeadSilenceMonitor,
+    bandwidth: crate::bandwidth::BandwidthProbe,
     active_attempt: Option<ActiveAttempt>,
     metadata_fault: Option<String>,
     /// A stop command has already been placed behind every callback that
@@ -2121,7 +2127,7 @@ impl Engine {
                     let device_name = input_device_name(&device)?;
                     let requested_format =
                         parse_requested_input_sample_format(&snapshot.input_sample_format)?;
-                    let supported = select_config(
+                    let candidates = select_config_candidates(
                         &device,
                         snapshot.audio_format.sample_rate,
                         input_channel_index,
@@ -2129,20 +2135,17 @@ impl Engine {
                         snapshot.capture_share_mode,
                         requested_format,
                     )?;
+                    let supported = candidates
+                        .first()
+                        .expect("select_config_candidates returns at least one config");
                     let input_channels = supported.channels();
                     let sample_format = supported.sample_format();
-                    let config = StreamConfig {
-                        channels: input_channels,
-                        sample_rate: snapshot.audio_format.sample_rate,
-                        buffer_size: cpal::BufferSize::Default,
-                        share_mode: ShareMode::from(snapshot.capture_share_mode),
-                    };
                     (
                         device_name,
                         device_id,
                         input_channels,
                         sample_format,
-                        Some((device, config)),
+                        Some((device, candidates)),
                     )
                 }
                 #[cfg(not(windows))]
@@ -2403,6 +2406,7 @@ impl Engine {
         // Own the writer and task lock before waiting for its initialization
         // handshake. A slow or wedged WAV open must never make this command
         // release the lock while an unjoined writer still holds the audio.
+        let bandwidth = crate::bandwidth::BandwidthProbe::new(snapshot.audio_format.sample_rate);
         let mut session = RecordingSession {
             _session_lock: Some(session_lock),
             session_dir,
@@ -2433,6 +2437,7 @@ impl Engine {
             silence_threshold_bits,
             silence_duration_ms,
             head_silence,
+            bandwidth,
             active_attempt: None,
             metadata_fault: None,
             stop_requested: false,
@@ -2473,52 +2478,87 @@ impl Engine {
             }
         }
 
-        if let Some((device, config)) = stream_setup {
-            let stream = match build_stream(
-                &device,
-                &config,
-                sample_format,
-                input_channel_index,
-                session.writer_tx.clone(),
-                Arc::clone(&session.captured),
-                Arc::clone(&session.overflow),
-                Arc::clone(&session.faulted),
-                CaptureFaultPersistence {
-                    session_dir: session.session_dir.clone(),
-                    recovery: capture_recovery.clone(),
-                },
-                Arc::clone(&capture_fault_code),
-                Arc::clone(&session.peak),
-                Arc::clone(&session.rms),
-                session.writer_queue.clone(),
-                waveform_tx,
-                SilenceMonitor {
-                    silence_samples: Arc::clone(&session.silence_samples),
-                    digital_silence_samples: Arc::clone(&session.digital_silence_samples),
-                    last_signal_sample: Arc::clone(&session.last_signal_sample),
-                    attempt_signal_start_sample: Arc::clone(&session.attempt_signal_start_sample),
-                    analyzed_samples: Arc::clone(&session.analyzed_samples),
-                    analysis_epoch: Arc::clone(&session.analysis_epoch),
-                    threshold_bits: Arc::clone(&session.silence_threshold_bits),
-                    capture_heartbeat: Arc::clone(&session.capture_heartbeat),
-                    head_silence: session.head_silence.clone(),
-                },
-            ) {
-                Ok(stream) => stream,
-                Err(error) => {
-                    let exclusive_open = session.snapshot.capture_share_mode.is_exclusive();
+        if let Some((device, candidates)) = stream_setup {
+            let exclusive_open = session.snapshot.capture_share_mode.is_exclusive();
+            let share_mode = ShareMode::from(session.snapshot.capture_share_mode);
+            let sample_rate = session.snapshot.audio_format.sample_rate;
+            let mut last_error: Option<anyhow::Error> = None;
+            let mut opened = None;
+            for supported in candidates {
+                let config = StreamConfig {
+                    channels: supported.channels(),
+                    sample_rate,
+                    buffer_size: cpal::BufferSize::Default,
+                    share_mode,
+                };
+                match build_stream(
+                    &device,
+                    &config,
+                    supported.sample_format(),
+                    input_channel_index,
+                    session.writer_tx.clone(),
+                    Arc::clone(&session.captured),
+                    Arc::clone(&session.overflow),
+                    Arc::clone(&session.faulted),
+                    CaptureFaultPersistence {
+                        session_dir: session.session_dir.clone(),
+                        recovery: capture_recovery.clone(),
+                    },
+                    Arc::clone(&capture_fault_code),
+                    Arc::clone(&session.peak),
+                    Arc::clone(&session.rms),
+                    session.writer_queue.clone(),
+                    waveform_tx.clone(),
+                    SilenceMonitor {
+                        silence_samples: Arc::clone(&session.silence_samples),
+                        digital_silence_samples: Arc::clone(&session.digital_silence_samples),
+                        last_signal_sample: Arc::clone(&session.last_signal_sample),
+                        attempt_signal_start_sample: Arc::clone(
+                            &session.attempt_signal_start_sample,
+                        ),
+                        analyzed_samples: Arc::clone(&session.analyzed_samples),
+                        analysis_epoch: Arc::clone(&session.analysis_epoch),
+                        threshold_bits: Arc::clone(&session.silence_threshold_bits),
+                        capture_heartbeat: Arc::clone(&session.capture_heartbeat),
+                        head_silence: session.head_silence.clone(),
+                        bandwidth: session.bandwidth.clone(),
+                    },
+                ) {
+                    Ok(stream) => {
+                        opened = Some((stream, supported.channels(), supported.sample_format()));
+                        break;
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "input stream candidate failed: {} Hz {}ch {} ({error:#})",
+                            sample_rate,
+                            supported.channels(),
+                            supported.sample_format()
+                        );
+                        last_error = Some(error);
+                    }
+                }
+            }
+            match opened {
+                Some((stream, input_channels, sample_format)) => {
+                    session.snapshot.audio_format.input_channels = input_channels;
+                    session.snapshot.input_sample_format = sample_format.to_string();
+                    session.stream = Some(stream);
+                }
+                None => {
                     return Err(self.finish_activation_failure(
                         session,
                         "build_input_stream",
-                        error.context(if exclusive_open {
-                            "独占开流失败。请确认声卡未被其他程序占用，并检查采样率/位深/通道；可改为「系统混音」，不会自动降级"
-                        } else {
-                            "build input stream"
-                        }),
+                        last_error
+                            .unwrap_or_else(|| anyhow!("no compatible input stream candidate"))
+                            .context(if exclusive_open {
+                                "独占开流失败。请确认声卡未被其他程序占用，并检查采样率/位深/通道；可改为「系统混音」，不会自动降级"
+                            } else {
+                                "build input stream"
+                            }),
                     ));
                 }
-            };
-            session.stream = Some(stream);
+            }
         }
 
         // Keep the liveness gate independent from protocol telemetry. Stdout
@@ -2818,6 +2858,7 @@ impl Engine {
             threshold_bits: Arc::clone(&session.silence_threshold_bits),
             capture_heartbeat: Arc::clone(&session.capture_heartbeat),
             head_silence: session.head_silence.clone(),
+            bandwidth: session.bandwidth.clone(),
         };
         let mut emitted = 0u64;
         while emitted < frames {
@@ -2883,6 +2924,7 @@ impl Engine {
             threshold_bits: Arc::clone(&session.silence_threshold_bits),
             capture_heartbeat: Arc::clone(&session.capture_heartbeat),
             head_silence: session.head_silence.clone(),
+            bandwidth: session.bandwidth.clone(),
         };
         saturating_atomic_add(&session.capture_heartbeat, 1);
         // Do not arm the production stall watchdog. Chromium may pause the
@@ -2971,9 +3013,17 @@ impl Engine {
                 }),
             );
         }
-        let (passed, failing_windows) = evaluate_noise(&samples, payload.threshold_dbfs);
+        let (level_passed, failing_windows) = evaluate_noise(&samples, payload.threshold_dbfs);
         let average_dbfs = samples.iter().sum::<f32>() / samples.len() as f32;
         let maximum_dbfs = samples.iter().copied().fold(-96.0f32, f32::max);
+        let bandwidth = session.bandwidth.evaluate();
+        let (passed, fail_reason) = if !level_passed {
+            (false, None)
+        } else if bandwidth.conclusive && !bandwidth.passed {
+            (false, Some("bandwidth".to_string()))
+        } else {
+            (true, None)
+        };
         let result = NoiseCheckResult {
             passed,
             threshold_dbfs: payload.threshold_dbfs,
@@ -2982,6 +3032,8 @@ impl Engine {
             failing_windows,
             samples,
             completed_at: Utc::now().to_rfc3339(),
+            fail_reason,
+            bandwidth_ratio_db: bandwidth.ratio_db,
         };
         session.snapshot.noise_check = Some(result.clone());
         session.persist("noise_check_completed", json!(&result))?;
@@ -7519,20 +7571,24 @@ fn catalog_sample_formats(catalog: &InputFormatCatalog) -> Vec<String> {
     formats
 }
 
-fn select_config(
+fn select_config_candidates(
     device: &Device,
     sample_rate: u32,
     input_channel_index: usize,
     output_bit_depth: u16,
     share_mode: CaptureShareMode,
     requested_sample_format: Option<SampleFormat>,
-) -> Result<SupportedStreamConfig> {
+) -> Result<Vec<SupportedStreamConfig>> {
     let minimum_representation_bits = if requested_sample_format.is_some() {
         0
     } else {
         minimum_input_representation_bits(output_bit_depth)?
     };
-    let mut selected: Option<(u8, SupportedStreamConfig)> = None;
+    let mut selected = Vec::<(
+        crate::capture_select::InputConfigRank,
+        usize,
+        SupportedStreamConfig,
+    )>::new();
     let mut compatible_rates = Vec::<(u32, u32)>::new();
     let mut formats_at_requested_rate = Vec::<(String, u16)>::new();
     let requested_channel = input_channel_index + 1;
@@ -7563,17 +7619,24 @@ fn select_config(
         if requested_sample_format.is_none() && representation_bits < minimum_representation_bits {
             continue;
         }
-        let score = input_format_score(range.sample_format());
+        let rank = crate::capture_select::InputConfigRank {
+            format_score: input_format_score(range.sample_format()),
+            channels: range.channels(),
+        };
         let config = range.with_sample_rate(sample_rate);
-        if selected
-            .as_ref()
-            .is_none_or(|(current_score, _)| score > *current_score)
-        {
-            selected = Some((score, config));
-        }
+        selected.push((rank, selected.len(), config));
     }
-    if let Some((_, config)) = selected {
-        return Ok(config);
+    if !selected.is_empty() {
+        selected.sort_by(|(left_rank, left_index, _), (right_rank, right_index, _)| {
+            crate::capture_select::sort_key(exclusive, right_rank.format_score, right_rank.channels)
+                .cmp(&crate::capture_select::sort_key(
+                    exclusive,
+                    left_rank.format_score,
+                    left_rank.channels,
+                ))
+                .then(left_index.cmp(right_index))
+        });
+        return Ok(selected.into_iter().map(|(_, _, config)| config).collect());
     }
     if compatible_rates.is_empty() {
         if exclusive {
@@ -8185,6 +8248,7 @@ fn publish_leased_block_with_preview(
         return;
     }
     let digital_silence_block = analyze_digital_silence_block(&mono);
+    silence.bandwidth.push(&mono);
     let mut peak = 0f32;
     let mut square_sum = 0f64;
     for sample in &mono {
@@ -9328,6 +9392,7 @@ mod tests {
                     threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
                     capture_heartbeat: Arc::new(AtomicU64::new(0)),
                     head_silence,
+                    bandwidth: crate::bandwidth::BandwidthProbe::default(),
                 },
             }
         }
@@ -9439,6 +9504,7 @@ mod tests {
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
             head_silence: test_head_silence_monitor(),
+            bandwidth: crate::bandwidth::BandwidthProbe::default(),
         };
         const BLOCKS: usize = 4;
         const FRAMES_PER_BLOCK: usize = 4;
@@ -9662,6 +9728,7 @@ mod tests {
             silence_threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             silence_duration_ms: Arc::new(AtomicU32::new(1_000)),
             head_silence: test_head_silence_monitor(),
+            bandwidth: crate::bandwidth::BandwidthProbe::default(),
             active_attempt: None,
             metadata_fault: None,
             stop_requested: false,
@@ -10746,6 +10813,7 @@ mod tests {
             silence_threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             silence_duration_ms: Arc::new(AtomicU32::new(1_000)),
             head_silence: test_head_silence_monitor(),
+            bandwidth: crate::bandwidth::BandwidthProbe::default(),
             active_attempt: None,
             metadata_fault: None,
             stop_requested: false,
@@ -11179,6 +11247,7 @@ mod tests {
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(1)),
             head_silence: test_head_silence_monitor(),
+            bandwidth: crate::bandwidth::BandwidthProbe::default(),
         };
         publish_block(
             vec![0.25, -0.25, 0.5, -0.5],
@@ -12028,6 +12097,7 @@ mod tests {
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
             head_silence: test_head_silence_monitor(),
+            bandwidth: crate::bandwidth::BandwidthProbe::default(),
         };
         let (write_entered_tx, write_entered_rx) = bounded(1);
         let (release_write_tx, release_write_rx) = bounded(1);
@@ -12409,6 +12479,7 @@ mod tests {
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
             head_silence: test_head_silence_monitor(),
+            bandwidth: crate::bandwidth::BandwidthProbe::default(),
         };
         const BLOCK_FRAMES: usize = 480;
         const BLOCK_COUNT: usize = 600;
@@ -12488,6 +12559,7 @@ mod tests {
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
             head_silence: test_head_silence_monitor(),
+            bandwidth: crate::bandwidth::BandwidthProbe::default(),
         };
 
         publish_block(
@@ -12640,6 +12712,7 @@ mod tests {
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
             head_silence: test_head_silence_monitor(),
+            bandwidth: crate::bandwidth::BandwidthProbe::default(),
         };
 
         publish_block(
@@ -12692,6 +12765,7 @@ mod tests {
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
             head_silence: test_head_silence_monitor(),
+            bandwidth: crate::bandwidth::BandwidthProbe::default(),
         };
         publish_block(
             vec![0.1, 0.2, 0.3],
@@ -12755,6 +12829,7 @@ mod tests {
             threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
             head_silence: test_head_silence_monitor(),
+            bandwidth: crate::bandwidth::BandwidthProbe::default(),
         };
         const BLOCK_FRAMES: usize = 4_800;
         let block_count = usize::try_from(queue.max_frames).unwrap() / BLOCK_FRAMES;
@@ -12839,6 +12914,7 @@ mod tests {
             silence_threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             silence_duration_ms: Arc::new(AtomicU32::new(1_000)),
             head_silence: test_head_silence_monitor(),
+            bandwidth: crate::bandwidth::BandwidthProbe::default(),
             active_attempt: None,
             metadata_fault: None,
             stop_requested: false,
@@ -12934,6 +13010,7 @@ mod tests {
             silence_threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             silence_duration_ms: Arc::new(AtomicU32::new(1_000)),
             head_silence: test_head_silence_monitor(),
+            bandwidth: crate::bandwidth::BandwidthProbe::default(),
             active_attempt: Some(ActiveAttempt {
                 item_id: "001".to_string(),
                 attempt_id: "001-a1".to_string(),
@@ -13108,6 +13185,8 @@ mod tests {
             failing_windows: 0,
             samples: vec![-50.0],
             completed_at: "2026-08-10T12:00:00Z".to_string(),
+            fail_reason: None,
+            bandwidth_ratio_db: None,
         });
         snapshot.items[0].status = "accepted".to_string();
         snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
@@ -14649,6 +14728,7 @@ mod tests {
             silence_threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
             silence_duration_ms: Arc::new(AtomicU32::new(1_000)),
             head_silence: test_head_silence_monitor(),
+            bandwidth: crate::bandwidth::BandwidthProbe::default(),
             active_attempt: None,
             metadata_fault: Some("injected initial persist failure".to_string()),
             stop_requested: false,
