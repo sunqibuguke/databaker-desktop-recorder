@@ -54,11 +54,61 @@ pub fn run() -> Result<(), eframe::Error> {
     )
 }
 
+pub fn run_fatal(message: &str) -> Result<(), eframe::Error> {
+    let options = eframe::NativeOptions {
+        viewport: ViewportBuilder::default()
+            .with_inner_size([440.0, 200.0])
+            .with_min_inner_size([360.0, 160.0])
+            .with_title("DataBaker 授权注册机"),
+        ..Default::default()
+    };
+    let message = message.to_string();
+    eframe::run_native(
+        "DataBaker 授权注册机",
+        options,
+        Box::new(move |cc| {
+            setup_style(&cc.egui_ctx);
+            Ok(Box::new(FatalApp { message }))
+        }),
+    )
+}
+
+struct FatalApp {
+    message: String,
+}
+
+impl eframe::App for FatalApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default()
+            .frame(
+                Frame::NONE
+                    .fill(INK)
+                    .inner_margin(Margin::symmetric(28, 24)),
+            )
+            .show(ctx, |ui| {
+                ui.label(RichText::new("无法打开").size(22.0).strong().color(TEXT));
+                ui.add_space(10.0);
+                ui.label(RichText::new(&self.message).size(14.0).color(DANGER));
+                ui.add_space(18.0);
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("关闭").color(CREAM).strong())
+                            .fill(DANGER)
+                            .corner_radius(CornerRadius::same(RADIUS))
+                            .min_size(egui::vec2(120.0, 36.0)),
+                    )
+                    .clicked()
+                {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+    }
+}
+
 struct IssuerApp {
     machine: String,
     expiry: String,
     subject: String,
-    perpetual: bool,
     ticket: String,
     error: String,
     notice: String,
@@ -73,7 +123,6 @@ impl IssuerApp {
             machine: String::new(),
             expiry: default_expiry_date(None),
             subject: String::new(),
-            perpetual: false,
             ticket: String::new(),
             error: String::new(),
             notice: String::new(),
@@ -96,15 +145,11 @@ impl IssuerApp {
                 return;
             }
         };
-        let expires_at = if self.perpetual {
-            None
-        } else {
-            match parse_expiry_date(&self.expiry) {
-                Ok(value) => Some(value),
-                Err(error) => {
-                    self.error = error.to_string();
-                    return;
-                }
+        let expires_at = match parse_expiry_date(&self.expiry) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                self.error = error.to_string();
+                return;
             }
         };
         match issue_license(IssueLicenseInput {
@@ -115,7 +160,7 @@ impl IssuerApp {
             now_ms: None,
             jti: None,
             days: None,
-            perpetual: self.perpetual,
+            perpetual: false,
             expires_at,
         }) {
             Ok(ticket) => self.ticket = ticket,
@@ -158,12 +203,9 @@ impl IssuerApp {
     }
 
     fn expiry_hint(&self) -> String {
-        if self.perpetual {
-            return "永久有效，不设到期日。".to_string();
-        }
         match parse_expiry_date(&self.expiry) {
-            Ok(value) => format!("到期日 {}", format_expiry_date(value)),
-            Err(_) => "填写 YYYY-MM-DD，或勾选永久。".to_string(),
+            Ok(value) => format!("到期日 {}，最长一年", format_expiry_date(value)),
+            Err(_) => "填写 YYYY-MM-DD，最长一年。".to_string(),
         }
     }
 }
@@ -183,9 +225,11 @@ impl eframe::App for IssuerApp {
                         ui.label(RichText::new("授权注册机").size(28.0).strong().color(TEXT));
                         ui.add_space(6.0);
                         ui.label(
-                            RichText::new("输入机器码和到期日，生成绑定该机器的离线授权。")
-                                .size(14.0)
-                                .color(MUTED),
+                            RichText::new(
+                                "输入机器码和到期日，生成绑定该机器的离线授权。单次最长一年；2027 年之后本工具无法打开。",
+                            )
+                            .size(14.0)
+                            .color(MUTED),
                         );
                         ui.add_space(20.0);
 
@@ -199,17 +243,8 @@ impl eframe::App for IssuerApp {
                             );
                             ui.add_space(16.0);
 
-                            ui.horizontal(|ui| {
-                                field_label(ui, "授权日期", None);
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        ui.checkbox(&mut self.perpetual, "永久");
-                                    },
-                                );
-                            });
-                            ui.add_enabled(
-                                !self.perpetual,
+                            field_label(ui, "授权日期", Some("最长一年"));
+                            ui.add(
                                 egui::TextEdit::singleline(&mut self.expiry)
                                     .desired_width(f32::INFINITY)
                                     .hint_text("2027-08-14")

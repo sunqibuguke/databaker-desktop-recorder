@@ -8,9 +8,10 @@ pub use local::{
     clear_local_license, probe_local_license, ClearLocalLicenseResult, LocalLicenseProbe,
 };
 pub use ticket::{
-    default_expiry_date, format_expiry_date, inspect_license_ticket, issue_license,
-    normalize_machine_code, parse_expiry_date, IssueLicenseInput, LicenseClaims, DEFAULT_KID,
-    LICENSE_TICKET_PREFIX,
+    assert_issuer_active, default_expiry_date, format_expiry_date, inspect_license_ticket,
+    issue_license, issuer_now_unix, normalize_machine_code, parse_expiry_date, IssueLicenseInput,
+    LicenseClaims, DEFAULT_KID, ISSUER_DISABLED_MESSAGE, ISSUER_SUNSET_UNIX, LICENSE_TICKET_PREFIX,
+    MAX_LICENSE_DAYS, MAX_LICENSE_MESSAGE, NO_PERPETUAL_MESSAGE,
 };
 
 #[derive(Debug)]

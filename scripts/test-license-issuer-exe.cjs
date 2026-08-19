@@ -95,21 +95,58 @@ function main() {
   assert.equal('claims' in unnamedVerified, true, JSON.stringify(unnamedVerified));
   assert.equal(unnamedVerified.claims.sub, '');
 
-  const fresh = runIssuer([
+  const year = runIssuer([
     '--key', key,
     '--kid', 'test1',
     '--machine', 'a7k2 9m3p q4wx',
     '--subject', '客户A-工位3',
-    '--perpetual',
+    '--days', '365',
   ]);
-  assert.equal(fresh.status, 0, fresh.stderr || fresh.stdout);
-  const freshTicket = fresh.stdout.trim();
-  const freshVerified = license.verifyLicenseTicket(freshTicket, {
+  assert.equal(year.status, 0, year.stderr || year.stdout);
+  const yearVerified = license.verifyLicenseTicket(year.stdout.trim(), {
     publicKeys: { test1: publicKey },
     machineCode: 'A7K2-9M3P-Q4WX',
   });
-  assert.equal('claims' in freshVerified, true, JSON.stringify(freshVerified));
-  assert.equal(freshVerified.claims.exp, null);
+  assert.equal('claims' in yearVerified, true, JSON.stringify(yearVerified));
+  assert.equal(typeof yearVerified.claims.exp, 'number');
+
+  const perpetual = runIssuer([
+    '--key', key,
+    '--kid', 'test1',
+    '--machine', 'A7K2-9M3P-Q4WX',
+    '--perpetual',
+  ]);
+  assert.notEqual(perpetual.status, 0);
+  assert.match(`${perpetual.stderr}${perpetual.stdout}`, /不支持永久授权，最长授权一年/);
+
+  const tooLong = runIssuer([
+    '--key', key,
+    '--kid', 'test1',
+    '--machine', 'A7K2-9M3P-Q4WX',
+    '--days', '366',
+  ]);
+  assert.notEqual(tooLong.status, 0);
+  assert.match(`${tooLong.stderr}${tooLong.stdout}`, /最长授权一年/);
+
+  const sunset = runIssuer([
+    '--key', key,
+    '--kid', 'test1',
+    '--machine', 'A7K2-9M3P-Q4WX',
+    '--days', '1',
+    '--now-ms', '1830268800000',
+  ]);
+  assert.notEqual(sunset.status, 0);
+  assert.match(`${sunset.stderr}${sunset.stdout}`, /2027 年之后无法打开/);
+
+  const lastDay = runIssuer([
+    '--key', key,
+    '--kid', 'test1',
+    '--machine', 'A7K2-9M3P-Q4WX',
+    '--days', '1',
+    '--jti', 'last-day',
+    '--now-ms', '1830268799000',
+  ]);
+  assert.equal(lastDay.status, 0, lastDay.stderr || lastDay.stdout);
 
   const tempRoot = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'databaker-issuer-clear-'));
   const licenseFile = path.join(tempRoot, 'license.json');

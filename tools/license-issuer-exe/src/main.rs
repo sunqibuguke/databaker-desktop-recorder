@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use databaker_license_issuer::{
-    clear_local_license, issue_license, load_private_key_pem, IssueLicenseInput, DEFAULT_KID,
+    assert_issuer_active, clear_local_license, issue_license, issuer_now_unix,
+    load_private_key_pem, IssueLicenseInput, DEFAULT_KID,
 };
 
 #[cfg(feature = "gui")]
@@ -24,6 +25,10 @@ fn main() -> ExitCode {
     } else {
         #[cfg(feature = "gui")]
         {
+            if let Err(error) = refuse_if_sunset(None) {
+                show_startup_failure(&error);
+                return ExitCode::FAILURE;
+            }
             if let Err(error) = gui::run() {
                 attach_parent_console();
                 eprintln!("{error}");
@@ -66,6 +71,7 @@ fn run_cli(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
     let parsed = parse_args(args)?;
+    refuse_if_sunset(parsed.now_ms)?;
     if parsed.clear_local {
         let result = clear_local_license(parsed.license_file.as_deref())
             .map_err(|error| error.to_string())?;
@@ -175,17 +181,58 @@ fn usage() -> String {
 
 不带参数时打开窗口。命令行：
 
-  databaker-license-issuer --machine A7K2-9M3P-Q4WX [--days 365|--perpetual] [--subject 工位名]
+  databaker-license-issuer --machine A7K2-9M3P-Q4WX [--days 365] [--subject 工位名]
   databaker-license-issuer --clear-local
 
 选项：
   --machine <CODE>   工位机器码
-  --days <N>         有效天数，默认 365
-  --perpetual        永久授权
+  --days <N>         有效天数，默认 365，最长 365
   --subject <NAME>   工位名称，选填
   --clear-local      删除本机采集软件里的授权记录
+
+硬限制：2027 年之后无法打开；单次授权最长一年。
 "
     .to_string()
+}
+
+fn refuse_if_sunset(now_ms: Option<u64>) -> Result<(), String> {
+    assert_issuer_active(issuer_now_unix(now_ms)).map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "gui")]
+fn show_startup_failure(message: &str) {
+    attach_parent_console();
+    eprintln!("{message}");
+    #[cfg(windows)]
+    show_windows_error(message);
+    #[cfg(not(windows))]
+    {
+        let _ = gui::run_fatal(message);
+    }
+}
+
+#[cfg(all(windows, feature = "gui"))]
+fn show_windows_error(message: &str) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    fn wide(value: &str) -> Vec<u16> {
+        OsStr::new(value)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let text = wide(message);
+    let caption = wide("DataBaker 授权注册机");
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            caption.as_ptr(),
+            windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
+        );
+    }
 }
 
 fn attach_parent_console() {

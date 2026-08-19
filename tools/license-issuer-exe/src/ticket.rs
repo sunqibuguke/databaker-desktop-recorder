@@ -12,7 +12,14 @@ pub const LICENSE_TICKET_PREFIX: &str = "DBR1";
 pub const DEFAULT_KID: &str = "2026a";
 const MAX_SUBJECT_LENGTH: usize = 128;
 const MAX_TICKET_LENGTH: usize = 4_096;
-const MAX_DAYS: u32 = 365 * 30;
+
+/// Hard sunset: the issuer refuses to start at 2028-01-01 00:00:00 +08:00.
+pub const ISSUER_SUNSET_UNIX: i64 = 1_830_268_800;
+pub const ISSUER_DISABLED_MESSAGE: &str = "授权注册机已停用：2027 年之后无法打开。";
+/// Maximum issued lifetime. Calendar dates may use one extra UTC day of slack.
+pub const MAX_LICENSE_DAYS: u32 = 365;
+pub const MAX_LICENSE_MESSAGE: &str = "最长授权一年";
+pub const NO_PERPETUAL_MESSAGE: &str = "不支持永久授权，最长授权一年";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LicenseClaims {
@@ -38,8 +45,20 @@ pub struct IssueLicenseInput<'a> {
     pub expires_at: Option<i64>,
 }
 
+pub fn issuer_now_unix(now_ms: Option<u64>) -> i64 {
+    unix_seconds(now_ms.unwrap_or_else(system_now_ms))
+}
+
+pub fn assert_issuer_active(now_unix: i64) -> Result<(), IssueError> {
+    if now_unix >= ISSUER_SUNSET_UNIX {
+        return Err(IssueError::from(ISSUER_DISABLED_MESSAGE));
+    }
+    Ok(())
+}
+
 pub fn issue_license(input: IssueLicenseInput<'_>) -> Result<String, IssueError> {
-    let now = unix_seconds(input.now_ms.unwrap_or_else(system_now_ms));
+    let now = issuer_now_unix(input.now_ms);
+    assert_issuer_active(now)?;
     let mid = normalize_machine_code(input.machine_code)?;
     let sub = normalize_subject(input.subject)?;
     let kid = input.kid.trim();
@@ -135,28 +154,35 @@ fn resolve_expiry(
     now: i64,
 ) -> Result<Option<i64>, IssueError> {
     if perpetual {
-        return Ok(None);
+        return Err(IssueError::from(NO_PERPETUAL_MESSAGE));
     }
     if let Some(exp) = expires_at {
         if exp <= now {
             return Err(IssueError::from("授权日期必须晚于今天"));
         }
-        let span_days = (exp - now + 86_399) / 86_400;
-        if !(1..=i64::from(MAX_DAYS)).contains(&span_days) {
-            return Err(IssueError::from("授权日期超出允许范围"));
+        if exp > max_calendar_expiry(now) {
+            return Err(IssueError::from(MAX_LICENSE_MESSAGE));
         }
         return Ok(Some(exp));
     }
-    let days = days.unwrap_or(365);
-    if !(1..=MAX_DAYS).contains(&days) {
+    let days = days.unwrap_or(MAX_LICENSE_DAYS);
+    if days < 1 {
         return Err(IssueError::from("授权天数无效"));
+    }
+    if days > MAX_LICENSE_DAYS {
+        return Err(IssueError::from(MAX_LICENSE_MESSAGE));
     }
     Ok(Some(now + i64::from(days) * 86_400))
 }
 
+fn max_calendar_expiry(now: i64) -> i64 {
+    // Last valid labeled day is today (UTC) plus 365 days; exp is the next midnight.
+    now.div_euclid(86_400) * 86_400 + i64::from(MAX_LICENSE_DAYS + 1) * 86_400
+}
+
 pub fn default_expiry_date(now_ms: Option<u64>) -> String {
     let millis = now_ms.unwrap_or_else(system_now_ms);
-    format_expiry_date(unix_seconds(millis) + i64::from(365) * 86_400)
+    format_expiry_date(unix_seconds(millis) + i64::from(MAX_LICENSE_DAYS) * 86_400)
 }
 
 pub fn format_expiry_date(exclusive_unix_seconds: i64) -> String {
@@ -396,8 +422,8 @@ mod tests {
     }
 
     #[test]
-    fn matches_node_perpetual_ticket() {
-        let ticket = issue_license(IssueLicenseInput {
+    fn rejects_perpetual_license() {
+        let error = issue_license(IssueLicenseInput {
             private_key_pem: &fixture_key(),
             kid: "test1",
             subject: "客户A-工位3",
@@ -408,8 +434,83 @@ mod tests {
             perpetual: true,
             expires_at: None,
         })
-        .unwrap();
-        assert_eq!(ticket, GOLDEN_PERPETUAL);
+        .unwrap_err();
+        assert_eq!(error.to_string(), NO_PERPETUAL_MESSAGE);
+    }
+
+    #[test]
+    fn still_inspects_legacy_perpetual_ticket() {
+        let claims = inspect_license_ticket(GOLDEN_PERPETUAL).unwrap();
+        assert_eq!(claims.jti, "forever");
+        assert_eq!(claims.exp, None);
+    }
+
+    #[test]
+    fn rejects_more_than_one_year() {
+        let error = issue_license(IssueLicenseInput {
+            private_key_pem: &fixture_key(),
+            kid: "test1",
+            subject: "",
+            machine_code: "A7K2-9M3P-Q4WX",
+            now_ms: Some(1_786_377_600_000),
+            jti: Some("too-long"),
+            days: Some(366),
+            perpetual: false,
+            expires_at: None,
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), MAX_LICENSE_MESSAGE);
+    }
+
+    #[test]
+    fn allows_default_calendar_year_and_rejects_the_next_day() {
+        let now_ms = 1_786_377_600_000;
+        let labeled = default_expiry_date(Some(now_ms));
+        let allowed = issue_license(IssueLicenseInput {
+            private_key_pem: &fixture_key(),
+            kid: "test1",
+            subject: "",
+            machine_code: "A7K2-9M3P-Q4WX",
+            now_ms: Some(now_ms),
+            jti: Some("one-year"),
+            days: None,
+            perpetual: false,
+            expires_at: Some(parse_expiry_date(&labeled).unwrap()),
+        });
+        assert!(allowed.is_ok(), "{}", allowed.unwrap_err());
+
+        let error = issue_license(IssueLicenseInput {
+            private_key_pem: &fixture_key(),
+            kid: "test1",
+            subject: "",
+            machine_code: "A7K2-9M3P-Q4WX",
+            now_ms: Some(now_ms),
+            jti: Some("one-year-plus"),
+            days: None,
+            perpetual: false,
+            expires_at: Some(parse_expiry_date("2027-08-11").unwrap()),
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), MAX_LICENSE_MESSAGE);
+    }
+
+    #[test]
+    fn refuses_to_issue_after_2027() {
+        let error = issue_license(IssueLicenseInput {
+            private_key_pem: &fixture_key(),
+            kid: "test1",
+            subject: "",
+            machine_code: "A7K2-9M3P-Q4WX",
+            now_ms: Some(1_830_268_800_000),
+            jti: Some("sunset"),
+            days: Some(1),
+            perpetual: false,
+            expires_at: None,
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), ISSUER_DISABLED_MESSAGE);
+        assert!(assert_issuer_active(ISSUER_SUNSET_UNIX - 1).is_ok());
+        assert!(assert_issuer_active(ISSUER_SUNSET_UNIX).is_err());
     }
 
     #[test]

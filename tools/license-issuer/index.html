@@ -89,17 +89,17 @@
 <body>
   <main>
     <h1>授权注册机</h1>
-    <p class="lede">输入机器码和到期日，生成绑定该机器的离线授权。</p>
+    <p class="lede">输入机器码和到期日，生成绑定该机器的离线授权。单次最长一年；2027 年之后本工具无法打开。</p>
     <div class="card">
       <label>机器码<input id="machine" placeholder="A7K2-9M3P-Q4WX" /></label>
       <label>
         <span class="label-row">
           授权日期
-          <span class="check"><input id="perpetual" type="checkbox" />永久</span>
+          <span class="optional">最长一年</span>
         </span>
         <input id="expiry" type="date" />
       </label>
-      <p id="expiryHint" class="hint">填写到期日，或勾选永久。</p>
+      <p id="expiryHint" class="hint">填写 YYYY-MM-DD，最长一年。</p>
       <label>
         <span class="label-row">工位名称<span class="optional">选填</span></span>
         <input id="subject" placeholder="客户A-工位3" />
@@ -122,18 +122,10 @@
     $('expiry').value = defaultExpiry;
 
     function refreshHint() {
-      if ($('perpetual').checked) {
-        $('expiryHint').textContent = '永久有效，不设到期日。';
-        return;
-      }
       const value = $('expiry').value;
-      $('expiryHint').textContent = value ? `到期日 ${value}` : '填写到期日，或勾选永久。';
+      $('expiryHint').textContent = value ? `到期日 ${value}，最长一年` : '填写 YYYY-MM-DD，最长一年。';
     }
 
-    $('perpetual').addEventListener('change', () => {
-      $('expiry').disabled = $('perpetual').checked;
-      refreshHint();
-    });
     $('expiry').addEventListener('input', refreshHint);
     refreshHint();
 
@@ -141,17 +133,14 @@
       $('error').hidden = true;
       $('result').hidden = true;
       try {
-        const perpetual = $('perpetual').checked;
         const expiry = $('expiry').value;
-        if (!perpetual && !/^\d{4}-\d{2}-\d{2}$/.test(expiry)) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(expiry)) {
           throw new Error('授权日期格式无效，请使用 YYYY-MM-DD');
         }
-        const expiresAt = perpetual ? null : expiry;
         const ticket = await window.issuer.issue({
           machineCode: $('machine').value,
           subject: $('subject').value,
-          perpetual,
-          expiresAt,
+          expiresAt: expiry,
         });
         $('ticket').textContent = ticket;
         $('result').hidden = false;
