@@ -1,7 +1,7 @@
 export const PROMPTER_APPEARANCE_KEY = 'databaker-prompter-appearance';
 export const DEFAULT_PROMPTER_FONT_SIZE = 36;
 export const MIN_PROMPTER_FONT_SIZE = 22;
-export const MAX_PROMPTER_FONT_SIZE = 72;
+export const MAX_PROMPTER_FONT_SIZE = 250;
 export const DEFAULT_PROMPTER_LABEL_FONT_SIZE = 16;
 export const MIN_PROMPTER_LABEL_FONT_SIZE = 12;
 export const MAX_PROMPTER_LABEL_FONT_SIZE = 40;

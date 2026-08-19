@@ -32,9 +32,12 @@ async function main() {
   assert.equal(DEFAULT_PROMPTER_FONT_SIZE, 36);
   assert.equal(DEFAULT_PROMPTER_LABEL_FONT_SIZE, 16);
   assert.equal(DEFAULT_PROMPTER_LIVE_COLOR, '#3dcc7a');
+  assert.equal(MAX_PROMPTER_FONT_SIZE, 250);
   assert.equal(normalizePrompterFontSize(48), 48);
   assert.equal(normalizePrompterFontSize(8), MIN_PROMPTER_FONT_SIZE);
-  assert.equal(normalizePrompterFontSize(200), MAX_PROMPTER_FONT_SIZE);
+  assert.equal(normalizePrompterFontSize(200), 200);
+  assert.equal(normalizePrompterFontSize(250), 250);
+  assert.equal(normalizePrompterFontSize(400), MAX_PROMPTER_FONT_SIZE);
   assert.equal(normalizePrompterFontSize('nope'), DEFAULT_PROMPTER_FONT_SIZE);
   assert.equal(prompterFontSizeRem(36), '2.25rem');
   assert.equal(prompterFontSizeRem(8), `${MIN_PROMPTER_FONT_SIZE / 16}rem`);

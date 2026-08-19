@@ -835,15 +835,16 @@ html:has(.prompter-shell), body:has(.prompter-shell), body:has(.prompter-shell) 
 .prompter-content > p.long { display: block; font-size: calc(var(--prompter-copy-size) * .85); }
 .prompter-content > p.dense { display: block; font-size: calc(var(--prompter-copy-size) * .72); line-height: 1.48; }
 .prompter-footer { min-height: 36px; display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; padding: 4px 10px; border-top: 1px solid var(--library-row-hover); background: var(--ink); }
-.prompter-type-size { display: inline-flex; flex: none; align-items: center; gap: 3px; }
+.prompter-type-size { display: inline-flex; flex: none; align-items: center; gap: 6px; }
 .prompter-type-size-caption { margin-right: 2px; color: var(--quiet); font-size: var(--text-xs); }
 .prompter-type-size button { min-width: 22px; height: 22px; padding: 0 5px; border: 1px solid var(--line-field); border-radius: 3px; color: var(--text-2); background: var(--surface); font-weight: 650; line-height: 1; }
 .prompter-type-size button:first-of-type { font-size: var(--text-xs); }
 .prompter-type-size button:last-of-type { font-size: var(--text-lg); }
 .prompter-type-size button:hover:not(:disabled) { border-color: var(--faint); color: var(--text-soft); background: var(--line); }
 .prompter-type-size button:disabled { opacity: .38; cursor: not-allowed; }
-.prompter-type-size output { min-width: 3.4em; color: var(--quiet); font: 600 var(--text-xs) var(--mono); font-variant-numeric: tabular-nums; text-align: center; }
+.prompter-type-size output { min-width: 4.4em; color: var(--quiet); font: 600 var(--text-xs) var(--mono); font-variant-numeric: tabular-nums; text-align: center; }
 .prompter-type-size.compact button { min-width: 20px; height: 20px; padding: 0 4px; }
+.prompter-footer .prompter-type-size input[type="range"] { width: 108px; margin: 0; }
 .prompter-settings { position: relative; }
 .prompter-settings-button { width: 28px; height: 28px; display: grid; place-items: center; border: 0; border-radius: 4px; color: var(--muted); background: transparent; }
 .prompter-settings-button:hover, .prompter-settings-button.open { color: var(--text-soft); background: var(--dialog); }
