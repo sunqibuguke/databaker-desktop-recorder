@@ -247,6 +247,20 @@ export function shouldShowSessionNoiseCheckDialog(
   return blocksAttempt && !hasCaptureFault && !overlayOpen;
 }
 
+export type CaptureEntryOverlay = 'device-warning' | 'noise-check' | 'none';
+
+export function captureEntryOverlay(options: {
+  deviceWarningOpen: boolean;
+  noiseCheckBlocksAttempt: boolean;
+  hasCaptureFault: boolean;
+  otherOverlayOpen?: boolean;
+}): CaptureEntryOverlay {
+  if (options.hasCaptureFault || options.otherOverlayOpen) return 'none';
+  if (options.deviceWarningOpen) return 'device-warning';
+  if (options.noiseCheckBlocksAttempt) return 'noise-check';
+  return 'none';
+}
+
 export function noiseCheckShortcutAction(
   key: string,
   code: string,

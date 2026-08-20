@@ -74,6 +74,9 @@ async function main() {
   assert.equal(t('noise.leave'), '退出任务');
   assert.equal(t('noise.skipCheck'), '关闭本次环境检测并继续');
   assert.equal(t('setup.detectionAdvanced'), '检测策略（高级）');
+  assert.equal(t('recorder.detectorVad'), 'VAD');
+  assert.equal(t('deviceWarning.continue'), '已知晓，继续');
+  assert.equal(t('setup.deviceRejectedSuffix'), '（非独立/阵列）');
   assert.equal(t('settings.detectionAdvanced'), '高级：检测默认');
   assert.equal(t('readerCue.hush'), '先别出声');
   assert.equal(t('readerCue.halt'), '立即停止朗读');

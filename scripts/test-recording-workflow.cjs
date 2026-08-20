@@ -25,6 +25,7 @@ async function main() {
     sessionNoiseGate,
     shouldAutoRunSessionNoiseCheck,
     shouldShowSessionNoiseCheckDialog,
+    captureEntryOverlay,
     shouldAutoStartAfterAccept,
     viewShortcutAction,
     workflowShortcutAction,
@@ -37,6 +38,7 @@ async function main() {
   } = await import(pathToFileURL(inputQualityModulePath).href);
   const {
     classifyInputDevice,
+    inputDeviceNeedsWarning,
     preferredInputDevice,
     productionSampleRates,
     captureFormatsSupportBitDepth,
@@ -121,6 +123,42 @@ async function main() {
   );
   assert.equal(shouldShowSessionNoiseCheckDialog(true, true), false);
   assert.equal(shouldShowSessionNoiseCheckDialog(false, false), false);
+  assert.equal(
+    captureEntryOverlay({
+      deviceWarningOpen: true,
+      noiseCheckBlocksAttempt: true,
+      hasCaptureFault: false,
+    }),
+    'device-warning',
+    'a non-production sound-card warning must appear before the room-noise check',
+  );
+  assert.equal(
+    captureEntryOverlay({
+      deviceWarningOpen: false,
+      noiseCheckBlocksAttempt: true,
+      hasCaptureFault: false,
+    }),
+    'noise-check',
+    'after the operator acknowledges the device warning, the room-noise check can open',
+  );
+  assert.equal(
+    captureEntryOverlay({
+      deviceWarningOpen: true,
+      noiseCheckBlocksAttempt: true,
+      hasCaptureFault: false,
+      otherOverlayOpen: true,
+    }),
+    'none',
+    'leave-confirm must replace both entry overlays so the operator can exit',
+  );
+  assert.equal(
+    captureEntryOverlay({
+      deviceWarningOpen: true,
+      noiseCheckBlocksAttempt: true,
+      hasCaptureFault: true,
+    }),
+    'none',
+  );
   assert.equal(noiseCheckShortcutAction('Escape', 'Escape', false), 'leave');
   assert.equal(noiseCheckShortcutAction('Escape', 'Escape', true), 'leave');
   assert.equal(noiseCheckShortcutAction(' ', 'Space', false), 'retry');
@@ -206,6 +244,10 @@ async function main() {
   assert.equal(classifyInputDevice({ name: '麦克风阵列 (Senary Audio)' }), 'rejected');
   assert.equal(classifyInputDevice({ name: 'Headset (Bluetooth)' }), 'rejected');
   assert.equal(classifyInputDevice({ name: 'Microphone Array (Realtek)' }), 'rejected');
+  assert.equal(classifyInputDevice({ name: 'Internal Microphone' }), 'discouraged');
+  assert.equal(inputDeviceNeedsWarning('production'), false);
+  assert.equal(inputDeviceNeedsWarning('discouraged'), true);
+  assert.equal(inputDeviceNeedsWarning('rejected'), true);
   const picked = preferredInputDevice([
     { id: 'senary', name: '麦克风阵列 (Senary Audio)', is_default: true },
     { id: 'focusrite', name: 'Analogue 1 + 2 (Focusrite USB Audio)' },

@@ -95,6 +95,10 @@ export function classifyInputDevice(device: { name?: string } | null | undefined
   return 'production';
 }
 
+export function inputDeviceNeedsWarning(kind: InputDeviceKind): boolean {
+  return kind !== 'production';
+}
+
 export function preferredInputDevice<T extends { id: string; name: string; is_default?: boolean }>(
   devices: readonly T[],
   defaultId?: string | null,
