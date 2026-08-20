@@ -1,6 +1,6 @@
 import { t } from '../shared/i18n/index.ts';
 import { loadAutomationRules, saveAutomationRules } from './automation-rules.ts';
-import type { Attempt, HeadSilencePhase, ItemState } from './types';
+import type { Attempt, HeadSilencePhase, ItemState, SilenceDetector } from './types';
 
 export type SilencePadStatus = 'unknown' | 'short' | 'met';
 
@@ -73,6 +73,52 @@ export function headSilencePadStartSample(input: {
   return armed;
 }
 
+/** Mirror of engine `trimmed_speech_bounds` start: speech minus pad, clamped to the click. */
+export function vadPaddedStartSample(input: {
+  recordingStartedSample: number;
+  firstSpeechSample: number;
+  padSamples: number;
+}): number {
+  const started = Math.max(0, input.recordingStartedSample);
+  const first = Math.max(0, input.firstSpeechSample);
+  const pad = Math.max(0, input.padSamples);
+  if (first <= 0) return started;
+  return Math.max(started, first - pad);
+}
+
+/** Mirror of engine `trimmed_speech_bounds` end: last speech plus pad, clamped to stop. */
+export function vadPaddedEndSample(input: {
+  capturedBoundary: number;
+  lastSpeechSample: number;
+  padSamples: number;
+  startSample: number;
+}): number {
+  const boundary = Math.max(0, input.capturedBoundary);
+  const last = Math.max(0, input.lastSpeechSample);
+  const pad = Math.max(0, input.padSamples);
+  const start = Math.max(0, input.startSample);
+  if (last <= 0) return boundary;
+  return Math.max(start + 1, Math.min(boundary, last + pad));
+}
+
+export function attemptHeadStartSample(
+  attempt: Pick<
+    Attempt,
+    | 'start_sample'
+    | 'recording_started_sample'
+    | 'head_silence_passed_sample'
+    | 'required_head_silence_samples'
+  >,
+  detector: SilenceDetector = 'energy',
+): number {
+  if (detector === 'vad') return Math.max(0, attempt.start_sample);
+  return headSilencePadStartSample({
+    recordingStartedSample: attempt.recording_started_sample || attempt.start_sample || 0,
+    headSilencePassedSample: attempt.head_silence_passed_sample,
+    requiredHeadSilenceSamples: attempt.required_head_silence_samples,
+  });
+}
+
 export function isHeadSilenceShort(headMs: number | null, requiredMs: number): boolean {
   return headMs !== null && requiredMs > 0 && headMs < requiredMs;
 }
@@ -123,15 +169,12 @@ export function itemSilenceMarks(
   item: ItemState | null | undefined,
   sampleRate: number,
   requiredMs: number,
+  detector: SilenceDetector = 'energy',
 ): ItemSilenceMarks {
   if (!item || (item.status !== 'review' && item.status !== 'accepted')) return EMPTY_SILENCE_MARKS;
   const attempt = selectedOrLatestUsableAttempt(item);
   if (!attempt) return EMPTY_SILENCE_MARKS;
-  const start = headSilencePadStartSample({
-    recordingStartedSample: attempt.recording_started_sample || attempt.start_sample || 0,
-    headSilencePassedSample: attempt.head_silence_passed_sample,
-    requiredHeadSilenceSamples: attempt.required_head_silence_samples,
-  });
+  const start = attemptHeadStartSample(attempt, detector);
   const headMs = actualHeadSilenceMs(start, attempt.content_started_sample, sampleRate);
   const tailMs = attemptTailMs(attempt, sampleRate);
   const headShort = isHeadSilenceShort(headMs, requiredMs);
@@ -225,15 +268,12 @@ export function reviewSilencePair(input: {
   showHeadTailHints?: boolean;
   showAlmostSilent?: boolean;
   showPeakHigh?: boolean;
+  detector?: SilenceDetector;
 }): SilencePairView {
   const required = Math.max(0, input.requiredMs);
   const attempt = input.attempt;
   if (!attempt) return emptySilencePair();
-  const start = headSilencePadStartSample({
-    recordingStartedSample: attempt.recording_started_sample || attempt.start_sample || 0,
-    headSilencePassedSample: attempt.head_silence_passed_sample,
-    requiredHeadSilenceSamples: attempt.required_head_silence_samples,
-  });
+  const start = attemptHeadStartSample(attempt, input.detector ?? 'energy');
   const headMs = actualHeadSilenceMs(start, attempt.content_started_sample, input.sampleRate);
   const tailMs = attemptTailMs(attempt, input.sampleRate);
   const headStatus = padStatus(headMs, required);
@@ -306,6 +346,47 @@ export function takeStartSample(input: {
   return input.recordingStartedSample;
 }
 
+export function displayedTakeStartSample(input: {
+  detector: SilenceDetector;
+  enforce: boolean;
+  recordingStartedSample: number;
+  headSilencePassedSample: number;
+  contentStartedSample: number;
+  padSamples: number;
+}): number {
+  if (input.detector === 'vad') {
+    return vadPaddedStartSample({
+      recordingStartedSample: input.recordingStartedSample,
+      firstSpeechSample: input.contentStartedSample,
+      padSamples: input.padSamples,
+    });
+  }
+  return takeStartSample({
+    enforce: input.enforce,
+    recordingStartedSample: input.recordingStartedSample,
+    headSilencePassedSample: input.headSilencePassedSample,
+  });
+}
+
+/** Predicted clip end while VAD is live. Undefined means the band still follows the playhead. */
+export function displayedTakeEndSample(input: {
+  detector: SilenceDetector;
+  capturedSamples: number;
+  lastSpeechSample: number;
+  padSamples: number;
+  startSample: number;
+}): number | undefined {
+  if (input.detector !== 'vad') return undefined;
+  const end = vadPaddedEndSample({
+    capturedBoundary: input.capturedSamples,
+    lastSpeechSample: input.lastSpeechSample,
+    padSamples: input.padSamples,
+    startSample: input.startSample,
+  });
+  if (end >= input.capturedSamples) return undefined;
+  return end;
+}
+
 export function liveSilenceProgress(input: {
   pending: boolean;
   spoken: boolean;
@@ -330,17 +411,21 @@ export function liveHeadMsFromMeter(input: {
   passedSample?: number;
   requiredSamples?: number;
   phase?: HeadSilencePhase;
+  detector?: SilenceDetector;
 }): number | null {
   if ((input.contentStartedSample ?? 0) <= 0 && input.phase !== 'speech_started') return null;
-  return actualHeadSilenceMs(
-    headSilencePadStartSample({
+  const start = input.detector === 'vad'
+    ? vadPaddedStartSample({
+      recordingStartedSample: input.armedSample,
+      firstSpeechSample: input.contentStartedSample,
+      padSamples: input.requiredSamples ?? 0,
+    })
+    : headSilencePadStartSample({
       recordingStartedSample: input.armedSample,
       headSilencePassedSample: input.passedSample,
       requiredHeadSilenceSamples: input.requiredSamples,
-    }),
-    input.contentStartedSample,
-    input.sampleRate,
-  );
+    });
+  return actualHeadSilenceMs(start, input.contentStartedSample, input.sampleRate);
 }
 
 export function shouldUseRecordedSilencePair(

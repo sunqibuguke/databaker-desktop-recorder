@@ -23,6 +23,7 @@ type Props = {
   waveformEndSample?: number;
   recording: boolean;
   takeStartSample?: number;
+  takeEndSample?: number;
   sampleRate: number;
   mode?: 'live' | 'review';
   ariaLabel?: string;
@@ -84,6 +85,7 @@ export function WebGLWaveform({
   waveformEndSample,
   recording,
   takeStartSample,
+  takeEndSample,
   sampleRate,
   mode = 'live',
   ariaLabel,
@@ -151,8 +153,9 @@ export function WebGLWaveform({
       recording,
       takeStartSample,
       cursor,
+      takeEndSample,
     );
-  }, [recording, takeStartSample, capturedSamples]);
+  }, [recording, takeStartSample, takeEndSample, capturedSamples]);
 
   useEffect(() => {
     if (sampleRateRef.current !== sampleRate) {

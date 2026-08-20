@@ -5,12 +5,17 @@ const { pathToFileURL } = require('node:url');
 async function main() {
   const {
     actualHeadSilenceMs,
+    attemptHeadStartSample,
+    displayedTakeEndSample,
+    displayedTakeStartSample,
     headSilencePadStartSample,
     liveHeadMsFromMeter,
     canFinishSpokenTake,
     itemSilenceMarks,
     liveSilenceProgress,
     takeStartSample,
+    vadPaddedEndSample,
+    vadPaddedStartSample,
     liveSilenceHint,
     liveSilencePair,
     peakFromWaveformBins,
@@ -398,6 +403,132 @@ async function main() {
     recordingStartedSample: 0,
     headSilencePassedSample: 48_000,
   }), 0);
+
+  assert.equal(vadPaddedStartSample({
+    recordingStartedSample: 10,
+    firstSpeechSample: 80,
+    padSamples: 20,
+  }), 60);
+  assert.equal(vadPaddedEndSample({
+    capturedBoundary: 200,
+    lastSpeechSample: 120,
+    padSamples: 20,
+    startSample: 60,
+  }), 140);
+  assert.equal(
+    displayedTakeStartSample({
+      detector: 'vad',
+      enforce: false,
+      recordingStartedSample: 0,
+      headSilencePassedSample: 48_000,
+      contentStartedSample: 168_000,
+      padSamples: 48_000,
+    }),
+    120_000,
+    'VAD live ticks start at speech minus the pad, not the click',
+  );
+  assert.equal(
+    displayedTakeEndSample({
+      detector: 'vad',
+      capturedSamples: 288_000,
+      lastSpeechSample: 216_000,
+      padSamples: 48_000,
+      startSample: 120_000,
+    }),
+    264_000,
+    'VAD live ticks freeze at last speech plus the pad once capture walks past it',
+  );
+  assert.equal(
+    displayedTakeEndSample({
+      detector: 'vad',
+      capturedSamples: 240_000,
+      lastSpeechSample: 216_000,
+      padSamples: 48_000,
+      startSample: 120_000,
+    }),
+    undefined,
+    'VAD live ticks still follow the playhead while speech or the pad is growing',
+  );
+  assert.equal(
+    liveHeadMsFromMeter({
+      sampleRate: 48_000,
+      armedSample: 0,
+      contentStartedSample: 168_000,
+      passedSample: 48_000,
+      requiredSamples: 48_000,
+      phase: 'speech_started',
+      detector: 'vad',
+    }),
+    1_000,
+    'VAD live head silence is the pad, not the wait from the click',
+  );
+  assert.equal(
+    liveHeadMsFromMeter({
+      sampleRate: 48_000,
+      armedSample: 0,
+      contentStartedSample: 168_000,
+      passedSample: 48_000,
+      requiredSamples: 48_000,
+      phase: 'speech_started',
+    }),
+    3_500,
+    'energy live head still measures from the qualifying pad start',
+  );
+
+  const vadReview = reviewSilencePair({
+    attempt: {
+      attempt_id: '001-vad',
+      start_sample: 120_000,
+      recording_started_sample: 0,
+      head_silence_armed_sample: 0,
+      head_silence_passed_sample: 48_000,
+      required_head_silence_samples: 48_000,
+      content_started_sample: 168_000,
+      end_sample: 264_000,
+      tail_silence_samples: 48_000,
+      required_tail_silence_samples: 48_000,
+      status: 'recorded',
+      created_at: '2026-08-13T00:00:00Z',
+    },
+    sampleRate: 48_000,
+    requiredMs: 1_000,
+    peak: 0.3,
+    detector: 'vad',
+  });
+  assert.equal(vadReview.headText, '首 1000 ms');
+  assert.equal(vadReview.tailText, '尾 1000 ms');
+  assert.equal(vadReview.headStatus, 'met');
+  assert.equal(vadReview.tailStatus, 'met');
+  assert.equal(
+    attemptHeadStartSample({
+      start_sample: 120_000,
+      recording_started_sample: 0,
+      head_silence_passed_sample: 48_000,
+      required_head_silence_samples: 48_000,
+    }, 'vad'),
+    120_000,
+  );
+
+  const energyLongWait = reviewSilencePair({
+    attempt: {
+      attempt_id: '001-energy-wait',
+      start_sample: 0,
+      recording_started_sample: 0,
+      head_silence_armed_sample: 0,
+      head_silence_passed_sample: 48_000,
+      required_head_silence_samples: 48_000,
+      content_started_sample: 168_000,
+      end_sample: 264_000,
+      tail_silence_samples: 48_000,
+      required_tail_silence_samples: 48_000,
+      status: 'recorded',
+      created_at: '2026-08-13T00:00:00Z',
+    },
+    sampleRate: 48_000,
+    requiredMs: 1_000,
+    peak: 0.3,
+  });
+  assert.equal(energyLongWait.headText, '首 3500 ms', 'energy review still reports click-to-speech when the clip was not VAD-trimmed');
 
   const headProgress = liveSilenceProgress({
     pending: true,

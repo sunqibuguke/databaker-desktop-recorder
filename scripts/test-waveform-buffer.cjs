@@ -261,6 +261,20 @@ async function main() {
       'reconnecting mid-take must paint from the engine start sample, not wait for a rising edge',
     );
 
+    let vadTakes = waveform.reconcileWaveformTakeSpans([], true, 120_000, 216_000);
+    vadTakes = waveform.reconcileWaveformTakeSpans(vadTakes, true, 120_000, 288_000, 264_000);
+    assert.deepEqual(
+      vadTakes,
+      [{ startSample: 120_000, endSample: 264_000, live: true }],
+      'VAD live ticks freeze at last speech plus pad instead of following extra wait',
+    );
+    vadTakes = waveform.reconcileWaveformTakeSpans(vadTakes, false, undefined, 300_000);
+    assert.deepEqual(
+      vadTakes,
+      [{ startSample: 120_000, endSample: 264_000 }],
+      'stopping a VAD take must keep the padded end, not the extra wait to the click-stop',
+    );
+
     assert.equal(waveform.sampleIsRecordedTake(95_871, takes), false);
     assert.equal(waveform.sampleIsRecordedTake(95_872, takes), true);
     assert.equal(waveform.sampleIsRecordedTake(239_999, takes), true);

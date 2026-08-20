@@ -40,6 +40,8 @@ import { PreviewPlayer } from './PreviewPlayer';
 import { inputQualityWarning, shouldHandleLiveMeter } from './input-quality';
 import {
   canFinishSpokenTake,
+  displayedTakeEndSample,
+  displayedTakeStartSample,
   itemSilenceMarks,
   liveHeadMsFromMeter,
   liveSilenceHint,
@@ -864,7 +866,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const itemSilenceViews = items.map((item, index) => (
     recording && index === currentIndex
       ? { headShort: false, tailShort: false, title: '' }
-      : itemSilenceMarks(item, sampleRateForDisplay, effectiveSilenceDurationMs)
+      : itemSilenceMarks(item, sampleRateForDisplay, effectiveSilenceDurationMs, silenceDetector)
   ));
   const flaggedSilenceCount = itemSilenceViews.filter((marks) => marks.headShort || marks.tailShort).length;
   const requiredSilenceSamples = sampleRateForDisplay * effectiveSilenceDurationMs / 1_000;
@@ -886,7 +888,25 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     || meter.last_signal_sample > attemptRecordingStartedSample
   );
   const liveSilenceMs = Math.round((meter.silence_samples ?? 0) / Math.max(sampleRateForDisplay, 1) * 1_000);
+  const displayedLiveSilenceMs = silenceDetector === 'vad'
+    ? Math.min(liveSilenceMs, effectiveSilenceDurationMs)
+    : liveSilenceMs;
   const tailSilenceMet = liveSilenceMs >= effectiveSilenceDurationMs;
+  const liveTakeStartSample = displayedTakeStartSample({
+    detector: silenceDetector,
+    enforce: automationRules.enforceHeadTailSilence,
+    recordingStartedSample: attemptRecordingStartedSample,
+    headSilencePassedSample: meter.head_silence_passed_sample ?? 0,
+    contentStartedSample: meter.content_started_sample ?? 0,
+    padSamples: requiredSilenceSamples,
+  });
+  const liveTakeEndSample = displayedTakeEndSample({
+    detector: silenceDetector,
+    capturedSamples: meter.captured_samples,
+    lastSpeechSample: Math.max(meter.last_signal_sample ?? 0, meter.content_started_sample ?? 0),
+    padSamples: requiredSilenceSamples,
+    startSample: liveTakeStartSample,
+  });
   const enforceHeadTailSilence = automationRules.enforceHeadTailSilence;
   const canFinishTake = canFinishSpokenTake({
     enforce: enforceHeadTailSilence,
@@ -901,7 +921,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     pending: isPendingTake,
     spoken: Boolean(hasSpoken),
     pendingRemainingMs,
-    liveSilenceMs,
+    liveSilenceMs: displayedLiveSilenceMs,
     requiredMs: effectiveSilenceDurationMs,
   });
   const reviewAttempt = !recording && currentItem
@@ -929,6 +949,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     showHeadTailHints: automationRules.headTailSilence,
     showAlmostSilent: automationRules.almostSilent,
     showPeakHigh: automationRules.peakHigh,
+    detector: silenceDetector,
   });
   const livePair = liveSilencePair({
     recording,
@@ -936,14 +957,15 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     spoken: Boolean(hasSpoken),
     pendingRemainingMs,
     requiredMs: effectiveSilenceDurationMs,
-    liveSilenceMs,
+    liveSilenceMs: displayedLiveSilenceMs,
     headMs: liveHeadMsFromMeter({
       sampleRate: sampleRateForDisplay,
       armedSample: meter.head_silence_armed_sample || attemptRecordingStartedSample,
       contentStartedSample: meter.content_started_sample ?? 0,
       passedSample: meter.head_silence_passed_sample,
-      requiredSamples: meter.required_head_silence_samples,
+      requiredSamples: meter.required_head_silence_samples ?? requiredSilenceSamples,
       phase: meter.head_silence_phase,
+      detector: silenceDetector,
     }),
   });
   const silencePair = shouldUseRecordedSilencePair(recording, reviewAttempt)
@@ -3718,7 +3740,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             {qualityWarning && <div className="input-quality-banner" role="alert"><Icon name="meter" size={16} /><div><strong>{t('quality.bannerTitle')}</strong><span>{qualityWarning}. {t('quality.bannerHint')}</span></div></div>}
           </div>}
           <section className="script-monitor" style={{ ['--prompter-copy-size' as string]: prompterFontSizeRem(appearance.fontSize), ['--prompter-label-size' as string]: prompterLabelFontSizeRem(appearance.labelFontSize) }}><header><span>{t('recorder.currentSentence')}</span><div><PrompterFontSizeControl size={appearance.fontSize} min={MIN_PROMPTER_FONT_SIZE} max={MAX_PROMPTER_FONT_SIZE} onNudge={nudgeFontSize} compact smallerLabel={t('prompter.fontSizeSmaller')} largerLabel={t('prompter.fontSizeLarger')} /><span className="studio-cue">{cueLabel}</span><em>{workflowComplete ? t('recorder.itemsCount', { count: items.length }) : `${currentIndex + 1} / ${items.length}`}</em></div></header><div className={`prompt-surface ${captureFault ? 'fault' : cue === 'pending' || cue === 'checking' ? 'pending' : cue === 'ready' ? 'ready' : cue === 'recording' ? 'live' : ''}`}>{captureFault ? <span className="label-chip">{t('recorder.stopReadingChip')}</span> : entryBlocksAttempt ? <span className="label-chip">{deviceWarningOpen ? t('deviceWarning.dialogKicker') : t('recorder.envChip')}</span> : (workflowComplete || currentItem?.label) && <span className="label-chip">{workflowComplete ? t('recorder.allDoneChip') : currentItem?.label}</span>}<p>{captureFault ? captureFaultCopy.title : entryBlocksAttempt ? (deviceWarningOpen ? t('deviceWarning.pendingCue') : t('recorder.keepQuiet')) : workflowComplete ? t('recorder.scriptFinished') : currentItem?.text ?? t('recorder.noText')}</p><small>{captureFault ? captureFaultCopy.detail : entryBlocksAttempt ? (deviceWarningOpen ? t('deviceWarning.warning') : noiseCheckMessage) : workflowComplete ? t('recorder.exportLater') : <>{currentItem?.id}</>}</small></div></section>
-          <section className="signal-monitor"><header><div><strong>{t('recorder.waveform')}</strong>{captureActive || shouldUseRecordedSilencePair(recording, reviewAttempt) ? <SilencePairReadout pair={silencePair} /> : null}</div><div>{captureActive ? <><span>RMS <b>{db(meter.rms)}</b></span><span>PEAK <b className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</b></span></> : <span>{reviewAttempt ? formatDuration(reviewAttempt.end_sample - reviewAttempt.start_sample, sampleRateForDisplay) : t('recorder.noTakeWaveform')}</span>}</div></header><div className="signal-scope"><WebGLWaveform key={showReviewWaveform ? `${sessionDir}:${reviewAttempt?.attempt_id}` : `${sessionDir}:${waveformGeneration}`} mode={showReviewWaveform ? 'review' : 'live'} bins={showReviewWaveform ? reviewWaveformBins : (meter.waveform ?? [])} capturedSamples={meter.captured_samples} waveformEndSample={meter.waveform_end_sample} recording={waveformTakeIsActive(recording && !captureFault, hasSpoken)} takeStartSample={recording && !captureFault ? attemptStartSample : undefined} sampleRate={sampleRateForDisplay} />{captureActive ? <LiveSilenceHint liveMs={liveSilenceMs} requiredMs={effectiveSilenceDurationMs} /> : null}<div className="scope-scale"><span>−1.0</span><span>−0.5</span><span>0</span><span>+0.5</span><span>+1.0</span></div></div><div className="horizontal-meter"><i className="meter-rms" style={{ width: `${rmsPercent}%` }} /><i className="meter-peak" style={{ left: `${peakPercent}%` }} /></div></section>
+          <section className="signal-monitor"><header><div><strong>{t('recorder.waveform')}</strong>{captureActive || shouldUseRecordedSilencePair(recording, reviewAttempt) ? <SilencePairReadout pair={silencePair} /> : null}</div><div>{captureActive ? <><span>RMS <b>{db(meter.rms)}</b></span><span>PEAK <b className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</b></span></> : <span>{reviewAttempt ? formatDuration(reviewAttempt.end_sample - reviewAttempt.start_sample, sampleRateForDisplay) : t('recorder.noTakeWaveform')}</span>}</div></header><div className="signal-scope"><WebGLWaveform key={showReviewWaveform ? `${sessionDir}:${reviewAttempt?.attempt_id}` : `${sessionDir}:${waveformGeneration}`} mode={showReviewWaveform ? 'review' : 'live'} bins={showReviewWaveform ? reviewWaveformBins : (meter.waveform ?? [])} capturedSamples={meter.captured_samples} waveformEndSample={meter.waveform_end_sample} recording={waveformTakeIsActive(recording && !captureFault, hasSpoken)} takeStartSample={recording && !captureFault ? liveTakeStartSample : undefined} takeEndSample={recording && !captureFault ? liveTakeEndSample : undefined} sampleRate={sampleRateForDisplay} />{captureActive ? <LiveSilenceHint liveMs={displayedLiveSilenceMs} requiredMs={effectiveSilenceDurationMs} /> : null}<div className="scope-scale"><span>−1.0</span><span>−0.5</span><span>0</span><span>+0.5</span><span>+1.0</span></div></div><div className="horizontal-meter"><i className="meter-rms" style={{ width: `${rmsPercent}%` }} /><i className="meter-peak" style={{ left: `${peakPercent}%` }} /></div></section>
           <section className="transport-panel">
             <div className="transport-review">
               {showReviewSilenceBill && <span className={`silence-bill${silencePair.hint || silencePair.extra ? ' has-issue' : ''}`} data-testid="review-silence-bill"><SilencePairReadout pair={silencePair} hint /></span>}

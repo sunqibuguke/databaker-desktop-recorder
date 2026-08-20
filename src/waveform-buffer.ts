@@ -95,6 +95,8 @@ export function waveformWindowStartSample(playheadSample: number, sampleRate: nu
 export type WaveformTakeSpan = {
   startSample: number;
   endSample: number | null;
+  /** True while the current take is still being captured, even if a predicted end is known. */
+  live?: boolean;
 };
 
 /**
@@ -116,28 +118,37 @@ export function reconcileWaveformTakeSpans(
   recording: boolean,
   takeStartSample: number | undefined,
   cursorSample: number,
+  takeEndSample?: number,
 ): WaveformTakeSpan[] {
   const cursor = Math.max(0, Number.isFinite(cursorSample) ? cursorSample : 0);
   const resolvedStart = Number.isSafeInteger(takeStartSample) && (takeStartSample ?? -1) >= 0
     ? Number(takeStartSample)
     : cursor;
   const last = spans[spans.length - 1];
-  const open = last !== undefined && last.endSample === null;
+  const liveOpen = Boolean(last && (last.endSample === null || last.live));
+  const predictedEnd = Number.isSafeInteger(takeEndSample)
+    && Number(takeEndSample) > resolvedStart
+    && Number(takeEndSample) < cursor
+    ? Number(takeEndSample)
+    : null;
 
   if (recording) {
-    if (!open) {
-      return [...spans, { startSample: resolvedStart, endSample: null }];
+    const next: WaveformTakeSpan = predictedEnd === null
+      ? { startSample: resolvedStart, endSample: null }
+      : { startSample: resolvedStart, endSample: predictedEnd, live: true };
+    if (!last || !liveOpen) {
+      return [...spans, next];
     }
-    if (Number.isSafeInteger(takeStartSample) && last.startSample !== resolvedStart) {
-      return [...spans.slice(0, -1), { startSample: resolvedStart, endSample: null }];
+    if (last.startSample !== next.startSample || last.endSample !== next.endSample || Boolean(last.live) !== Boolean(next.live)) {
+      return [...spans.slice(0, -1), next];
     }
     return spans as WaveformTakeSpan[];
   }
 
-  if (open) {
+  if (last && liveOpen) {
     return [...spans.slice(0, -1), {
       startSample: last.startSample,
-      endSample: Math.max(last.startSample, cursor),
+      endSample: last.endSample ?? Math.max(last.startSample, cursor),
     }];
   }
   return spans as WaveformTakeSpan[];
