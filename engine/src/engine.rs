@@ -2395,7 +2395,11 @@ impl Engine {
             .saturating_mul(u64::from(snapshot.silence_duration_ms))
             / 1_000;
         let head_silence = HeadSilenceMonitor::new(required_head_silence_samples);
-        let (vad_tx, vad_rx) = bounded::<VadAnalysisMessage>(64);
+        // Unbounded like the writer channel: system-test and exclusive capture
+        // can enqueue many small blocks before the analysis thread is scheduled.
+        // Earshot is faster than realtime, so the backlog should not grow in
+        // production. Disconnect still fail-closes the capture timeline.
+        let (vad_tx, vad_rx) = unbounded::<VadAnalysisMessage>();
         let silence_analysis = SilenceAnalysisPorts {
             detector_kind: Arc::new(AtomicU32::new(snapshot.silence_detector.as_u32())),
             generation: Arc::new(AtomicU64::new(1)),
@@ -2413,6 +2417,7 @@ impl Engine {
         let vad_sample_rate = snapshot.audio_format.sample_rate;
         let vad_join = thread::Builder::new()
             .name("speech-vad".to_string())
+            .stack_size(2 * 1024 * 1024)
             .spawn(move || run_vad_analysis_thread(vad_rx, vad_sample_rate, vad_sink))
             .context("start speech VAD analysis thread")?;
         let (waveform_tx, waveform_rx) = bounded::<WaveformPacket>(128);
@@ -8508,7 +8513,8 @@ fn publish_leased_block_with_preview(
             .is_err()
         {
             fail_capture_block(
-                "speech VAD analysis queue exceeded its capacity".to_string(),
+                "speech VAD analysis thread disconnected before accepting a capture block"
+                    .to_string(),
                 frames,
                 writer,
                 overflow,

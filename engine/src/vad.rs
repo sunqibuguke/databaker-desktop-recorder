@@ -6,6 +6,7 @@
 
 use crate::attempt::{HeadSilenceMonitor, annotate_attempt_block, begin_analysis_write};
 use crossbeam_channel::{Receiver, Sender};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -41,7 +42,7 @@ pub(crate) struct VadAnnotationSink {
     pub(crate) generation: Arc<AtomicU64>,
 }
 
-struct Downsampler {
+pub(crate) struct Downsampler {
     in_rate: u32,
     /// Fractional source position of the next 16 kHz sample, relative to the
     /// first sample of `pending`.
@@ -99,11 +100,13 @@ impl Downsampler {
             out.push((sample, capture));
             self.pos += step;
         }
-        let consumed = self.pos.floor() as usize;
+        // `pos` can advance past the last produced interpolant (step may be > 1).
+        // Never consume the final sample; the next block still needs it as the
+        // left point of the next linear interpolant.
+        let consumed = (self.pos.floor() as usize).min(self.pending.len().saturating_sub(1));
         if consumed > 0 {
-            let remain = self.pending.len().saturating_sub(consumed);
             self.pending.copy_within(consumed.., 0);
-            self.pending.truncate(remain);
+            self.pending.truncate(self.pending.len() - consumed);
             self.pending_origin = self.pending_origin.saturating_add(consumed as u64);
             self.pos -= consumed as f64;
         }
@@ -123,8 +126,8 @@ impl Downsampler {
     }
 }
 
-struct VadWorker {
-    detector: earshot::Detector,
+pub(crate) struct VadWorker {
+    detector: Box<earshot::Detector>,
     downsampler: Downsampler,
     frame: Vec<f32>,
     frame_capture: Vec<u64>,
@@ -134,7 +137,7 @@ struct VadWorker {
 impl VadWorker {
     fn new(sample_rate: u32) -> Self {
         Self {
-            detector: earshot::Detector::default(),
+            detector: earshot::Detector::default_boxed(),
             downsampler: Downsampler::new(sample_rate),
             frame: Vec::with_capacity(VAD_FRAME_SAMPLES),
             frame_capture: Vec::with_capacity(VAD_FRAME_SAMPLES),
@@ -143,7 +146,7 @@ impl VadWorker {
     }
 
     fn reset(&mut self) {
-        self.detector = earshot::Detector::default();
+        self.detector = earshot::Detector::default_boxed();
         self.downsampler.reset();
         self.frame.clear();
         self.frame_capture.clear();
@@ -173,8 +176,16 @@ impl VadWorker {
             self.frame_capture.clear();
             return;
         }
-        let score = self.detector.predict_f32(&self.frame);
-        let is_speech = score > 0.5;
+        let score = catch_unwind(AssertUnwindSafe(|| self.detector.predict_f32(&self.frame)));
+        let is_speech = match score {
+            Ok(value) => value > 0.5,
+            Err(_) => {
+                // Earshot can panic on some frames (internal FFT/slice bounds).
+                // Rebuild the detector so one bad frame cannot kill analysis.
+                self.detector = earshot::Detector::default_boxed();
+                false
+            }
+        };
         let start = self.frame_capture[0];
         let end = end_override.unwrap_or_else(|| {
             self.frame_capture
@@ -298,7 +309,7 @@ pub(crate) fn trimmed_speech_bounds(
 
 #[cfg(test)]
 mod tests {
-    use super::trimmed_speech_bounds;
+    use super::{VAD_FRAME_SAMPLES, trimmed_speech_bounds};
 
     #[test]
     fn trim_keeps_pad_inside_the_take() {
@@ -313,5 +324,49 @@ mod tests {
     #[test]
     fn trim_without_speech_keeps_the_raw_window() {
         assert_eq!(trimmed_speech_bounds(10, 50, 0, 0, 20), (10, 50));
+    }
+
+    #[test]
+    fn earshot_scores_silent_and_noisy_frames_without_panicking() {
+        let mut detector = earshot::Detector::default_boxed();
+        let silence = vec![0.0; VAD_FRAME_SAMPLES];
+        let noise: Vec<f32> = (0..VAD_FRAME_SAMPLES)
+            .map(|index| (index as f32 * 0.37).sin() * 0.2)
+            .collect();
+        for _ in 0..64 {
+            let silent = detector.predict_f32(&silence);
+            let noisy = detector.predict_f32(&noise);
+            assert!(silent.is_finite(), "silent score={silent}");
+            assert!(noisy.is_finite(), "noisy score={noisy}");
+        }
+    }
+
+    #[test]
+    fn downsampled_system_test_noise_does_not_panic_earshot() {
+        let mut worker = super::VadWorker::new(48_000);
+        let mut detector = earshot::Detector::default_boxed();
+        let mut downsampler = super::Downsampler::new(48_000);
+        let seed = 0x5a17u64;
+        let mut produced = 0usize;
+        for block in 0..2_000u64 {
+            let mut samples = Vec::with_capacity(256);
+            for offset in 0..256u64 {
+                let index = block * 256 + offset;
+                let word = seed
+                    .wrapping_add(index.wrapping_mul(6_364_136_223_846_793_005))
+                    .rotate_left(17);
+                samples.push(((word >> 40) as f32 / 16_777_215.0) * 0.5 - 0.25);
+            }
+            for (sample, _) in downsampler.push(&samples, block * 256) {
+                worker.frame.push(sample);
+                if worker.frame.len() == VAD_FRAME_SAMPLES {
+                    let score = detector.predict_f32(&worker.frame);
+                    assert!(score.is_finite(), "score={score} frame={produced}");
+                    worker.frame.clear();
+                    produced += 1;
+                }
+            }
+        }
+        assert!(produced > 10, "produced {produced} vad frames");
     }
 }
