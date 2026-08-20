@@ -4858,7 +4858,7 @@ fn validate_attempt_boundaries(snapshot: &SessionSnapshot, durable_frames: u64) 
                         < attempt.required_head_silence_samples
                     || (attempt.status != "interrupted"
                         && (attempt.recording_started_sample != attempt.head_silence_armed_sample
-                            || !valid_completed_attempt_start(attempt)))
+                            || !valid_completed_attempt_start(attempt, snapshot.silence_detector)))
             };
             attempt.start_sample > durable_frames
                 || attempt.recording_started_sample > durable_frames
@@ -4877,9 +4877,26 @@ fn validate_attempt_boundaries(snapshot: &SessionSnapshot, durable_frames: u64) 
     Ok(())
 }
 
-fn valid_completed_attempt_start(attempt: &Attempt) -> bool {
+fn valid_completed_attempt_start(attempt: &Attempt, detector: SilenceDetector) -> bool {
     attempt.start_sample == attempt.recording_started_sample
         || attempt.start_sample == attempt.head_silence_passed_sample
+        || (detector == SilenceDetector::Vad && valid_vad_trimmed_clip_start(attempt))
+}
+
+/// VAD stop-trim keeps about `required_head_silence_samples` before first speech,
+/// clamped to the operator click. That start is neither the click nor the
+/// elapsed pending-timer mark, so export must accept it as a third legal origin.
+fn valid_vad_trimmed_clip_start(attempt: &Attempt) -> bool {
+    if attempt.content_started_sample == 0 {
+        return false;
+    }
+    let expected = attempt
+        .content_started_sample
+        .saturating_sub(attempt.required_head_silence_samples)
+        .max(attempt.recording_started_sample);
+    attempt.start_sample == expected
+        && attempt.start_sample <= attempt.content_started_sample
+        && attempt.content_started_sample <= attempt.end_sample
 }
 
 fn capture_span_from_snapshot(
@@ -13449,6 +13466,41 @@ mod tests {
     }
 
     #[test]
+    fn validate_attempt_boundaries_accepts_vad_trimmed_clip_start() {
+        let mut snapshot = test_snapshot();
+        snapshot.status = "stopped".to_string();
+        snapshot.silence_detector = SilenceDetector::Vad;
+        snapshot.committed_samples = 5_144_640;
+        snapshot.items[0].id = "0001".to_string();
+        snapshot.items[0].status = "accepted".to_string();
+        snapshot.items[0].selected_attempt_id = Some("0001-a1".to_string());
+        snapshot.items[0].attempts.push(Attempt {
+            attempt_id: "0001-a1".to_string(),
+            // Click at 1_178_400, first speech at 1_973_760, 1s pad → clip starts
+            // at 1_925_760, not at the click or the pending-timer mark.
+            start_sample: 1_925_760,
+            recording_started_sample: 1_178_400,
+            head_silence_armed_sample: 1_178_400,
+            head_silence_passed_sample: 1_226_400,
+            required_head_silence_samples: 48_000,
+            content_started_sample: 1_973_760,
+            end_sample: 2_294_400,
+            forced_without_tail_silence: false,
+            tail_silence_samples: 48_000,
+            required_tail_silence_samples: 48_000,
+            status: "accepted".to_string(),
+            created_at: "2026-08-20T10:50:00Z".to_string(),
+        });
+
+        validate_attempt_boundaries(&snapshot, snapshot.committed_samples).unwrap();
+        validate_snapshot_for_artifact(&snapshot, Some(ExportArtifact::CutsZip)).unwrap();
+
+        snapshot.items[0].attempts[0].start_sample = 1_500_000;
+        let error = validate_attempt_boundaries(&snapshot, snapshot.committed_samples).unwrap_err();
+        assert!(format!("{error:#}").contains("句子时间戳"));
+    }
+
+    #[test]
     fn create_and_inspect_session_never_activate_capture() {
         let root = test_root("create-inspect-offline");
         // prepare_new_session requires the final task directory not to exist.
@@ -14154,6 +14206,56 @@ mod tests {
             required_tail_silence_samples: 10,
             status: "accepted".to_string(),
             created_at: "2026-08-11T00:00:00Z".to_string(),
+        });
+        write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
+
+        let result = Engine::new(Emitter::new())
+            .export_session_artifact_expected(&root, "resume-test", ExportArtifact::CutsZip)
+            .unwrap();
+        assert_eq!(result["exported_count"].as_u64(), Some(1));
+        assert!(root.join("export/cuts.zip").is_file());
+        let cuts_archive = std::fs::read(root.join("export/cuts.zip")).unwrap();
+        assert!(cuts_archive.starts_with(b"PK\x03\x04"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cuts_zip_export_accepts_vad_trimmed_clip_start() {
+        let root = test_root("cuts-zip-vad-trim-start");
+        for directory in ["audio", "script", "preview", "export"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        let segment_dir = root.join(SEGMENTED_MASTER_AUDIO);
+        let mut writer = SegmentedWav::create(&segment_dir, 10, 1, 16, 10).unwrap();
+        writer.write_samples(&[0.125; 25]).unwrap();
+        assert_eq!(writer.finalize().unwrap(), 25);
+
+        let mut stopped = test_snapshot();
+        stopped.journal_seq = 1;
+        stopped.status = "stopped".to_string();
+        stopped.silence_detector = SilenceDetector::Vad;
+        stopped.audio_format.sample_rate = 10;
+        stopped.audio_format.bit_depth = 16;
+        stopped.master_audio = SEGMENTED_MASTER_AUDIO.to_string();
+        stopped.segment_frames = Some(10);
+        stopped.captured_samples = 25;
+        stopped.committed_samples = 25;
+        stopped.items[0].status = "accepted".to_string();
+        stopped.items[0].selected_attempt_id = Some("001-a1".to_string());
+        stopped.items[0].attempts.push(Attempt {
+            attempt_id: "001-a1".to_string(),
+            start_sample: 10,
+            recording_started_sample: 2,
+            head_silence_armed_sample: 2,
+            head_silence_passed_sample: 4,
+            required_head_silence_samples: 2,
+            content_started_sample: 12,
+            end_sample: 25,
+            forced_without_tail_silence: false,
+            tail_silence_samples: 2,
+            required_tail_silence_samples: 2,
+            status: "accepted".to_string(),
+            created_at: "2026-08-20T00:00:00Z".to_string(),
         });
         write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
 
