@@ -81,7 +81,7 @@ import { createLatestFrameCommitter } from './latest-frame';
 import type { LatestFrameCommitter } from './latest-frame';
 import type { SessionNoiseCheckOperation } from './recording-workflow';
 import { licenseSummary } from './ActivateLicense';
-import type { Attempt, AudioDevice, CapturePreset, CapturePresetDraft, CapturePresetStore, CaptureShareMode, EngineEvent, ExportArtifact, ExportResult, HeadSilencePhase, InspectedSessionState, ItemState, LicenseStatus, Meter, NoiseCheckProgress, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SealInterruptedSessionResult, SessionSnapshot } from './types';
+import { normalizeSilenceDetector, type Attempt, type AudioDevice, type CapturePreset, type CapturePresetDraft, type CapturePresetStore, type CaptureShareMode, type EngineEvent, type ExportArtifact, type ExportResult, type HeadSilencePhase, type InspectedSessionState, type ItemState, type LicenseStatus, type Meter, type NoiseCheckProgress, type NoiseCheckResult, type PrompterState, type RecordingHistoryEntry, type ScriptItem, type SealInterruptedSessionResult, type SessionSnapshot, type SilenceDetector } from './types';
 import { reportRendererError } from './sentry';
 import { logUserAction } from './debug-log';
 import { translateExportDeliverError } from './export-deliver-i18n';
@@ -176,6 +176,7 @@ const emptyMeter: Meter = {
   content_started_sample: 0,
   silence_threshold_dbfs: -42,
   silence_duration_ms: 1_000,
+  silence_detector: 'vad',
   waveform: [],
 };
 
@@ -571,6 +572,9 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const [silenceSettingsSaving, setSilenceSettingsSaving] = useState(false);
   const [silenceSettingsError, setSilenceSettingsError] = useState('');
   const [silenceDurationMs, setSilenceDurationMs] = useState(1_000);
+  const [silenceDetector, setSilenceDetector] = useState<SilenceDetector>('vad');
+  const [silenceDetectorDraft, setSilenceDetectorDraft] = useState<SilenceDetector>('vad');
+  const [taskInitialSilenceDetector, setTaskInitialSilenceDetector] = useState<SilenceDetector>('vad');
   const [noiseCheckRunning, setNoiseCheckRunning] = useState(false);
   const [noiseCheckProgress, setNoiseCheckProgress] = useState(0);
   const [noiseCheckLive, setNoiseCheckLive] = useState<NoiseCheckProgress | null>(null);
@@ -1012,6 +1016,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       void window.recorder.request('set_silence_settings', {
         threshold_dbfs: snapshot?.silence_threshold_dbfs ?? noiseThresholdDbfs,
         silence_duration_ms: snapshot?.silence_duration_ms ?? silenceDurationMs,
+        silence_detector: snapshot?.silence_detector ?? silenceDetector,
         enforce_silence: enabled,
       }).catch(() => undefined);
     }
@@ -1752,6 +1757,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setTaskInitialSilenceDurationMs(nextSnapshot.silence_duration_ms ?? 1_000);
     setSilenceThresholdDraftDbfs(threshold);
     setSilenceDurationDraftMs(nextSnapshot.silence_duration_ms ?? 1_000);
+    const detector = normalizeSilenceDetector(nextSnapshot.silence_detector);
+    setSilenceDetector(detector);
+    setSilenceDetectorDraft(detector);
+    setTaskInitialSilenceDetector(detector);
     setSilenceSettingsError('');
     setCurrentIndex(restoredIndex);
     setRecording(Boolean(current.active_attempt));
@@ -1767,6 +1776,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       overflow_samples: nextSnapshot.overflow_samples,
       silence_threshold_dbfs: threshold,
       silence_duration_ms: nextSnapshot.silence_duration_ms,
+      silence_detector: detector,
       head_silence_phase: current.active_attempt?.head_silence_phase ?? 'idle',
       head_silence_armed_sample: current.active_attempt?.head_silence_armed_sample ?? 0,
       head_silence_progress_samples: current.active_attempt?.head_silence_progress_samples ?? 0,
@@ -1842,6 +1852,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setTaskInitialSilenceDurationMs(nextSnapshot.silence_duration_ms ?? 1_000);
     setSilenceThresholdDraftDbfs(taskThreshold);
     setSilenceDurationDraftMs(nextSnapshot.silence_duration_ms ?? 1_000);
+    const detector = normalizeSilenceDetector(nextSnapshot.silence_detector);
+    setSilenceDetector(detector);
+    setSilenceDetectorDraft(detector);
+    setTaskInitialSilenceDetector(detector);
     setSilenceSettingsError('');
     setCurrentIndex(0);
     setRecording(false);
@@ -1935,13 +1949,19 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     }
   }
 
-  async function applyTaskSilenceSettings(thresholdValue: number, durationValue: number) {
+  async function applyTaskSilenceSettings(
+    thresholdValue: number,
+    durationValue: number,
+    detectorValue: SilenceDetector = silenceDetectorDraft,
+  ) {
     const threshold = Math.min(-12, Math.max(-72, Math.round(thresholdValue)));
     const durationMs = Math.min(5_000, Math.max(200, Math.round(durationValue / 100) * 100));
+    const detector = normalizeSilenceDetector(detectorValue);
     setSilenceThresholdDraftDbfs(threshold);
     setSilenceDurationDraftMs(durationMs);
+    setSilenceDetectorDraft(detector);
     if (!snapshot || !captureActive || workspaceFaulted || captureFault
-      || (threshold === noiseThresholdDbfs && durationMs === silenceDurationMs)) return;
+      || (threshold === noiseThresholdDbfs && durationMs === silenceDurationMs && detector === silenceDetector)) return;
     const request = ++silenceSettingsSaveSequenceRef.current;
     setSilenceSettingsSaving(true);
     setSilenceSettingsError('');
@@ -1949,11 +1969,13 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       const result = await window.recorder.request<{
         threshold_dbfs: number;
         silence_duration_ms: number;
+        silence_detector?: SilenceDetector;
         reset_kind: 'idle' | 'head_silence' | 'tail_silence';
         snapshot: SessionSnapshot;
       }>('set_silence_settings', {
         threshold_dbfs: threshold,
         silence_duration_ms: durationMs,
+        silence_detector: detector,
         enforce_silence: automationRules.enforceHeadTailSilence,
       });
       if (request !== silenceSettingsSaveSequenceRef.current) return;
@@ -1962,10 +1984,14 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       setSilenceDurationMs(result.silence_duration_ms);
       setSilenceThresholdDraftDbfs(result.threshold_dbfs);
       setSilenceDurationDraftMs(result.silence_duration_ms);
+      const appliedDetector = normalizeSilenceDetector(result.silence_detector ?? detector);
+      setSilenceDetector(appliedDetector);
+      setSilenceDetectorDraft(appliedDetector);
       setMeter((previous) => ({
         ...previous,
         silence_threshold_dbfs: result.threshold_dbfs,
         silence_duration_ms: result.silence_duration_ms,
+        silence_detector: appliedDetector,
         silence_samples: 0,
         ...(result.reset_kind === 'head_silence' ? {
           head_silence_phase: 'waiting_for_head_silence' as HeadSilencePhase,
@@ -2027,6 +2053,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       silence_duration_ms: silenceDurationMs,
       noise_threshold_dbfs: noiseThresholdDbfs,
       silence_threshold_dbfs: noiseThresholdDbfs,
+      silence_detector: silenceDetector,
       items: scriptItems,
     }));
     if (!result) return false;
@@ -3582,9 +3609,11 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             {monitorPanelTab === 'monitor' && <>
               <section className="monitor-section input-inspector"><h3>{t('recorder.listenInput')}</h3><div className="vertical-meter-wrap"><div className="vertical-meter"><i className="safe-zone" /><i className="vertical-fill" style={{ height: `${peakPercent}%` }} /></div><div className="vertical-scale"><span>0</span><span>−6</span><span>−12</span><span>−24</span><span>−48</span></div><div className="level-readout"><strong className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</strong><small>PEAK</small><strong>{db(meter.rms)}</strong><small>RMS</small></div></div><p className={`level-hint ${captureFault || meter.peak > .92 ? 'danger' : meter.peak > .04 ? 'good' : ''}`}><i />{!captureActive ? t('recorder.cardOff') : captureFault ? t('recorder.inputStopped') : meter.peak > .92 ? t('recorder.inputClip') : meter.peak > .04 ? t('recorder.inputOk') : t('recorder.inputWait')}</p>{devWebCaptureEnabled && captureActive && <p className="dev-web-capture-hint">{devWebCaptureNotice || t('recorder.devWebCaptureOn')}</p>}</section>
               <section className="monitor-section"><h3>{t('recorder.currentState')}</h3><dl className="property-list"><div><dt>{t('recorder.sentence')}</dt><dd>{cueLabel}</dd></div><div><dt>{t('recorder.headTail')}</dt><dd><SilencePairReadout pair={silencePair} /></dd></div><div><dt>{t('recorder.disk')}</dt><dd>{meter.storage_status === 'healthy' ? t('recorder.diskHealthy') : meter.storage_status === 'warning' ? t('recorder.diskWarning') : t('recorder.diskCritical')}</dd></div></dl></section>
-              <button className="detection-summary" onClick={() => setMonitorPanelTab('detection')}><span><strong>{t('recorder.silenceJudge')}</strong><small>{noiseThresholdDbfs} dBFS / {(effectiveSilenceDurationMs / 1_000).toFixed(1)} {t('recorder.seconds')}</small></span><em>{t('recorder.adjust')}</em></button>
+              <button className="detection-summary" onClick={() => setMonitorPanelTab('detection')}><span><strong>{t('recorder.silenceJudge')}</strong><small>{silenceDetector === 'vad' ? t('recorder.detectorVad') : `${noiseThresholdDbfs} dBFS`} / {(effectiveSilenceDurationMs / 1_000).toFixed(1)} {t('recorder.seconds')}</small></span><em>{t('recorder.adjust')}</em></button>
             </>}
-            {monitorPanelTab === 'detection' && <section className="monitor-section detection-settings"><h3>{t('recorder.detectionTitle')}</h3><p>{t('recorder.detectionHelp')}</p><div className="detection-setting"><header><span><strong>{t('recorder.threshold')}</strong><small>{t('recorder.currentRms', { value: liveRmsDbfs <= -96 ? '−∞' : `${liveRmsDbfs.toFixed(1)} dBFS` })}</small></span><output>{silenceThresholdDraftDbfs} <small>dBFS</small></output></header><div className="threshold-track"><i style={{ left: `${liveRmsOnThresholdScale}%` }} title={t('quality.currentRmsTitle', { value: liveRmsDbfs.toFixed(1) })} /><input data-testid="task-silence-threshold" aria-label={t('recorder.threshold')} aria-valuetext={`${silenceThresholdDraftDbfs} dBFS`} type="range" min="-72" max="-12" step="1" value={silenceThresholdDraftDbfs} onChange={(event) => setSilenceThresholdDraftDbfs(Number(event.target.value))} onPointerUp={(event) => void applyTaskSilenceSettings(Number(event.currentTarget.value), silenceDurationDraftMs)} onKeyUp={(event) => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) void applyTaskSilenceSettings(Number(event.currentTarget.value), silenceDurationDraftMs); }} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving} /></div><div className="threshold-labels"><span>{t('recorder.moreSensitive')}</span><span>{t('recorder.moreReject')}</span></div></div><div className="detection-setting"><header><span><strong>{t('recorder.duration')}</strong><small>{t('recorder.sameDuration')}</small></span><output>{(silenceDurationDraftMs / 1_000).toFixed(1)} <small>{t('recorder.seconds')}</small></output></header><input data-testid="task-silence-duration" aria-label={t('recorder.duration')} aria-valuetext={`${(silenceDurationDraftMs / 1_000).toFixed(1)} ${t('recorder.seconds')}`} type="range" min="200" max="5000" step="100" value={silenceDurationDraftMs} onChange={(event) => setSilenceDurationDraftMs(Number(event.target.value))} onPointerUp={(event) => void applyTaskSilenceSettings(silenceThresholdDraftDbfs, Number(event.currentTarget.value))} onKeyUp={(event) => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) void applyTaskSilenceSettings(silenceThresholdDraftDbfs, Number(event.currentTarget.value)); }} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving} /><div className="threshold-labels"><span>0.2 {t('recorder.seconds')}</span><span>5.0 {t('recorder.seconds')}</span></div></div><div className="automation-rules"><header><strong>{t('recorder.automationRules')}</strong><small>{t('recorder.automationRulesHelp')}</small></header><AutomationRuleRow testId="rule-auto-start-next" checked={automationRules.autoStartNext} title={t('recorder.ruleAutoStartNext')} hint={t('recorder.ruleAutoStartNextHint')} onChange={(enabled) => applyAutomationRule('autoStartNext', enabled)} /><AutomationRuleRow testId="rule-enforce-head-tail" checked={automationRules.enforceHeadTailSilence} title={t('recorder.ruleEnforceHeadTail')} hint={t('recorder.ruleEnforceHeadTailHint')} onChange={(enabled) => applyAutomationRule('enforceHeadTailSilence', enabled)} /><AutomationRuleRow testId="rule-head-tail" checked={automationRules.headTailSilence} title={t('recorder.ruleHeadTail')} hint={t('recorder.ruleHeadTailHint')} onChange={(enabled) => applyAutomationRule('headTailSilence', enabled)} /><AutomationRuleRow testId="rule-discard-empty" checked={automationRules.discardEmpty} title={t('recorder.ruleDiscardEmpty')} hint={t('recorder.ruleDiscardEmptyHint')} onChange={(enabled) => applyAutomationRule('discardEmpty', enabled)} /><AutomationRuleRow testId="rule-env-check" checked={automationRules.envCheck} title={t('recorder.ruleEnvCheck')} hint={t('recorder.ruleEnvCheckHint')} onChange={(enabled) => applyAutomationRule('envCheck', enabled)} /><AutomationRuleRow testId="rule-almost-silent" checked={automationRules.almostSilent} title={t('recorder.ruleAlmostSilent')} hint={t('recorder.ruleAlmostSilentHint')} onChange={(enabled) => applyAutomationRule('almostSilent', enabled)} /><AutomationRuleRow testId="rule-peak-high" checked={automationRules.peakHigh} title={t('recorder.rulePeakHigh')} hint={t('recorder.rulePeakHighHint')} onChange={(enabled) => applyAutomationRule('peakHigh', enabled)} /></div><p className={`settings-apply-state ${silenceSettingsError ? 'error' : ''}`}>{silenceSettingsSaving ? t('recorder.applyingSettings') : silenceSettingsError || t('recorder.appliedSettings', { db: noiseThresholdDbfs, seconds: (effectiveSilenceDurationMs / 1_000).toFixed(1) })}</p><button className="restore-settings" onClick={() => void applyTaskSilenceSettings(taskInitialSilenceThresholdDbfs, taskInitialSilenceDurationMs)} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving || (noiseThresholdDbfs === taskInitialSilenceThresholdDbfs && silenceDurationMs === taskInitialSilenceDurationMs)}>{t('recorder.restoreInitial')}</button></section>}
+            {monitorPanelTab === 'detection' && <section className="monitor-section detection-settings"><h3>{t('recorder.detectionTitle')}</h3><p>{t('recorder.detectionHelp')}</p><div className="detection-setting detector-choice"><header><span><strong>{t('recorder.detectorTitle')}</strong><small>{t('recorder.detectorHelp')}</small></span></header><div className="detector-options" role="radiogroup" aria-label={t('recorder.detectorTitle')}><button type="button" data-testid="detector-energy" className={silenceDetectorDraft === 'energy' ? 'active' : ''} role="radio" aria-checked={silenceDetectorDraft === 'energy'} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving} onClick={() => void applyTaskSilenceSettings(silenceThresholdDraftDbfs, silenceDurationDraftMs, 'energy')}><strong>{t('recorder.detectorEnergy')}</strong><small>{t('recorder.detectorEnergyHint')}</small></button><button type="button" data-testid="detector-vad" className={silenceDetectorDraft === 'vad' ? 'active' : ''} role="radio" aria-checked={silenceDetectorDraft === 'vad'} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving} onClick={() => void applyTaskSilenceSettings(silenceThresholdDraftDbfs, silenceDurationDraftMs, 'vad')}><strong>{t('recorder.detectorVad')}</strong><small>{t('recorder.detectorVadHint')}</small></button></div></div>{silenceDetectorDraft === 'energy' ? <div className="detection-setting"><header><span><strong>{t('recorder.threshold')}</strong><small>{t('recorder.currentRms', { value: liveRmsDbfs <= -96 ? '−∞' : `${liveRmsDbfs.toFixed(1)} dBFS` })}</small></span><output>{silenceThresholdDraftDbfs} <small>dBFS</small></output></header><div className="threshold-track"><i style={{ left: `${liveRmsOnThresholdScale}%` }} title={t('quality.currentRmsTitle', { value: liveRmsDbfs.toFixed(1) })} /><input data-testid="task-silence-threshold" aria-label={t('recorder.threshold')} aria-valuetext={`${silenceThresholdDraftDbfs} dBFS`} type="range" min="-72" max="-12" step="1" value={silenceThresholdDraftDbfs} onChange={(event) => setSilenceThresholdDraftDbfs(Number(event.target.value))} onPointerUp={(event) => void applyTaskSilenceSettings(Number(event.currentTarget.value), silenceDurationDraftMs)} onKeyUp={(event) => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) void applyTaskSilenceSettings(Number(event.currentTarget.value), silenceDurationDraftMs); }} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving} /></div><div className="threshold-labels"><span>{t('recorder.moreSensitive')}</span><span>{t('recorder.moreReject')}</span></div></div> : null}<div className="detection-setting"><header><span><strong>{t('recorder.duration')}</strong><small>{t('recorder.sameDuration')}</small></span><output>{(silenceDurationDraftMs / 1_000).toFixed(1)} <small>{t('recorder.seconds')}</small></output></header><input data-testid="task-silence-duration" aria-label={t('recorder.duration')} aria-valuetext={`${(silenceDurationDraftMs / 1_000).toFixed(1)} ${t('recorder.seconds')}`} type="range" min="200" max="5000" step="100" value={silenceDurationDraftMs} onChange={(event) => setSilenceDurationDraftMs(Number(event.target.value))} onPointerUp={(event) => void applyTaskSilenceSettings(silenceThresholdDraftDbfs, Number(event.currentTarget.value))} onKeyUp={(event) => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) void applyTaskSilenceSettings(silenceThresholdDraftDbfs, Number(event.currentTarget.value)); }} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving} /><div className="threshold-labels"><span>0.2 {t('recorder.seconds')}</span><span>5.0 {t('recorder.seconds')}</span></div></div><div className="automation-rules"><header><strong>{t('recorder.automationRules')}</strong><small>{t('recorder.automationRulesHelp')}</small></header><AutomationRuleRow testId="rule-auto-start-next" checked={automationRules.autoStartNext} title={t('recorder.ruleAutoStartNext')} hint={t('recorder.ruleAutoStartNextHint')} onChange={(enabled) => applyAutomationRule('autoStartNext', enabled)} /><AutomationRuleRow testId="rule-enforce-head-tail" checked={automationRules.enforceHeadTailSilence} title={t('recorder.ruleEnforceHeadTail')} hint={t('recorder.ruleEnforceHeadTailHint')} onChange={(enabled) => applyAutomationRule('enforceHeadTailSilence', enabled)} /><AutomationRuleRow testId="rule-head-tail" checked={automationRules.headTailSilence} title={t('recorder.ruleHeadTail')} hint={t('recorder.ruleHeadTailHint')} onChange={(enabled) => applyAutomationRule('headTailSilence', enabled)} /><AutomationRuleRow testId="rule-discard-empty" checked={automationRules.discardEmpty} title={t('recorder.ruleDiscardEmpty')} hint={silenceDetector === 'vad' ? t('recorder.ruleDiscardEmptyHintVad') : t('recorder.ruleDiscardEmptyHint')} onChange={(enabled) => applyAutomationRule('discardEmpty', enabled)} /><AutomationRuleRow testId="rule-env-check" checked={automationRules.envCheck} title={t('recorder.ruleEnvCheck')} hint={t('recorder.ruleEnvCheckHint')} onChange={(enabled) => applyAutomationRule('envCheck', enabled)} /><AutomationRuleRow testId="rule-almost-silent" checked={automationRules.almostSilent} title={t('recorder.ruleAlmostSilent')} hint={t('recorder.ruleAlmostSilentHint')} onChange={(enabled) => applyAutomationRule('almostSilent', enabled)} /><AutomationRuleRow testId="rule-peak-high" checked={automationRules.peakHigh} title={t('recorder.rulePeakHigh')} hint={t('recorder.rulePeakHighHint')} onChange={(enabled) => applyAutomationRule('peakHigh', enabled)} /></div><p className={`settings-apply-state ${silenceSettingsError ? 'error' : ''}`}>{silenceSettingsSaving ? t('recorder.applyingSettings') : silenceSettingsError || (silenceDetector === 'vad'
+              ? t('recorder.appliedSettingsVad', { seconds: (effectiveSilenceDurationMs / 1_000).toFixed(1) })
+              : t('recorder.appliedSettings', { db: noiseThresholdDbfs, seconds: (effectiveSilenceDurationMs / 1_000).toFixed(1) }))}</p><button className="restore-settings" onClick={() => void applyTaskSilenceSettings(taskInitialSilenceThresholdDbfs, taskInitialSilenceDurationMs, taskInitialSilenceDetector)} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving || (noiseThresholdDbfs === taskInitialSilenceThresholdDbfs && silenceDurationMs === taskInitialSilenceDurationMs && silenceDetector === taskInitialSilenceDetector)}>{t('recorder.restoreInitial')}</button></section>}
             {monitorPanelTab === 'task' && <section className="monitor-section"><h3>{t('recorder.taskParams')}</h3><dl className="property-list"><div><dt>{t('setup.inputDevice')}</dt><dd title={snapshot?.device_name}>{snapshot?.device_name || t('common.dash')}</dd></div><div><dt>{t('setup.shareMode')}</dt><dd>{captureShareModeLabel(snapshot?.capture_share_mode ?? captureShareMode)}</dd></div><div><dt>{t('setup.inputChannel')}</dt><dd>{snapshot?.audio_format.input_channel ?? 1}</dd></div><div><dt>{t('recorder.exportFormat')}</dt><dd>{sampleRateForDisplay / 1000}k / {snapshot?.audio_format.bit_depth}-bit {snapshot?.audio_format.encoding ?? ''}</dd></div><div><dt>{t('recorder.driverInputFormat')}</dt><dd>{snapshot?.input_sample_format?.toUpperCase() ?? t('common.dash')}</dd></div><div><dt>{t('recorder.envCeiling')}</dt><dd>{snapshot?.noise_threshold_dbfs ?? snapshot?.noise_check?.threshold_dbfs ?? t('common.dash')} dBFS</dd></div><div><dt>{t('recorder.accepted')}</dt><dd>{counts.accepted ?? 0} / {items.length}</dd></div><div><dt>{t('recorder.skipped')}</dt><dd>{counts.skipped ?? 0}</dd></div></dl><button className="button panel-action" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? t('recorder.locatePrompter') : t('recorder.openPrompter')}</button></section>}
             {monitorPanelTab === 'export' && snapshot && <section className="monitor-section monitor-export"><h3>{t('recorder.exportCurrent')}</h3><p>{captureActive ? recording ? t('recorder.exportWhileRecording') : t('recorder.exportWillPause') : t('recorder.exportIndependent')}</p>{exportDestinationPicker(sessionDir)}<div>
               <button onClick={() => void exportRecordingArtifact({ session_id: snapshot.session_id, session_dir: sessionDir }, 'full_track')} disabled={Boolean(busy) || recording}><Icon name="meter" /><span><strong>{t('recorder.fullTrackShort')}</strong><small>{artifactStatusCopy(workspaceRecording, 'full_track')}</small></span></button>

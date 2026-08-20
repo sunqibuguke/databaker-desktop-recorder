@@ -1,6 +1,38 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+pub(crate) struct AnalysisWriteGuard<'a> {
+    epoch: &'a AtomicU64,
+}
+
+impl Drop for AnalysisWriteGuard<'_> {
+    fn drop(&mut self) {
+        // Publish an even epoch only after all analysis fields and the analyzed
+        // sample watermark have been written.
+        self.epoch.fetch_add(1, Ordering::Release);
+    }
+}
+
+pub(crate) fn begin_analysis_write(epoch: &AtomicU64) -> AnalysisWriteGuard<'_> {
+    let mut observed = epoch.load(Ordering::Acquire);
+    loop {
+        if observed & 1 != 0 {
+            std::hint::spin_loop();
+            observed = epoch.load(Ordering::Acquire);
+            continue;
+        }
+        match epoch.compare_exchange_weak(
+            observed,
+            observed.wrapping_add(1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return AnalysisWriteGuard { epoch },
+            Err(actual) => observed = actual,
+        }
+    }
+}
+
 pub(crate) const HEAD_SILENCE_IDLE: u32 = 0;
 pub(crate) const HEAD_SILENCE_WAITING: u32 = 1;
 pub(crate) const HEAD_SILENCE_PASSED: u32 = 2;
@@ -63,25 +95,28 @@ pub(crate) fn head_silence_phase_name(phase: u32) -> &'static str {
     }
 }
 
+pub(crate) fn energy_is_speech(threshold_bits: &AtomicU32, rms: f32) -> bool {
+    let threshold_dbfs = f32::from_bits(threshold_bits.load(Ordering::Relaxed));
+    let threshold_linear = 10f32.powf(threshold_dbfs / 20.0);
+    rms > threshold_linear
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn annotate_attempt_block(
     head_silence: &HeadSilenceMonitor,
     silence_samples: &AtomicU64,
     last_signal_sample: &AtomicU64,
     attempt_signal_start_sample: &AtomicU64,
-    threshold_bits: &AtomicU32,
-    rms: f32,
+    is_speech: bool,
     frames: u64,
     block_start: u64,
     block_end: u64,
 ) {
-    let threshold_dbfs = f32::from_bits(threshold_bits.load(Ordering::Relaxed));
-    let threshold_linear = 10f32.powf(threshold_dbfs / 20.0);
     let armed_sample = head_silence.armed_sample.load(Ordering::Acquire);
     let mut phase = head_silence.phase.load(Ordering::Acquire);
 
     let enforce = head_silence.enforce.load(Ordering::Acquire);
-    if rms <= threshold_linear {
+    if !is_speech {
         let _ = silence_samples.fetch_add(frames, Ordering::AcqRel);
     } else {
         silence_samples.store(0, Ordering::Release);
@@ -103,7 +138,7 @@ pub(crate) fn annotate_attempt_block(
     if phase == HEAD_SILENCE_WAITING && block_end > armed_sample {
         let required_samples = head_silence.required_samples();
         let updated = if enforce {
-            if rms > threshold_linear {
+            if is_speech {
                 0
             } else {
                 head_silence
@@ -134,10 +169,7 @@ pub(crate) fn annotate_attempt_block(
             };
             head_silence.phase.store(phase, Ordering::Release);
         }
-    } else if matches!(phase, HEAD_SILENCE_PASSED)
-        && rms > threshold_linear
-        && block_end > armed_sample
-    {
+    } else if matches!(phase, HEAD_SILENCE_PASSED) && is_speech && block_end > armed_sample {
         head_silence
             .phase
             .store(HEAD_SILENCE_SPEECH_STARTED, Ordering::Release);

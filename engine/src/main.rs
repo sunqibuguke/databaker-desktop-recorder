@@ -7,6 +7,7 @@ mod protocol;
 mod segmented_wav;
 mod session_lock;
 mod storage_guard;
+mod vad;
 mod wav;
 
 #[cfg(feature = "system-test")]
@@ -473,6 +474,7 @@ mod tests {
             noise_threshold_dbfs: Some(-42.0),
             silence_duration_ms: 1_000,
             silence_threshold_dbfs: -42.0,
+            silence_detector: crate::engine::SilenceDetector::Energy,
             items: vec![ItemState {
                 id: "001".to_string(),
                 text: "测试文本".to_string(),

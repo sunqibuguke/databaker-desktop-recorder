@@ -2,7 +2,7 @@
 use crate::attempt::HEAD_SILENCE_IDLE;
 use crate::attempt::{
     HEAD_SILENCE_PASSED, HEAD_SILENCE_SPEECH_STARTED, HEAD_SILENCE_WAITING, HeadSilenceMonitor,
-    annotate_attempt_block, head_silence_phase_name,
+    annotate_attempt_block, begin_analysis_write, energy_is_speech, head_silence_phase_name,
 };
 use crate::durable_fs::{
     durable_create_directory, durable_create_directory_all, durable_replace, sync_directory,
@@ -13,6 +13,10 @@ use crate::segmented_wav::{PreparedWavExport, SegmentedWav};
 use crate::session_lock::SessionLock;
 use crate::storage_guard::{
     AtomicExportStep, StorageReport, StorageStatus, check_storage, evaluate_atomic_export_space,
+};
+use crate::vad::{
+    DETECTOR_ENERGY, DETECTOR_VAD, VadAnalysisMessage, VadAnnotationSink, run_vad_analysis_thread,
+    trimmed_speech_bounds,
 };
 use crate::wav::{
     RecoverableWav, WavEncoding, WavExportMode, WavExportWriter, automatic_wav_container_name,
@@ -303,6 +307,9 @@ pub struct SessionSnapshot {
     pub silence_duration_ms: u32,
     #[serde(default = "default_noise_threshold_dbfs")]
     pub silence_threshold_dbfs: f32,
+    /// Missing on pre-VAD snapshots; those keep the energy gate.
+    #[serde(default = "default_silence_detector_legacy")]
+    pub silence_detector: SilenceDetector,
     pub items: Vec<ItemState>,
 }
 
@@ -347,6 +354,8 @@ pub struct StartSessionPayload {
     pub noise_threshold_dbfs: Option<f32>,
     #[serde(default = "default_noise_threshold_dbfs")]
     pub silence_threshold_dbfs: f32,
+    #[serde(default = "default_silence_detector_new")]
+    pub silence_detector: SilenceDetector,
     pub items: Vec<ScriptItem>,
 }
 
@@ -384,6 +393,8 @@ pub struct SetSilenceSettingsPayload {
     pub silence_duration_ms: u32,
     #[serde(default)]
     pub enforce_silence: Option<bool>,
+    #[serde(default)]
+    pub silence_detector: Option<SilenceDetector>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -512,6 +523,39 @@ fn default_silence_duration_ms() -> u32 {
     1_000
 }
 
+fn default_silence_detector_legacy() -> SilenceDetector {
+    SilenceDetector::Energy
+}
+
+fn default_silence_detector_new() -> SilenceDetector {
+    SilenceDetector::Vad
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SilenceDetector {
+    #[default]
+    Energy,
+    Vad,
+}
+
+impl SilenceDetector {
+    fn as_u32(self) -> u32 {
+        match self {
+            Self::Energy => DETECTOR_ENERGY,
+            Self::Vad => DETECTOR_VAD,
+        }
+    }
+
+    fn from_u32(value: u32) -> Self {
+        if value == DETECTOR_VAD {
+            Self::Vad
+        } else {
+            Self::Energy
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ActiveAttempt {
     item_id: String,
@@ -626,6 +670,28 @@ fn append_waveform_packet(
 }
 
 #[derive(Clone)]
+struct SilenceAnalysisPorts {
+    detector_kind: Arc<AtomicU32>,
+    generation: Arc<AtomicU64>,
+    tx: Option<Sender<VadAnalysisMessage>>,
+}
+
+impl SilenceAnalysisPorts {
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn energy() -> Self {
+        Self {
+            detector_kind: Arc::new(AtomicU32::new(DETECTOR_ENERGY)),
+            generation: Arc::new(AtomicU64::new(0)),
+            tx: None,
+        }
+    }
+
+    fn uses_vad(&self) -> bool {
+        self.detector_kind.load(Ordering::Acquire) == DETECTOR_VAD && self.tx.is_some()
+    }
+}
+
+#[derive(Clone)]
 struct SilenceMonitor {
     silence_samples: Arc<AtomicU64>,
     digital_silence_samples: Arc<AtomicU64>,
@@ -637,6 +703,7 @@ struct SilenceMonitor {
     capture_heartbeat: Arc<AtomicU64>,
     head_silence: HeadSilenceMonitor,
     bandwidth: crate::bandwidth::BandwidthProbe,
+    analysis: SilenceAnalysisPorts,
 }
 
 #[derive(Clone)]
@@ -660,10 +727,6 @@ impl CaptureFaultPersistence {
 
 struct WriterQueueLease<'a> {
     enqueue_state: &'a AtomicU64,
-}
-
-struct AnalysisWriteGuard<'a> {
-    epoch: &'a AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -817,34 +880,6 @@ fn trip_stalled_capture(
 impl Drop for WriterQueueLease<'_> {
     fn drop(&mut self) {
         self.enqueue_state.fetch_sub(1, Ordering::Release);
-    }
-}
-
-impl Drop for AnalysisWriteGuard<'_> {
-    fn drop(&mut self) {
-        // Publish an even epoch only after all analysis fields and the analyzed
-        // sample watermark have been written.
-        self.epoch.fetch_add(1, Ordering::Release);
-    }
-}
-
-fn begin_analysis_write(epoch: &AtomicU64) -> AnalysisWriteGuard<'_> {
-    let mut observed = epoch.load(Ordering::Acquire);
-    loop {
-        if observed & 1 != 0 {
-            std::hint::spin_loop();
-            observed = epoch.load(Ordering::Acquire);
-            continue;
-        }
-        match epoch.compare_exchange_weak(
-            observed,
-            observed.wrapping_add(1),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => return AnalysisWriteGuard { epoch },
-            Err(actual) => observed = actual,
-        }
     }
 }
 
@@ -1356,6 +1391,9 @@ pub struct RecordingSession {
     silence_duration_ms: Arc<AtomicU32>,
     head_silence: HeadSilenceMonitor,
     bandwidth: crate::bandwidth::BandwidthProbe,
+    silence_analysis: SilenceAnalysisPorts,
+    vad_tx: Option<Sender<VadAnalysisMessage>>,
+    vad_join: Option<JoinHandle<()>>,
     active_attempt: Option<ActiveAttempt>,
     metadata_fault: Option<String>,
     /// A stop command has already been placed behind every callback that
@@ -1410,6 +1448,8 @@ impl Drop for RecordingSession {
         // neither store can block the caller or protocol thread.
         self.capture_watchdog_armed.store(false, Ordering::Release);
         self.telemetry_stop.store(true, Ordering::Release);
+        self.vad_tx.take();
+        self.vad_join.take();
 
         let stream_reaper = &mut self.stream_reaper;
         let retired_stream = fail_closed_abnormal_capture_drop(
@@ -1620,6 +1660,7 @@ impl Engine {
             ),
             silence_duration_ms: existing.silence_duration_ms,
             silence_threshold_dbfs: existing.silence_threshold_dbfs,
+            silence_detector: existing.silence_detector,
             items: existing
                 .items
                 .into_iter()
@@ -1789,6 +1830,7 @@ impl Engine {
             ),
             silence_duration_ms: payload.silence_duration_ms,
             silence_threshold_dbfs: payload.silence_threshold_dbfs,
+            silence_detector: payload.silence_detector,
             items: payload
                 .items
                 .into_iter()
@@ -2300,6 +2342,7 @@ impl Engine {
                     "noise_threshold_dbfs": snapshot.noise_threshold_dbfs,
                     "silence_duration_ms": snapshot.silence_duration_ms,
                     "silence_threshold_dbfs": snapshot.silence_threshold_dbfs,
+                    "silence_detector": snapshot.silence_detector,
                     "started_at": snapshot.started_at,
                     "updated_at": snapshot.updated_at,
                 }),
@@ -2352,6 +2395,26 @@ impl Engine {
             .saturating_mul(u64::from(snapshot.silence_duration_ms))
             / 1_000;
         let head_silence = HeadSilenceMonitor::new(required_head_silence_samples);
+        let (vad_tx, vad_rx) = bounded::<VadAnalysisMessage>(64);
+        let silence_analysis = SilenceAnalysisPorts {
+            detector_kind: Arc::new(AtomicU32::new(snapshot.silence_detector.as_u32())),
+            generation: Arc::new(AtomicU64::new(1)),
+            tx: Some(vad_tx.clone()),
+        };
+        let vad_sink = VadAnnotationSink {
+            head_silence: head_silence.clone(),
+            silence_samples: Arc::clone(&silence_samples),
+            last_signal_sample: Arc::clone(&last_signal_sample),
+            attempt_signal_start_sample: Arc::clone(&attempt_signal_start_sample),
+            analyzed_samples: Arc::clone(&analyzed_samples),
+            analysis_epoch: Arc::clone(&analysis_epoch),
+            generation: Arc::clone(&silence_analysis.generation),
+        };
+        let vad_sample_rate = snapshot.audio_format.sample_rate;
+        let vad_join = thread::Builder::new()
+            .name("speech-vad".to_string())
+            .spawn(move || run_vad_analysis_thread(vad_rx, vad_sample_rate, vad_sink))
+            .context("start speech VAD analysis thread")?;
         let (waveform_tx, waveform_rx) = bounded::<WaveformPacket>(128);
         // Production preview leaves the callback only through this bounded,
         // non-blocking channel. The writer receives no visualization sink, so
@@ -2438,6 +2501,9 @@ impl Engine {
             silence_duration_ms,
             head_silence,
             bandwidth,
+            silence_analysis,
+            vad_tx: Some(vad_tx),
+            vad_join: Some(vad_join),
             active_attempt: None,
             metadata_fault: None,
             stop_requested: false,
@@ -2522,6 +2588,7 @@ impl Engine {
                         capture_heartbeat: Arc::clone(&session.capture_heartbeat),
                         head_silence: session.head_silence.clone(),
                         bandwidth: session.bandwidth.clone(),
+                        analysis: session.silence_analysis.clone(),
                     },
                 ) {
                     Ok(stream) => {
@@ -2644,6 +2711,7 @@ impl Engine {
         let silence_threshold_thread = Arc::clone(&session.silence_threshold_bits);
         let head_silence_thread = session.head_silence.clone();
         let silence_duration_ms_thread = Arc::clone(&session.silence_duration_ms);
+        let silence_detector_thread = Arc::clone(&session.silence_analysis.detector_kind);
         let telemetry_session_dir = session.session_dir.clone();
         let capture_share_mode = session.snapshot.capture_share_mode.as_str();
         let telemetry_join = match thread::Builder::new()
@@ -2720,6 +2788,9 @@ impl Engine {
                             "last_signal_sample": last_signal_sample_thread.load(Ordering::Acquire),
                             "silence_threshold_dbfs": f32::from_bits(silence_threshold_thread.load(Ordering::Relaxed)),
                             "silence_duration_ms": silence_duration_ms_thread.load(Ordering::Acquire),
+                            "silence_detector": SilenceDetector::from_u32(
+                                silence_detector_thread.load(Ordering::Acquire)
+                            ),
                             "head_silence_phase": head_silence_phase_name(
                                 head_silence_thread.phase.load(Ordering::Acquire)
                             ),
@@ -2766,6 +2837,7 @@ impl Engine {
                 "segment_frames": session.snapshot.segment_frames,
                 "silence_duration_ms": session.snapshot.silence_duration_ms,
                 "silence_threshold_dbfs": session.snapshot.silence_threshold_dbfs,
+                "silence_detector": session.snapshot.silence_detector,
                 "existing_samples": expected_existing_frames,
                 "capture_source": match capture_activation {
                     CaptureActivation::Device => "device",
@@ -2859,6 +2931,7 @@ impl Engine {
             capture_heartbeat: Arc::clone(&session.capture_heartbeat),
             head_silence: session.head_silence.clone(),
             bandwidth: session.bandwidth.clone(),
+            analysis: session.silence_analysis.clone(),
         };
         let mut emitted = 0u64;
         while emitted < frames {
@@ -2925,6 +2998,7 @@ impl Engine {
             capture_heartbeat: Arc::clone(&session.capture_heartbeat),
             head_silence: session.head_silence.clone(),
             bandwidth: session.bandwidth.clone(),
+            analysis: session.silence_analysis.clone(),
         };
         saturating_atomic_add(&session.capture_heartbeat, 1);
         // Do not arm the production stall watchdog. Chromium may pause the
@@ -3058,15 +3132,24 @@ impl Engine {
         if let Some(enforce_silence) = payload.enforce_silence {
             session.head_silence.set_enforce(enforce_silence);
         }
+        if let Some(detector) = payload.silence_detector {
+            session.snapshot.silence_detector = detector;
+            session
+                .silence_analysis
+                .detector_kind
+                .store(detector.as_u32(), Ordering::Release);
+        }
         let (analysis_boundary, reset_kind) =
             session.apply_silence_settings(payload.threshold_dbfs, payload.silence_duration_ms);
         session.snapshot.silence_threshold_dbfs = payload.threshold_dbfs;
         session.snapshot.silence_duration_ms = payload.silence_duration_ms;
+        session.reset_vad_analysis();
         session.persist(
             "silence_settings_changed",
             json!({
                 "threshold_dbfs": payload.threshold_dbfs,
                 "silence_duration_ms": payload.silence_duration_ms,
+                "silence_detector": session.snapshot.silence_detector,
                 "analysis_boundary": analysis_boundary,
                 "active_attempt": session.active_attempt.is_some(),
                 "reset_kind": reset_kind,
@@ -3075,6 +3158,7 @@ impl Engine {
         Ok(json!({
             "threshold_dbfs": payload.threshold_dbfs,
             "silence_duration_ms": payload.silence_duration_ms,
+            "silence_detector": session.snapshot.silence_detector,
             "analysis_boundary": analysis_boundary,
             "active_attempt": session.active_attempt.is_some(),
             "reset_kind": reset_kind,
@@ -3194,6 +3278,7 @@ impl Engine {
         // advance to a callback that was already being analyzed, but its final
         // boundary and signal fields always come from the same even epoch.
         let requested_boundary = session.captured.load(Ordering::Acquire);
+        session.flush_vad_analysis()?;
         let analysis = session.wait_for_analysis_snapshot(requested_boundary)?;
         let captured_boundary = analysis.boundary;
         let observed_content_started_sample = analysis.content_started_sample;
@@ -3241,7 +3326,7 @@ impl Engine {
         if !force && content_started_sample > 0 && forced_without_tail_silence {
             bail!("尾静音未满，不能结束本句");
         }
-        let end_sample = match session.wait_until_committed(captured_boundary) {
+        let committed_end = match session.wait_until_committed(captured_boundary) {
             Ok(_) => captured_boundary,
             Err(error) if session.faulted.load(Ordering::Acquire) => {
                 // The writer can fail after the analysis snapshot but before
@@ -3269,7 +3354,27 @@ impl Engine {
             }
             Err(error) => return Err(error),
         };
-        if end_sample <= active.start_sample {
+        let use_vad_trim =
+            session.snapshot.silence_detector == SilenceDetector::Vad && content_started_sample > 0;
+        let (start_sample, end_sample, recorded_tail_silence_samples) = if use_vad_trim {
+            let (start, end) = trimmed_speech_bounds(
+                active.recording_started_sample,
+                committed_end,
+                content_started_sample,
+                last_signal_sample,
+                required_silence_samples,
+            );
+            let tail = end.saturating_sub(last_signal_sample.min(end));
+            (start, end, tail)
+        } else {
+            let start = if enforce_silence && head_silence_passed_sample > 0 {
+                head_silence_passed_sample
+            } else {
+                active.recording_started_sample
+            };
+            (start, committed_end, tail_silence_samples)
+        };
+        if end_sample <= start_sample {
             if session.faulted.load(Ordering::Acquire) {
                 session.active_attempt = None;
                 session.persist(
@@ -3295,13 +3400,10 @@ impl Engine {
             > active.input_discontinuity_count_at_start;
         let attempt = Attempt {
             attempt_id: active.attempt_id.clone(),
-            // Silence enforcement starts the exported clip where the required
-            // head pad completed. Forced / ungated takes keep the click.
-            start_sample: if enforce_silence && head_silence_passed_sample > 0 {
-                head_silence_passed_sample
-            } else {
-                active.recording_started_sample
-            },
+            // Energy gating starts the clip where the required head pad
+            // completed. AI VAD trims extra silence so each take keeps about
+            // `silence_duration_ms` on both sides of detected speech.
+            start_sample,
             recording_started_sample: active.recording_started_sample,
             head_silence_armed_sample: analysis.head_silence_armed_sample,
             head_silence_passed_sample,
@@ -3309,7 +3411,7 @@ impl Engine {
             content_started_sample,
             end_sample,
             forced_without_tail_silence,
-            tail_silence_samples,
+            tail_silence_samples: recorded_tail_silence_samples,
             required_tail_silence_samples: required_silence_samples,
             status: "recorded".to_string(),
             created_at: Utc::now().to_rfc3339(),
@@ -4918,6 +5020,7 @@ fn session_summary_value(snapshot: &SessionSnapshot) -> Value {
         "input_discontinuity_silence_samples": snapshot.input_discontinuity_silence_samples,
         "silence_duration_ms": snapshot.silence_duration_ms,
         "silence_threshold_dbfs": snapshot.silence_threshold_dbfs,
+        "silence_detector": snapshot.silence_detector,
         "started_at": snapshot.started_at,
         "updated_at": snapshot.updated_at,
     })
@@ -5689,6 +5792,7 @@ impl RecordingSession {
         self.last_signal_sample.store(0, Ordering::Release);
         self.head_silence.arm(armed_sample);
         drop(analysis_write);
+        self.reset_vad_analysis();
         armed_sample
     }
 
@@ -5745,6 +5849,48 @@ impl RecordingSession {
         self.attempt_signal_start_sample.store(0, Ordering::Release);
         self.last_signal_sample.store(0, Ordering::Release);
         drop(analysis_write);
+        self.reset_vad_analysis();
+    }
+
+    fn reset_vad_analysis(&self) {
+        let Some(tx) = self.vad_tx.as_ref() else {
+            return;
+        };
+        let generation = self
+            .silence_analysis
+            .generation
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
+        let _ = tx.try_send(VadAnalysisMessage::Reset { generation });
+    }
+
+    fn flush_vad_analysis(&self) -> Result<()> {
+        let Some(tx) = self.vad_tx.as_ref() else {
+            return Ok(());
+        };
+        if self.silence_analysis.detector_kind.load(Ordering::Acquire) != DETECTOR_VAD {
+            return Ok(());
+        }
+        let (done_tx, done_rx) = bounded(1);
+        let generation = self.silence_analysis.generation.load(Ordering::Acquire);
+        tx.send(VadAnalysisMessage::Flush {
+            generation,
+            done: done_tx,
+        })
+        .context("speech VAD analysis thread is unavailable")?;
+        done_rx
+            .recv_timeout(CAPTURE_ANALYSIS_TIMEOUT)
+            .context("speech VAD analysis did not flush before the stop boundary")?;
+        Ok(())
+    }
+
+    fn shutdown_vad_analysis(&mut self) {
+        if let Some(tx) = self.vad_tx.take() {
+            let _ = tx.send(VadAnalysisMessage::Shutdown);
+        }
+        if let Some(join) = self.vad_join.take() {
+            let _ = join.join();
+        }
     }
 
     fn interrupt_attempt(
@@ -5973,6 +6119,7 @@ impl RecordingSession {
             self.stream_reaper.close_input();
         }
         self.telemetry_stop.store(true, Ordering::Release);
+        self.shutdown_vad_analysis();
         let telemetry_joined = match self.telemetry_join.as_ref() {
             None => true,
             Some(join) if wait_for_thread_until(join, deadline) => {
@@ -6253,6 +6400,7 @@ impl RecordingSession {
                 "noise_threshold_dbfs": self.snapshot.noise_threshold_dbfs,
                 "silence_duration_ms": self.snapshot.silence_duration_ms,
                 "silence_threshold_dbfs": self.snapshot.silence_threshold_dbfs,
+                "silence_detector": self.snapshot.silence_detector,
                 "started_at": self.snapshot.started_at,
                 "updated_at": self.snapshot.updated_at,
             }),
@@ -6352,6 +6500,7 @@ impl RecordingSession {
                 "noise_threshold_dbfs": self.snapshot.noise_threshold_dbfs,
                 "silence_duration_ms": self.snapshot.silence_duration_ms,
                 "silence_threshold_dbfs": self.snapshot.silence_threshold_dbfs,
+                "silence_detector": self.snapshot.silence_detector,
                 "started_at": self.snapshot.started_at,
                 "updated_at": self.snapshot.updated_at,
             }),
@@ -8296,6 +8445,7 @@ fn publish_leased_block_with_preview(
     let waveform_packet = waveform_preview
         .as_deref_mut()
         .and_then(|preview| preview.prepare(block_start, &mono));
+    let vad_copy = silence.analysis.uses_vad().then(|| mono.clone());
     if writer.try_send(WriterMessage::Samples(mono)).is_err() {
         queue.release(frames);
         let rollback_succeeded = captured
@@ -8331,13 +8481,61 @@ fn publish_leased_block_with_preview(
         apply_digital_silence_block(previous_digital_silence, digital_silence_block),
         Ordering::Release,
     );
+    let use_vad = silence.analysis.uses_vad();
+    if use_vad {
+        drop(analysis_write);
+        let generation = silence.analysis.generation.load(Ordering::Acquire);
+        let Some(tx) = silence.analysis.tx.as_ref() else {
+            fail_capture_block(
+                "speech VAD analysis channel is missing".to_string(),
+                frames,
+                writer,
+                overflow,
+                faulted,
+                queue,
+                enqueue_lease,
+                fault_persistence,
+            );
+            return;
+        };
+        if tx
+            .try_send(VadAnalysisMessage::Block {
+                samples: vad_copy.unwrap_or_default(),
+                block_start,
+                block_end,
+                generation,
+            })
+            .is_err()
+        {
+            fail_capture_block(
+                "speech VAD analysis queue exceeded its capacity".to_string(),
+                frames,
+                writer,
+                overflow,
+                faulted,
+                queue,
+                enqueue_lease,
+                fault_persistence,
+            );
+        }
+        let previous_peak = f32::from_bits(peak_bits.load(Ordering::Relaxed));
+        let previous_rms = f32::from_bits(rms_bits.load(Ordering::Relaxed));
+        let smoothed_peak = peak.max(previous_peak * 0.86);
+        let smoothed_rms = if previous_rms <= f32::EPSILON {
+            rms
+        } else {
+            previous_rms * 0.72 + rms * 0.28
+        };
+        peak_bits.store(smoothed_peak.to_bits(), Ordering::Relaxed);
+        rms_bits.store(smoothed_rms.to_bits(), Ordering::Relaxed);
+        return;
+    }
     annotate_attempt_block(
         &silence.head_silence,
         &silence.silence_samples,
         &silence.last_signal_sample,
         &silence.attempt_signal_start_sample,
-        &silence.threshold_bits,
-        rms,
+        energy_is_speech(&silence.threshold_bits, rms),
         frames,
         block_start,
         block_end,
@@ -9398,6 +9596,7 @@ mod tests {
                     capture_heartbeat: Arc::new(AtomicU64::new(0)),
                     head_silence,
                     bandwidth: crate::bandwidth::BandwidthProbe::default(),
+                    analysis: SilenceAnalysisPorts::energy(),
                 },
             }
         }
@@ -9510,6 +9709,7 @@ mod tests {
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
             head_silence: test_head_silence_monitor(),
             bandwidth: crate::bandwidth::BandwidthProbe::default(),
+            analysis: SilenceAnalysisPorts::energy(),
         };
         const BLOCKS: usize = 4;
         const FRAMES_PER_BLOCK: usize = 4;
@@ -9615,6 +9815,7 @@ mod tests {
             noise_threshold_dbfs: Some(-42.0),
             silence_duration_ms: 1_000,
             silence_threshold_dbfs: -42.0,
+            silence_detector: SilenceDetector::Energy,
             items: vec![ItemState {
                 id: "001".to_string(),
                 text: "测试文本".to_string(),
@@ -9734,6 +9935,9 @@ mod tests {
             silence_duration_ms: Arc::new(AtomicU32::new(1_000)),
             head_silence: test_head_silence_monitor(),
             bandwidth: crate::bandwidth::BandwidthProbe::default(),
+            silence_analysis: SilenceAnalysisPorts::energy(),
+            vad_tx: None,
+            vad_join: None,
             active_attempt: None,
             metadata_fault: None,
             stop_requested: false,
@@ -10359,6 +10563,80 @@ mod tests {
     }
 
     #[test]
+    fn missing_snapshot_detector_keeps_the_energy_gate() {
+        let snapshot = test_snapshot();
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        let mut without_detector = encoded.as_object().unwrap().clone();
+        without_detector.remove("silence_detector");
+        let restored: SessionSnapshot =
+            serde_json::from_value(serde_json::Value::Object(without_detector)).unwrap();
+        assert_eq!(restored.silence_detector, SilenceDetector::Energy);
+    }
+
+    #[test]
+    fn new_session_payload_defaults_to_ai_vad() {
+        let payload: StartSessionPayload = serde_json::from_value(json!({
+            "session_dir": "/tmp/unused",
+            "session_id": "new-vad-default",
+            "sample_rate": 48_000,
+            "bit_depth": 24,
+            "silence_duration_ms": 1_000,
+            "silence_threshold_dbfs": -42.0,
+            "items": [{ "id": "001", "text": "一句" }]
+        }))
+        .unwrap();
+        assert_eq!(payload.silence_detector, SilenceDetector::Vad);
+    }
+
+    #[test]
+    fn vad_stop_trims_pad_around_detected_speech() {
+        let root = test_root("vad-stop-trims-pad");
+        let mut session = prepare_metadata_test_session(&root);
+        session.snapshot.audio_format.sample_rate = 100;
+        session.snapshot.silence_duration_ms = 200;
+        session.snapshot.silence_detector = SilenceDetector::Vad;
+        session.captured.store(100, Ordering::Release);
+        session.committed.store(100, Ordering::Release);
+        session.analyzed_samples.store(100, Ordering::Release);
+        session.last_signal_sample.store(80, Ordering::Release);
+        let (writer_tx, writer_rx) = bounded::<WriterMessage>(1);
+        session.writer_tx = writer_tx;
+        session.writer_join = Some(thread::spawn(move || {
+            if let Ok(WriterMessage::Checkpoint(reply)) = writer_rx.recv() {
+                let _ = reply.send(Ok(100));
+            }
+        }));
+        session
+            .attempt_signal_start_sample
+            .store(50, Ordering::Release);
+        session
+            .head_silence
+            .passed_sample
+            .store(40, Ordering::Release);
+        session
+            .head_silence
+            .phase
+            .store(HEAD_SILENCE_SPEECH_STARTED, Ordering::Release);
+        session.active_attempt = Some(ActiveAttempt {
+            item_id: "001".to_string(),
+            attempt_id: "001-a1".to_string(),
+            start_sample: 10,
+            recording_started_sample: 10,
+            input_discontinuity_count_at_start: 0,
+        });
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+
+        let stopped = engine.stop_attempt(true, true, true).unwrap();
+        assert_eq!(stopped["attempt"]["start_sample"], 30);
+        assert_eq!(stopped["attempt"]["end_sample"], 100);
+        assert_eq!(stopped["attempt"]["content_started_sample"], 50);
+        assert_eq!(stopped["attempt"]["tail_silence_samples"], 20);
+        drop(engine.session.take());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn forced_stop_keeps_detected_speech_when_tail_silence_is_short() {
         let root = test_root("forced-stop-short-tail");
         let mut session = prepare_metadata_test_session(&root);
@@ -10819,6 +11097,9 @@ mod tests {
             silence_duration_ms: Arc::new(AtomicU32::new(1_000)),
             head_silence: test_head_silence_monitor(),
             bandwidth: crate::bandwidth::BandwidthProbe::default(),
+            silence_analysis: SilenceAnalysisPorts::energy(),
+            vad_tx: None,
+            vad_join: None,
             active_attempt: None,
             metadata_fault: None,
             stop_requested: false,
@@ -11253,6 +11534,7 @@ mod tests {
             capture_heartbeat: Arc::new(AtomicU64::new(1)),
             head_silence: test_head_silence_monitor(),
             bandwidth: crate::bandwidth::BandwidthProbe::default(),
+            analysis: SilenceAnalysisPorts::energy(),
         };
         publish_block(
             vec![0.25, -0.25, 0.5, -0.5],
@@ -12103,6 +12385,7 @@ mod tests {
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
             head_silence: test_head_silence_monitor(),
             bandwidth: crate::bandwidth::BandwidthProbe::default(),
+            analysis: SilenceAnalysisPorts::energy(),
         };
         let (write_entered_tx, write_entered_rx) = bounded(1);
         let (release_write_tx, release_write_rx) = bounded(1);
@@ -12485,6 +12768,7 @@ mod tests {
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
             head_silence: test_head_silence_monitor(),
             bandwidth: crate::bandwidth::BandwidthProbe::default(),
+            analysis: SilenceAnalysisPorts::energy(),
         };
         const BLOCK_FRAMES: usize = 480;
         const BLOCK_COUNT: usize = 600;
@@ -12565,6 +12849,7 @@ mod tests {
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
             head_silence: test_head_silence_monitor(),
             bandwidth: crate::bandwidth::BandwidthProbe::default(),
+            analysis: SilenceAnalysisPorts::energy(),
         };
 
         publish_block(
@@ -12718,6 +13003,7 @@ mod tests {
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
             head_silence: test_head_silence_monitor(),
             bandwidth: crate::bandwidth::BandwidthProbe::default(),
+            analysis: SilenceAnalysisPorts::energy(),
         };
 
         publish_block(
@@ -12771,6 +13057,7 @@ mod tests {
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
             head_silence: test_head_silence_monitor(),
             bandwidth: crate::bandwidth::BandwidthProbe::default(),
+            analysis: SilenceAnalysisPorts::energy(),
         };
         publish_block(
             vec![0.1, 0.2, 0.3],
@@ -12835,6 +13122,7 @@ mod tests {
             capture_heartbeat: Arc::new(AtomicU64::new(0)),
             head_silence: test_head_silence_monitor(),
             bandwidth: crate::bandwidth::BandwidthProbe::default(),
+            analysis: SilenceAnalysisPorts::energy(),
         };
         const BLOCK_FRAMES: usize = 4_800;
         let block_count = usize::try_from(queue.max_frames).unwrap() / BLOCK_FRAMES;
@@ -12920,6 +13208,9 @@ mod tests {
             silence_duration_ms: Arc::new(AtomicU32::new(1_000)),
             head_silence: test_head_silence_monitor(),
             bandwidth: crate::bandwidth::BandwidthProbe::default(),
+            silence_analysis: SilenceAnalysisPorts::energy(),
+            vad_tx: None,
+            vad_join: None,
             active_attempt: None,
             metadata_fault: None,
             stop_requested: false,
@@ -13016,6 +13307,9 @@ mod tests {
             silence_duration_ms: Arc::new(AtomicU32::new(1_000)),
             head_silence: test_head_silence_monitor(),
             bandwidth: crate::bandwidth::BandwidthProbe::default(),
+            silence_analysis: SilenceAnalysisPorts::energy(),
+            vad_tx: None,
+            vad_join: None,
             active_attempt: Some(ActiveAttempt {
                 item_id: "001".to_string(),
                 attempt_id: "001-a1".to_string(),
@@ -13169,6 +13463,7 @@ mod tests {
                 silence_duration_ms: 1_000,
                 noise_threshold_dbfs: Some(-42.0),
                 silence_threshold_dbfs: -42.0,
+                silence_detector: SilenceDetector::Energy,
                 items: vec![ScriptItem {
                     id: "001".to_string(),
                     text: "第一句".to_string(),
@@ -13919,6 +14214,7 @@ mod tests {
             silence_duration_ms: 1_000,
             noise_threshold_dbfs: Some(-42.0),
             silence_threshold_dbfs: -42.0,
+            silence_detector: SilenceDetector::Energy,
             items: vec![ScriptItem {
                 id: "001".to_string(),
                 text: "第一句".to_string(),
@@ -13985,6 +14281,7 @@ mod tests {
                 silence_duration_ms: 1_000,
                 noise_threshold_dbfs: Some(-42.0),
                 silence_threshold_dbfs: -42.0,
+                silence_detector: SilenceDetector::Energy,
                 items: vec![ScriptItem {
                     id: "001".to_string(),
                     text: "第一句".to_string(),
@@ -14837,6 +15134,9 @@ mod tests {
             silence_duration_ms: Arc::new(AtomicU32::new(1_000)),
             head_silence: test_head_silence_monitor(),
             bandwidth: crate::bandwidth::BandwidthProbe::default(),
+            silence_analysis: SilenceAnalysisPorts::energy(),
+            vad_tx: None,
+            vad_join: None,
             active_attempt: None,
             metadata_fault: Some("injected initial persist failure".to_string()),
             stop_requested: false,

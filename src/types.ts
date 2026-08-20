@@ -56,6 +56,12 @@ export type ItemState = ScriptItem & {
 
 export type CaptureShareMode = 'exclusive' | 'shared';
 
+export type SilenceDetector = 'energy' | 'vad';
+
+export function normalizeSilenceDetector(value: unknown): SilenceDetector {
+  return value === 'vad' ? 'vad' : 'energy';
+}
+
 export type CaptureProvenanceSpan = {
   start_sample: number;
   end_sample: number;
@@ -99,6 +105,7 @@ export type SessionSnapshot = {
   noise_threshold_dbfs?: number;
   silence_duration_ms: number;
   silence_threshold_dbfs: number;
+  silence_detector?: SilenceDetector;
   items: ItemState[];
 };
 
@@ -199,6 +206,7 @@ export type Meter = {
   content_started_sample?: number;
   silence_threshold_dbfs: number;
   silence_duration_ms: number;
+  silence_detector?: SilenceDetector;
   waveform: Array<[number, number]>;
   waveform_end_sample?: number;
 };

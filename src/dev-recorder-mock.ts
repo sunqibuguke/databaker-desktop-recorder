@@ -267,6 +267,7 @@ export function installDevRecorderMock() {
       noise_threshold_dbfs: recording.noise_check?.threshold_dbfs ?? -42,
       silence_duration_ms: 1_000,
       silence_threshold_dbfs: -42,
+      silence_detector: 'energy',
       items: Array.from({ length: recording.total_items }, (_, index) => ({
         id: String(index + 1).padStart(3, '0'),
         text: `恢复录制测试文本 ${index + 1}`,
@@ -354,6 +355,7 @@ export function installDevRecorderMock() {
       content_started_sample: activeAttempt?.content_started_sample ?? 0,
       silence_threshold_dbfs: snapshot?.silence_threshold_dbfs ?? -42,
       silence_duration_ms: snapshot?.silence_duration_ms ?? 1_000,
+      silence_detector: snapshot?.silence_detector ?? 'vad',
       waveform,
       waveform_end_sample: waveformSampleCursor,
     };
@@ -406,6 +408,7 @@ export function installDevRecorderMock() {
         noise_check: null,
         silence_duration_ms: Number(data.silence_duration_ms ?? 1_000),
         silence_threshold_dbfs: Number(data.silence_threshold_dbfs ?? -42),
+        silence_detector: data.silence_detector === 'energy' ? 'energy' : 'vad',
         items: items.map((item) => ({ ...item, status: 'pending', attempts: [], selected_attempt_id: null })),
       };
       captureActive = command === 'start_session';
@@ -450,6 +453,7 @@ export function installDevRecorderMock() {
         noise_check: recording.noise_check,
         silence_duration_ms: 1_000,
         silence_threshold_dbfs: -42,
+        silence_detector: 'energy',
         items: Array.from({ length: recording.total_items }, (_, index) => ({
           id: String(index + 1).padStart(3, '0'),
           text: `恢复录制测试文本 ${index + 1}`,
@@ -613,10 +617,14 @@ export function installDevRecorderMock() {
       if (typeof data.enforce_silence === 'boolean') enforceSilence = data.enforce_silence;
       snapshot.silence_threshold_dbfs = thresholdDbfs;
       snapshot.silence_duration_ms = silenceDurationMs;
+      if (data.silence_detector === 'energy' || data.silence_detector === 'vad') {
+        snapshot.silence_detector = data.silence_detector;
+      }
       snapshot.updated_at = new Date().toISOString();
       return {
         threshold_dbfs: thresholdDbfs,
         silence_duration_ms: silenceDurationMs,
+        silence_detector: snapshot.silence_detector,
         analysis_boundary: capturedSamples,
         active_attempt: Boolean(activeAttempt),
         reset_kind: resetKind,

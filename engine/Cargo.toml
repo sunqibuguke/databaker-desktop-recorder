@@ -18,6 +18,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # CPU or DPC pressure; capture faults still remain fail-closed.
 cpal = { path = "vendor/cpal", features = ["realtime"] }
 crossbeam-channel = "0.5"
+earshot = "1.2.2"
 fs2 = "0.4.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
