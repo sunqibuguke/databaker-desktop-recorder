@@ -4065,7 +4065,8 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             onKeyDown={(event) => moveItemListFocus(event, index)}
           >
             <span className={`item-state ${item.status}`}>{item.status === 'accepted' ? <Icon name="check" size={12} /> : item.status === 'skipped' ? '—' : String(index + 1).padStart(2, '0')}</span>
-            <span className="item-copy"><strong>{item.id}</strong><small>{item.text}</small>{normalizedLabel || labelBoundary ? <span className="item-label-line"><b>{labelBoundary ? t('recorder.labelChanged') : t('recorder.labelShort')}</b><em>{labelValue}</em></span> : null}</span>
+            <span className="item-copy"><strong>{item.id}</strong><small>{item.text}</small></span>
+            {normalizedLabel || labelBoundary ? <span className="item-label-line"><b>{labelBoundary ? t('recorder.labelChanged') : t('recorder.labelShort')}</b><em className="item-label-value" title={normalizedLabel || undefined}>{labelValue}</em></span> : null}
             <span className="item-meta">
               <em className={statusClass}>{statusLabel(item.status)}</em>
               {requiresRerecord ? <i className="item-rerecord-mark">{t('recorder.requiresRerecord')}</i> : null}

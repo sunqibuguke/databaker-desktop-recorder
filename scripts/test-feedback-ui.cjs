@@ -20,6 +20,7 @@ assert.match(recorder, /findNextRerecordIndex\(items, currentIndex\)/);
 assert.match(recorder, /scrollIntoView\(\{\s*block: 'nearest'/);
 assert.match(recorder, /tabIndex=\{index === currentIndex \? 0 : -1\}/);
 assert.match(recorder, /event\.key === 'ArrowDown'/);
+assert.match(recorder, /className="item-label-value" title=\{normalizedLabel \|\| undefined\}/);
 assert.match(recorder, /testId="recorder-label-font-size"/);
 assert.match(recorder, /labelTransition\(currentItem\.label, nextItem\.label\)/);
 assert.match(recorder, /testId="rule-pause-on-label-change" checked=\{automationRules\.pauseOnLabelChange\}/);
@@ -57,6 +58,15 @@ assert.match(prompter, /className="prompter-label-transition" role="status" aria
 
 assert.match(css, /--label-change:\s*#[0-9a-f]{6}/i);
 assert.match(css, /\.professional-item\.label-boundary/);
+assert.match(css, /\.professional-item\s*\{[^}]*grid-template-areas:\s*"state copy meta" "state label label"/);
+assert.match(css, /\.item-label-line em\s*\{[^}]*white-space:\s*nowrap[^}]*text-overflow:\s*ellipsis/);
+assert.match(css, /\.professional-item\.active \.item-label-line em,[\s\S]*?\.professional-item:focus-visible \.item-label-line em\s*\{[^}]*overflow-wrap:\s*anywhere[^}]*white-space:\s*normal[^}]*-webkit-line-clamp:\s*2/);
+const ordinaryLabelBadgeRule = css.match(/\.item-label-line b\s*\{([^}]*)\}/)?.[1] ?? '';
+const ordinaryLabelValueRule = css.match(/\.item-label-line em\s*\{([^}]*)\}/)?.[1] ?? '';
+assert.doesNotMatch(ordinaryLabelBadgeRule, /label-change/, 'ordinary labels must not use the label-change accent');
+assert.doesNotMatch(ordinaryLabelValueRule, /label-change/, 'ordinary label values must not use the label-change accent');
+assert.match(css, /\.professional-item\.label-boundary \.item-label-line b\s*\{[^}]*var\(--label-change-line\)[^}]*var\(--label-change-bright\)[^}]*var\(--label-change-fill\)/);
+assert.match(css, /\.professional-item\.label-boundary \.item-label-line em\s*\{[^}]*var\(--label-change\)/);
 assert.match(css, /\.prompt-surface\.label-changed/);
 assert.match(css, /\.prompt-surface\s*\{[^}]*position:\s*relative/);
 assert.match(css, /\.label-transition-chip\s*\{[^}]*position:\s*absolute/);
@@ -86,6 +96,18 @@ function contrast(foreground, background) {
 assert.ok(
   contrast(token('label-change'), token('library')) >= 4.5,
   'label-change text must meet WCAG AA contrast on the sidebar surface',
+);
+assert.ok(
+  contrast(token('label'), token('library')) >= 4.5,
+  'ordinary label text must meet WCAG AA contrast on the sidebar surface',
+);
+assert.ok(
+  contrast(token('label'), token('library-raised')) >= 4.5,
+  'ordinary label badge text must meet WCAG AA contrast',
+);
+assert.ok(
+  contrast(token('text-2'), token('control')) >= 4.5,
+  'selected ordinary label text must meet WCAG AA contrast',
 );
 assert.ok(
   contrast(token('label-change-bright'), token('chrome')) >= 4.5,
