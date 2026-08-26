@@ -26,12 +26,15 @@ assert.match(recorder, /testId="rule-pause-on-label-change" checked=\{automation
 assert.match(recorder, /applyAutomationRule\('pauseOnLabelChange', enabled\)/);
 assert.match(recorder, /pauseOnLabelChange: automationRules\.pauseOnLabelChange/);
 assert.match(recorder, /startAttempt\(nextItem, \{ acknowledgeLabelTransition: false \}\)/);
+assert.match(recorder, /acceptTarget\?\.status === 'review' \|\| acceptPausesForLabelChange/);
 assert.match(recorder, /acceptAttempt\(retainedDeliveryAttempt\.attempt_id\)/);
 assert.match(recorder, /nextPhysicalItemIndex\(currentIndex, latest\.items\.length\)/);
 assert.match(recorder, /moveToAutomaticTarget\(currentItem, latest\.items\[nextIndex\], nextIndex\)/);
 assert.match(recorder, /selectionIndexAfterStoppedRetake/);
 assert.match(recorder, /setRetakeItemId\(item\.status === 'pending' \? null : item\.id\)/);
 assert.match(recorder, /retakeItemId === currentItem\.id/);
+assert.match(recorder, /const isRetakeDecision = hasRetakeDecision/);
+assert.match(recorder, /hasRetakeVersionChoice/);
 assert.ok(
   recorder.indexOf('if (isRetakeDecision)')
     < recorder.indexOf('const continuation = continuationAfterAccept'),

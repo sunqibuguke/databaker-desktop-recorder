@@ -165,6 +165,14 @@ async function main() {
   assert.deepEqual(headeredTabularTxt.errors, []);
   assert.deepEqual(headeredTabularTxt.items[0], { id: '0001', text: '第一句', label: '自然' });
 
+  const malformedHeaderedTxt = parseScript(
+    '序号\t正文\t标签\n0001\t第一句\t自然\t多余',
+    'malformed-legacy.txt',
+  );
+  assert.equal(malformedHeaderedTxt.mode, 'structured');
+  assert.match(malformedHeaderedTxt.errors.join('\n'), /第 2 行：必须正好包含三列/);
+  assert.equal(malformedHeaderedTxt.items.length, 0);
+
   const proseTxtWithTabs = parseScript('开场\t请自然朗读\t不要拆列\n结束语\t保持完整\t谢谢', 'notes.txt');
   assert.equal(proseTxtWithTabs.mode, 'plain_text_compat', '首列不像序号的三段 TXT 仍按每行正文解析');
   assert.equal(proseTxtWithTabs.items[0].text, '开场\t请自然朗读\t不要拆列');

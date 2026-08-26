@@ -931,7 +931,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   );
   const acceptButtonLabel = finalReview || !automationRules.autoStartNext
     ? t('recorder.acceptThis')
-    : acceptPausesForLabelChange
+    : acceptTarget?.status === 'review' || acceptPausesForLabelChange
       ? t('recorder.acceptAndReviewNext')
       : t('recorder.acceptAndNext');
   const sampleRateForDisplay = snapshot?.audio_format.sample_rate ?? sampleRate;
@@ -1021,11 +1021,19 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     && reviewAttempt?.attempt_id !== retainedDeliveryAttempt.attempt_id
     ? reviewAttempt
     : undefined;
-  const hasRetakeDecision = Boolean(
+  const hasRetakeVersionChoice = Boolean(
     currentItem?.status === 'review'
     && retainedDeliveryAttempt
     && retakeCandidateAttempt
     && retakeCandidateAttempt.attempt_id !== retainedDeliveryAttempt.attempt_id,
+  );
+  const hasRetakeDecision = Boolean(
+    currentItem?.status === 'review'
+    && (
+      retakeItemId === currentItem.id
+      || itemHasPendingRetakeDecision(currentItem)
+      || hasRetakeVersionChoice
+    ),
   );
   const hasRetainedPreviousWarning = Boolean(
     currentItem && itemHasRetainedPreviousWarning(currentItem),
@@ -2677,15 +2685,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     if (captureFault || !currentItem || currentItem.status !== 'review' || recording) return;
     const retainedAttemptId = currentItem.selected_attempt_id;
     const retakeCandidateId = retakeCandidateAttempt?.attempt_id;
-    const isRetakeDecision = Boolean(
-      retakeItemId === currentItem.id
-      || itemHasPendingRetakeDecision(currentItem)
-      || (
-        retainedAttemptId
-        && retakeCandidateId
-        && retainedAttemptId !== retakeCandidateId
-      ),
-    );
+    const isRetakeDecision = hasRetakeDecision;
     const attemptId = targetAttemptId
       ?? retakeCandidateId
       ?? reviewAttemptId
@@ -4115,7 +4115,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           <section className="signal-monitor"><header><div><strong>{t('recorder.waveform')}</strong>{captureActive || shouldUseRecordedSilencePair(recording, reviewAttempt) ? <SilencePairReadout pair={silencePair} /> : null}</div><div>{captureActive ? <><span>RMS <b>{db(meter.rms)}</b></span><span>PEAK <b className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</b></span></> : <span>{reviewAttempt ? formatDuration(reviewAttempt.end_sample - reviewAttempt.start_sample, sampleRateForDisplay) : t('recorder.noTakeWaveform')}</span>}</div></header><div className="signal-scope"><WebGLWaveform key={showReviewWaveform ? `${sessionDir}:${reviewAttempt?.attempt_id}` : `${sessionDir}:${waveformGeneration}`} mode={showReviewWaveform ? 'review' : 'live'} bins={showReviewWaveform ? reviewWaveformBins : (meter.waveform ?? [])} capturedSamples={meter.captured_samples} waveformEndSample={meter.waveform_end_sample} recording={waveformTakeIsActive(recording && !captureFault, hasSpoken)} takeStartSample={recording && !captureFault ? liveTakeStartSample : undefined} takeEndSample={recording && !captureFault ? liveTakeEndSample : undefined} sampleRate={sampleRateForDisplay} />{captureActive ? <LiveSilenceHint liveMs={displayedLiveSilenceMs} requiredMs={effectiveSilenceDurationMs} /> : null}<div className="scope-scale"><span>−1.0</span><span>−0.5</span><span>0</span><span>+0.5</span><span>+1.0</span></div></div><div className="horizontal-meter"><i className="meter-rms" style={{ width: `${rmsPercent}%` }} /><i className="meter-peak" style={{ left: `${peakPercent}%` }} /></div></section>
           <section className="transport-panel">
             <div className="transport-review">
-              {hasRetakeDecision
+              {hasRetakeVersionChoice
                 ? <span className="retake-decision-summary" data-testid="retake-decision-summary"><b>{t('recorder.currentDeliveryVersion')}</b><i aria-hidden="true">→</i><strong>{t('recorder.retakeCandidateVersion')}</strong><em>{t('recorder.retakeDecisionHint')}</em></span>
                 : hasRetainedPreviousWarning
                   ? <span className="retake-retained-warning" role="status"><Icon name="meter" size={13} />{t('recorder.retakeFailedPreviousRetained')}</span>

@@ -165,8 +165,12 @@ function looksLikeHeaderlessCsv(rows: string[][]): boolean {
 }
 
 function looksLikeStrictThreeColumnTable(rows: string[][]): boolean {
-  if (!rows.length || !rows.every((row) => row.length === 3)) return false;
+  if (!rows.length) return false;
+  // An explicit complete header is authoritative. Keep the file in
+  // structured mode so malformed data rows surface as import errors instead
+  // of silently falling back to label-less plain text.
   if (recognizedHeaderCount(rows[0]) === 3) return true;
+  if (!rows.every((row) => row.length === 3)) return false;
   const identifier = /^(?=.*\d)[a-z0-9_-]+$/i;
   return rows.every((row) => identifier.test(row[0]));
 }
