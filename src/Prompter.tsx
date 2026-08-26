@@ -62,7 +62,7 @@ export function PrompterView() {
   useEffect(() => {
     copyRef.current?.scrollTo({ top: 0 });
     labelRef.current?.scrollTo({ top: 0 });
-  }, [state?.id, state?.text, state?.label]);
+  }, [state?.id, state?.text, state?.label, state?.labelTransition]);
   useEffect(() => {
     if (!settingsOpen) return;
     const onPointerDown = (event: PointerEvent) => {
@@ -81,6 +81,9 @@ export function PrompterView() {
   const cue = state?.cue ?? 'idle';
   const readerLabel = state?.readerCueLabel || state?.cueLabel || t('prompter.waitTask');
   const qualityWarning = cue === 'fault' ? '' : state?.qualityWarning ?? '';
+  const visibleLabelTransition = state?.labelTransition?.changed ? state.labelTransition : null;
+  const transitionFrom = visibleLabelTransition?.fromLabel || t('prompter.none');
+  const transitionTo = visibleLabelTransition?.toLabel || t('prompter.none');
   const copyLength = Array.from(state?.text ?? '').length;
   const copyDensity = copyLength > 180 ? 'dense' : copyLength > 90 ? 'long' : '';
   return <main
@@ -108,7 +111,11 @@ export function PrompterView() {
     {qualityWarning && <div className="prompter-quality-warning" role="alert"><i />{qualityWarning}</div>}
     <article className="prompter-content">
       <p ref={copyRef} className={`${copyDensity} ${cue === 'recording' ? 'live' : ''}`.trim()}>{state?.text || t('prompter.noText')}</p>
-      <aside ref={labelRef} className={`prompter-label ${state?.label ? '' : 'empty'}`}><span>{t('prompter.labelTitle')}</span><strong>{state?.label || t('prompter.none')}</strong></aside>
+      {visibleLabelTransition && <div className="prompter-label-transition" role="status" aria-live="polite" aria-atomic="true">
+        <span>{t('prompter.labelChanged')}</span>
+        <strong>{t('prompter.labelChangedFromTo', { from: transitionFrom, to: transitionTo })}</strong>
+      </div>}
+      <aside ref={labelRef} className={`prompter-label ${state?.label ? '' : 'empty'}${visibleLabelTransition ? ' changed' : ''}`}><span>{t('prompter.labelTitle')}</span><strong>{state?.label || t('prompter.none')}</strong></aside>
     </article>
     <footer className="prompter-footer">
       <label className="prompter-type-size" data-testid="prompter-font-size">
@@ -134,7 +141,7 @@ export function PrompterView() {
           type="range"
           min={MIN_PROMPTER_LABEL_FONT_SIZE}
           max={MAX_PROMPTER_LABEL_FONT_SIZE}
-          step={1}
+          step={2}
           value={appearance.labelFontSize}
           aria-label={t('prompter.labelFontSize')}
           aria-valuetext={t('prompter.fontSizeValue', { size: appearance.labelFontSize })}
@@ -178,7 +185,7 @@ export function PrompterView() {
               type="range"
               min={MIN_PROMPTER_LABEL_FONT_SIZE}
               max={MAX_PROMPTER_LABEL_FONT_SIZE}
-              step={1}
+              step={2}
               value={appearance.labelFontSize}
               aria-valuetext={t('prompter.fontSizeValue', { size: appearance.labelFontSize })}
               onChange={(event) => commitAppearance({

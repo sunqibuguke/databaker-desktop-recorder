@@ -15,13 +15,22 @@ async function main() {
     continuationAfterAccept,
     executeSafePause,
     findNextActionableItemIndex,
+    findNextRerecordIndex,
     idlePrimaryAction,
+    isLabelBoundary,
     isCurrentSessionNoiseCheckOperation,
     isFinalReview,
+    itemHasPendingRetakeDecision,
+    itemHasRetainedPreviousWarning,
+    itemRequiresRerecord,
+    labelTransition,
     noiseCheckShortcutAction,
     noiseLevelPercent,
     noiseWindowState,
+    normalizeScriptLabel,
+    nextPhysicalItemIndex,
     resolveRunningItemIndex,
+    selectionIndexAfterStoppedRetake,
     sessionNoiseGate,
     shouldAutoRunSessionNoiseCheck,
     shouldShowSessionNoiseCheckDialog,
@@ -56,6 +65,31 @@ async function main() {
   } = await import(pathToFileURL(captureConfigurationModulePath).href);
 
   const item = (status) => ({ status });
+
+  assert.equal(normalizeScriptLabel('  正常音量  '), '正常音量');
+  assert.equal(normalizeScriptLabel(null), '');
+  assert.deepEqual(
+    labelTransition('  正常音量 ', '高音量  '),
+    { changed: true, fromLabel: '正常音量', toLabel: '高音量' },
+    '标签转换为 UI 提供 trim 后的前后文案',
+  );
+  assert.deepEqual(
+    labelTransition(' 正常音量', '正常音量 '),
+    { changed: false, fromLabel: '正常音量', toLabel: '正常音量' },
+  );
+  assert.equal(labelTransition('', '高音量').changed, true, '空标签到非空标签也是边界');
+  assert.equal(labelTransition(undefined, '   ').changed, false);
+  const labelledItems = [
+    { label: '正常音量' },
+    { label: ' 正常音量 ' },
+    { label: '高音量' },
+    { label: '' },
+  ];
+  assert.equal(isLabelBoundary(labelledItems, 0), false, '第一句没有前一句，不是边界');
+  assert.equal(isLabelBoundary(labelledItems, 1), false);
+  assert.equal(isLabelBoundary(labelledItems, 2), true);
+  assert.equal(isLabelBoundary(labelledItems, 3), true);
+  assert.equal(isLabelBoundary(labelledItems, 4), false);
 
   assert.equal(sessionNoiseGate(null, false), 'pending');
   assert.equal(sessionNoiseGate(null, true), 'checking');
@@ -451,6 +485,143 @@ async function main() {
     0,
     'navigation must wrap to an earlier review row',
   );
+
+  const acceptedAttempt = (attemptId) => ({ attempt_id: attemptId, status: 'accepted' });
+  const rerecordAttempt = (attemptId) => ({ attempt_id: attemptId, status: 'needs_rerecord' });
+  const unresolvedRerecord = {
+    status: 'review',
+    attempts: [rerecordAttempt('a1')],
+    selected_attempt_id: null,
+  };
+  const retainedPrevious = {
+    status: 'accepted',
+    attempts: [acceptedAttempt('old'), rerecordAttempt('new')],
+    selected_attempt_id: 'old',
+  };
+  assert.equal(
+    itemHasPendingRetakeDecision({
+      status: 'review',
+      attempts: [{ attempt_id: 'first', status: 'recorded' }],
+      selected_attempt_id: null,
+    }),
+    false,
+    '首录的单一候选不是重录决策',
+  );
+  assert.equal(
+    itemHasPendingRetakeDecision({
+      status: 'review',
+      attempts: [
+        { attempt_id: 'first', status: 'recorded' },
+        { attempt_id: 'retake', status: 'recorded' },
+      ],
+      selected_attempt_id: null,
+    }),
+    true,
+    '无旧 selected 的再次录制也必须从 attempt 历史恢复为重录决策',
+  );
+  assert.equal(
+    itemHasPendingRetakeDecision({
+      status: 'review',
+      attempts: [
+        { attempt_id: 'bad', status: 'needs_rerecord' },
+        { attempt_id: 'retake', status: 'recorded' },
+      ],
+      selected_attempt_id: null,
+    }),
+    true,
+    '异常尝试后的干净重录在重启后仍走物理下一句',
+  );
+  assert.equal(
+    selectionIndexAfterStoppedRetake(
+      [retainedPrevious, { status: 'pending', attempts: [], selected_attempt_id: null }],
+      0,
+      true,
+      1,
+    ),
+    1,
+    '暂停一条异常重录时不得用旧 keepItemId 覆盖已选定的物理下一句',
+  );
+  assert.equal(
+    selectionIndexAfterStoppedRetake(
+      [unresolvedRerecord, { status: 'pending', attempts: [], selected_attempt_id: null }],
+      0,
+      true,
+      1,
+    ),
+    0,
+    '无旧合格版本的异常尝试在暂停后仍停在本句待重录',
+  );
+  assert.equal(
+    selectionIndexAfterStoppedRetake(
+      [retainedPrevious, { status: 'pending', attempts: [], selected_attempt_id: null }],
+      0,
+      true,
+      2,
+    ),
+    0,
+    '旧“沿用旧版”警告不得把本次无语音取消误当成新异常尝试',
+  );
+  assert.equal(
+    itemRequiresRerecord(unresolvedRerecord),
+    true,
+    '最新尝试需重录且没有可用选中版本时才进入问题队列',
+  );
+  assert.equal(
+    idlePrimaryAction([unresolvedRerecord], 0),
+    'start',
+    '定位到无合格版本的问题句后，Space 必须直接开始重录而不是尝试确认异常版本',
+  );
+  assert.equal(itemHasRetainedPreviousWarning(unresolvedRerecord), false);
+  assert.equal(itemRequiresRerecord(retainedPrevious), false);
+  assert.equal(
+    itemHasRetainedPreviousWarning(retainedPrevious),
+    true,
+    '最新重录异常但旧合格版本仍被选中时只显示沿用警告',
+  );
+  assert.equal(
+    itemRequiresRerecord({
+      status: 'review',
+      attempts: [rerecordAttempt('a1'), { attempt_id: 'a2', status: 'recorded' }],
+      selected_attempt_id: null,
+    }),
+    false,
+    '只检查最新尝试，不应让较早的 needs_rerecord 污染新版本',
+  );
+  assert.equal(
+    itemRequiresRerecord({
+      status: 'accepted',
+      attempts: [acceptedAttempt('old'), rerecordAttempt('new')],
+      selected_attempt_id: 'missing',
+    }),
+    true,
+    '指向不存在尝试的 selected id 不是可用旧版本',
+  );
+  assert.equal(
+    itemRequiresRerecord({
+      status: 'accepted',
+      attempts: [{ attempt_id: 'old', status: 'rejected_by_operator' }, rerecordAttempt('new')],
+      selected_attempt_id: 'old',
+    }),
+    true,
+    '被拒绝的 selected 尝试不得被当作合格回退版本',
+  );
+  assert.equal(itemRequiresRerecord({ status: 'pending', attempts: [], selected_attempt_id: null }), false);
+
+  const rerecordQueue = [
+    unresolvedRerecord,
+    { status: 'accepted', attempts: [acceptedAttempt('b1')], selected_attempt_id: 'b1' },
+    { ...unresolvedRerecord, attempts: [rerecordAttempt('c1')] },
+    retainedPrevious,
+  ];
+  assert.equal(findNextRerecordIndex(rerecordQueue, -1), 0, '无当前句时从第一条问题句开始');
+  assert.equal(findNextRerecordIndex(rerecordQueue, 0), 2, '向后定位下一条问题句');
+  assert.equal(findNextRerecordIndex(rerecordQueue, 2), 0, '到末尾后显式回绕');
+  assert.equal(findNextRerecordIndex([retainedPrevious], 0), -1, '沿用旧版本的警告不进入需重录队列');
+  assert.equal(findNextRerecordIndex([], 0), -1);
+  assert.equal(nextPhysicalItemIndex(29, 50), 30, '重录第 30 句后只定位到物理第 31 句');
+  assert.equal(nextPhysicalItemIndex(49, 50), 49, '末句重录决策后停留在末句');
+  assert.equal(nextPhysicalItemIndex(-1, 50), 0);
+  assert.equal(nextPhysicalItemIndex(0, 0), -1);
 
   const successfulPauseCalls = [];
   const stoppedState = { snapshot: { status: 'stopped' } };

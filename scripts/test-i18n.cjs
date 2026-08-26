@@ -57,6 +57,7 @@ async function main() {
   assert.equal(t('notice.captureFinishedStay'), '采集已完成，已进入查看模式。可试听或导出；补录请点「进入录制」。');
   assert.equal(t('notice.finishSealingStay'), '正在封存母轨并进入查看…');
   assert.equal(t('recorder.exportLater'), '可试听抽检或导出');
+  assert.equal(t('recorder.review'), '待确认');
   assert.equal(t('notice.importedItems', { count: 12 }), '已导入 12 条文本');
   assert.equal(t('recorder.headTail'), '首尾静音');
   assert.equal(t('recorder.silenceFlagged', { count: 2 }), '2 条首尾不足');
@@ -94,6 +95,8 @@ async function main() {
   assert.equal(t('silence.tailEnough', { ms: '1000 ms' }), '尾已够 · 1000 ms');
   assert.equal(t('quality.bannerTitle'), '输入质量强提醒');
   assert.equal(t('issues.discontinuityTitle'), '声卡链路告警 · 未停录');
+  assert.match(t('discontinuity.withSilence', { count: 1, ms: 15 }), /需重录且不可交付/);
+  assert.equal(t('notice.jitterRetake'), '本次录音不可确认或试听，请重新录制本句。');
   assert.equal(t('exportDialog.resultOkTitle'), '导出完成');
   assert.equal(t('exportDialog.resultFailedTitle'), '导出失败');
   assert.equal(t('exportDialog.destination'), '导出到');

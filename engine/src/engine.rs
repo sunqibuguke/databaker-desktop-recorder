@@ -2102,7 +2102,7 @@ impl Engine {
         for attempt in &mut item.attempts {
             if attempt.attempt_id == attempt_id {
                 attempt.status = "accepted".to_string();
-            } else if attempt.status == "accepted" {
+            } else if matches!(attempt.status.as_str(), "recorded" | "accepted") {
                 attempt.status = "rejected_by_operator".to_string();
             }
         }
@@ -3418,7 +3418,11 @@ impl Engine {
             forced_without_tail_silence,
             tail_silence_samples: recorded_tail_silence_samples,
             required_tail_silence_samples: required_silence_samples,
-            status: "recorded".to_string(),
+            status: if recovered_discontinuity {
+                "needs_rerecord".to_string()
+            } else {
+                "recorded".to_string()
+            },
             created_at: Utc::now().to_rfc3339(),
         };
         let item = session
@@ -3427,30 +3431,29 @@ impl Engine {
             .iter_mut()
             .find(|item| item.id == active.item_id)
             .ok_or_else(|| anyhow!("item disappeared while recording"))?;
-        // Recovered USB/WASAPI jitter is a quality warning, not a delivery
-        // block. Only a clean retake auto-replaces an already accepted take;
-        // a jittered take still goes to review so the operator can confirm.
-        let replaces_accepted_version = !recovered_discontinuity
-            && item.status == "accepted"
-            && item.selected_attempt_id.is_some();
-        item.status = if replaces_accepted_version {
-            "accepted".to_string()
+        let has_accepted_selection =
+            item.selected_attempt_id
+                .as_deref()
+                .is_some_and(|selected_id| {
+                    item.attempts.iter().any(|previous| {
+                        previous.attempt_id == selected_id
+                            && previous.status == "accepted"
+                            && previous.end_sample > previous.start_sample
+                    })
+                });
+        // A clean retake is always an explicit review candidate. Keep the
+        // previously accepted version selected until the operator adopts the
+        // new candidate or explicitly keeps the old one. A recovered input gap
+        // makes this take non-deliverable; when a known-good selection exists,
+        // preserve it and keep the item accepted while retaining the bad take
+        // as durable warning evidence.
+        if recovered_discontinuity && has_accepted_selection {
+            item.status = "accepted".to_string();
         } else {
-            "review".to_string()
-        };
-        if replaces_accepted_version {
-            for previous in &mut item.attempts {
-                if previous.status == "accepted" {
-                    previous.status = "rejected_by_operator".to_string();
-                }
-            }
-            item.selected_attempt_id = Some(attempt.attempt_id.clone());
-        } else {
-            item.selected_attempt_id = None;
+            item.status = "review".to_string();
         }
-        let mut attempt = attempt;
-        if replaces_accepted_version {
-            attempt.status = "accepted".to_string();
+        if !has_accepted_selection {
+            item.selected_attempt_id = None;
         }
         item.attempts.push(attempt.clone());
         session.active_attempt = None;
@@ -3460,7 +3463,7 @@ impl Engine {
                 "item_id": active.item_id,
                 "attempt": attempt,
                 "forced": forced_without_tail_silence,
-                "auto_selected": replaces_accepted_version,
+                "auto_selected": false,
                 "tail_silence_samples": tail_silence_samples,
                 "required_tail_silence_samples": required_silence_samples,
             }),
@@ -3470,7 +3473,7 @@ impl Engine {
             "item_id": active.item_id,
             "attempt": attempt,
             "forced": forced_without_tail_silence,
-            "auto_selected": replaces_accepted_version,
+            "auto_selected": false,
             "recovered_discontinuity": recovered_discontinuity,
         }))
     }
@@ -3497,10 +3500,15 @@ impl Engine {
         {
             bail!("异常中断的录音版本不能被确认或交付");
         }
+        let is_current_accepted = selected.status == "accepted"
+            && item.selected_attempt_id.as_deref() == Some(attempt_id);
+        if selected.status != "recorded" && !is_current_accepted {
+            bail!("只能确认待审核的新录音或保留当前已确认版本");
+        }
         for attempt in &mut item.attempts {
             if attempt.attempt_id == attempt_id {
                 attempt.status = "accepted".to_string();
-            } else if attempt.status == "accepted" {
+            } else if matches!(attempt.status.as_str(), "recorded" | "accepted") {
                 attempt.status = "rejected_by_operator".to_string();
             }
         }
@@ -5058,6 +5066,12 @@ fn validate_snapshot_for_export(snapshot: &SessionSnapshot) -> Result<()> {
     validate_attempt_boundaries(snapshot, snapshot.committed_samples)?;
     validate_capture_provenance(snapshot, snapshot.committed_samples, true)?;
     for item in &snapshot.items {
+        if item.status == "review" {
+            bail!(
+                "条目 {} 存在待确认或需重录的录音版本，无法导出切片。",
+                item.id
+            );
+        }
         if item.status == "accepted" && item.selected_attempt_id.is_none() {
             bail!(
                 "条目 {} 已标记为确认，但没有选中的录音版本，无法导出切片。",
@@ -5119,6 +5133,12 @@ fn validate_snapshot_for_artifact(
         bail!("异常任务修复并检查前不能导出分段 ZIP；可先导出原始整轨或时间戳 JSON。");
     }
     for item in &snapshot.items {
+        if item.status == "review" {
+            bail!(
+                "条目 {} 存在待确认或需重录的录音版本，无法导出切片。",
+                item.id
+            );
+        }
         let Some(selected_id) = item.selected_attempt_id.as_deref() else {
             continue;
         };
@@ -9850,6 +9870,24 @@ mod tests {
         }
     }
 
+    fn test_attempt(attempt_id: &str, start_sample: u64, end_sample: u64, status: &str) -> Attempt {
+        Attempt {
+            attempt_id: attempt_id.to_string(),
+            start_sample,
+            recording_started_sample: start_sample,
+            head_silence_armed_sample: 0,
+            head_silence_passed_sample: 0,
+            required_head_silence_samples: 0,
+            content_started_sample: start_sample,
+            end_sample,
+            forced_without_tail_silence: false,
+            tail_silence_samples: 0,
+            required_tail_silence_samples: 0,
+            status: status.to_string(),
+            created_at: "2026-08-11T00:00:00Z".to_string(),
+        }
+    }
+
     fn sequenced_event(kind: &str, snapshot: &SessionSnapshot) -> Value {
         json!({
             "journal_seq": snapshot.journal_seq,
@@ -10057,6 +10095,35 @@ mod tests {
             false,
             1,
         );
+    }
+
+    #[test]
+    fn accept_attempt_can_keep_the_current_version_and_reject_new_candidates() {
+        let root = test_root("accept-keep-current-version");
+        let mut session = prepare_metadata_test_session(&root);
+        session.snapshot.items[0].status = "review".to_string();
+        session.snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
+        session.snapshot.items[0].attempts = vec![
+            test_attempt("001-a1", 0, 10, "accepted"),
+            test_attempt("001-a2", 10, 20, "recorded"),
+            test_attempt("001-a3", 20, 30, "recorded"),
+        ];
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+
+        let kept = engine.accept_attempt("001", "001-a1").unwrap();
+
+        assert_eq!(kept["attempt_id"], "001-a1");
+        let item = &engine.session.as_ref().unwrap().snapshot.items[0];
+        assert_eq!(item.status, "accepted");
+        assert_eq!(item.selected_attempt_id.as_deref(), Some("001-a1"));
+        assert_eq!(item.attempts[0].status, "accepted");
+        assert_eq!(item.attempts[1].status, "rejected_by_operator");
+        assert_eq!(item.attempts[2].status, "rejected_by_operator");
+        assert!(engine.accept_attempt("001", "001-a2").is_err());
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -10737,7 +10804,19 @@ mod tests {
         assert_eq!(stopped["attempt"]["required_tail_silence_samples"], 20);
         let session = engine.session.as_ref().unwrap();
         assert!(session.active_attempt.is_none());
-        assert_eq!(stopped["auto_selected"], true);
+        assert_eq!(stopped["auto_selected"], false);
+        assert_eq!(session.snapshot.items[0].status, "review");
+        assert_eq!(
+            session.snapshot.items[0].selected_attempt_id.as_deref(),
+            Some("001-a1")
+        );
+        assert_eq!(session.snapshot.items[0].attempts[0].status, "accepted");
+        assert_eq!(session.snapshot.items[0].attempts[1].status, "recorded");
+        assert_eq!(session.snapshot.items[0].attempts.len(), 2);
+
+        let accepted = engine.accept_attempt("001", "001-a2").unwrap();
+        assert_eq!(accepted["attempt_id"], "001-a2");
+        let session = engine.session.as_ref().unwrap();
         assert_eq!(session.snapshot.items[0].status, "accepted");
         assert_eq!(
             session.snapshot.items[0].selected_attempt_id.as_deref(),
@@ -10748,7 +10827,6 @@ mod tests {
             "rejected_by_operator"
         );
         assert_eq!(session.snapshot.items[0].attempts[1].status, "accepted");
-        assert_eq!(session.snapshot.items[0].attempts.len(), 2);
         engine
             .session
             .as_mut()
@@ -10874,8 +10952,8 @@ mod tests {
     }
 
     #[test]
-    fn recovered_discontinuity_keeps_review_and_accept_open() {
-        let root = test_root("recovered-discontinuity-keeps-review");
+    fn recovered_discontinuity_retake_keeps_the_previous_accepted_version() {
+        let root = test_root("recovered-discontinuity-keeps-previous");
         let mut session = prepare_metadata_test_session(&root);
         session.snapshot.audio_format.sample_rate = 100;
         session.snapshot.silence_duration_ms = 200;
@@ -10940,21 +11018,109 @@ mod tests {
         let stopped = engine.stop_attempt(false, true, false).unwrap();
 
         assert_eq!(stopped["recovered_discontinuity"], true);
-        assert_eq!(stopped["attempt"]["status"], "recorded");
+        assert_eq!(stopped["attempt"]["status"], "needs_rerecord");
         assert_eq!(stopped["auto_selected"], false);
-        let session = engine.session.as_ref().unwrap();
-        assert_eq!(session.snapshot.items[0].status, "review");
-        assert_eq!(session.snapshot.items[0].selected_attempt_id, None);
-        assert_eq!(session.snapshot.items[0].attempts[0].status, "accepted");
-        assert_eq!(session.snapshot.items[0].attempts[1].status, "recorded");
-        let accepted = engine.accept_attempt("001", "001-a2").unwrap();
-        assert_eq!(accepted["attempt_id"], "001-a2");
         let session = engine.session.as_ref().unwrap();
         assert_eq!(session.snapshot.items[0].status, "accepted");
         assert_eq!(
             session.snapshot.items[0].selected_attempt_id.as_deref(),
-            Some("001-a2")
+            Some("001-a1")
         );
+        assert_eq!(session.snapshot.items[0].attempts[0].status, "accepted");
+        assert_eq!(
+            session.snapshot.items[0].attempts[1].status,
+            "needs_rerecord"
+        );
+
+        assert!(engine.accept_attempt("001", "001-a2").is_err());
+        assert!(engine.render_attempt("001", "001-a2").is_err());
+        assert!(engine.preview_attempt_waveform("001", "001-a2").is_err());
+        let mut stopped_snapshot = engine.session.as_ref().unwrap().live_snapshot();
+        stopped_snapshot.status = "stopped".to_string();
+        validate_snapshot_for_artifact(&stopped_snapshot, Some(ExportArtifact::CutsZip)).unwrap();
+        engine
+            .session
+            .as_mut()
+            .unwrap()
+            .writer_join
+            .take()
+            .unwrap()
+            .join()
+            .unwrap();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovered_discontinuity_without_a_previous_version_requires_rerecord() {
+        let root = test_root("recovered-discontinuity-requires-rerecord");
+        let mut session = prepare_metadata_test_session(&root);
+        session.snapshot.audio_format.sample_rate = 100;
+        session.snapshot.silence_duration_ms = 200;
+        session
+            .capture_recovery
+            .discontinuities
+            .store(1, Ordering::Release);
+        session.head_silence = HeadSilenceMonitor::new(20);
+        session.captured.store(100, Ordering::Release);
+        session.committed.store(100, Ordering::Release);
+        session.analyzed_samples.store(100, Ordering::Release);
+        session.last_signal_sample.store(80, Ordering::Release);
+        session
+            .attempt_signal_start_sample
+            .store(50, Ordering::Release);
+        session
+            .head_silence
+            .armed_sample
+            .store(20, Ordering::Release);
+        session
+            .head_silence
+            .passed_sample
+            .store(40, Ordering::Release);
+        session
+            .head_silence
+            .phase
+            .store(HEAD_SILENCE_SPEECH_STARTED, Ordering::Release);
+        session.active_attempt = Some(ActiveAttempt {
+            item_id: "001".to_string(),
+            attempt_id: "001-a1".to_string(),
+            start_sample: 20,
+            recording_started_sample: 20,
+            input_discontinuity_count_at_start: 0,
+        });
+        let (writer_tx, writer_rx) = bounded::<WriterMessage>(1);
+        session.writer_tx = writer_tx;
+        session.writer_join = Some(thread::spawn(move || {
+            if let Ok(WriterMessage::Checkpoint(reply)) = writer_rx.recv() {
+                let _ = reply.send(Ok(100));
+            }
+        }));
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+
+        let stopped = engine.stop_attempt(false, true, false).unwrap();
+
+        assert_eq!(stopped["attempt"]["status"], "needs_rerecord");
+        assert_eq!(stopped["auto_selected"], false);
+        let session = engine.session.as_ref().unwrap();
+        assert_eq!(session.snapshot.items[0].status, "review");
+        assert!(session.snapshot.items[0].selected_attempt_id.is_none());
+        assert_eq!(
+            session.snapshot.items[0].attempts[0].status,
+            "needs_rerecord"
+        );
+
+        assert!(engine.accept_attempt("001", "001-a1").is_err());
+        assert!(engine.render_attempt("001", "001-a1").is_err());
+        assert!(engine.preview_attempt_waveform("001", "001-a1").is_err());
+        let mut stopped_snapshot = engine.session.as_ref().unwrap().live_snapshot();
+        stopped_snapshot.status = "stopped".to_string();
+        assert!(
+            validate_snapshot_for_artifact(&stopped_snapshot, Some(ExportArtifact::CutsZip))
+                .is_err()
+        );
+        validate_snapshot_for_artifact(&stopped_snapshot, Some(ExportArtifact::FullTrack)).unwrap();
+
         engine
             .session
             .as_mut()
@@ -13359,7 +13525,7 @@ mod tests {
     }
 
     #[test]
-    fn export_accepts_incomplete_tasks_but_rejects_faults_and_invalid_selected_attempts() {
+    fn export_accepts_pending_rows_but_rejects_review_and_invalid_selected_attempts() {
         let mut snapshot = test_snapshot();
         snapshot.status = "faulted".to_string();
         let error = validate_snapshot_for_export(&snapshot).unwrap_err();
@@ -13373,7 +13539,7 @@ mod tests {
         assert!(validate_snapshot_for_export(&snapshot).is_ok());
 
         snapshot.items[0].status = "review".to_string();
-        assert!(validate_snapshot_for_export(&snapshot).is_ok());
+        assert!(validate_snapshot_for_export(&snapshot).is_err());
 
         snapshot.items[0].status = "accepted".to_string();
         assert!(validate_snapshot_for_export(&snapshot).is_err());
@@ -13412,6 +13578,34 @@ mod tests {
     }
 
     #[test]
+    fn cuts_block_review_but_allow_an_accepted_previous_version_after_a_bad_retake() {
+        let mut snapshot = test_snapshot();
+        snapshot.status = "stopped".to_string();
+        snapshot.captured_samples = 30;
+        snapshot.committed_samples = 30;
+        snapshot.items[0].status = "review".to_string();
+        snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
+        snapshot.items[0].attempts = vec![
+            test_attempt("001-a1", 0, 10, "accepted"),
+            test_attempt("001-a2", 10, 20, "recorded"),
+        ];
+
+        assert!(validate_snapshot_for_artifact(&snapshot, Some(ExportArtifact::CutsZip)).is_err());
+        validate_snapshot_for_artifact(&snapshot, Some(ExportArtifact::FullTrack)).unwrap();
+        validate_snapshot_for_artifact(&snapshot, Some(ExportArtifact::TimestampsJson)).unwrap();
+
+        snapshot.items[0].status = "accepted".to_string();
+        snapshot.items[0].attempts[1].status = "needs_rerecord".to_string();
+        validate_snapshot_for_artifact(&snapshot, Some(ExportArtifact::CutsZip)).unwrap();
+        validate_snapshot_for_export(&snapshot).unwrap();
+
+        snapshot.items[0].status = "review".to_string();
+        snapshot.items[0].selected_attempt_id = None;
+        snapshot.items[0].attempts = vec![test_attempt("001-a1", 10, 20, "needs_rerecord")];
+        assert!(validate_snapshot_for_artifact(&snapshot, Some(ExportArtifact::CutsZip)).is_err());
+    }
+
+    #[test]
     fn validate_attempt_boundaries_accepts_clip_start_after_required_head_silence() {
         let mut snapshot = test_snapshot();
         snapshot.status = "stopped".to_string();
@@ -13438,7 +13632,7 @@ mod tests {
             id: "0003".to_string(),
             text: "今天过得怎么样".to_string(),
             label: "疑问句".to_string(),
-            status: "review".to_string(),
+            status: "accepted".to_string(),
             attempts: vec![Attempt {
                 attempt_id: "0003-a1".to_string(),
                 start_sample: 4_024_800,
@@ -13451,10 +13645,10 @@ mod tests {
                 forced_without_tail_silence: false,
                 tail_silence_samples: 78_240,
                 required_tail_silence_samples: 48_000,
-                status: "recorded".to_string(),
+                status: "accepted".to_string(),
                 created_at: "2026-08-18T06:29:35Z".to_string(),
             }],
-            selected_attempt_id: None,
+            selected_attempt_id: Some("0003-a1".to_string()),
         });
 
         validate_attempt_boundaries(&snapshot, snapshot.committed_samples).unwrap();
@@ -13701,7 +13895,7 @@ mod tests {
         snapshot.journal_seq = 1;
         snapshot.captured_samples = 4;
         snapshot.committed_samples = 4;
-        snapshot.items[0].status = "accepted".to_string();
+        snapshot.items[0].status = "review".to_string();
         snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
         snapshot.items[0].attempts = vec![
             Attempt {
@@ -13731,8 +13925,23 @@ mod tests {
                 forced_without_tail_silence: false,
                 tail_silence_samples: 0,
                 required_tail_silence_samples: 0,
-                status: "rejected_by_operator".to_string(),
+                status: "recorded".to_string(),
                 created_at: "2026-08-11T00:01:00Z".to_string(),
+            },
+            Attempt {
+                attempt_id: "001-a3".to_string(),
+                start_sample: 1,
+                recording_started_sample: 1,
+                head_silence_armed_sample: 0,
+                head_silence_passed_sample: 0,
+                required_head_silence_samples: 0,
+                content_started_sample: 1,
+                end_sample: 2,
+                forced_without_tail_silence: false,
+                tail_silence_samples: 0,
+                required_tail_silence_samples: 0,
+                status: "needs_rerecord".to_string(),
+                created_at: "2026-08-11T00:02:00Z".to_string(),
             },
         ];
         write_journal(&root, &[sequenced_event("session_stopped", &snapshot)]);
@@ -13743,6 +13952,16 @@ mod tests {
             .render_session_attempt_expected(&root, "resume-test", "001", "001-a2")
             .unwrap();
         assert!(PathBuf::from(rendered["file_path"].as_str().unwrap()).is_file());
+        assert!(
+            engine
+                .render_session_attempt_expected(&root, "resume-test", "001", "001-a3")
+                .is_err()
+        );
+        assert!(
+            engine
+                .select_session_attempt_expected(&root, "resume-test", "001", "001-a3")
+                .is_err()
+        );
         let selected = engine
             .select_session_attempt_expected(&root, "resume-test", "001", "001-a2")
             .unwrap();
@@ -13755,9 +13974,21 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .len(),
-            2
+            3
         );
         assert_eq!(selected["snapshot"]["items"][0]["status"], "accepted");
+        assert_eq!(
+            selected["snapshot"]["items"][0]["attempts"][0]["status"],
+            "rejected_by_operator"
+        );
+        assert_eq!(
+            selected["snapshot"]["items"][0]["attempts"][1]["status"],
+            "accepted"
+        );
+        assert_eq!(
+            selected["snapshot"]["items"][0]["attempts"][2]["status"],
+            "needs_rerecord"
+        );
         let journal = read_journal(&root).unwrap();
         assert_eq!(
             journal.entries.last().unwrap()["event"],

@@ -65,10 +65,9 @@ async function main() {
   const warning = t('discontinuity.withSilence', { count: 164, ms: discontinuityDurationMs(24_192, 48_000) });
   assert.match(warning, /164/);
   assert.match(warning, /504/);
-  assert.match(warning, /确认或重录/);
-  assert.doesNotMatch(warning, /不会进入交付/);
-  assert.match(t('notice.jitterRetake'), /仍可确认或重录/);
-  assert.doesNotMatch(t('notice.jitterRetake'), /不会进入交付/);
+  assert.match(warning, /需重录且不可交付/);
+  assert.doesNotMatch(warning, /确认或试听/);
+  assert.match(t('notice.jitterRetake'), /不可确认或试听.*重新录制/);
 
   console.log('discontinuity toast tests passed');
 }

@@ -256,6 +256,12 @@ export type SealInterruptedSessionResult = {
 
 export type PrompterCue = 'idle' | 'checking' | 'pending' | 'recording' | 'ready' | 'review' | 'complete' | 'fault';
 
+export type ScriptLabelTransition = {
+  changed: boolean;
+  fromLabel: string;
+  toLabel: string;
+};
+
 export type PrompterState = {
   sessionName: string;
   sequence: number;
@@ -263,6 +269,7 @@ export type PrompterState = {
   id: string;
   text: string;
   label: string;
+  labelTransition?: ScriptLabelTransition | null;
   cue: PrompterCue;
   cueLabel: string;
   readerCueLabel: string;

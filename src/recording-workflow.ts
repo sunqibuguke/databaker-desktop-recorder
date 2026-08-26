@@ -1,6 +1,14 @@
 import type { ItemState } from './types';
 
-type WorkflowItem = Pick<ItemState, 'status'>;
+export type WorkflowAttempt = Pick<ItemState['attempts'][number], 'attempt_id' | 'status'>;
+export type WorkflowItem = Pick<ItemState, 'status'>
+  & Partial<Pick<ItemState, 'label' | 'selected_attempt_id'>>
+  & { attempts?: readonly WorkflowAttempt[] };
+export type LabelTransition = {
+  changed: boolean;
+  fromLabel: string;
+  toLabel: string;
+};
 type PersistedNoiseCheck = { passed: boolean } | null | undefined;
 
 export type IdlePrimaryAction = 'finish' | 'accept' | 'start' | 'retake-only' | 'none';
@@ -61,6 +69,100 @@ export type SafePauseOperations<T> = {
 
 function needsHandling(item: WorkflowItem): boolean {
   return item.status === 'pending' || item.status === 'review';
+}
+
+export function normalizeScriptLabel(value: string | null | undefined): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+export function labelTransition(
+  from: string | null | undefined,
+  to: string | null | undefined,
+): LabelTransition {
+  const fromLabel = normalizeScriptLabel(from);
+  const toLabel = normalizeScriptLabel(to);
+  return { changed: fromLabel !== toLabel, fromLabel, toLabel };
+}
+
+export function isLabelBoundary(
+  items: readonly Pick<WorkflowItem, 'label'>[],
+  index: number,
+): boolean {
+  if (index <= 0 || index >= items.length) return false;
+  return labelTransition(items[index - 1]?.label, items[index]?.label).changed;
+}
+
+function latestAttempt(item: WorkflowItem): WorkflowAttempt | undefined {
+  return item.attempts?.[item.attempts.length - 1];
+}
+
+function hasUsableSelectedAttempt(item: WorkflowItem): boolean {
+  if (!item.selected_attempt_id) return false;
+  return item.attempts?.some((attempt) => (
+    attempt.attempt_id === item.selected_attempt_id && attempt.status === 'accepted'
+  )) ?? false;
+}
+
+export function itemRequiresRerecord(item: WorkflowItem): boolean {
+  return latestAttempt(item)?.status === 'needs_rerecord' && !hasUsableSelectedAttempt(item);
+}
+
+export function itemHasRetainedPreviousWarning(item: WorkflowItem): boolean {
+  return latestAttempt(item)?.status === 'needs_rerecord' && hasUsableSelectedAttempt(item);
+}
+
+export function itemHasPendingRetakeDecision(item: WorkflowItem): boolean {
+  if (item.status !== 'review') return false;
+  const attempts = item.attempts ?? [];
+  let candidateIndex = -1;
+  for (let index = attempts.length - 1; index >= 0; index -= 1) {
+    if (attempts[index]?.status === 'recorded') {
+      candidateIndex = index;
+      break;
+    }
+  }
+  if (candidateIndex < 0) return false;
+  if (item.selected_attempt_id) return item.selected_attempt_id !== attempts[candidateIndex]?.attempt_id;
+  // With no selected delivery version, a recorded candidate following any
+  // earlier persisted attempt is still a retake. Deriving this from the
+  // existing attempt history keeps the physical-next rule across restarts
+  // without adding a disk field.
+  return candidateIndex > 0;
+}
+
+export function selectionIndexAfterStoppedRetake(
+  items: readonly WorkflowItem[],
+  sourceIndex: number,
+  wasRecordingRetake: boolean,
+  attemptCountBeforeStop: number,
+): number {
+  if (sourceIndex < 0 || sourceIndex >= items.length) return sourceIndex;
+  const source = items[sourceIndex];
+  const persistedNewAttempt = (source.attempts?.length ?? 0) > attemptCountBeforeStop;
+  return wasRecordingRetake && persistedNewAttempt && itemHasRetainedPreviousWarning(source)
+    ? nextPhysicalItemIndex(sourceIndex, items.length)
+    : sourceIndex;
+}
+
+export function findNextRerecordIndex(
+  items: readonly WorkflowItem[],
+  currentIndex: number,
+): number {
+  if (!items.length) return -1;
+  const start = Number.isInteger(currentIndex) && currentIndex >= 0 && currentIndex < items.length
+    ? currentIndex
+    : -1;
+  for (let offset = 1; offset <= items.length; offset += 1) {
+    const index = (start + offset) % items.length;
+    if (itemRequiresRerecord(items[index])) return index;
+  }
+  return -1;
+}
+
+export function nextPhysicalItemIndex(currentIndex: number, itemCount: number): number {
+  if (itemCount <= 0) return -1;
+  if (currentIndex < 0) return 0;
+  return Math.min(currentIndex + 1, itemCount - 1);
 }
 
 export function areAllItemsHandled(items: readonly WorkflowItem[]): boolean {
@@ -157,6 +259,7 @@ export function idlePrimaryAction(
   if (areAllItemsHandled(items)) return 'finish';
   const currentItem = items[currentIndex];
   if (!currentItem) return 'none';
+  if (itemRequiresRerecord(currentItem)) return 'start';
   if (currentItem.status === 'review') return 'accept';
   if (currentItem.status === 'pending') return 'start';
   return 'retake-only';

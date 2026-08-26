@@ -13,6 +13,7 @@ type MockActiveAttempt = {
   required_head_silence_samples: number;
   head_silence_phase: HeadSilencePhase;
   content_started_sample: number;
+  discontinuity_injected?: boolean;
 };
 
 function previewWavBytes(seconds = 1.2, sampleRate = 48_000): ArrayBuffer {
@@ -61,6 +62,13 @@ export function installDevRecorderMock() {
   let captureActive = false;
   let mockSampleRate = 48_000;
   let recordingStartedAt = 0;
+  const configuredDiscontinuityAttempt = Number.parseInt(
+    new URLSearchParams(globalThis.location?.search ?? '').get('mockDiscontinuityAttempt') ?? '',
+    10,
+  );
+  let completedAttemptCount = 0;
+  let inputDiscontinuityCount = 0;
+  let inputDiscontinuitySilenceSamples = 0;
   let meterTimer: number | undefined;
   let mockPrompterOpen = false;
   let capturePresetStore: CapturePresetStore = { schemaVersion: 1, lastSelectedPresetId: null, presets: [] };
@@ -249,6 +257,37 @@ export function installDevRecorderMock() {
     return structuredClone(snapshot);
   }
 
+  function historicalItems(recording: RecordingHistoryEntry): SessionSnapshot['items'] {
+    const itemFrames = Math.max(1, Math.floor(recording.captured_samples / Math.max(1, recording.total_items)));
+    return Array.from({ length: recording.total_items }, (_, index) => {
+      const accepted = index < recording.accepted_items;
+      const skipped = !accepted && index < recording.accepted_items + recording.skipped_items;
+      const attemptId = `${String(index + 1).padStart(3, '0')}-a1`;
+      const startSample = Math.min(index * itemFrames, Math.max(0, recording.captured_samples - 1));
+      const endSample = Math.min(recording.captured_samples, startSample + itemFrames);
+      const attempts: Attempt[] = accepted ? [{
+        attempt_id: attemptId,
+        start_sample: startSample,
+        recording_started_sample: startSample,
+        head_silence_armed_sample: 0,
+        head_silence_passed_sample: 0,
+        required_head_silence_samples: 0,
+        content_started_sample: 0,
+        end_sample: endSample,
+        status: 'accepted',
+        created_at: recording.updated_at,
+      }] : [];
+      return {
+        id: String(index + 1).padStart(3, '0'),
+        text: `恢复录制测试文本 ${index + 1}`,
+        label: index === 0 ? '自然语气' : '',
+        status: accepted ? 'accepted' : skipped ? 'skipped' : 'pending',
+        attempts,
+        selected_attempt_id: accepted ? attemptId : null,
+      };
+    });
+  }
+
   function snapshotForRecording(recording: RecordingHistoryEntry, status = recording.status): SessionSnapshot {
     return {
       schema_version: 1,
@@ -268,23 +307,18 @@ export function installDevRecorderMock() {
       silence_duration_ms: 1_000,
       silence_threshold_dbfs: -42,
       silence_detector: 'energy',
-      items: Array.from({ length: recording.total_items }, (_, index) => ({
-        id: String(index + 1).padStart(3, '0'),
-        text: `恢复录制测试文本 ${index + 1}`,
-        label: index === 0 ? '自然语气' : '',
-        status: index < recording.accepted_items
-          ? 'accepted'
-          : index < recording.accepted_items + recording.skipped_items
-            ? 'skipped'
-            : 'pending',
-        attempts: [],
-        selected_attempt_id: null,
-      })),
+      items: historicalItems(recording),
     };
   }
 
   function emitMeter() {
     capturedSamples = Math.max(capturedSamples, Math.floor((performance.now() - recordingStartedAt) / 1_000 * mockSampleRate));
+    const committedSamples = Math.max(snapshot?.committed_samples ?? 0, capturedSamples - 2_400);
+    if (snapshot) {
+      snapshot.captured_samples = capturedSamples;
+      snapshot.committed_samples = committedSamples;
+      snapshot.updated_at = new Date().toISOString();
+    }
     const newSamples = Math.max(0, capturedSamples - previousCapturedSamples);
     previousCapturedSamples = capturedSamples;
     const requiredHeadSilence = activeAttempt?.required_head_silence_samples ?? 0;
@@ -309,12 +343,31 @@ export function installDevRecorderMock() {
     }
     const mockSpeechDelay = Math.round(mockSampleRate * 0.4);
     const mockSpeechSamples = Math.round(mockSampleRate * 1.5);
+    const mockSpeechStart = activeAttempt
+      ? Math.max(
+        activeAttempt.recording_started_sample + mockSpeechDelay,
+        (activeAttempt.head_silence_passed_sample || activeAttempt.recording_started_sample) + mockSpeechDelay,
+      )
+      : 0;
     if (activeAttempt && !activeAttempt.content_started_sample
       && activeAttempt.head_silence_phase !== 'waiting_for_head_silence'
-      && capturedSamples >= activeAttempt.recording_started_sample + mockSpeechDelay) {
-      activeAttempt.content_started_sample = activeAttempt.recording_started_sample + mockSpeechDelay;
+      && capturedSamples >= mockSpeechStart) {
+      activeAttempt.content_started_sample = mockSpeechStart;
       firstAttemptSignalSample = activeAttempt.content_started_sample;
       activeAttempt.head_silence_phase = 'speech_started';
+    }
+    if (activeAttempt?.content_started_sample
+      && !activeAttempt.discontinuity_injected
+      && Number.isSafeInteger(configuredDiscontinuityAttempt)
+      && configuredDiscontinuityAttempt > 0
+      && completedAttemptCount + 1 === configuredDiscontinuityAttempt) {
+      activeAttempt.discontinuity_injected = true;
+      inputDiscontinuityCount += 1;
+      inputDiscontinuitySilenceSamples += Math.max(1, Math.round(mockSampleRate * 0.015));
+      if (snapshot) {
+        snapshot.input_discontinuity_count = inputDiscontinuityCount;
+        snapshot.input_discontinuity_silence_samples = inputDiscontinuitySilenceSamples;
+      }
     }
     const speaking = Boolean(activeAttempt?.content_started_sample)
       && capturedSamples < (activeAttempt?.content_started_sample ?? 0) + mockSpeechSamples;
@@ -336,9 +389,11 @@ export function installDevRecorderMock() {
     });
     const meter: Meter = {
       captured_samples: capturedSamples,
-      committed_samples: Math.max(0, capturedSamples - 2_400),
+      committed_samples: committedSamples,
       overflow_samples: 0,
       faulted: false,
+      input_discontinuity_count: inputDiscontinuityCount,
+      input_discontinuity_silence_samples: inputDiscontinuitySilenceSamples,
       storage_status: 'healthy',
       storage_safe_remaining_seconds: 12 * 60 * 60,
       peak: pulse,
@@ -379,6 +434,9 @@ export function installDevRecorderMock() {
       devices: mockDevices,
     } as T;
     if (command === 'start_session' || command === 'create_session') {
+      completedAttemptCount = 0;
+      inputDiscontinuityCount = 0;
+      inputDiscontinuitySilenceSamples = 0;
       capturedSamples = 0;
       previousCapturedSamples = 0;
       waveformSampleCursor = 0;
@@ -404,6 +462,8 @@ export function installDevRecorderMock() {
         capture_share_mode: data.capture_share_mode === 'shared' ? 'shared' : 'exclusive',
         audio_format: { sample_rate: Number(data.sample_rate), bit_depth: Number(data.bit_depth ?? 24), encoding: Number(data.bit_depth ?? 24) === 32 ? 'float' : 'pcm', channels: 1, input_channels: 2, input_channel: Number(data.input_channel ?? 1) },
         master_audio: 'audio/master.wav', storage_layout_version: 1, segment_frames: Number(data.sample_rate) * 300, captured_samples: 0, committed_samples: 0, overflow_samples: 0,
+        input_discontinuity_count: 0,
+        input_discontinuity_silence_samples: 0,
         started_at: now, updated_at: now,
         noise_check: null,
         silence_duration_ms: Number(data.silence_duration_ms ?? 1_000),
@@ -423,6 +483,8 @@ export function installDevRecorderMock() {
         snapshot = snapshotForRecording(recording);
         currentSessionDir = target;
         capturedSamples = snapshot.captured_samples;
+        inputDiscontinuityCount = snapshot.input_discontinuity_count ?? 0;
+        inputDiscontinuitySilenceSamples = snapshot.input_discontinuity_silence_samples ?? 0;
         currentExportExists = recording.export_exists;
       }
       captureActive = false;
@@ -454,18 +516,7 @@ export function installDevRecorderMock() {
         silence_duration_ms: 1_000,
         silence_threshold_dbfs: -42,
         silence_detector: 'energy',
-        items: Array.from({ length: recording.total_items }, (_, index) => ({
-          id: String(index + 1).padStart(3, '0'),
-          text: `恢复录制测试文本 ${index + 1}`,
-          label: index === 0 ? '自然语气' : '',
-          status: index < recording.accepted_items
-            ? 'accepted'
-            : index < recording.accepted_items + recording.skipped_items
-              ? 'skipped'
-              : 'pending',
-          attempts: [],
-          selected_attempt_id: null,
-        })),
+        items: historicalItems(recording),
       };
       return {
         session_dir: target,
@@ -481,6 +532,8 @@ export function installDevRecorderMock() {
       const target = String(data.session_dir ?? '');
       if (snapshot && target === currentSessionDir) {
         capturedSamples = snapshot.captured_samples;
+        inputDiscontinuityCount = snapshot.input_discontinuity_count ?? 0;
+        inputDiscontinuitySilenceSamples = snapshot.input_discontinuity_silence_samples ?? 0;
         previousCapturedSamples = capturedSamples;
         waveformSampleCursor = capturedSamples;
         silenceSamples = 0;
@@ -514,6 +567,8 @@ export function installDevRecorderMock() {
       mockSampleRate = recording.sample_rate;
       recordingStartedAt = performance.now() - capturedSamples / mockSampleRate * 1_000;
       snapshot = snapshotForRecording(recording, 'recording');
+      inputDiscontinuityCount = snapshot.input_discontinuity_count ?? 0;
+      inputDiscontinuitySilenceSamples = snapshot.input_discontinuity_silence_samples ?? 0;
       snapshot.noise_check = null;
       snapshot.updated_at = new Date().toISOString();
       window.clearInterval(meterTimer);
@@ -524,19 +579,48 @@ export function installDevRecorderMock() {
     if (command === 'export_session' || command === 'export_session_artifact') {
       const target = String(data.session_dir ?? '');
       const source = snapshot && target === currentSessionDir ? snapshot : null;
+      const historical = previewHistory.find((recording) => recording.session_dir === target);
+      const validationSource = source ?? (historical ? snapshotForRecording(historical) : null);
+      const artifact = String(data.artifact ?? '');
+      if (!validationSource) throw new Error('Mock 中没有该录制任务');
+      if (validationSource.status !== 'stopped' && validationSource.status !== 'faulted') {
+        throw new Error('录制尚未安全结束，请先暂停后再导出');
+      }
+      if (artifact === 'cuts_zip' || !artifact) {
+        if (validationSource.status === 'faulted' || validationSource.overflow_samples > 0) {
+          throw new Error('异常任务修复并检查前不能导出分段 ZIP');
+        }
+        for (const item of validationSource.items) {
+          if (item.status === 'review') {
+            throw new Error('仍有待确认或需重录的句子，不能导出切片。');
+          }
+          if (!artifact && item.status === 'accepted' && !item.selected_attempt_id) {
+            throw new Error('已确认的句子没有选中的录音版本，不能导出切片。');
+          }
+          if (!artifact && item.status === 'skipped' && item.selected_attempt_id) {
+            throw new Error('已跳过的句子仍有选中版本，不能导出切片。');
+          }
+          if (!item.selected_attempt_id) continue;
+          const selected = item.attempts.find((attempt) => attempt.attempt_id === item.selected_attempt_id);
+          if (!selected
+            || ['interrupted', 'needs_rerecord'].includes(selected.status)
+            || selected.end_sample <= selected.start_sample
+            || selected.end_sample > validationSource.committed_samples) {
+            throw new Error('选中的录音版本异常或越过已落盘边界，不能导出切片。');
+          }
+        }
+      }
       if (source) currentExportExists = true;
       else {
-        const historical = previewHistory.find((recording) => recording.session_dir === target);
         if (historical) historical.export_exists = true;
       }
       const exportedCount = source
         ? source.items.filter((item) => item.status === 'accepted').length
-        : previewHistory.find((recording) => recording.session_dir === target)?.accepted_items ?? 0;
+        : historical?.accepted_items ?? 0;
       const total = source?.items.length
-        ?? previewHistory.find((recording) => recording.session_dir === target)?.total_items
+        ?? historical?.total_items
         ?? exportedCount;
       const exportDir = `${target || '/tmp/DataBaker Preview'}/export`;
-      const artifact = String(data.artifact ?? '');
       return {
         artifact: artifact || undefined,
         export_dir: exportDir,
@@ -632,9 +716,12 @@ export function installDevRecorderMock() {
       } as T;
     }
     if (command === 'start_attempt') {
+      if (!captureActive || snapshot.status !== 'recording') throw new Error('当前任务未进入采集状态');
+      if (activeAttempt) throw new Error('已有正在录制的版本');
       enforceSilence = data.enforce_silence === true;
       const required = mockSampleRate * snapshot.silence_duration_ms / 1_000;
-      const item = snapshot.items.find((candidate) => candidate.id === data.item_id)!;
+      const item = snapshot.items.find((candidate) => candidate.id === data.item_id);
+      if (!item) throw new Error('找不到指定句子');
       activeAttempt = {
         item_id: item.id,
         attempt_id: `${item.id}-a${item.attempts.length + 1}`,
@@ -654,6 +741,10 @@ export function installDevRecorderMock() {
     }
     if (command === 'stop_attempt') {
       if (!activeAttempt) throw new Error('没有正在录制的版本');
+      // Sample at the command boundary instead of waiting for the 100 ms
+      // telemetry timer. Rust freezes this captured boundary and waits for the
+      // writer checkpoint before sealing the attempt.
+      emitMeter();
       const discardEmpty = data.discard_empty !== false;
       if (!firstAttemptSignalSample && discardEmpty) {
         const itemId = activeAttempt.item_id;
@@ -665,60 +756,166 @@ export function installDevRecorderMock() {
       if (data.force !== true && firstAttemptSignalSample && forcedWithoutTailSilence) {
         throw new Error('尾静音未满，不能结束本句');
       }
+      completedAttemptCount += 1;
+      const recoveredDiscontinuity = activeAttempt.discontinuity_injected === true;
+      const committedBoundary = capturedSamples;
+      snapshot.captured_samples = committedBoundary;
+      snapshot.committed_samples = committedBoundary;
+      const useVadTrim = snapshot.silence_detector === 'vad' && firstAttemptSignalSample > 0;
+      const attemptStart = useVadTrim
+        ? Math.max(
+          activeAttempt.recording_started_sample,
+          firstAttemptSignalSample - activeAttempt.required_head_silence_samples,
+        )
+        : data.enforce_silence === true && activeAttempt.head_silence_passed_sample > 0
+          ? activeAttempt.head_silence_passed_sample
+          : activeAttempt.recording_started_sample;
+      const lastSpeechSample = Math.max(lastSignalSample, firstAttemptSignalSample);
+      const attemptEnd = useVadTrim
+        ? Math.min(
+          committedBoundary,
+          Math.max(
+            lastSpeechSample + requiredSilence,
+            firstAttemptSignalSample,
+            attemptStart + 1,
+          ),
+        )
+        : committedBoundary;
+      if (attemptEnd <= attemptStart || firstAttemptSignalSample > attemptEnd) {
+        throw new Error('录音版本的 VAD 裁切边界无效');
+      }
       const attempt: Attempt = {
         attempt_id: activeAttempt.attempt_id,
-        start_sample: data.enforce_silence === true && activeAttempt.head_silence_passed_sample > 0
-          ? activeAttempt.head_silence_passed_sample
-          : activeAttempt.recording_started_sample,
+        start_sample: attemptStart,
         recording_started_sample: activeAttempt.recording_started_sample,
         head_silence_armed_sample: activeAttempt.head_silence_armed_sample,
         head_silence_passed_sample: activeAttempt.head_silence_passed_sample,
         required_head_silence_samples: activeAttempt.required_head_silence_samples,
         content_started_sample: firstAttemptSignalSample,
-        end_sample: capturedSamples,
+        end_sample: attemptEnd,
         forced_without_tail_silence: forcedWithoutTailSilence,
-        tail_silence_samples: silenceSamples,
+        tail_silence_samples: useVadTrim
+          ? Math.max(0, attemptEnd - lastSpeechSample)
+          : silenceSamples,
         required_tail_silence_samples: requiredSilence,
         status: 'recorded',
         created_at: new Date().toISOString(),
       };
       const item = snapshot.items.find((candidate) => candidate.id === activeAttempt!.item_id)!;
+      const selectedAttempt = item.selected_attempt_id
+        ? item.attempts.find((candidate) => candidate.attempt_id === item.selected_attempt_id)
+        : undefined;
+      const hasAcceptedSelection = Boolean(
+        selectedAttempt
+        && selectedAttempt.status === 'accepted'
+        && selectedAttempt.end_sample > selectedAttempt.start_sample,
+      );
+      attempt.status = recoveredDiscontinuity ? 'needs_rerecord' : 'recorded';
       item.attempts.push(attempt);
-      item.status = 'review';
+      item.status = recoveredDiscontinuity && hasAcceptedSelection ? 'accepted' : 'review';
+      if (!hasAcceptedSelection) item.selected_attempt_id = null;
       activeAttempt = null;
-      return { item_id: item.id, attempt, forced: forcedWithoutTailSilence } as T;
+      return {
+        item_id: item.id,
+        attempt,
+        forced: forcedWithoutTailSilence,
+        auto_selected: false,
+        recovered_discontinuity: recoveredDiscontinuity,
+      } as T;
     }
     if (command === 'accept_attempt') {
-      const item = snapshot.items.find((candidate) => candidate.id === data.item_id)!;
-      item.selected_attempt_id = String(data.attempt_id);
+      if (!captureActive || snapshot.status !== 'recording') throw new Error('当前任务未进入采集状态');
+      if (activeAttempt) throw new Error('录制进行中不能确认版本');
+      const item = snapshot.items.find((candidate) => candidate.id === data.item_id);
+      if (!item) throw new Error('找不到指定句子');
+      const selectedId = String(data.attempt_id);
+      const selected = item.attempts.find((attempt) => attempt.attempt_id === selectedId);
+      if (!selected
+        || ['interrupted', 'needs_rerecord'].includes(selected.status)
+        || selected.end_sample <= selected.start_sample
+        || selected.end_sample > snapshot.committed_samples) {
+        throw new Error('异常中断的录音版本不能被确认或交付');
+      }
+      const isCurrentAccepted = selected.status === 'accepted' && item.selected_attempt_id === selectedId;
+      if (selected.status !== 'recorded' && !isCurrentAccepted) {
+        throw new Error('只能确认待审核的新录音或保留当前已确认版本');
+      }
+      item.selected_attempt_id = selectedId;
       item.status = 'accepted';
-      item.attempts.forEach((attempt) => { attempt.status = attempt.attempt_id === data.attempt_id ? 'accepted' : 'rejected_by_operator'; });
+      item.attempts.forEach((attempt) => {
+        if (attempt.attempt_id === selectedId) attempt.status = 'accepted';
+        else if (attempt.status === 'accepted' || attempt.status === 'recorded') {
+          attempt.status = 'rejected_by_operator';
+        }
+      });
       return { item_id: item.id, attempt_id: data.attempt_id } as T;
     }
     if (command === 'skip_item') {
-      const item = snapshot.items.find((candidate) => candidate.id === data.item_id)!;
+      if (!captureActive || snapshot.status !== 'recording') throw new Error('当前任务未进入采集状态');
+      if (activeAttempt) throw new Error('录制进行中不能跳过句子');
+      const item = snapshot.items.find((candidate) => candidate.id === data.item_id);
+      if (!item) throw new Error('找不到指定句子');
       item.status = 'skipped';
       item.selected_attempt_id = null;
       return { item_id: item.id } as T;
     }
     if (command === 'get_state') return { snapshot: snapshotCopy(), session_dir: currentSessionDir, active_attempt: activeAttempt ? { ...activeAttempt } : null } as T;
-    if (command === 'render_attempt' || command === 'render_session_attempt') return { file_path: '/tmp/databaker-dev-preview.wav' } as T;
+    if (command === 'render_attempt' || command === 'render_session_attempt') {
+      const offline = command === 'render_session_attempt';
+      if (offline && captureActive) throw new Error('当前已有录制进行中，请使用实时任务试听');
+      if (!offline && !captureActive) throw new Error('当前没有活动录制任务');
+      const item = snapshot.items.find((candidate) => candidate.id === data.item_id);
+      const attempt = item?.attempts.find((candidate) => candidate.attempt_id === data.attempt_id);
+      if (!attempt
+        || ['interrupted', 'needs_rerecord'].includes(attempt.status)
+        || attempt.end_sample <= attempt.start_sample
+        || attempt.end_sample > snapshot.committed_samples) {
+        throw new Error('异常中断的录音版本不能试听或交付');
+      }
+      return { file_path: '/tmp/databaker-dev-preview.wav' } as T;
+    }
     if (command === 'preview_attempt_waveform' || command === 'preview_session_waveform') {
+      const offline = command === 'preview_session_waveform';
+      if (offline && captureActive) throw new Error('当前已有录制进行中，请使用实时任务波形');
+      if (!offline && !captureActive) throw new Error('当前没有活动录制任务');
+      const item = snapshot.items.find((candidate) => candidate.id === data.item_id);
+      const attempt = item?.attempts.find((candidate) => candidate.attempt_id === data.attempt_id);
+      if (!attempt
+        || ['interrupted', 'needs_rerecord'].includes(attempt.status)
+        || attempt.end_sample <= attempt.start_sample
+        || attempt.end_sample > snapshot.committed_samples) {
+        throw new Error('异常中断的录音版本不能预览波形');
+      }
       const bins = Array.from({ length: 80 }, (_, index): [number, number] => {
         const envelope = Math.sin((index + 1) / 12) * 0.55;
         return [-Math.abs(envelope), Math.abs(envelope) + 0.08];
       });
-      return { bins, start_sample: 0, end_sample: 80 * 64, sample_rate: 48_000 } as T;
+      return { bins, start_sample: attempt.start_sample, end_sample: attempt.end_sample, sample_rate: snapshot.audio_format.sample_rate } as T;
     }
     if (command === 'select_session_attempt') {
+      if (captureActive || activeAttempt) throw new Error('当前已有录制进行中，请先安全暂停再切换版本');
+      if (snapshot.status !== 'stopped') throw new Error('任务尚未安全暂停，不能离线切换录音版本');
+      if (snapshot.overflow_samples > 0) throw new Error('异常任务不能切换录音版本');
       const item = snapshot.items.find((candidate) => candidate.id === data.item_id);
       const attempt = item?.attempts.find((candidate) => candidate.attempt_id === data.attempt_id);
       if (!item || !attempt) throw new Error('找不到指定录音版本');
+      if (['interrupted', 'needs_rerecord'].includes(attempt.status)
+        || attempt.end_sample <= attempt.start_sample
+        || attempt.end_sample > snapshot.committed_samples) {
+        throw new Error('异常中断的录音版本不能设为当前版本');
+      }
       item.selected_attempt_id = attempt.attempt_id;
-      item.attempts.forEach((candidate) => { candidate.status = candidate === attempt ? 'accepted' : 'rejected_by_operator'; });
+      item.status = 'accepted';
+      item.attempts.forEach((candidate) => {
+        if (candidate === attempt) candidate.status = 'accepted';
+        else if (candidate.status === 'accepted' || candidate.status === 'recorded') {
+          candidate.status = 'rejected_by_operator';
+        }
+      });
       return { snapshot: snapshotCopy(), item_id: item.id, attempt_id: attempt.attempt_id } as T;
     }
     if (command === 'stop_session') {
+      if (activeAttempt) throw new Error('仍有正在录制的句子，请先结束当前句');
       if (meterTimer) window.clearInterval(meterTimer);
       snapshot.status = 'stopped';
       snapshot.captured_samples = capturedSamples;
