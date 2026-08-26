@@ -153,10 +153,37 @@ async function main() {
   assert.equal(proseWithCommasWithoutName.items[0].text, 'Hello, world, please read naturally.');
 
   const tabularTxt = parseScript('0001\t第一句\t正常\n0002\t第二句\t', 'script.txt');
-  assert.equal(tabularTxt.mode, 'plain_text_compat', 'TXT 始终按每行一句的兼容模式解析');
-  assert.equal(tabularTxt.delimiter, ',');
+  assert.equal(tabularTxt.mode, 'structured', '严格三列 Tab 的历史 TXT 应兼容为结构化脚本');
+  assert.equal(tabularTxt.delimiter, '\t');
   assert.deepEqual(tabularTxt.errors, []);
-  assert.equal(tabularTxt.items[0].text, '0001\t第一句\t正常');
+  assert.deepEqual(tabularTxt.warnings, []);
+  assert.deepEqual(tabularTxt.items[0], { id: '0001', text: '第一句', label: '正常' });
+  assert.deepEqual(tabularTxt.items[1], { id: '0002', text: '第二句', label: '' });
+
+  const headeredTabularTxt = parseScript('序号\t正文\t标签\n0001\t第一句\t自然', 'legacy.txt');
+  assert.equal(headeredTabularTxt.mode, 'structured');
+  assert.deepEqual(headeredTabularTxt.errors, []);
+  assert.deepEqual(headeredTabularTxt.items[0], { id: '0001', text: '第一句', label: '自然' });
+
+  const proseTxtWithTabs = parseScript('开场\t请自然朗读\t不要拆列\n结束语\t保持完整\t谢谢', 'notes.txt');
+  assert.equal(proseTxtWithTabs.mode, 'plain_text_compat', '首列不像序号的三段 TXT 仍按每行正文解析');
+  assert.equal(proseTxtWithTabs.items[0].text, '开场\t请自然朗读\t不要拆列');
+  assert.equal(proseTxtWithTabs.items[0].label, '');
+
+  const twoColumnTxt = parseScript('0001\t第一句\n0002\t第二句', 'two-column.txt');
+  assert.equal(twoColumnTxt.mode, 'plain_text_compat', '两列 TXT 不应误进入三列结构化解析');
+  assert.equal(twoColumnTxt.items[0].text, '0001\t第一句');
+
+  const mixedWidthTxt = parseScript('0001\t第一句\t自然\n0002\t第二句\t正常\t额外', 'mixed-width.txt');
+  assert.equal(mixedWidthTxt.mode, 'plain_text_compat', '混入非三列行时整份 TXT 应保守回退');
+  assert.equal(mixedWidthTxt.items[1].text, '0002\t第二句\t正常\t额外');
+
+  const proseIdTxt = parseScript('第1段\t开场正文\t自然\n第2段\t结束正文\t强调', 'prose-id.txt');
+  assert.equal(proseIdTxt.mode, 'plain_text_compat', '普通中文段落编号不应被误认为结构化序号');
+
+  const alphanumericIdTxt = parseScript('SENT-001\t第一句\t自然\nSENT-002\t第二句\t强调', 'legacy-ids.txt');
+  assert.equal(alphanumericIdTxt.mode, 'structured', '历史字母数字序号仍应兼容三列 TXT');
+  assert.equal(alphanumericIdTxt.items[1].id, 'SENT-002');
 
   const empty = parseScript('  \n\n');
   assert.deepEqual(empty.items, []);

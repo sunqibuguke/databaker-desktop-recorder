@@ -22,12 +22,21 @@ assert.match(recorder, /tabIndex=\{index === currentIndex \? 0 : -1\}/);
 assert.match(recorder, /event\.key === 'ArrowDown'/);
 assert.match(recorder, /testId="recorder-label-font-size"/);
 assert.match(recorder, /labelTransition\(currentItem\.label, nextItem\.label\)/);
+assert.match(recorder, /testId="rule-pause-on-label-change" checked=\{automationRules\.pauseOnLabelChange\}/);
+assert.match(recorder, /applyAutomationRule\('pauseOnLabelChange', enabled\)/);
+assert.match(recorder, /pauseOnLabelChange: automationRules\.pauseOnLabelChange/);
+assert.match(recorder, /startAttempt\(nextItem, \{ acknowledgeLabelTransition: false \}\)/);
 assert.match(recorder, /acceptAttempt\(retainedDeliveryAttempt\.attempt_id\)/);
 assert.match(recorder, /nextPhysicalItemIndex\(currentIndex, latest\.items\.length\)/);
 assert.match(recorder, /moveToAutomaticTarget\(currentItem, latest\.items\[nextIndex\], nextIndex\)/);
 assert.match(recorder, /selectionIndexAfterStoppedRetake/);
 assert.match(recorder, /setRetakeItemId\(item\.status === 'pending' \? null : item\.id\)/);
 assert.match(recorder, /retakeItemId === currentItem\.id/);
+assert.ok(
+  recorder.indexOf('if (isRetakeDecision)')
+    < recorder.indexOf('const continuation = continuationAfterAccept'),
+  'retake decisions must return before ordinary auto-start continuation',
+);
 assert.match(recorder, /reviewCount > 0/);
 assert.match(recorder, /export-status-summary/);
 assert.match(recorder, /exportDialog\.cutsBlockedReview/);
@@ -46,6 +55,8 @@ assert.match(prompter, /className="prompter-label-transition" role="status" aria
 assert.match(css, /--label-change:\s*#[0-9a-f]{6}/i);
 assert.match(css, /\.professional-item\.label-boundary/);
 assert.match(css, /\.prompt-surface\.label-changed/);
+assert.match(css, /\.prompt-surface\s*\{[^}]*position:\s*relative/);
+assert.match(css, /\.label-transition-chip\s*\{[^}]*position:\s*absolute/);
 assert.match(css, /\.prompter-label-transition/);
 assert.match(css, /\.export-dialog \.export-status-summary/);
 

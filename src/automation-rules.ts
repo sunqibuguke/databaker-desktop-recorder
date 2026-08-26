@@ -1,5 +1,6 @@
 export type AutomationRules = {
   autoStartNext: boolean;
+  pauseOnLabelChange: boolean;
   headTailSilence: boolean;
   enforceHeadTailSilence: boolean;
   discardEmpty: boolean;
@@ -10,6 +11,7 @@ export type AutomationRules = {
 
 export const DEFAULT_AUTOMATION_RULES: AutomationRules = {
   autoStartNext: true,
+  pauseOnLabelChange: false,
   headTailSilence: true,
   enforceHeadTailSilence: true,
   discardEmpty: true,
@@ -32,6 +34,10 @@ export function normalizeAutomationRules(value: unknown): AutomationRules {
   const source = value && typeof value === 'object' ? value as Record<string, unknown> : {};
   return {
     autoStartNext: asBoolean(source.autoStartNext, DEFAULT_AUTOMATION_RULES.autoStartNext),
+    pauseOnLabelChange: asBoolean(
+      source.pauseOnLabelChange,
+      DEFAULT_AUTOMATION_RULES.pauseOnLabelChange,
+    ),
     headTailSilence: asBoolean(source.headTailSilence, DEFAULT_AUTOMATION_RULES.headTailSilence),
     enforceHeadTailSilence: asBoolean(
       source.enforceHeadTailSilence,

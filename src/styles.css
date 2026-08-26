@@ -614,10 +614,10 @@ input[type="range"]:focus-visible::-moz-range-thumb { box-shadow: 0 0 0 2px var(
 .script-monitor > header > div { display: flex; align-items: center; gap: 10px; }.script-monitor > header em { color: var(--quiet); font: var(--text-xs) var(--mono); font-style: normal; }
 .studio-cue { display: flex; align-items: center; gap: 6px; color: var(--label); font-size: var(--text-xs); }
 .take-state { padding: 3px 5px; border: 1px solid var(--line-control); color: var(--muted); font: var(--text-xs) var(--mono); }
-.prompt-surface { flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: flex-start; justify-content: center; overflow: auto; padding: 20px clamp(25px, 5vw, 65px) 22px; background: var(--chrome); }
+.prompt-surface { position: relative; flex: 1; min-height: 0; display: flex; flex-direction: column; align-items: flex-start; justify-content: center; overflow: auto; padding: 20px clamp(25px, 5vw, 65px) 22px; background: var(--chrome); }
 .label-chip { max-width: 100%; padding: 3px 7px; overflow-wrap: anywhere; border: 1px solid var(--accent-deep-line); border-radius: 1px; color: var(--accent-muted); background: var(--accent-wash); font-size: var(--prompter-label-size, var(--text-xs)); }
 .prompt-surface.label-changed { box-shadow: inset 3px 0 0 var(--label-change-line); background: linear-gradient(90deg, var(--label-change-wash), transparent 34%); }
-.label-transition-chip { max-width: 100%; display: flex; align-items: baseline; gap: 7px; margin-bottom: 7px; padding: 4px 8px; overflow: hidden; border: 1px solid var(--label-change-line); border-radius: 2px; color: var(--label-change); background: var(--label-change-fill); font-size: var(--text-xs); line-height: 1.4; }
+.label-transition-chip { position: absolute; z-index: 1; top: 10px; right: clamp(25px, 5vw, 65px); left: clamp(25px, 5vw, 65px); width: fit-content; max-width: 100%; box-sizing: border-box; display: flex; align-items: baseline; gap: 7px; margin: 0; padding: 4px 8px; overflow: hidden; border: 1px solid var(--label-change-line); border-radius: 2px; color: var(--label-change); background: var(--label-change-fill); font-size: var(--text-xs); line-height: 1.4; pointer-events: none; }
 .label-transition-chip b { flex: none; color: var(--label-change-bright); font-weight: 650; }
 .prompt-surface p { max-width: 850px; margin: 13px 0 16px; color: var(--text-bright); font-size: var(--prompter-copy-size, var(--text-prompt)); line-height: 1.55; letter-spacing: .018em; font-weight: 500; text-wrap: pretty; }
 .prompt-surface.pending p { color: var(--warning); }

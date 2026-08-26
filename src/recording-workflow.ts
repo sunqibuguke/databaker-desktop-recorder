@@ -247,9 +247,15 @@ export function continuationAfterAccept(
 
 export function shouldAutoStartAfterAccept(
   continuation: AcceptContinuation,
-  autoStartNext: boolean,
+  rules: Readonly<{
+    autoStartNext: boolean;
+    pauseOnLabelChange: boolean;
+    labelChanged: boolean;
+  }>,
 ): boolean {
-  return continuation.kind === 'start' && autoStartNext;
+  return continuation.kind === 'start'
+    && rules.autoStartNext
+    && !(rules.pauseOnLabelChange && rules.labelChanged);
 }
 
 export function idlePrimaryAction(

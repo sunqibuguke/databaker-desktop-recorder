@@ -72,6 +72,9 @@ async function main() {
   assert.equal(t('recorder.ruleAlmostSilent'), '几乎无声提示');
   assert.equal(t('recorder.rulePeakHigh'), '峰值偏高提示');
   assert.equal(t('recorder.ruleAutoStartNext'), '确认后自动开下一句');
+  assert.equal(t('recorder.rulePauseOnLabelChange'), '标签变化时先暂停');
+  assert.match(t('recorder.rulePauseOnLabelChangeHint'), /默认关闭/);
+  assert.equal(t('recorder.acceptAndReviewNext'), '确认并查看下一句');
   assert.equal(t('noise.leave'), '退出任务');
   assert.equal(t('noise.skipCheck'), '关闭本次环境检测并继续');
   assert.equal(t('setup.detectionAdvanced'), '检测策略（高级）');

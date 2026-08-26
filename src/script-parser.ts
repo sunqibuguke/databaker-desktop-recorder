@@ -164,6 +164,13 @@ function looksLikeHeaderlessCsv(rows: string[][]): boolean {
   return rows.every((row) => /\d/.test(row[0]) && !/\s/.test(row[0]));
 }
 
+function looksLikeStrictThreeColumnTable(rows: string[][]): boolean {
+  if (!rows.length || !rows.every((row) => row.length === 3)) return false;
+  if (recognizedHeaderCount(rows[0]) === 3) return true;
+  const identifier = /^(?=.*\d)[a-z0-9_-]+$/i;
+  return rows.every((row) => identifier.test(row[0]));
+}
+
 function structuredDelimiter(
   lines: string[],
   fileName?: string,
@@ -171,9 +178,14 @@ function structuredDelimiter(
   const extension = fileExtension(fileName);
   if (extension === 'csv') return ',';
   if (extension === 'tsv' || extension === 'tab') return '\t';
-  // TXT is the explicit line-oriented compatibility mode. Content punctuation
-  // or tabs belong to the sentence and must not silently turn it into a table.
-  if (extension === 'txt') return null;
+  // Historical collection scripts sometimes use a .txt suffix even though
+  // every row is a strict three-column TSV record. Preserve that input while
+  // keeping ordinary TXT (including prose that happens to contain tabs) in
+  // the explicit line-oriented compatibility mode.
+  if (extension === 'txt') {
+    const tabRows = lines.map((line) => parseRow(line, '\t'));
+    return looksLikeStrictThreeColumnTable(tabRows) ? '\t' : null;
+  }
   if (lines.some((line) => line.includes('\t'))) return '\t';
   if (!lines.length) return null;
   const commaRows = lines.map((line) => parseRow(line, ','));

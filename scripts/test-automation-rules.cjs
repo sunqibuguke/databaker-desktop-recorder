@@ -16,6 +16,7 @@ async function main() {
 
   assert.deepEqual(DEFAULT_AUTOMATION_RULES, {
     autoStartNext: true,
+    pauseOnLabelChange: false,
     headTailSilence: true,
     enforceHeadTailSilence: true,
     discardEmpty: true,
@@ -51,12 +52,14 @@ async function main() {
 
   saveAutomationRules('session-a', {
     ...DEFAULT_AUTOMATION_RULES,
+    pauseOnLabelChange: true,
     envCheck: false,
     almostSilent: true,
   });
   const loaded = loadAutomationRules('session-a');
   assert.equal(loaded.envCheck, false);
   assert.equal(loaded.almostSilent, true);
+  assert.equal(loaded.pauseOnLabelChange, true);
   assert.equal(loaded.headTailSilence, true);
   assert.deepEqual(
     normalizeAutomationRules({ discardEmpty: 'nope', peakHigh: true }),
@@ -68,6 +71,16 @@ async function main() {
     'older saved rules without autoStartNext must default on',
   );
   assert.equal(
+    normalizeAutomationRules({ headTailSilence: false }).pauseOnLabelChange,
+    false,
+    'older saved rules without pauseOnLabelChange must keep the two-click flow',
+  );
+  assert.equal(
+    normalizeAutomationRules({ pauseOnLabelChange: 'yes' }).pauseOnLabelChange,
+    false,
+    'non-boolean label pause values must fall back to the safe product default',
+  );
+  assert.equal(
     normalizeAutomationRules({ headTailSilence: false }).enforceHeadTailSilence,
     true,
     'older saved rules without enforceHeadTailSilence must default on',
@@ -75,7 +88,12 @@ async function main() {
 
   assert.deepEqual(
     loadWorkstationAutomationRules(),
-    { ...DEFAULT_AUTOMATION_RULES, envCheck: false, almostSilent: true },
+    {
+      ...DEFAULT_AUTOMATION_RULES,
+      pauseOnLabelChange: true,
+      envCheck: false,
+      almostSilent: true,
+    },
     'saving a task also remembers the last-used workstation defaults',
   );
   assert.equal(

@@ -399,18 +399,54 @@ async function main() {
     'accepting a sentence names the next pending sentence as the start candidate',
   );
   assert.equal(
-    shouldAutoStartAfterAccept({ kind: 'start', nextIndex: 1 }, true),
+    shouldAutoStartAfterAccept(
+      { kind: 'start', nextIndex: 1 },
+      { autoStartNext: true, pauseOnLabelChange: false, labelChanged: true },
+    ),
     true,
+    'label changes keep the ordinary two-click rhythm while pause is off',
   );
   assert.equal(
-    shouldAutoStartAfterAccept({ kind: 'start', nextIndex: 1 }, false),
+    shouldAutoStartAfterAccept(
+      { kind: 'start', nextIndex: 1 },
+      { autoStartNext: true, pauseOnLabelChange: true, labelChanged: true },
+    ),
     false,
-    'the auto-start rule must be able to keep confirm from arming the next take',
+    'the optional label-boundary rule pauses before the changed label',
   );
   assert.equal(
-    shouldAutoStartAfterAccept({ kind: 'review', nextIndex: 1 }, true),
+    shouldAutoStartAfterAccept(
+      { kind: 'start', nextIndex: 1 },
+      { autoStartNext: true, pauseOnLabelChange: true, labelChanged: false },
+    ),
+    true,
+    'the label-boundary rule must not interrupt an unchanged label',
+  );
+  assert.equal(
+    shouldAutoStartAfterAccept(
+      { kind: 'start', nextIndex: 1 },
+      { autoStartNext: false, pauseOnLabelChange: false, labelChanged: false },
+    ),
+    false,
+    'the global auto-start rule must be able to keep confirm from arming the next take',
+  );
+  assert.equal(
+    shouldAutoStartAfterAccept(
+      { kind: 'review', nextIndex: 1 },
+      { autoStartNext: true, pauseOnLabelChange: false, labelChanged: false },
+    ),
     false,
   );
+  for (const continuation of [{ kind: 'finish' }, { kind: 'blocked' }]) {
+    assert.equal(
+      shouldAutoStartAfterAccept(
+        continuation,
+        { autoStartNext: true, pauseOnLabelChange: false, labelChanged: false },
+      ),
+      false,
+      `${continuation.kind} must never arm another recording`,
+    );
+  }
   assert.deepEqual(
     continuationAfterAccept([item('accepted'), item('review'), item('pending')], 0),
     { kind: 'review', nextIndex: 1 },
