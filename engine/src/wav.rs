@@ -62,20 +62,20 @@ pub(crate) fn decode_encoded_mono_samples(bytes: &[u8], bit_depth: u16) -> Resul
     let mut samples = Vec::with_capacity(bytes.len() / sample_bytes);
     match bit_depth {
         16 => {
-            for chunk in bytes.chunks_exact(2) {
+            for chunk in bytes.as_chunks::<2>().0 {
                 let value = i16::from_le_bytes([chunk[0], chunk[1]]);
                 samples.push(f32::from(value) / 32_768.0);
             }
         }
         24 => {
-            for chunk in bytes.chunks_exact(3) {
+            for chunk in bytes.as_chunks::<3>().0 {
                 let sign = if chunk[2] & 0x80 == 0 { 0 } else { 0xFF };
                 let value = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], sign]);
                 samples.push(value as f32 / 8_388_608.0);
             }
         }
         32 => {
-            for chunk in bytes.chunks_exact(4) {
+            for chunk in bytes.as_chunks::<4>().0 {
                 samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
             }
         }
@@ -343,8 +343,8 @@ impl WavExportWriter {
             bail!("encoded export audio does not contain complete channel frames");
         }
         if self.plan.encoding == WavEncoding::Float {
-            for sample in bytes.chunks_exact(std::mem::size_of::<f32>()) {
-                let value = f32::from_le_bytes(sample.try_into().expect("f32 chunk size"));
+            for sample in bytes.as_chunks::<4>().0 {
+                let value = f32::from_le_bytes(*sample);
                 if !value.is_finite() {
                     bail!("WAV export contains a non-finite 32-bit Float sample");
                 }
@@ -638,8 +638,8 @@ impl RecoverableWav {
             while remaining > 0 {
                 let count = usize::try_from(remaining.min(buffer.len() as u64))?;
                 file.read_exact(&mut buffer[..count])?;
-                for sample in buffer[..count].chunks_exact(4) {
-                    let value = f32::from_le_bytes(sample.try_into().expect("four-byte float"));
+                for sample in buffer[..count].as_chunks::<4>().0 {
+                    let value = f32::from_le_bytes(*sample);
                     if !value.is_finite() {
                         bail!("torn active Float WAV contains invalid recorder sample data");
                     }
@@ -1276,7 +1276,9 @@ mod tests {
         writer.finalize().unwrap();
         let bytes_16 = std::fs::read(&path_16).unwrap();
         let decoded_16 = bytes_16[PCM_HEADER_LEN as usize..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|bytes| i16::from_le_bytes([bytes[0], bytes[1]]))
             .collect::<Vec<_>>();
         assert_eq!(decoded_16, values_16);
@@ -1304,7 +1306,9 @@ mod tests {
         writer.finalize().unwrap();
         let bytes_24 = std::fs::read(&path_24).unwrap();
         let decoded_24 = bytes_24[PCM_HEADER_LEN as usize..]
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|bytes| {
                 let raw = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]);
                 if raw & 0x0080_0000 != 0 {
@@ -1329,8 +1333,10 @@ mod tests {
         float_writer.finalize().unwrap();
         let float_bytes = std::fs::read(&float_path).unwrap();
         let decoded_float = float_bytes[FLOAT_HEADER_LEN as usize..]
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect::<Vec<_>>();
         assert_eq!(decoded_float, input);
 
@@ -1340,8 +1346,10 @@ mod tests {
         pcm16_writer.finalize().unwrap();
         let pcm16_bytes = std::fs::read(&pcm16_path).unwrap();
         let decoded_16 = pcm16_bytes[PCM_HEADER_LEN as usize..]
-            .chunks_exact(2)
-            .map(|bytes| i16::from_le_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| i16::from_le_bytes(*bytes))
             .collect::<Vec<_>>();
         assert_eq!(decoded_16, vec![i16::MAX, i16::MIN]);
 
@@ -1351,7 +1359,9 @@ mod tests {
         pcm24_writer.finalize().unwrap();
         let pcm24_bytes = std::fs::read(&pcm24_path).unwrap();
         let decoded_24 = pcm24_bytes[PCM_HEADER_LEN as usize..]
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .map(|bytes| {
                 let raw = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]);
                 if raw & 0x0080_0000 != 0 {
