@@ -1,4 +1,4 @@
-import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { HomeHeader, Icon, StudioChrome, StudioStatus, type EngineStatus, type Phase } from './studio-chrome';
 import {
   effectiveCaptureFaultKind,
@@ -713,6 +713,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const [reviewWaveformBins, setReviewWaveformBins] = useState<Array<[number, number]>>([]);
   const reviewWaveformRequestRef = useRef(0);
   const itemRowRefs = useRef(new Map<string, HTMLButtonElement>());
+  const selectedItemRowRef = useRef<HTMLButtonElement | null>(null);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [clearedLabelTransitionKey, setClearedLabelTransitionKey] = useState('');
   const [continuationLabelTransition, setContinuationLabelTransition] = useState<(
@@ -1022,7 +1023,6 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const flaggedSilenceCount = itemSilenceViews.filter((marks) => marks.headShort || marks.tailShort).length;
   const captureFaultKind = effectiveCaptureFaultKind(phase === 'running' && captureActive, engineStatus, meter);
   const captureFault = captureFaultKind !== null;
-  const deferredItemBrowserIndex = useDeferredValue(currentIndex);
   const itemBrowserRows = useMemo(() => items.map((item, index) => {
     const marks = itemSilenceViews[index] ?? { headShort: false, tailShort: false, title: '' };
     const flagged = marks.headShort || marks.tailShort;
@@ -1047,10 +1047,9 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         if (node) itemRowRefs.current.set(item.id, node);
         else itemRowRefs.current.delete(item.id);
       }}
-      className={`professional-item${index === deferredItemBrowserIndex ? ' active' : ''}${item.status === 'skipped' ? ' skipped' : ''}${flagged ? ' has-silence-issue' : ''}${labelBoundary ? ' label-boundary' : ''}${requiresRerecord ? ' requires-rerecord' : ''}${retainedWarning ? ' retained-warning' : ''}`}
+      className={`professional-item${item.status === 'skipped' ? ' skipped' : ''}${flagged ? ' has-silence-issue' : ''}${labelBoundary ? ' label-boundary' : ''}${requiresRerecord ? ' requires-rerecord' : ''}${retainedWarning ? ' retained-warning' : ''}`}
       disabled={recording || Boolean(captureFault)}
-      tabIndex={index === deferredItemBrowserIndex ? 0 : -1}
-      aria-current={index === deferredItemBrowserIndex ? 'step' : undefined}
+      tabIndex={-1}
       aria-label={accessibleParts}
       title={[marks.title, item.label].filter(Boolean).join(' · ') || undefined}
       onClick={(event) => {
@@ -1094,7 +1093,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         <ItemSilenceMarkPills marks={marks} />
       </span>
     </button>;
-  }), [captureFault, deferredItemBrowserIndex, itemSilenceViews, items, locale, recording]);
+  }), [captureFault, itemSilenceViews, items, locale, recording]);
   const requiredSilenceSamples = sampleRateForDisplay * effectiveSilenceDurationMs / 1_000;
   const headSilenceRequiredSamples = Math.max(1, meter.required_head_silence_samples ?? requiredSilenceSamples);
   const headSilenceProgressSamples = Math.min(
@@ -2037,20 +2036,33 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     clearAudioPreview();
   }, [currentIndex]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     setClearedLabelTransitionKey('');
     setContinuationLabelTransition((transition) => (
       transition?.targetItemId === currentItem?.id ? transition : null
     ));
-    if (phase !== 'running' || !currentItem) return;
-    const frame = window.requestAnimationFrame(() => {
-      itemRowRefs.current.get(currentItem.id)?.scrollIntoView({
-        block: 'nearest',
-        inline: 'nearest',
-      });
+    const previousRow = selectedItemRowRef.current;
+    const nextRow = phase === 'running' && currentItem
+      ? itemRowRefs.current.get(currentItem.id) ?? null
+      : null;
+    if (previousRow && previousRow !== nextRow) {
+      previousRow.classList.remove('active');
+      previousRow.removeAttribute('aria-current');
+      previousRow.tabIndex = -1;
+    }
+    if (!nextRow) {
+      selectedItemRowRef.current = null;
+      return;
+    }
+    nextRow.classList.add('active');
+    nextRow.setAttribute('aria-current', 'step');
+    nextRow.tabIndex = 0;
+    nextRow.scrollIntoView({
+      block: 'nearest',
+      inline: 'nearest',
     });
-    return () => window.cancelAnimationFrame(frame);
-  }, [currentIndex, currentItem?.id, phase]);
+    selectedItemRowRef.current = nextRow;
+  }, [currentIndex, currentItem?.id, itemBrowserRows, phase]);
 
   useEffect(() => {
     if (phase !== 'running' || !snapshot?.session_id) return;
