@@ -94,8 +94,9 @@ async function importScript(
     mimeType: 'text/csv',
     buffer: Buffer.from(source, 'utf8'),
   });
-  await expect(page.getByTestId('script-import-preview')).toBeVisible();
-  await page.getByTestId('confirm-script-preview').click();
+  await expect(page.getByTestId('script-preview-entry')).toBeVisible();
+  await expect(page.getByTestId('open-script-preview')).toBeVisible();
+  await expect(page.getByTestId('script-import-preview')).toHaveCount(0);
   const detectorOption = page.getByTestId(`detector-${detector}`);
   if (detector === 'energy') await detectorOption.click();
   await expect(detectorOption).toHaveAttribute('aria-checked', 'true');
