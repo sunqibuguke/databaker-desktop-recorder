@@ -5679,10 +5679,7 @@ fn validate_snapshot_for_export(snapshot: &SessionSnapshot) -> Result<()> {
     validate_capture_provenance(snapshot, snapshot.committed_samples, true)?;
     for item in &snapshot.items {
         if item.status == "review" {
-            bail!(
-                "条目 {} 存在待确认录音或需要重录，无法导出切片。",
-                item.id
-            );
+            bail!("条目 {} 存在待确认录音或需要重录，无法导出切片。", item.id);
         }
         if item.status == "accepted" && item.selected_attempt_id.is_none() {
             bail!(
@@ -5746,10 +5743,7 @@ fn validate_snapshot_for_artifact(
     }
     for item in &snapshot.items {
         if item.status == "review" {
-            bail!(
-                "条目 {} 存在待确认录音或需要重录，无法导出切片。",
-                item.id
-            );
+            bail!("条目 {} 存在待确认录音或需要重录，无法导出切片。", item.id);
         }
         let Some(selected_id) = item.selected_attempt_id.as_deref() else {
             continue;
