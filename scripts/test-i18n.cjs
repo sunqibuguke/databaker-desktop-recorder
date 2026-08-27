@@ -74,6 +74,11 @@ async function main() {
   assert.equal(t('recorder.ruleAutoStartNext'), '确认后自动开下一句');
   assert.equal(t('recorder.rulePauseOnLabelChange'), '标签变化时先暂停');
   assert.match(t('recorder.rulePauseOnLabelChangeHint'), /默认关闭/);
+  assert.equal(t('recorder.labelChanged'), '标签已变化');
+  assert.equal(t('prompter.labelChanged'), '标签已变化');
+  assert.equal(t('recorder.previewCandidate'), '试听本次重录');
+  assert.equal(t('recorder.useRetakeCandidate'), '使用本次重录');
+  assert.equal(t('recorder.keepPreviousVersion'), '放弃本次重录');
   assert.equal(t('recorder.acceptAndReviewNext'), '确认并查看下一句');
   assert.equal(t('noise.leave'), '退出任务');
   assert.equal(t('noise.skipCheck'), '关闭本次环境检测并继续');

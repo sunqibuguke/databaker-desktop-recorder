@@ -31,7 +31,17 @@ import {
   systemPreferences,
   Tray,
 } from 'electron';
-import { constants as fsConstants, copyFileSync, chmodSync, promises as fs, statSync } from 'node:fs';
+import {
+  constants as fsConstants,
+  copyFileSync,
+  chmodSync,
+  lstatSync,
+  mkdirSync,
+  promises as fs,
+  realpathSync,
+  statSync,
+} from 'node:fs';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import {
   EngineClient,
@@ -46,12 +56,16 @@ import {
   type CaptureFaultNotice,
 } from './capture-fault';
 import {
-  deliveredExportFilePath,
+  assertExportDeliveryDestinationUnchanged,
+  bindExportDeliveryDestination,
+  bindExportDeliverySource,
   EXPORT_DELIVER_ERROR,
-  exportPathsAreSameDirectory,
-  formatExportDeliverStamp,
-  isAllowedExportArtifactName,
-  MAX_EXPORT_DELIVER_NAME_ATTEMPTS,
+  EXPORT_DELIVERY_PROGRESS_CHANNEL,
+  isExportDeliveryRequest,
+  ReliableExportDeliveryManager,
+  type ExportDeliveryArtifact,
+  type ExportDeliveryDestinationBinding,
+  type ExportDeliveryRequest,
 } from './export-deliver';
 import { CapturePresetRepository, type CapturePresetDraft } from './capture-presets';
 import {
@@ -76,10 +90,63 @@ import {
   LatestOnlyMeterBackpressure,
 } from './meter-backpressure';
 import { applyDevWebCaptureEnv, isDevWebCaptureEnabled } from './dev-web-capture';
+import { deriveHistoryWorkflowSummary } from './p1-history';
 
 let mainWindow: BrowserWindow | null = null;
 let prompterWindow: BrowserWindow | null = null;
 let activeWindowLocale: AppLocale = normalizeAppLocale(process.env.DATABAKER_LOCALE);
+
+function e2eMainProcessEnabled(): boolean {
+  return !app.isPackaged && process.env.DATABAKER_E2E === '1';
+}
+
+function configureE2EUserData(): void {
+  if (!e2eMainProcessEnabled()) return;
+  const configured = process.env.DATABAKER_E2E_USER_DATA;
+  if (!configured) return;
+  if (!path.isAbsolute(configured)) {
+    throw new Error('DATABAKER_E2E_USER_DATA must be an absolute path');
+  }
+  mkdirSync(configured, { recursive: true });
+  const lexicalMetadata = lstatSync(configured);
+  const canonical = realpathSync(configured);
+  const metadata = lstatSync(canonical);
+  if (!lexicalMetadata.isDirectory()
+    || lexicalMetadata.isSymbolicLink()
+    || !metadata.isDirectory()
+    || metadata.isSymbolicLink()) {
+    throw new Error('DATABAKER_E2E_USER_DATA must resolve to a real directory');
+  }
+  app.setPath('userData', canonical);
+}
+
+configureE2EUserData();
+
+async function e2eOverridePath(
+  environmentName: 'DATABAKER_E2E_SCRIPT_PATH' | 'DATABAKER_E2E_OUTPUT_DIR' | 'DATABAKER_E2E_EXPORT_DIR',
+  kind: 'file' | 'directory',
+): Promise<string | null> {
+  if (!e2eMainProcessEnabled()) return null;
+  const configured = process.env[environmentName];
+  if (!configured) return null;
+  if (!path.isAbsolute(configured)) throw new Error(`${environmentName} must be an absolute path`);
+  if (kind === 'directory' && environmentName === 'DATABAKER_E2E_OUTPUT_DIR') {
+    await fs.mkdir(configured, { recursive: true });
+  }
+  const lexicalMetadata = await fs.lstat(configured);
+  const canonical = await fs.realpath(configured);
+  const metadata = await fs.lstat(canonical);
+  if ((kind === 'file' && !metadata.isFile())
+    || (kind === 'directory' && !metadata.isDirectory())
+    || (kind === 'file' && !lexicalMetadata.isFile())
+    || (kind === 'directory' && !lexicalMetadata.isDirectory())
+    || lexicalMetadata.isSymbolicLink()
+    || metadata.isSymbolicLink()
+  ) {
+    throw new Error(`${environmentName} must resolve to a real ${kind}`);
+  }
+  return canonical;
+}
 
 function currentAppWindowTitle(): string {
   return nativeWindowTitle(activeWindowLocale, 'app');
@@ -298,7 +365,6 @@ const allowedCommands = new Set([
   'get_state',
   'stop_session',
   'seal_interrupted_session',
-  'export_session',
   'export_session_artifact',
 ]);
 
@@ -539,12 +605,28 @@ function assertCanMutateActiveSession(command: string): void {
     || engineIntent.phase === 'quitting') {
     throw new Error(operationBusyMessage());
   }
-  if (command === 'export_session' || command === 'export_session_artifact') return;
+  if (command === 'export_session_artifact') return;
 }
 
 function engineExecutable(): string {
   const executable = process.platform === 'win32' ? 'recorder-engine.exe' : 'recorder-engine';
   if (app.isPackaged) return path.join(process.resourcesPath, 'bin', executable);
+  if (e2eMainProcessEnabled() && process.env.DATABAKER_E2E_ENGINE_PATH) {
+    const configured = process.env.DATABAKER_E2E_ENGINE_PATH;
+    if (!path.isAbsolute(configured)) {
+      throw new Error('DATABAKER_E2E_ENGINE_PATH must be an absolute path');
+    }
+    const lexicalMetadata = lstatSync(configured);
+    const canonical = realpathSync(configured);
+    const metadata = lstatSync(canonical);
+    if (!lexicalMetadata.isFile()
+      || lexicalMetadata.isSymbolicLink()
+      || !metadata.isFile()
+      || metadata.isSymbolicLink()) {
+      throw new Error('DATABAKER_E2E_ENGINE_PATH must resolve to a real executable file');
+    }
+    return canonical;
+  }
   const built = path.join(app.getAppPath(), 'engine', 'target', 'debug', executable);
   return stageMacDevSidecar(built, executable) ?? built;
 }
@@ -972,7 +1054,7 @@ function synthesizeTimedOutAttemptResult(
       || previousAttempts.some((attempt) => isRecord(attempt) && attempt.attempt_id === attemptId)
       || currentAttempts.length !== previousAttempts.length + 1
       || JSON.stringify(otherCurrentAttempts) !== JSON.stringify(previousAttempts)) {
-      throw new Error('结束录音超时后，录音版本变化无法唯一对账');
+      throw new Error('结束录音超时后，录音状态变化无法唯一对账');
     }
     return {
       item_id: itemId,
@@ -1279,85 +1361,285 @@ const exportArtifactFiles: Record<ExportArtifactName, { status: string; output: 
   cuts_zip: { status: 'status-cuts-zip.json', output: 'cuts.zip' },
   timestamps_json: { status: 'status-timestamps-json.json', output: 'timestamps.json' },
 };
-const rememberedExportDirectories = new Set<string>();
+
+export type VerifiedExportArtifactIntegrity = Readonly<{
+  file_path: string;
+  size_bytes: number;
+  sha256: string;
+}>;
+
+function sameBigintFileIdentity(
+  left: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; ctimeNs: bigint },
+  right: { dev: bigint; ino: bigint; size: bigint; mtimeNs: bigint; ctimeNs: bigint },
+): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs;
+}
+
+export async function verifyExportArtifactIntegrity(
+  filePath: string,
+  expectedSha256: string,
+): Promise<VerifiedExportArtifactIntegrity | null> {
+  if (!/^[a-f0-9]{64}$/i.test(expectedSha256)) return null;
+  const lexicalPath = path.resolve(filePath);
+  let handle: Awaited<ReturnType<typeof fs.open>> | null = null;
+  try {
+    const entry = await fs.lstat(lexicalPath, { bigint: true });
+    const canonical = await fs.realpath(lexicalPath);
+    if (!entry.isFile()
+      || entry.isSymbolicLink()
+      || entry.size <= 0n
+      || entry.size > BigInt(Number.MAX_SAFE_INTEGER)
+      || !isSameSessionDir(canonical, lexicalPath)) return null;
+    handle = await fs.open(lexicalPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const before = await handle.stat({ bigint: true });
+    if (!before.isFile() || !sameBigintFileIdentity(entry, before)) return null;
+    const hash = createHash('sha256');
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let position = 0;
+    while (true) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, position);
+      if (bytesRead === 0) break;
+      hash.update(buffer.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+    const after = await handle.stat({ bigint: true });
+    const actualSha256 = hash.digest('hex');
+    if (!sameBigintFileIdentity(before, after)
+      || actualSha256 !== expectedSha256.toLocaleLowerCase('en-US')) return null;
+    return {
+      file_path: lexicalPath,
+      size_bytes: Number(after.size),
+      sha256: actualSha256,
+    };
+  } catch {
+    return null;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+function exportStatusSizeMatches(status: Record<string, unknown>, actualSize: number): boolean {
+  return status.size_bytes === undefined
+    || (isNonNegativeSafeInteger(status.size_bytes) && status.size_bytes === actualSize);
+}
+const rememberedExportDirectories = new Map<string, ExportDeliveryDestinationBinding>();
 
 async function rememberUserExportDirectory(directory: string): Promise<string> {
-  const lexical = path.resolve(directory);
-  let canonical: string;
-  try {
-    canonical = await fs.realpath(lexical);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      throw new Error(EXPORT_DELIVER_ERROR.destMissing);
-    }
-    throw error;
-  }
-  const metadata = await fs.lstat(canonical);
-  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
-    throw new Error(EXPORT_DELIVER_ERROR.destNotDirectory);
-  }
-  rememberedExportDirectories.add(canonical);
-  return canonical;
+  const binding = await bindExportDeliveryDestination(directory);
+  rememberedExportDirectories.set(normalizedSessionDir(binding.canonicalPath), binding);
+  return binding.canonicalPath;
 }
 
 function isInsideRememberedExportDirectory(resolvedTarget: string): boolean {
-  for (const remembered of rememberedExportDirectories) {
-    if (isSameSessionDir(remembered, resolvedTarget) || isWithin(remembered, resolvedTarget)) {
+  for (const remembered of rememberedExportDirectories.values()) {
+    if (isSameSessionDir(remembered.canonicalPath, resolvedTarget)
+      || isWithin(remembered.canonicalPath, resolvedTarget)) {
       return true;
     }
   }
   return false;
 }
 
-async function deliverExportArtifact(sourceFile: string, destinationDir: string): Promise<{
-  directory: string;
-  file_path: string;
-  copied: boolean;
-}> {
-  const sourceReal = await fs.realpath(path.resolve(sourceFile));
-  if (!(await isInsideKnownSession(sourceReal))) {
+function knownSessionDirById(sessionId: string): string | null {
+  const matches = [...knownSessionIds.entries()]
+    .filter(([, knownId]) => knownId === sessionId)
+    .map(([normalized]) => [...knownSessionDirs]
+      .find((candidate) => normalizedSessionDir(candidate) === normalized) ?? normalized);
+  return matches.length === 1 ? matches[0] : null;
+}
+
+async function assertCurrentExportGeneration(
+  sessionDir: string,
+  request: Pick<ExportDeliveryRequest, 'session_id' | 'artifact' | 'export_id'>,
+): Promise<Record<string, unknown>> {
+  const recovered = await loadHistorySnapshot(sessionDir, path.join(sessionDir, 'metadata'));
+  if (!recovered || recovered.snapshot.session_id !== request.session_id) {
     throw new Error(EXPORT_DELIVER_ERROR.sourceNotInSession);
   }
-  if (!isAllowedExportArtifactName(sourceReal) || path.basename(path.dirname(sourceReal)) !== 'export') {
-    throw new Error(EXPORT_DELIVER_ERROR.sourceNotInExportDir);
+  const inspected = await inspectExportArtifact(
+    path.join(sessionDir, 'export'),
+    recovered.snapshot,
+    request.artifact,
+  );
+  if (inspected.state !== 'current') throw new Error(EXPORT_DELIVER_ERROR.exportStale);
+  const descriptor = exportArtifactFiles[request.artifact];
+  const statusSource = await readBoundedRegularFile(
+    path.join(sessionDir, 'export', descriptor.status),
+    EXPORT_STATUS_MAX_BYTES,
+  );
+  if (!statusSource) throw new Error(EXPORT_DELIVER_ERROR.exportStale);
+  let status: unknown;
+  try {
+    status = JSON.parse(statusSource.bytes.toString('utf8')) as unknown;
+  } catch (error) {
+    throw new Error(EXPORT_DELIVER_ERROR.exportStale, { cause: error });
   }
-  const sourceMeta = await fs.lstat(sourceReal);
-  if (!sourceMeta.isFile() || sourceMeta.isSymbolicLink()) {
-    throw new Error(EXPORT_DELIVER_ERROR.sourceInvalid);
+  if (!isRecord(status)
+    || status.schema_version !== 2
+    || status.status !== 'complete'
+    || status.session_id !== request.session_id
+    || status.artifact !== request.artifact
+    || status.export_id !== request.export_id
+    || typeof status.sha256 !== 'string'
+    || !/^[a-f0-9]{64}$/i.test(status.sha256)) {
+    throw new Error(EXPORT_DELIVER_ERROR.exportStale);
   }
-  const destCanonical = await rememberUserExportDirectory(destinationDir);
-  if (exportPathsAreSameDirectory(path.dirname(sourceReal), destCanonical)) {
-    return { directory: destCanonical, file_path: sourceReal, copied: false };
+  if (inspected.export_id !== status.export_id
+    || inspected.sha256 !== status.sha256
+    || !isNonNegativeSafeInteger(inspected.size_bytes)
+    || !exportStatusSizeMatches(status, inspected.size_bytes)) {
+    throw new Error(EXPORT_DELIVER_ERROR.exportStale);
   }
-  const stamp = formatExportDeliverStamp();
-  let destFile = '';
-  let copied = false;
-  for (let collision = 0; collision < MAX_EXPORT_DELIVER_NAME_ATTEMPTS; collision += 1) {
-    destFile = deliveredExportFilePath(destCanonical, sourceReal, stamp, collision);
-    try {
-      await fs.copyFile(sourceReal, destFile, fsConstants.COPYFILE_EXCL);
-      copied = true;
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  return status;
+}
+
+async function resolveExportDeliverySession(
+  request: Pick<ExportDeliveryRequest, 'session_id' | 'artifact' | 'export_id'>,
+): Promise<string> {
+  const sessionDir = knownSessionDirById(request.session_id);
+  if (!sessionDir) throw new Error(EXPORT_DELIVER_ERROR.sourceNotInSession);
+  const authorizedRoots = Array.from(canonicalOutputRoots.values());
+  const binding = await bindAuthorizedSession(sessionDir, authorizedRoots, request.session_id);
+  await assertAuthorizedSessionUnchanged(binding, authorizedRoots);
+  return binding.canonicalPath;
+}
+
+async function resolveExportDeliverySource(
+  request: ExportDeliveryRequest,
+): Promise<Awaited<ReturnType<typeof bindExportDeliverySource>>> {
+  const sessionDir = await resolveExportDeliverySession(request);
+  const authorizedRoots = Array.from(canonicalOutputRoots.values());
+  const sessionBinding = await bindAuthorizedSession(sessionDir, authorizedRoots, request.session_id);
+  const validateCurrent = async () => {
+    await assertAuthorizedSessionUnchanged(sessionBinding, authorizedRoots);
+    await assertCurrentExportGeneration(sessionBinding.canonicalPath, request);
+  };
+  return bindExportDeliverySource(sessionBinding.canonicalPath, request, validateCurrent);
+}
+
+async function resolveRememberedExportDestination(
+  request: ExportDeliveryRequest,
+): Promise<ExportDeliveryDestinationBinding> {
+  let canonical: string;
+  try {
+    canonical = await fs.realpath(path.resolve(request.destination_dir));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new Error(EXPORT_DELIVER_ERROR.destMissing);
     }
+    throw error;
   }
-  if (!copied || !destFile) {
-    throw new Error(EXPORT_DELIVER_ERROR.copyResultInvalid);
+  const remembered = rememberedExportDirectories.get(normalizedSessionDir(canonical));
+  if (!remembered) throw new Error(EXPORT_DELIVER_ERROR.destNotAuthorized);
+  await assertExportDeliveryDestinationUnchanged(remembered);
+  return remembered;
+}
+
+const exportDeliveryManager = new ReliableExportDeliveryManager({
+  resolveSource: resolveExportDeliverySource,
+  resolveDestination: resolveRememberedExportDestination,
+  resolveSessionDir: resolveExportDeliverySession,
+  onProgress: (progress) => {
+    if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed()) {
+      mainWindow.webContents.send(EXPORT_DELIVERY_PROGRESS_CHANNEL, progress);
+    }
+  },
+});
+
+async function reconcileExportResultGeneration(
+  result: unknown,
+  sessionDir: string,
+  sessionId: string,
+  artifact?: ExportArtifactName,
+): Promise<unknown> {
+  if (!artifact) return result;
+  if (!isRecord(result)) throw new Error('录音引擎返回的导出结果无效');
+  const descriptor = exportArtifactFiles[artifact];
+  const statusSource = await readBoundedRegularFile(
+    path.join(sessionDir, 'export', descriptor.status),
+    EXPORT_STATUS_MAX_BYTES,
+  );
+  if (!statusSource) throw new Error('导出已返回，但无法确认导出代次');
+  let status: unknown;
+  try {
+    status = JSON.parse(statusSource.bytes.toString('utf8')) as unknown;
+  } catch (error) {
+    throw new Error('导出已返回，但导出状态已损坏', { cause: error });
   }
-  const destMeta = await fs.lstat(destFile);
-  if (!destMeta.isFile() || destMeta.isSymbolicLink()) {
-    throw new Error(EXPORT_DELIVER_ERROR.copyResultInvalid);
+  if (!isRecord(status)
+    || status.schema_version !== 2
+    || status.status !== 'complete'
+    || status.session_id !== sessionId
+    || status.artifact !== artifact
+    || typeof status.export_id !== 'string'
+    || !status.export_id.trim()
+    || typeof status.sha256 !== 'string'
+    || !/^[a-f0-9]{64}$/i.test(status.sha256)) {
+    throw new Error('导出已返回，但导出代次不可信');
   }
-  debugLog?.append({
-    level: 'info',
-    source: 'main',
-    category: 'export',
-    event: 'export.deliver',
-    message: `已复制导出文件到所选目录：${path.basename(destFile)}`,
-    data: { source_file: sourceReal, destination_dir: destCanonical },
-  });
-  return { directory: destCanonical, file_path: destFile, copied: true };
+  const recovered = await loadHistorySnapshot(sessionDir, path.join(sessionDir, 'metadata'));
+  if (!recovered || recovered.snapshot.session_id !== sessionId) {
+    throw new Error('导出已返回，但任务快照无法对账');
+  }
+  const sourceMatches = artifact === 'full_track'
+    ? fullTrackExportSourceMatchesSnapshot(status.source, recovered.snapshot)
+    : exportSourceMatchesSnapshot(status.source, recovered.snapshot);
+  if (!sourceMatches) throw new Error('导出代次与当前任务快照不一致');
+  const integrity = await verifyExportArtifactIntegrity(
+    path.join(sessionDir, 'export', descriptor.output),
+    status.sha256,
+  );
+  if (!integrity || !exportStatusSizeMatches(status, integrity.size_bytes)) {
+    throw new Error('导出已返回，但任务内产物的大小或 SHA-256 校验失败');
+  }
+  const confirmedStatusSource = await readBoundedRegularFile(
+    path.join(sessionDir, 'export', descriptor.status),
+    EXPORT_STATUS_MAX_BYTES,
+  );
+  if (!confirmedStatusSource || !confirmedStatusSource.bytes.equals(statusSource.bytes)) {
+    throw new Error('导出已返回，但导出代次在物理校验期间发生变化');
+  }
+  const confirmedRecovered = await loadHistorySnapshot(
+    sessionDir,
+    path.join(sessionDir, 'metadata'),
+  );
+  if (!confirmedRecovered
+    || confirmedRecovered.snapshot.session_id !== sessionId
+    || confirmedRecovered.snapshot.journal_seq !== recovered.snapshot.journal_seq
+    || !(artifact === 'full_track'
+      ? fullTrackExportSourceMatchesSnapshot(status.source, confirmedRecovered.snapshot)
+      : exportSourceMatchesSnapshot(status.source, confirmedRecovered.snapshot))) {
+    throw new Error('导出已返回，但任务快照在物理校验期间发生变化');
+  }
+  if (typeof result.export_id === 'string' && result.export_id !== status.export_id) {
+    throw new Error('录音引擎结果与磁盘导出代次不一致');
+  }
+  return {
+    ...result,
+    export_id: status.export_id,
+    scope: typeof status.scope === 'string' ? status.scope : result.scope,
+    manifest_file: typeof result.manifest_file === 'string'
+      ? result.manifest_file
+      : (typeof status.manifest_file === 'string'
+        ? path.join(sessionDir, 'export', status.manifest_file)
+        : undefined),
+    sha256: typeof status.sha256 === 'string' ? status.sha256 : result.sha256,
+    size_bytes: integrity.size_bytes,
+    source: status.source,
+    journal_seq: isRecord(status.source) && isNonNegativeSafeInteger(status.source.journal_seq)
+      ? status.source.journal_seq
+      : result.journal_seq,
+    committed_samples: isRecord(status.source)
+      && isNonNegativeSafeInteger(status.source.committed_samples)
+      ? status.source.committed_samples
+      : result.committed_samples,
+    source_snapshot: status.source,
+    export_confirmed_complete: true,
+  };
 }
 
 function fullTrackExportSourceMatchesSnapshot(
@@ -1370,7 +1652,7 @@ function fullTrackExportSourceMatchesSnapshot(
       === JSON.stringify(snapshot.capture_provenance ?? []);
 }
 
-async function inspectExportArtifact(
+export async function inspectExportArtifact(
   exportDir: string,
   snapshot: Record<string, unknown>,
   artifact: ExportArtifactName,
@@ -1390,7 +1672,11 @@ async function inspectExportArtifact(
   if (!isRecord(status)
     || status.schema_version !== 2
     || status.session_id !== snapshot.session_id
-    || status.artifact !== artifact) {
+    || status.artifact !== artifact
+    || typeof status.export_id !== 'string'
+    || !status.export_id.trim()
+    || typeof status.sha256 !== 'string'
+    || !/^[a-f0-9]{64}$/i.test(status.sha256)) {
     return { artifact, state: 'failed', message: '导出状态与当前任务不匹配' };
   }
   if (status.status !== 'complete') {
@@ -1400,16 +1686,29 @@ async function inspectExportArtifact(
     ? fullTrackExportSourceMatchesSnapshot(status.source, snapshot)
     : exportSourceMatchesSnapshot(status.source, snapshot);
   const filePath = path.join(exportDir, descriptor.output);
-  const outputExists = await fs.lstat(filePath)
-    .then((metadata) => metadata.isFile() && !metadata.isSymbolicLink())
-    .catch(() => false);
-  if (!outputExists) {
-    return { artifact, state: 'failed', message: '导出文件缺失' };
+  const integrity = await verifyExportArtifactIntegrity(filePath, status.sha256);
+  if (!integrity || !exportStatusSizeMatches(status, integrity.size_bytes)) {
+    return { artifact, state: 'failed', message: '导出文件缺失、被替换或 SHA-256 校验失败' };
+  }
+  const confirmedStatusSource = await readBoundedRegularFile(
+    path.join(exportDir, descriptor.status),
+    EXPORT_STATUS_MAX_BYTES,
+  );
+  if (!confirmedStatusSource || !confirmedStatusSource.bytes.equals(statusSource.bytes)) {
+    return { artifact, state: 'failed', message: '导出代次在物理校验期间发生变化' };
   }
   return {
     artifact,
     state: sourceMatches ? 'current' : 'stale',
     file_path: filePath,
+    export_id: status.export_id,
+    scope: typeof status.scope === 'string' ? status.scope : undefined,
+    manifest_file: typeof status.manifest_file === 'string'
+      ? path.join(exportDir, status.manifest_file)
+      : undefined,
+    sha256: typeof status.sha256 === 'string' ? status.sha256 : undefined,
+    size_bytes: integrity.size_bytes,
+    delivery_verification: 'pending',
     exported_at: typeof status.completed_at === 'string' ? status.completed_at : undefined,
     exported_count: isNonNegativeSafeInteger(status.exported_count) ? status.exported_count : undefined,
     skipped_count: isNonNegativeSafeInteger(status.skipped_count) ? status.skipped_count : undefined,
@@ -1425,16 +1724,16 @@ async function inspectExportArtifacts(
   const result = Object.fromEntries(entries) as Record<ExportArtifactName, Record<string, unknown>>;
   if (Object.values(result).some((entry) => entry.state !== 'never')) return result;
 
-  // A legacy bundle remains discoverable. Its source tracked every selection,
-  // so it can only be called current while the legacy commit marker still
-  // matches the snapshot; files are never deleted during this migration.
+  // A legacy bundle remains discoverable, but its marker does not bind the
+  // bytes with a SHA-256. Never describe those files as a current, verified
+  // artifact; keep the paths visible so an operator can recover or re-export.
   if (await hasCompleteExport(exportDir, snapshot)) {
     for (const artifact of Object.keys(exportArtifactFiles) as ExportArtifactName[]) {
       result[artifact] = {
         artifact,
-        state: 'current',
+        state: 'stale',
         file_path: path.join(exportDir, exportArtifactFiles[artifact].output),
-        message: '由旧版整包导出记录兼容识别',
+        message: '早期导出缺少 SHA-256 校验，请重新导出',
       };
     }
   }
@@ -1576,6 +1875,24 @@ function historyIssueRow(
     skipped_items: 0,
     review_items: 0,
     pending_items: 0,
+    blocker_items: 1,
+    warning_items: 0,
+    confirmed_only_readiness: {
+      ready: false,
+      health: 'blocked',
+      included_items: 0,
+      excluded_items: 0,
+      blocker_count: 1,
+      warning_count: 0,
+    },
+    complete_task_readiness: {
+      ready: false,
+      health: 'blocked',
+      included_items: 0,
+      excluded_items: 0,
+      blocker_count: 1,
+      warning_count: 0,
+    },
     noise_check: null,
     export_exists: false,
     history_issue: issue,
@@ -1763,6 +2080,7 @@ async function listRecordings(
       const exportDir = path.join(candidate.sessionDir, 'export');
       const exportExists = await hasCompleteExport(exportDir, snapshot);
       const exportArtifacts = await inspectExportArtifacts(exportDir, snapshot);
+      const workflowSummary = deriveHistoryWorkflowSummary(snapshot);
       const faulted = snapshot.audio_fault_marker === true
         || snapshot.status === 'faulted'
         || snapshot.status === 'recording'
@@ -1791,6 +2109,10 @@ async function listRecordings(
         skipped_items: countItems(items, 'skipped'),
         review_items: countItems(items, 'review'),
         pending_items: countItems(items, 'pending'),
+        blocker_items: workflowSummary.blocker_items,
+        warning_items: workflowSummary.warning_items,
+        confirmed_only_readiness: workflowSummary.confirmed_only_readiness,
+        complete_task_readiness: workflowSummary.complete_task_readiness,
         noise_check: snapshot.noise_check ?? null,
         export_exists: exportExists || Object.values(exportArtifacts)
           .some((artifact) => artifact.state === 'current'),
@@ -2474,7 +2796,12 @@ function performSafeStopAndQuit(source: string): Promise<void> {
 }
 
 async function requestSessionWithReconciliation(
-  command: 'start_session' | 'resume_session' | 'activate_session',
+  command:
+    | 'start_session'
+    | 'resume_session'
+    | 'activate_session'
+    | 'test_start_session'
+    | 'test_activate_session',
   payload: Record<string, unknown>,
   sessionDir: string,
   timeoutMs: number,
@@ -2626,7 +2953,8 @@ async function requestAttemptWithReconciliation(
 }
 
 function shouldSkipMicrophonePreflight(): boolean {
-  return process.env.DATABAKER_SKIP_MIC_PREFLIGHT === '1' && !app.isPackaged;
+  return !app.isPackaged
+    && (process.env.DATABAKER_SKIP_MIC_PREFLIGHT === '1' || e2eMainProcessEnabled());
 }
 
 function devWebCaptureEnabled(): boolean {
@@ -3386,9 +3714,10 @@ async function reconciledCompleteExportResult(
   const recovered = await loadHistorySnapshot(sessionDir, path.join(sessionDir, 'metadata'));
   if (!recovered || recovered.snapshot.session_id !== expectedSessionId) return null;
   const exportDir = path.join(sessionDir, 'export');
+  let inspectedArtifact: Record<string, unknown> | null = null;
   if (artifact) {
-    const inspected = await inspectExportArtifact(exportDir, recovered.snapshot, artifact);
-    if (inspected.state !== 'current') return null;
+    inspectedArtifact = await inspectExportArtifact(exportDir, recovered.snapshot, artifact);
+    if (inspectedArtifact.state !== 'current') return null;
   } else if (!(await hasCompleteExport(exportDir, recovered.snapshot))) return null;
   const statusSource = await readBoundedRegularFile(
     path.join(exportDir, artifact ? exportArtifactFiles[artifact].status : 'status.json'),
@@ -3400,14 +3729,39 @@ async function reconciledCompleteExportResult(
     || status.schema_version !== 2
     || status.status !== 'complete'
     || status.session_id !== recovered.snapshot.session_id
+    || (artifact !== undefined
+      && (typeof status.sha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(status.sha256)))
     || (artifact === 'full_track'
       ? !fullTrackExportSourceMatchesSnapshot(status.source, recovered.snapshot)
       : !exportSourceMatchesSnapshot(status.source, recovered.snapshot))
     || !isNonNegativeSafeInteger(status.exported_count)
     || !isNonNegativeSafeInteger(status.skipped_count)) return null;
+  if (artifact && (!inspectedArtifact
+    || inspectedArtifact.export_id !== status.export_id
+    || inspectedArtifact.sha256 !== status.sha256
+    || !isNonNegativeSafeInteger(inspectedArtifact.size_bytes)
+    || !exportStatusSizeMatches(status, inspectedArtifact.size_bytes))) return null;
   return {
     artifact,
     export_dir: exportDir,
+    export_id: status.export_id,
+    scope: typeof status.scope === 'string' ? status.scope : undefined,
+    manifest_file: typeof status.manifest_file === 'string'
+      ? path.join(exportDir, status.manifest_file)
+      : undefined,
+    sha256: typeof status.sha256 === 'string' ? status.sha256 : undefined,
+    size_bytes: isNonNegativeSafeInteger(inspectedArtifact?.size_bytes)
+      ? inspectedArtifact.size_bytes
+      : undefined,
+    source: status.source,
+    journal_seq: isRecord(status.source) && isNonNegativeSafeInteger(status.source.journal_seq)
+      ? status.source.journal_seq
+      : undefined,
+    committed_samples: isRecord(status.source)
+      && isNonNegativeSafeInteger(status.source.committed_samples)
+      ? status.source.committed_samples
+      : undefined,
+    source_snapshot: status.source,
     ...(artifact === 'full_track' || !artifact
       ? { master_file: path.join(exportDir, 'full-track.wav') }
       : {}),
@@ -3486,7 +3840,7 @@ async function exportSession(payload: unknown): Promise<unknown> {
     && Object.hasOwn(exportArtifactFiles, requestedArtifact)
     ? requestedArtifact as ExportArtifactName
     : undefined;
-  if (requestedArtifact !== undefined && !artifact) throw new Error('导出项目无效');
+  if (!artifact) throw new Error('导出项目无效；界面切片必须使用带代次门禁的 artifact 导出');
   assertCanStartOrResume();
   const exportIntent = beginEngineIntent('exporting', path.resolve(sessionDir));
   let binding: AuthorizedSessionBinding | null = null;
@@ -3509,11 +3863,8 @@ async function exportSession(payload: unknown): Promise<unknown> {
       await assertEngineIdleForExport(exportIntent);
       await assertAuthorizedSessionUnchanged(binding, authorizedRoots);
       assertCurrentEngineIntent(exportIntent, ['exporting']);
-      const exportCommand = artifact
-        ? 'export_session_artifact'
-        : 'export_session';
       const result = await exportEngine.request(
-        exportCommand,
+        'export_session_artifact',
         {
           ...(payload as Record<string, unknown>),
           session_dir: canonical,
@@ -3524,9 +3875,18 @@ async function exportSession(payload: unknown): Promise<unknown> {
       assertCurrentEngineIntent(exportIntent, ['exporting']);
       await assertAuthorizedSessionUnchanged(binding, authorizedRoots);
       assertCurrentEngineIntent(exportIntent, ['exporting']);
+      const reconciled = await reconcileExportResultGeneration(
+        result,
+        canonical,
+        binding.sessionId,
+        artifact,
+      );
+      assertCurrentEngineIntent(exportIntent, ['exporting']);
+      await assertAuthorizedSessionUnchanged(binding, authorizedRoots);
+      assertCurrentEngineIntent(exportIntent, ['exporting']);
       transitionEngineIntent(exportIntent, 'idle', null);
       rememberKnownSession(canonical, binding.sessionId);
-      return result;
+      return reconciled;
     } catch (error) {
       if (error instanceof AuthorizedSessionBindingError) {
         const invalidated = binding?.canonicalPath ?? canonicalSessionDir;
@@ -3996,6 +4356,31 @@ function registerIpc(): void {
     }
   });
   ipcMain.handle('app:dev-web-capture', () => devWebCaptureEnabled());
+  ipcMain.handle('e2e:test-feed-pcm', async (event, payload: unknown) => {
+    assertMainRenderer(event.sender);
+    if (!e2eMainProcessEnabled()) throw new Error('仅 E2E 测试模式可注入合成 PCM');
+    if (!engine || engineIntent.phase !== 'active') throw new Error('E2E 录音任务未启动');
+    if (!isRecord(payload)
+      || !isNonNegativeSafeInteger(payload.frames)
+      || payload.frames === 0
+      || payload.frames > 480_000
+      || (payload.seed !== undefined && !isNonNegativeSafeInteger(payload.seed))
+      || (payload.pattern !== undefined
+        && payload.pattern !== 'silence'
+        && payload.pattern !== 'speech')
+      || (payload.block_frames !== undefined
+        && (!isNonNegativeSafeInteger(payload.block_frames)
+          || payload.block_frames < 1
+          || payload.block_frames > 8_192))) {
+      throw new Error('E2E PCM 注入参数无效');
+    }
+    return engine.request('test_feed_pcm', {
+      frames: payload.frames,
+      seed: payload.seed ?? 0,
+      block_frames: payload.block_frames ?? 256,
+      pattern: payload.pattern ?? 'speech',
+    }, 20_000);
+  });
   ipcMain.handle('engine:request', async (event, command: string, payload: unknown) => {
     assertMainRenderer(event.sender);
     if (command === 'dev_feed_pcm') {
@@ -4014,6 +4399,28 @@ function registerIpc(): void {
     if (!engine) throw new Error('录音引擎不可用');
     const activeEngine = engine;
     return withDebugLoggedCommand(command, payload, async () => {
+    if (command === 'list_devices' && e2eMainProcessEnabled()) {
+      return {
+        devices: [{
+          id: 'system-test:synthetic',
+          name: 'DataBaker E2E Synthetic Input',
+          is_default: true,
+          sample_rates: [48_000],
+          input_channels: [1],
+          configurations: [{
+            min_sample_rate: 48_000,
+            max_sample_rate: 48_000,
+            channels: 1,
+            sample_format: 'f32',
+            share_mode: 'shared',
+          }],
+          exclusive_available: false,
+          shared_sample_rates: [48_000],
+          shared_input_channels: [1],
+        }],
+        default_device_id: 'system-test:synthetic',
+      };
+    }
     if (command === 'create_session') {
       const sessionDir = (payload as { session_dir?: unknown })?.session_dir;
       if (typeof sessionDir !== 'string') throw new Error('录制目录无效');
@@ -4107,9 +4514,17 @@ function registerIpc(): void {
         await activeEngine.start();
         assertCurrentEngineIntent(startIntent, ['starting']);
         const safePayload = { ...(payload as Record<string, unknown>), session_dir: canonicalTarget };
+        const e2eSynthetic = e2eMainProcessEnabled();
         const result = await requestSessionWithReconciliation(
-          'start_session',
-          safePayload,
+          e2eSynthetic ? 'test_start_session' : 'start_session',
+          e2eSynthetic
+            ? {
+                ...safePayload,
+                device_id: 'system-test:synthetic',
+                device_name: 'DataBaker E2E Synthetic Input',
+                segment_frames: 48_000,
+              }
+            : safePayload,
           canonicalTarget,
           20_000,
           startIntent,
@@ -4183,7 +4598,9 @@ function registerIpc(): void {
         await activeEngine.start();
         assertCurrentEngineIntent(resumeIntent, ['starting']);
         const result = await requestSessionWithReconciliation(
-          command,
+          command === 'activate_session' && e2eMainProcessEnabled()
+            ? 'test_activate_session'
+            : command,
           { session_dir: canonical, expected_session_id: binding.sessionId },
           canonical,
           30_000,
@@ -4237,7 +4654,7 @@ function registerIpc(): void {
       assertCanMutateActiveSession(command);
       return await stopActiveSession();
     }
-    if (command === 'export_session' || command === 'export_session_artifact') {
+    if (command === 'export_session_artifact') {
       return await exportSession(payload);
     }
     assertCanMutateActiveSession(command);
@@ -4281,6 +4698,11 @@ function registerIpc(): void {
 
   ipcMain.handle('dialog:open-script', async () => {
     await assertAppLicensed();
+    const e2eScript = await e2eOverridePath('DATABAKER_E2E_SCRIPT_PATH', 'file');
+    if (e2eScript) {
+      const content = (await fs.readFile(e2eScript, 'utf8')).replace(/^\uFEFF/, '');
+      return { filePath: e2eScript, name: path.basename(e2eScript), content };
+    }
     const result = await dialog.showOpenDialog(mainWindow!, {
       title: '选择录音脚本',
       properties: ['openFile'],
@@ -4298,6 +4720,8 @@ function registerIpc(): void {
   ipcMain.handle('dialog:choose-output', async (event) => {
     assertMainRenderer(event.sender);
     await assertAppLicensed();
+    const e2eOutput = await e2eOverridePath('DATABAKER_E2E_OUTPUT_DIR', 'directory');
+    if (e2eOutput) return bindAndRememberOutputRoot(e2eOutput, false);
     const result = await dialog.showOpenDialog(mainWindow!, {
       title: '选择录制保存目录',
       properties: ['openDirectory', 'createDirectory'],
@@ -4317,6 +4741,8 @@ function registerIpc(): void {
   ipcMain.handle('dialog:choose-export-dir', async (event, payload?: unknown) => {
     assertMainRenderer(event.sender);
     await assertAppLicensed();
+    const e2eDestination = await e2eOverridePath('DATABAKER_E2E_EXPORT_DIR', 'directory');
+    if (e2eDestination) return rememberUserExportDirectory(e2eDestination);
     const options = typeof payload === 'string' ? { defaultPath: payload } : isRecord(payload) ? payload : {};
     const defaultPath = typeof options.defaultPath === 'string' && options.defaultPath.trim()
       ? options.defaultPath
@@ -4336,14 +4762,54 @@ function registerIpc(): void {
   ipcMain.handle('export:deliver-artifact', async (event, payload: unknown) => {
     assertMainRenderer(event.sender);
     await assertAppLicensed();
-    if (!isRecord(payload)
-      || typeof payload.source_file !== 'string'
-      || typeof payload.destination_dir !== 'string'
-      || !payload.source_file.trim()
-      || !payload.destination_dir.trim()) {
+    if (!isExportDeliveryRequest(payload)) {
       throw new Error(EXPORT_DELIVER_ERROR.payloadInvalid);
     }
-    return deliverExportArtifact(payload.source_file, payload.destination_dir);
+    const result = await exportDeliveryManager.deliver(payload);
+    debugLog?.append({
+      level: 'info',
+      source: 'main',
+      category: 'export',
+      event: 'export.deliver',
+      message: `已校验并复制导出文件到所选目录：${result.file_name}`,
+      data: {
+        request_id: result.request_id,
+        session_id: result.session_id,
+        artifact: result.artifact,
+        export_id: result.export_id,
+        destination_dir: result.directory,
+        size_bytes: result.size_bytes,
+        sha256: result.sha256,
+      },
+    });
+    return result;
+  });
+
+  ipcMain.handle('export:cancel-delivery', async (event, requestId: unknown) => {
+    assertMainRenderer(event.sender);
+    await assertAppLicensed();
+    if (typeof requestId !== 'string' || !requestId.trim()) {
+      throw new Error(EXPORT_DELIVER_ERROR.payloadInvalid);
+    }
+    return exportDeliveryManager.cancel(requestId);
+  });
+
+  ipcMain.handle('export:verify-delivery', async (event, payload: unknown) => {
+    assertMainRenderer(event.sender);
+    await assertAppLicensed();
+    if (!isRecord(payload)
+      || typeof payload.session_id !== 'string'
+      || typeof payload.export_id !== 'string'
+      || !payload.session_id.trim()
+      || !payload.export_id.trim()
+      || !['full_track', 'cuts_zip', 'timestamps_json'].includes(String(payload.artifact))) {
+      throw new Error(EXPORT_DELIVER_ERROR.payloadInvalid);
+    }
+    return exportDeliveryManager.verify({
+      session_id: payload.session_id,
+      artifact: payload.artifact as ExportDeliveryArtifact,
+      export_id: payload.export_id,
+    });
   });
 
   ipcMain.handle('app:get-locale', async () => {

@@ -41,6 +41,7 @@ import {
   shouldAutoStartAfterAccept,
   viewShortcutAction,
   workflowShortcutAction,
+  workflowShortcutTargetAllowed,
 } from './recording-workflow';
 import { waveformTakeIsActive } from './waveform-buffer';
 import { WebGLWaveform } from './WebGLWaveform';
@@ -94,7 +95,7 @@ import { createLatestFrameCommitter } from './latest-frame';
 import type { LatestFrameCommitter } from './latest-frame';
 import type { SessionNoiseCheckOperation } from './recording-workflow';
 import { licenseSummary } from './ActivateLicense';
-import { normalizeSilenceDetector, type Attempt, type AudioDevice, type CapturePreset, type CapturePresetDraft, type CapturePresetStore, type CaptureShareMode, type EngineEvent, type ExportArtifact, type ExportResult, type HeadSilencePhase, type InspectedSessionState, type ItemState, type LicenseStatus, type Meter, type NoiseCheckProgress, type NoiseCheckResult, type PrompterState, type RecordingHistoryEntry, type ScriptItem, type ScriptLabelTransition, type SealInterruptedSessionResult, type SessionSnapshot, type SilenceDetector } from './types';
+import { normalizeSilenceDetector, type Attempt, type AudioDevice, type CapturePreset, type CapturePresetDraft, type CapturePresetStore, type CaptureShareMode, type EngineEvent, type ExportArtifact, type ExportDeliveryProgress, type ExportResult, type ExportScope, type HeadSilencePhase, type InspectedSessionState, type ItemState, type LicenseStatus, type Meter, type NoiseCheckProgress, type NoiseCheckResult, type PrompterState, type RecordingHistoryEntry, type ScriptItem, type ScriptLabelTransition, type SealInterruptedSessionResult, type SessionSnapshot, type SilenceDetector } from './types';
 import { reportRendererError } from './sentry';
 import { logUserAction } from './debug-log';
 import { translateExportDeliverError } from './export-deliver-i18n';
@@ -120,6 +121,17 @@ import {
 import { PrompterFontSizeControl } from './PrompterFontSizeControl';
 import { readerCueKey, readerFacingCue, resolveMonitorCue } from './prompter-cues';
 import { usePrompterAppearance } from './usePrompterAppearance';
+import {
+  adjacentWorkbenchIssue,
+  buildIssueWorkbench,
+  deriveTaskWorkflow,
+  filterWorkbenchIssues,
+  isAttemptPreviewSafe,
+  type IssueFilter,
+  type WorkbenchIssue,
+  type WorkflowReasonCode,
+} from './p1-workflow';
+import { loadWorkspaceContext, saveWorkspaceContext } from './workspace-context';
 
 type HistoryFilter = 'all' | 'completed' | 'unfinished';
 type RecordingStateKind = 'completed' | 'unfinished' | 'attention';
@@ -155,10 +167,12 @@ type ExportFeedback = {
   sessionId: string;
   sessionDir: string;
   artifact: ExportArtifact;
-  status: 'working' | 'ok' | 'failed';
+  status: 'working' | 'ok' | 'preserved' | 'failed';
   output: string;
   exportDir?: string;
   filePath?: string;
+  requestId?: string;
+  progress?: ExportDeliveryProgress;
   warning?: string;
   error?: string;
 };
@@ -556,6 +570,21 @@ function recordingMatchesFilter(recording: RecordingHistoryEntry, filter: Histor
   return filter === 'completed' ? kind === 'completed' : kind !== 'completed';
 }
 
+function preserveDeliveryVerification(
+  next: RecordingHistoryEntry,
+  previous: RecordingHistoryEntry | undefined,
+): RecordingHistoryEntry {
+  if (!previous?.delivery_verifications) return next;
+  const verified = (Object.keys(previous.delivery_verifications) as ExportArtifact[]).reduce((result, artifact) => {
+    if (previous.export_artifacts?.[artifact]?.export_id
+      && previous.export_artifacts?.[artifact]?.export_id === next.export_artifacts?.[artifact]?.export_id) {
+      result[artifact] = previous.delivery_verifications?.[artifact];
+    }
+    return result;
+  }, {} as NonNullable<RecordingHistoryEntry['delivery_verifications']>);
+  return Object.keys(verified).length ? { ...next, delivery_verifications: verified } : next;
+}
+
 function pad2(value: number): string {
   return String(value).padStart(2, '0');
 }
@@ -625,12 +654,18 @@ function artifactFilePath(artifact: ExportArtifact, exported: ExportResult): str
 function artifactStatusCopy(recording: RecordingHistoryEntry | undefined, artifact: ExportArtifact): string {
   const state = recording?.export_artifacts?.[artifact];
   if (!state || state.state === 'never') return t('exportDialog.never');
+  const delivery = state.export_id
+    ? recording?.delivery_verifications?.[artifact] ?? state.delivery_verification ?? 'pending'
+    : null;
+  const withDelivery = (copy: string) => delivery
+    ? `${copy} · ${t(`p1.deliveryVerification.${delivery}`)}`
+    : copy;
   const cutsSummary = artifact === 'cuts_zip'
     && typeof state.exported_count === 'number'
     && typeof state.skipped_count === 'number'
     ? t('notice.exportedCuts', { count: state.exported_count, skipped: state.skipped_count })
     : '';
-  const withCutsSummary = (copy: string) => cutsSummary ? `${copy} · ${cutsSummary}` : copy;
+  const withCutsSummary = (copy: string) => withDelivery(cutsSummary ? `${copy} · ${cutsSummary}` : copy);
   if (state.state === 'stale') {
     return withCutsSummary(state.exported_at
       ? t('exportDialog.staleWithTime', { time: formatDateTime(state.exported_at) })
@@ -669,6 +704,8 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const [devWebCaptureNotice, setDevWebCaptureNotice] = useState('');
   const [workspaceFaulted, setWorkspaceFaulted] = useState(false);
   const [monitorPanelTab, setMonitorPanelTab] = useState<MonitorPanelTab>('monitor');
+  const [issueFilter, setIssueFilter] = useState<IssueFilter>('all');
+  const [selectedIssueId, setSelectedIssueId] = useState<string | null>(null);
   const [prompterStatus, setPrompterStatus] = useState({ open: false, ready: false });
   const { appearance, nudgeFontSize, nudgeLabelFontSize } = usePrompterAppearance();
   const [sessionDir, setSessionDir] = useState('');
@@ -720,7 +757,6 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const [audioUrl, setAudioUrl] = useState('');
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewBins, setPreviewBins] = useState<Array<[number, number]>>([]);
-  const [previewingAttemptId, setPreviewingAttemptId] = useState('');
   const [finishConfirmOpen, setFinishConfirmOpen] = useState(false);
   const [pauseConfirmOpen, setPauseConfirmOpen] = useState(false);
   const [pauseDestination, setPauseDestination] = useState<PauseDestination>('leave');
@@ -746,6 +782,8 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const [exportDestination, setExportDestination] = useState(loadExportDestination);
   const [taskExportDir, setTaskExportDir] = useState('');
   const [exportFeedback, setExportFeedback] = useState<ExportFeedback | null>(null);
+  const [exportScope, setExportScope] = useState<ExportScope>('confirmed_only');
+  const [acknowledgedExportWarnings, setAcknowledgedExportWarnings] = useState<WorkflowReasonCode[]>([]);
   const [userAlert, setUserAlert] = useState<UserAlert | null>(null);
   const [activationFailure, setActivationFailure] = useState<ClassifiedEngineError | null>(null);
   const [activationFailureOpen, setActivationFailureOpen] = useState(false);
@@ -786,6 +824,36 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     selected_attempt_id: null,
   }));
   const currentItem = items[currentIndex] ?? null;
+  const workflowSummary = useMemo(() => deriveTaskWorkflow({
+    items,
+    committed_samples: snapshot?.committed_samples ?? 0,
+    capture_provenance: snapshot?.capture_provenance,
+    status: snapshot?.status,
+    overflow_samples: snapshot?.overflow_samples,
+    silence_detector: snapshot?.silence_detector,
+    audio_format: snapshot?.audio_format,
+  }), [items, snapshot?.audio_format, snapshot?.capture_provenance, snapshot?.committed_samples, snapshot?.overflow_samples, snapshot?.silence_detector, snapshot?.status]);
+  // An active but idle capture can be exported through the existing
+  // pause-then-export flow. Preview cuts against the exact current item/audio
+  // state with only the status projected to the post-pause value; the command
+  // still stops the engine and recomputes readiness from its authoritative
+  // stopped snapshot before writing anything.
+  const exportWorkflowSummary = useMemo(() => deriveTaskWorkflow({
+    items,
+    committed_samples: snapshot?.committed_samples ?? 0,
+    capture_provenance: snapshot?.capture_provenance,
+    status: captureActive && snapshot?.status === 'recording' ? 'stopped' : snapshot?.status,
+    overflow_samples: snapshot?.overflow_samples,
+    silence_detector: snapshot?.silence_detector,
+    audio_format: snapshot?.audio_format,
+  }), [captureActive, items, snapshot?.audio_format, snapshot?.capture_provenance, snapshot?.committed_samples, snapshot?.overflow_samples, snapshot?.silence_detector, snapshot?.status]);
+  const currentWorkflow = workflowSummary.items[currentIndex] ?? null;
+  const cutsReadiness = exportScope === 'complete_task'
+    ? exportWorkflowSummary.completeTask
+    : exportWorkflowSummary.confirmedOnly;
+  const exportWarningsAcknowledged = cutsReadiness.warningCodes.every((code) => (
+    acknowledgedExportWarnings.includes(code)
+  ));
   const currentLabelTransition = useMemo(() => {
     if (!currentItem) return null;
     if (continuationLabelTransition?.targetItemId === currentItem.id) {
@@ -1021,7 +1089,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     && reviewAttempt?.attempt_id !== retainedDeliveryAttempt.attempt_id
     ? reviewAttempt
     : undefined;
-  const hasRetakeVersionChoice = Boolean(
+  const hasRetakeChoice = Boolean(
     currentItem?.status === 'review'
     && retainedDeliveryAttempt
     && retakeCandidateAttempt
@@ -1032,11 +1100,21 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     && (
       retakeItemId === currentItem.id
       || itemHasPendingRetakeDecision(currentItem)
-      || hasRetakeVersionChoice
+      || hasRetakeChoice
     ),
   );
   const hasRetainedPreviousWarning = Boolean(
     currentItem && itemHasRetainedPreviousWarning(currentItem),
+  );
+  const safeAttemptIds = useMemo(() => new Set(snapshot && currentWorkflow?.disposition !== 'inconsistent'
+    ? (currentItem?.attempts ?? []).filter((attempt) => isAttemptPreviewSafe(attempt, snapshot)).map((attempt) => attempt.attempt_id)
+    : []), [currentItem?.attempts, currentWorkflow?.disposition, snapshot]);
+  const defaultAcceptAttemptId = retakeCandidateAttempt?.attempt_id
+    ?? reviewAttemptId
+    ?? currentItem?.selected_attempt_id
+    ?? (currentItem ? latestUsableAttempt(currentItem)?.attempt_id : undefined);
+  const defaultAcceptAttemptSafe = Boolean(
+    defaultAcceptAttemptId && safeAttemptIds.has(defaultAcceptAttemptId),
   );
   const showReviewWaveform = !captureActive && Boolean(reviewAttempt);
   const showInspectSilenceBill = Boolean(reviewAttempt && showsPostTakeQualityBill(automationRules));
@@ -1104,8 +1182,32 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       })
       : t('discontinuity.noSilence', { count: discontinuityCount }))
     : '';
-  const hasBlockingMonitorIssues = Boolean(captureFault || workspaceFaulted || qualityWarning || meter.overflow_samples > 0 || meter.storage_status !== 'healthy');
-  const hasMonitorIssues = Boolean(hasBlockingMonitorIssues || discontinuityWarning);
+  const persistedVadFaults = snapshot?.vad_diagnostics
+    ? snapshot.vad_diagnostics.overflow_count
+      + snapshot.vad_diagnostics.classifier_failure_count
+      + snapshot.vad_diagnostics.flush_timeout_count
+      + snapshot.vad_diagnostics.worker_disconnect_count
+    : 0;
+  // Cumulative diagnostics describe earlier isolated faults. Only the live
+  // meter is authoritative for the current worker's health.
+  const vadHealth = meter.vad_health ?? 'healthy';
+  const vadBacklogMs = Math.round((meter.vad_backlog_samples ?? 0) / Math.max(sampleRateForDisplay, 1) * 1_000);
+  const vadCapacityMs = Math.round((meter.vad_capacity_samples ?? sampleRateForDisplay) / Math.max(sampleRateForDisplay, 1) * 1_000);
+  const workbenchIssues = useMemo(() => buildIssueWorkbench(workflowSummary, {
+    captureFault,
+    storageFault: workspaceFaulted || meter.overflow_samples > 0 || meter.storage_status !== 'healthy',
+    inputDiscontinuity: Boolean(discontinuityWarning),
+    vadHealth,
+    vadDiagnosticFaultCount: persistedVadFaults,
+  }), [captureFault, discontinuityWarning, meter.overflow_samples, meter.storage_status, persistedVadFaults, vadHealth, workflowSummary, workspaceFaulted]);
+  const visibleWorkbenchIssues = useMemo(
+    () => filterWorkbenchIssues(workbenchIssues, issueFilter),
+    [issueFilter, workbenchIssues],
+  );
+  const hasBlockingMonitorIssues = Boolean(
+    qualityWarning || workbenchIssues.some((issue) => issue.severity === 'blocker'),
+  );
+  const hasMonitorIssues = Boolean(qualityWarning || workbenchIssues.length > 0);
   const currentNoiseGate = sessionNoiseGate(snapshot?.noise_check, noiseCheckRunning, automationRules.envCheck);
   const noiseCheckBlocksAttempt = phase === 'running' && captureActive && !recording && currentNoiseGate !== 'ready';
   const deviceWarningOpen = Boolean(deviceWarningKind) && captureActive && !captureFault;
@@ -1188,7 +1290,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     silenceProgress: isPendingTake ? silenceProgress : 0,
     silenceDurationMs: effectiveSilenceDurationMs,
     qualityWarning: '',
-  }), [captureFault, cue, currentIndex, currentItem?.id, currentItem?.label, currentItem?.text, currentLabelTransition, effectiveSilenceDurationMs, isPendingTake, items.length, readerCue, readerCueLabel, sessionName, showCurrentLabelTransition, silenceProgress, snapshot?.session_id, t, workflowComplete]);
+    itemDisposition: currentWorkflow?.disposition,
+    recommendedAction: currentWorkflow?.recommendedAction,
+    deliveryHealth: currentWorkflow?.deliveryHealth,
+  }), [captureFault, cue, currentIndex, currentItem?.id, currentItem?.label, currentItem?.text, currentLabelTransition, currentWorkflow?.deliveryHealth, currentWorkflow?.disposition, currentWorkflow?.recommendedAction, effectiveSilenceDurationMs, isPendingTake, items.length, readerCue, readerCueLabel, sessionName, showCurrentLabelTransition, silenceProgress, snapshot?.session_id, t, workflowComplete]);
 
   async function run<T>(label: string, action: () => Promise<T>): Promise<T | null> {
     setBusy(label);
@@ -1574,7 +1679,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         { offset: 0, limit: HISTORY_PAGE_SIZE },
       );
       if (sequence !== historyLoadSequenceRef.current) return;
-      setRecordings(result.recordings);
+      setRecordings((current) => result.recordings.map((recording) => preserveDeliveryVerification(
+        recording,
+        current.find((candidate) => candidate.session_dir === recording.session_dir),
+      )));
       setHistoryNextOffset(result.next_offset);
       setError((current) => current.startsWith(t('notice.historyPrefix')) ? '' : current);
     } catch (caught) {
@@ -1871,6 +1979,51 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   }, [currentIndex, currentItem?.id, phase]);
 
   useEffect(() => {
+    if (phase !== 'running' || !snapshot?.session_id) return;
+    try {
+      saveWorkspaceContext({
+        sessionId: snapshot.session_id,
+        currentItemId: currentItem?.id ?? null,
+        issueFilter,
+        panel: monitorPanelTab,
+      });
+    } catch {
+      // Local workstation context is convenience state; task data never depends on it.
+    }
+  }, [currentItem?.id, issueFilter, monitorPanelTab, phase, snapshot?.session_id]);
+
+  useEffect(() => {
+    setAcknowledgedExportWarnings([]);
+  }, [snapshot?.journal_seq, snapshot?.session_id]);
+
+  useEffect(() => {
+    setExportScope('confirmed_only');
+    setSelectedIssueId(null);
+  }, [snapshot?.session_id]);
+
+  useEffect(() => window.recorder.onExportDeliveryProgress?.((progress) => {
+    setExportFeedback((current) => current?.requestId === progress.request_id
+      ? { ...current, progress }
+      : current);
+  }), []);
+
+  useEffect(() => {
+    if (monitorPanelTab !== 'export' || !workspaceRecording) return;
+    const missing = (['full_track', 'timestamps_json', 'cuts_zip'] as const).filter((artifact) => (
+      workspaceRecording.export_artifacts?.[artifact]?.export_id
+      && !workspaceRecording.delivery_verifications?.[artifact]
+    ));
+    if (!missing.length) return;
+    const delivery_verifications = { ...(workspaceRecording.delivery_verifications ?? {}) };
+    for (const artifact of missing) delivery_verifications[artifact] = 'pending';
+    const pending = { ...workspaceRecording, delivery_verifications };
+    setRecordings((current) => current.map((recording) => (
+      recording.session_dir === pending.session_dir ? pending : recording
+    )));
+    void verifyRecordingDeliveries(pending);
+  }, [monitorPanelTab, workspaceRecording]);
+
+  useEffect(() => {
     window.recorder.sendPrompterState(prompterState);
   }, [prompterState]);
 
@@ -2007,10 +2160,16 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     const nextSnapshot = current.snapshot;
     const nextSessionDir = current.session_dir || activeSessionDirRef.current || sessionDir;
     const threshold = nextSnapshot.silence_threshold_dbfs ?? nextSnapshot.noise_check?.threshold_dbfs ?? -42;
+    let localContext = null as ReturnType<typeof loadWorkspaceContext>;
+    try {
+      localContext = loadWorkspaceContext(nextSnapshot.session_id);
+    } catch {
+      // Restricted renderer storage falls back to the workflow-derived location.
+    }
     const restoredIndex = resolveRunningItemIndex(
       nextSnapshot.items,
       current.active_attempt?.item_id,
-      keepItemId,
+      keepItemId ?? localContext?.currentItemId,
     );
     const restoredItem = nextSnapshot.items[restoredIndex];
     // A suspended renderer may still hold a healthy meter from the previous
@@ -2052,6 +2211,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       || itemHasPendingRetakeDecision(restoredItem)
     ) ? restoredItem.id : null);
     setContinuationLabelTransition(null);
+    if (localContext) {
+      setIssueFilter(localContext.issueFilter);
+      setMonitorPanelTab(localContext.panel);
+    }
     setCurrentIndex(restoredIndex);
     setRecording(Boolean(current.active_attempt));
     setAttemptStartSample(current.active_attempt?.start_sample ?? 0);
@@ -2147,7 +2310,17 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setSilenceDetectorDraft(detector);
     setSilenceSettingsError('');
     setContinuationLabelTransition(null);
-    const inspectionIndex = resolveRunningItemIndex(nextSnapshot.items, null, null);
+    let localContext = null as ReturnType<typeof loadWorkspaceContext>;
+    try {
+      localContext = loadWorkspaceContext(nextSnapshot.session_id);
+    } catch {
+      // Restricted renderer storage falls back to the workflow-derived location.
+    }
+    const inspectionIndex = resolveRunningItemIndex(nextSnapshot.items, null, localContext?.currentItemId);
+    if (localContext) {
+      setIssueFilter(localContext.issueFilter);
+      setMonitorPanelTab(localContext.panel);
+    }
     setCurrentIndex(inspectionIndex);
     setRecording(false);
     setCaptureActive(false);
@@ -2661,6 +2834,22 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     }));
   }
 
+  function locateWorkbenchIssue(issue: WorkbenchIssue, wrapped = false) {
+    if (recording) return;
+    setSelectedIssueId(issue.id);
+    setMonitorPanelTab('issues');
+    if (issue.itemIndex !== null && items[issue.itemIndex]) {
+      setCurrentIndex(issue.itemIndex);
+      setReviewAttemptId(preferredReviewAttemptId(items[issue.itemIndex]));
+    }
+    setNotice(wrapped ? t('p1.issueWrapped') : t('p1.issueLocated'));
+  }
+
+  function moveWorkbenchIssue(direction: 1 | -1) {
+    const next = adjacentWorkbenchIssue(visibleWorkbenchIssues, selectedIssueId, direction);
+    if (next.issue) locateWorkbenchIssue(next.issue, next.wrapped);
+  }
+
   function moveItemListFocus(event: ReactKeyboardEvent<HTMLButtonElement>, index: number) {
     const nextIndex = event.key === 'ArrowDown'
       ? Math.min(items.length - 1, index + 1)
@@ -2692,6 +2881,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       ?? currentItem.selected_attempt_id
       ?? latestUsableAttempt(currentItem)?.attempt_id;
     if (!attemptId || !currentItem.attempts.some((attempt) => attempt.attempt_id === attemptId)) return;
+    if (!safeAttemptIds.has(attemptId)) return;
     const accepted = await run(t('notice.savingAccept'), () => window.recorder.request('accept_attempt', {
       item_id: currentItem.id,
       attempt_id: attemptId,
@@ -2763,20 +2953,25 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     previewWaveformRequestRef.current += 1;
     setPreviewOpen(false);
     setPreviewBins([]);
-    setPreviewingAttemptId('');
     setAudioUrl((current) => {
       if (current) URL.revokeObjectURL(current);
       return '';
     });
   }
 
-  async function previewAttempt() {
+  async function previewAttempt(targetAttemptId?: string) {
     if (!currentItem || recording) return;
-    const attemptId = reviewAttempt?.attempt_id
+    const attemptId = targetAttemptId
+      ?? reviewAttempt?.attempt_id
       ?? reviewAttemptId
       ?? currentItem.selected_attempt_id
       ?? latestUsableAttempt(currentItem)?.attempt_id;
     if (!attemptId) return;
+    const targetAttempt = currentItem.attempts.find((attempt) => attempt.attempt_id === attemptId);
+    if (!targetAttempt || !snapshot || !isAttemptPreviewSafe(targetAttempt, snapshot)) {
+      showUserAlert('warning', t('p1.previewBlockedTitle'), t('p1.previewBlockedBody'));
+      return;
+    }
     const command = captureActive ? 'render_attempt' : 'render_session_attempt';
     const waveformCommand = captureActive ? 'preview_attempt_waveform' : 'preview_session_waveform';
     const requestId = previewWaveformRequestRef.current + 1;
@@ -2819,10 +3014,9 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       return;
     }
     setAudioUrl(url);
-    setPreviewingAttemptId(attemptId);
     setPreviewBins((current) => current.length ? current : reusedBins);
     setPreviewOpen(true);
-    setNotice(t('notice.previewing', { id: attemptId }));
+    setNotice(t('notice.previewing'));
   }
 
   async function openHistoricalRecording(
@@ -2838,12 +3032,13 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     }));
     if (!inspected) return;
     enterInspectionWorkspace(inspected);
-    if (options.activate) await activateCapture();
+    if (options.activate) await activateCapture(undefined, inspected.session_dir);
   }
 
   async function exportRecordingArtifact(
     task: Pick<RecordingHistoryEntry, 'session_id' | 'session_dir'>,
     artifact: ExportArtifact,
+    cutsScope: ExportScope = exportScope,
   ) {
     const failExport = (error: string) => {
       setExportFeedback({
@@ -2863,6 +3058,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       status: 'working',
       output: artifactLabel(artifact),
     });
+    let pausedSnapshot: SessionSnapshot | null = null;
     if (captureActive && snapshot && sessionDir === task.session_dir) {
       if (recording && !(await stopAttempt(true))) {
         failExport(lastOperationErrorRef.current || t('exportDialog.resultPauseFailed'));
@@ -2873,11 +3069,46 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         failExport(lastOperationErrorRef.current || t('exportDialog.resultPauseFailed'));
         return;
       }
+      pausedSnapshot = stopped.snapshot;
       enterInspectionWorkspace({ snapshot: stopped.snapshot, session_dir: task.session_dir, mode: 'inspect' });
     }
-    const exported = await run(t('notice.exportingFiles'), () => window.recorder.request<ExportResult>('export_session_artifact', {
+    let sourceSnapshot = pausedSnapshot ?? (snapshot && sessionDir === task.session_dir ? snapshot : null);
+    if (artifact === 'cuts_zip' && !sourceSnapshot) {
+      const inspected = await run(t('notice.openingTask'), () => window.recorder.request<InspectedSessionState>('inspect_session', {
+        session_dir: task.session_dir,
+      }));
+      sourceSnapshot = inspected?.snapshot ?? null;
+    }
+    const exportRequest: Record<string, unknown> = {
       session_dir: task.session_dir,
+      expected_session_id: task.session_id,
       artifact,
+    };
+    if (artifact === 'cuts_zip') {
+      if (!sourceSnapshot || typeof sourceSnapshot.journal_seq !== 'number') {
+        failExport(t('p1.revisionUnavailable'));
+        return;
+      }
+      const readiness = deriveTaskWorkflow(sourceSnapshot)[cutsScope === 'complete_task'
+        ? 'completeTask'
+        : 'confirmedOnly'];
+      if (!readiness.ready) {
+        failExport(t('p1.exportBlockedSummary', { count: readiness.blockers.length }));
+        return;
+      }
+      const missingWarning = readiness.warningCodes.find((code) => !acknowledgedExportWarnings.includes(code));
+      if (missingWarning) {
+        failExport(t('p1.exportAcknowledgeFirst'));
+        return;
+      }
+      Object.assign(exportRequest, {
+        scope: cutsScope,
+        expected_journal_seq: sourceSnapshot.journal_seq,
+        acknowledged_warning_codes: acknowledgedExportWarnings.filter((code) => readiness.warningCodes.includes(code)),
+      });
+    }
+    const exported = await run(t('notice.exportingFiles'), () => window.recorder.request<ExportResult>('export_session_artifact', {
+      ...exportRequest,
     }));
     if (!exported) {
       failExport(lastOperationErrorRef.current || t('exportDialog.resultFailedGeneric'));
@@ -2886,27 +3117,52 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     const sourceFile = artifactFilePath(artifact, exported);
     let deliveredDir = exported.export_dir;
     let deliveredFile = sourceFile;
+    let deliveryVerified = false;
     let copyWarning = '';
-    const destination = exportDestination || exported.export_dir;
-    if (sourceFile && destination) {
+    // Empty means "keep the canonical task export only". External delivery is
+    // an explicit, separately verified operation and must never copy back into
+    // the task's own export directory.
+    const destination = exportDestination;
+    if (destination) {
+      if (!sourceFile) {
+        copyWarning = t('p1.exportSourceMissingForDelivery');
+      } else if (!exported.export_id) {
+        copyWarning = t('p1.exportGenerationMissing');
+      } else {
+        const requestId = typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `delivery-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        setExportFeedback((current) => current ? { ...current, requestId } : current);
       const delivered = await run(t('notice.copyingExport'), () => (
-        window.recorder.deliverExportArtifact(sourceFile, destination)
+          window.recorder.deliverExportArtifact({
+            request_id: requestId,
+            session_id: task.session_id,
+            artifact,
+            export_id: exported.export_id!,
+            destination_dir: destination,
+          })
       ));
       if (!delivered) {
         copyWarning = translateExportDeliverError(lastOperationErrorRef.current || t('exportDialog.copyFailed'));
       } else {
         deliveredDir = delivered.directory;
         deliveredFile = delivered.file_path;
+        deliveryVerified = delivered.verification === 'verified';
+        if (!deliveryVerified) copyWarning = t('p1.deliveryVerificationFailed');
+      }
       }
     }
     const warning = recoveryWarning(t('notice.exportStorage'), exported.recovery_warnings);
     if (warning) setDataSafetyAlert(t('notice.exportSpotCheck', { warning }));
     const output = artifactOutputCopy(artifact, exported);
-    setNotice(t('notice.exported', {
-      id: task.session_id,
-      output,
-      note: warning || copyWarning ? t('notice.exportNeedCheck') : '',
-    }));
+    const externalDeliveryFailed = Boolean(destination) && !deliveryVerified;
+    setNotice(externalDeliveryFailed
+      ? t('p1.deliveryPreservedNotice', { id: task.session_id })
+      : t('notice.exported', {
+        id: task.session_id,
+        output,
+        note: warning ? t('notice.exportNeedCheck') : '',
+      }));
     const dialogWarning = [
       warning ? `${t('exportDialog.spotCheck')}\n${warning}` : '',
       copyWarning,
@@ -2915,13 +3171,24 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       sessionId: task.session_id,
       sessionDir: task.session_dir,
       artifact,
-      status: 'ok',
+      status: externalDeliveryFailed ? 'preserved' : 'ok',
       output,
       exportDir: deliveredDir,
       filePath: deliveredFile,
       warning: dialogWarning || undefined,
     });
     await refreshRecordings();
+    if (deliveryVerified) {
+      setRecordings((current) => current.map((recording) => recording.session_id === task.session_id
+        ? {
+          ...recording,
+          delivery_verifications: {
+            ...(recording.delivery_verifications ?? {}),
+            [artifact]: 'verified',
+          },
+        }
+        : recording));
+    }
   }
 
   function commitExportDestination(value: string) {
@@ -2959,8 +3226,47 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     showBlockingError(translateExportDeliverError(lastOperationErrorRef.current || t('notice.openingExport')));
   }
 
+  async function cancelExportDelivery() {
+    const requestId = exportFeedback?.requestId;
+    if (!requestId) return;
+    await window.recorder.cancelExportDelivery(requestId).catch(() => undefined);
+    setNotice(t('p1.deliveryCancelRequested'));
+  }
+
   function showExport(recording: RecordingHistoryEntry) {
-    setExportRecording(recording);
+    const pending = { ...(recording.delivery_verifications ?? {}) };
+    for (const artifact of ['full_track', 'timestamps_json', 'cuts_zip'] as const) {
+      if (recording.export_artifacts?.[artifact]?.export_id) pending[artifact] = 'pending';
+    }
+    const next = { ...recording, delivery_verifications: pending };
+    setExportRecording(next);
+    setRecordings((current) => current.map((candidate) => (
+      candidate.session_dir === next.session_dir ? next : candidate
+    )));
+    void verifyRecordingDeliveries(next);
+  }
+
+  async function verifyRecordingDeliveries(recording: RecordingHistoryEntry) {
+    const checks = (['full_track', 'timestamps_json', 'cuts_zip'] as const).flatMap((artifact) => {
+      const exportId = recording.export_artifacts?.[artifact]?.export_id;
+      if (!exportId) return [];
+      return [window.recorder.verifyExportDelivery({
+        session_id: recording.session_id,
+        artifact,
+        export_id: exportId,
+      }).then((result) => ({ artifact, status: result?.verification ?? 'missing' as const }))
+        .catch(() => ({ artifact, status: 'invalid' as const }))];
+    });
+    if (!checks.length) return;
+    const verified = await Promise.all(checks);
+    const apply = (candidate: RecordingHistoryEntry) => {
+      if (candidate.session_dir !== recording.session_dir) return candidate;
+      const delivery_verifications = { ...(candidate.delivery_verifications ?? {}) };
+      for (const result of verified) delivery_verifications[result.artifact] = result.status;
+      return { ...candidate, delivery_verifications };
+    };
+    setRecordings((current) => current.map(apply));
+    setExportRecording((current) => current ? apply(current) : current);
   }
 
   function showTaskDetails(recording: RecordingHistoryEntry) {
@@ -3466,7 +3772,17 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         return;
       }
       const target = event.target as HTMLElement | null;
-      if (target?.closest('input, textarea, select, button, audio')) return;
+      if (!workflowShortcutTargetAllowed({
+        // Device/noise overlays own their explicit Space/Escape contracts
+        // below. Every other modal blocks workspace shortcuts, including when
+        // focus was left on a sentence row behind the backdrop.
+        modalOpen: Boolean(document.querySelector('[role="dialog"][aria-modal="true"]'))
+          && !showDeviceWarningDialog
+          && !showNoiseCheckDialog,
+        formControl: Boolean(target?.closest('input, textarea, select, audio, [contenteditable="true"]')),
+        button: Boolean(target?.closest('button')),
+        professionalItem: Boolean(target?.closest('.professional-item')),
+      })) return;
       if (!captureActive) {
         const viewAction = viewShortcutAction(event.code, event.key);
         if (viewAction === 'preview') {
@@ -3673,7 +3989,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const exportFeedbackDialog = exportFeedback && <div className="dialog-backdrop export-feedback-backdrop" role="presentation">
     <section className="studio-dialog export-result-dialog" role="dialog" aria-modal="true" aria-labelledby="export-result-title" data-testid="export-result-dialog">
       <header>
-        <span className={`dialog-icon ${exportFeedback.status === 'failed' ? 'danger' : exportFeedback.status === 'ok' && exportFeedback.warning ? 'warning' : exportFeedback.status === 'ok' ? 'success' : ''}`}>
+        <span className={`dialog-icon ${exportFeedback.status === 'failed' ? 'danger' : exportFeedback.status === 'preserved' || exportFeedback.status === 'ok' && exportFeedback.warning ? 'warning' : exportFeedback.status === 'ok' ? 'success' : ''}`}>
           <Icon name={exportFeedback.status === 'failed' ? 'stop' : exportFeedback.status === 'ok' ? 'check' : 'export'} size={19} />
         </span>
         <div>
@@ -3682,7 +3998,9 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
               ? t('exportDialog.resultWorkingTitle')
               : exportFeedback.status === 'failed'
                 ? t('exportDialog.resultFailedTitle')
-                : t('exportDialog.resultOkTitle')}
+                : exportFeedback.status === 'preserved'
+                  ? t('p1.deliveryPreservedTitle')
+                  : t('exportDialog.resultOkTitle')}
           </h2>
         </div>
       </header>
@@ -3691,16 +4009,23 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           ? t('exportDialog.resultWorkingBody', { output: exportFeedback.output })
           : exportFeedback.status === 'failed'
             ? t('exportDialog.resultFailedBody', { id: exportFeedback.sessionId, output: exportFeedback.output })
-            : t('exportDialog.resultOkBody', { id: exportFeedback.sessionId, output: exportFeedback.output })}
+            : exportFeedback.status === 'preserved'
+              ? t('p1.deliveryPreservedBody', { id: exportFeedback.sessionId, output: exportFeedback.output })
+              : t('exportDialog.resultOkBody', { id: exportFeedback.sessionId, output: exportFeedback.output })}
       </p>
+      {exportFeedback.status === 'working' && exportFeedback.progress && <div className="delivery-progress" role="progressbar" aria-valuemin={0} aria-valuemax={exportFeedback.progress.total_bytes} aria-valuenow={exportFeedback.progress.bytes_copied}>
+        <span><strong>{t(`p1.deliveryStage.${exportFeedback.progress.stage}`)}</strong><em>{exportFeedback.progress.total_bytes > 0 ? `${Math.round(exportFeedback.progress.bytes_copied / exportFeedback.progress.total_bytes * 100)}%` : t('common.loading')}</em></span>
+        <i><b style={{ width: `${exportFeedback.progress.total_bytes > 0 ? Math.min(100, exportFeedback.progress.bytes_copied / exportFeedback.progress.total_bytes * 100) : 0}%` }} /></i>
+      </div>}
       {exportFeedback.status === 'failed' && exportFeedback.error && <div className="dialog-warning danger">{exportFeedback.error}</div>}
-      {exportFeedback.status === 'ok' && exportFeedback.warning && <div className="dialog-warning">{exportFeedback.warning}</div>}
-      {exportFeedback.status === 'ok' && (exportFeedback.filePath || exportFeedback.exportDir) && <div className="export-result-meta">
+      {(exportFeedback.status === 'ok' || exportFeedback.status === 'preserved') && exportFeedback.warning && <div className="dialog-warning">{exportFeedback.warning}</div>}
+      {(exportFeedback.status === 'ok' || exportFeedback.status === 'preserved') && (exportFeedback.filePath || exportFeedback.exportDir) && <div className="export-result-meta">
         {exportFeedback.filePath && <div><span>{t('exportDialog.resultFile')}</span><code title={exportFeedback.filePath}>{exportFeedback.filePath}</code></div>}
         {exportFeedback.exportDir && <div><span>{t('exportDialog.resultPath')}</span><code title={exportFeedback.exportDir}>{exportFeedback.exportDir}</code></div>}
       </div>}
       <footer>
-        {exportFeedback.status === 'ok' && <button data-testid="export-result-open-folder" className="button" onClick={() => void openExportFeedbackFolder()} disabled={Boolean(busy)}>{t('exportDialog.openFolder')}</button>}
+        {exportFeedback.status === 'working' && exportFeedback.requestId && <button className="button" onClick={() => void cancelExportDelivery()}>{t('common.cancel')}</button>}
+        {(exportFeedback.status === 'ok' || exportFeedback.status === 'preserved') && <button data-testid="export-result-open-folder" className="button" onClick={() => void openExportFeedbackFolder()} disabled={Boolean(busy)}>{t('exportDialog.openFolder')}</button>}
         <button data-testid="export-result-close" className="button primary" onClick={() => setExportFeedback(null)} disabled={exportFeedback.status === 'working'}>
           {exportFeedback.status === 'working' ? t('common.loading') : t('common.done')}
         </button>
@@ -4080,11 +4405,12 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         <div className="document-tabs"><span className="active"><Icon name="microphone" size={13} /> {workflowComplete ? t('recorder.taskComplete') : currentItem?.id ?? 'Item'} <i>×</i></span></div>
         <div className="editor-toolbar"><div className="editor-nav"><button title={t('recorder.prevItem')} disabled={recording || currentIndex === 0} onClick={() => setCurrentIndex((index) => Math.max(0, index - 1))}><Icon name="chevron-left" /></button><span>{currentIndex + 1} / {items.length}</span><button title={t('recorder.nextItem')} disabled={recording || currentIndex >= items.length - 1} onClick={() => setCurrentIndex((index) => Math.min(items.length - 1, index + 1))}><Icon name="chevron-right" /></button></div><div className="editor-time"><strong className={recording ? 'recording' : ''}>{recording ? attemptDuration : sessionDuration}</strong></div><div className="editor-toolbar-actions"><button className="prompter-launch" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? t('recorder.locatePrompter') : t('recorder.openPrompter')}</button></div><div className={`save-health ${workspaceFaulted || captureFault ? 'fault' : meter.storage_status === 'warning' ? 'warning' : ''}`}><i />{workspaceFaulted ? t('recorder.healthReadonly') : !captureActive ? t('recorder.healthView') : captureFault ? t('recorder.healthFaultStop', { title: captureFaultCopy.title }) : meter.storage_status === 'warning' ? t('recorder.healthWarning', { minutes: Math.max(0, Math.floor(meter.storage_safe_remaining_seconds / 60)) }) : t('recorder.healthLive')}</div></div>
         <div className="editor-canvas">
-          {(activationFailure || captureFault || discontinuityToast || qualityWarning) && <div className="workspace-toasts" aria-live="polite">
+          {(activationFailure || captureFault || discontinuityToast || qualityWarning || vadHealth !== 'healthy') && <div className="workspace-toasts" aria-live="polite">
             {activationFailure && !captureActive && <div className="session-noise-banner failed" role="alert" data-testid="activation-failure-banner"><Icon name="stop" size={16} /><div><strong>{activationErrorCopy(activationFailure.kind).title}</strong><span>{activationErrorCopy(activationFailure.kind).body}</span></div><button className="button" onClick={() => setActivationFailureOpen(true)} disabled={Boolean(busy)}>{t('activationError.openEditor')}</button></div>}
             {captureFault && <div className="capture-fault-banner" role="alert"><Icon name="stop" size={16} /><div><strong>{captureFaultCopy.title}</strong><span>{captureFaultCopy.detail}{snapshot?.device_name ? ` ${t('issues.currentDevice', { name: snapshot.device_name })}` : ' '}{t('issues.stopThenFinish')}</span></div></div>}
             {discontinuityToast && !captureFault && <div className="input-quality-banner workspace-toast" data-testid="discontinuity-toast" role="status"><Icon name="meter" size={16} /><div><strong>{t('discontinuity.bannerTitle')}</strong><span>{discontinuityToast}. {t('discontinuity.bannerHint')}</span></div></div>}
             {qualityWarning && <div className="input-quality-banner" role="alert"><Icon name="meter" size={16} /><div><strong>{t('quality.bannerTitle')}</strong><span>{qualityWarning}. {t('quality.bannerHint')}</span></div></div>}
+            {vadHealth !== 'healthy' && <div className={`vad-health-banner ${vadHealth}`} role={vadHealth === 'lagging' ? 'status' : 'alert'} data-testid="vad-health-banner"><Icon name="meter" size={16} /><div><strong>{t(`p1.vadHealth.${vadHealth}`)}</strong><span>{vadHealth === 'lagging' ? t('p1.vadLagDetail', { backlog: vadBacklogMs, capacity: vadCapacityMs }) : t('p1.vadFaultDetail')}</span></div></div>}
           </div>}
           <section className="script-monitor" style={{ ['--prompter-copy-size' as string]: prompterFontSizeRem(appearance.fontSize), ['--prompter-label-size' as string]: prompterLabelFontSizeRem(appearance.labelFontSize) }}>
             <header>
@@ -4097,18 +4423,14 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
               </div>
             </header>
             <div className={`prompt-surface${showCurrentLabelTransition ? ' label-changed' : ''} ${captureFault ? 'fault' : cue === 'pending' || cue === 'checking' ? 'pending' : cue === 'ready' ? 'ready' : cue === 'recording' ? 'live' : ''}`}>
-              {showCurrentLabelTransition && currentLabelTransition ? <span className="label-transition-chip" role="status" aria-live="polite" aria-atomic="true">
+              {showCurrentLabelTransition && currentLabelTransition ? <span key={`transition:${currentItem?.id ?? 'none'}:${currentLabelTransition.toLabel}`} className="label-transition-chip" role="status" aria-live="polite" aria-atomic="true">
                 <b>{t('recorder.labelChanged')}</b>
-                {t('recorder.labelChangedFromTo', {
-                  from: currentLabelTransition.fromLabel || t('prompter.none'),
-                  to: currentLabelTransition.toLabel || t('prompter.none'),
-                })}
               </span> : null}
               {captureFault
                 ? <span className="label-chip">{t('recorder.stopReadingChip')}</span>
                 : entryBlocksAttempt
                   ? <span className="label-chip">{deviceWarningOpen ? t('deviceWarning.dialogKicker') : t('recorder.envChip')}</span>
-                  : (workflowComplete || currentItem?.label || showCurrentLabelTransition) && <span className="label-chip">{workflowComplete ? t('recorder.allDoneChip') : currentItem?.label || t('recorder.noLabelThisItem')}</span>}
+                  : (workflowComplete || currentItem?.label || showCurrentLabelTransition) && <span key={`label:${currentItem?.id ?? 'none'}:${currentItem?.label ?? ''}`} className={`label-chip${showCurrentLabelTransition ? ' changed' : ''}`}>{workflowComplete ? t('recorder.allDoneChip') : currentItem?.label || t('recorder.noLabelThisItem')}</span>}
               <p>{captureFault ? captureFaultCopy.title : entryBlocksAttempt ? (deviceWarningOpen ? t('deviceWarning.pendingCue') : t('recorder.keepQuiet')) : workflowComplete ? t('recorder.scriptFinished') : currentItem?.text ?? t('recorder.noText')}</p>
               <small>{captureFault ? captureFaultCopy.detail : entryBlocksAttempt ? (deviceWarningOpen ? t('deviceWarning.warning') : noiseCheckMessage) : workflowComplete ? t('recorder.exportLater') : <>{currentItem?.id}</>}</small>
             </div>
@@ -4116,15 +4438,15 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           <section className="signal-monitor"><header><div><strong>{t('recorder.waveform')}</strong>{captureActive || shouldUseRecordedSilencePair(recording, reviewAttempt) ? <SilencePairReadout pair={silencePair} /> : null}</div><div>{captureActive ? <><span>RMS <b>{db(meter.rms)}</b></span><span>PEAK <b className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</b></span></> : <span>{reviewAttempt ? formatDuration(reviewAttempt.end_sample - reviewAttempt.start_sample, sampleRateForDisplay) : t('recorder.noTakeWaveform')}</span>}</div></header><div className="signal-scope"><WebGLWaveform key={showReviewWaveform ? `${sessionDir}:${reviewAttempt?.attempt_id}` : `${sessionDir}:${waveformGeneration}`} mode={showReviewWaveform ? 'review' : 'live'} bins={showReviewWaveform ? reviewWaveformBins : (meter.waveform ?? [])} capturedSamples={meter.captured_samples} waveformEndSample={meter.waveform_end_sample} recording={waveformTakeIsActive(recording && !captureFault, hasSpoken)} takeStartSample={recording && !captureFault ? liveTakeStartSample : undefined} takeEndSample={recording && !captureFault ? liveTakeEndSample : undefined} sampleRate={sampleRateForDisplay} />{captureActive ? <LiveSilenceHint liveMs={displayedLiveSilenceMs} requiredMs={effectiveSilenceDurationMs} /> : null}<div className="scope-scale"><span>−1.0</span><span>−0.5</span><span>0</span><span>+0.5</span><span>+1.0</span></div></div><div className="horizontal-meter"><i className="meter-rms" style={{ width: `${rmsPercent}%` }} /><i className="meter-peak" style={{ left: `${peakPercent}%` }} /></div></section>
           <section className="transport-panel">
             <div className="transport-review">
-              {hasRetakeVersionChoice
-                ? <span className="retake-decision-summary" data-testid="retake-decision-summary"><b>{t('recorder.currentDeliveryVersion')}</b><i aria-hidden="true">→</i><strong>{t('recorder.retakeCandidateVersion')}</strong><em>{t('recorder.retakeDecisionHint')}</em></span>
+              {hasRetakeChoice
+                ? <span className="retake-decision-summary" data-testid="retake-decision-summary"><strong>{t('recorder.retakeCandidateVersion')}</strong><em>{t('recorder.retakeDecisionHint')}</em></span>
                 : hasRetainedPreviousWarning
                   ? <span className="retake-retained-warning" role="status"><Icon name="meter" size={13} />{t('recorder.retakeFailedPreviousRetained')}</span>
                   : showReviewSilenceBill && <span className={`silence-bill${silencePair.hint || silencePair.extra ? ' has-issue' : ''}`} data-testid="review-silence-bill"><SilencePairReadout pair={silencePair} hint /></span>}
             </div>
             <div className="transport-controls">
               <div className="transport-secondary">
-              <button title={t('recorder.previewKey')} onClick={() => void previewAttempt()} disabled={recording || !reviewAttempt || Boolean(busy)}><Icon name="play" /><span>{hasRetakeDecision ? t('recorder.previewCandidate') : t('recorder.preview')}</span><kbd>P</kbd></button>
+              <button data-testid={hasRetakeDecision ? 'preview-retake' : undefined} title={t('recorder.previewKey')} onClick={() => void previewAttempt()} disabled={recording || !reviewAttempt || Boolean(busy)}><Icon name="play" /><span>{hasRetakeDecision ? t('recorder.previewCandidate') : t('recorder.preview')}</span><kbd>P</kbd></button>
               {captureActive && <button title={t('recorder.retakeKey')} onClick={() => void startAttempt()} disabled={workspaceFaulted || captureFault || entryBlocksAttempt || recording || !currentItem || Boolean(busy)}><Icon name="retake" /><span>{t('recorder.retake')}</span><kbd>R</kbd></button>}
               </div>
               <div className="transport-primary">
@@ -4139,7 +4461,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
                 : recording
                   ? <button data-testid="main-transport" className={`main-transport ${isPendingTake || waitingForTailSilence ? 'waiting' : cue === 'ready' ? 'accept' : 'stop'}`} onClick={() => void stopAttempt()} disabled={Boolean(busy) || waitingForTailSilence}><span><Icon name="stop" /></span><strong>{isPendingTake ? t('recorder.pendingCancel') : waitingForTailSilence ? t('recorder.waitTailSilence') : t('recorder.finishSentence')}</strong>{isPendingTake ? <div className="transport-keys"><kbd>ESC</kbd><kbd>SPACE</kbd></div> : waitingForTailSilence ? null : <kbd>SPACE</kbd>}</button>
                 : primaryAction === 'accept'
-                  ? <button data-testid="main-transport" className="main-transport accept" onClick={() => void acceptAttempt()} disabled={Boolean(busy)}><span><Icon name="check" /></span><strong>{hasRetakeDecision ? t('recorder.useRetakeCandidate') : acceptButtonLabel}</strong><kbd>SPACE</kbd></button>
+                  ? <button data-testid="main-transport" data-retake-action={hasRetakeDecision ? 'use' : undefined} className="main-transport accept" onClick={() => void acceptAttempt()} disabled={Boolean(busy) || !defaultAcceptAttemptSafe}><span><Icon name="check" /></span><strong>{hasRetakeDecision ? t('recorder.useRetakeCandidate') : acceptButtonLabel}</strong><kbd>SPACE</kbd></button>
                   : primaryAction === 'finish'
                     ? <button data-testid="main-transport" className="main-transport complete" onClick={requestFinishCapture} disabled={Boolean(busy)}><span><Icon name="check" /></span><strong>{t('recorder.finishAll')}</strong><kbd>SPACE</kbd></button>
                     : primaryAction === 'start'
@@ -4147,7 +4469,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
                       : <button data-testid="main-transport" className="main-transport handled" disabled><span><Icon name="check" /></span><strong>{t('recorder.itemHandled')}</strong><kbd>R</kbd></button>}
             </div>
               <div className="transport-secondary right">
-                {captureActive && hasRetakeDecision && retainedDeliveryAttempt ? <button className="keep-delivery-button" onClick={() => void acceptAttempt(retainedDeliveryAttempt.attempt_id)} disabled={Boolean(busy)}><Icon name="check" /><span>{t('recorder.keepPreviousVersion')}</span></button> : null}
+                {captureActive && hasRetakeDecision && retainedDeliveryAttempt ? <button className="discard-retake-button" data-testid="discard-retake" onClick={() => void acceptAttempt(retainedDeliveryAttempt.attempt_id)} disabled={Boolean(busy) || !safeAttemptIds.has(retainedDeliveryAttempt.attempt_id)}><Icon name="close" /><span>{t('recorder.keepPreviousVersion')}</span></button> : null}
                 {captureActive && <button title={t('recorder.skipKey')} onClick={() => void skipItem()} disabled={captureFault || recording || Boolean(busy) || hasRetakeDecision || !currentItem || !['pending', 'review'].includes(currentItem.status)}><Icon name="skip" /><span>{t('recorder.skip')}</span><kbd>S</kbd></button>}
               </div>
             </div>
@@ -4170,12 +4492,22 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
               ? t('recorder.appliedSettingsVad', { seconds: (effectiveSilenceDurationMs / 1_000).toFixed(1) })
               : t('recorder.appliedSettings', { db: noiseThresholdDbfs, seconds: (effectiveSilenceDurationMs / 1_000).toFixed(1) }))}</p><button className="restore-settings" onClick={() => void applyTaskSilenceSettings(taskInitialSilenceThresholdDbfs, taskInitialSilenceDurationMs)} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving || (noiseThresholdDbfs === taskInitialSilenceThresholdDbfs && silenceDurationMs === taskInitialSilenceDurationMs)}>{t('recorder.restoreInitial')}</button></section>}
             {monitorPanelTab === 'task' && <section className="monitor-section"><h3>{t('recorder.taskParams')}</h3><dl className="property-list"><div><dt>{t('setup.inputDevice')}</dt><dd title={snapshot?.device_name}>{snapshot?.device_name || t('common.dash')}</dd></div><div><dt>{t('recorder.detectorTitle')}</dt><dd>{silenceDetector === 'vad' ? t('recorder.detectorVad') : t('recorder.detectorEnergy')}</dd></div><div><dt>{t('setup.shareMode')}</dt><dd>{captureShareModeLabel(snapshot?.capture_share_mode ?? captureShareMode)}</dd></div><div><dt>{t('setup.inputChannel')}</dt><dd>{snapshot?.audio_format.input_channel ?? 1}</dd></div><div><dt>{t('recorder.exportFormat')}</dt><dd>{sampleRateForDisplay / 1000}k / {snapshot?.audio_format.bit_depth}-bit {snapshot?.audio_format.encoding ?? ''}</dd></div><div><dt>{t('recorder.driverInputFormat')}</dt><dd>{snapshot?.input_sample_format?.toUpperCase() ?? t('common.dash')}</dd></div><div><dt>{t('recorder.envCeiling')}</dt><dd>{snapshot?.noise_threshold_dbfs ?? snapshot?.noise_check?.threshold_dbfs ?? t('common.dash')} dBFS</dd></div><div><dt>{t('recorder.accepted')}</dt><dd>{counts.accepted ?? 0} / {items.length}</dd></div><div><dt>{t('recorder.skipped')}</dt><dd>{counts.skipped ?? 0}</dd></div></dl><button className="button panel-action" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? t('recorder.locatePrompter') : t('recorder.openPrompter')}</button></section>}
-            {monitorPanelTab === 'export' && snapshot && <section className="monitor-section monitor-export"><h3>{t('recorder.exportCurrent')}</h3><p>{captureActive ? recording ? t('recorder.exportWhileRecording') : t('recorder.exportWillPause') : t('recorder.exportIndependent')}</p><dl className="property-list export-status-summary"><div><dt>{t('recorder.review')}</dt><dd>{reviewCount}</dd></div><div><dt>{t('recorder.requiresRerecord')}</dt><dd>{rerecordCount}</dd></div><div><dt>{t('recorder.retainedPreviousShort')}</dt><dd>{retainedPreviousWarningCount}</dd></div></dl>{exportDestinationPicker(sessionDir)}<div>
+            {monitorPanelTab === 'export' && snapshot && <section className="monitor-section monitor-export"><h3>{t('recorder.exportCurrent')}</h3><p>{captureActive ? recording ? t('recorder.exportWhileRecording') : t('recorder.exportWillPause') : t('recorder.exportIndependent')}</p><dl className="property-list export-status-summary"><div><dt>{t('p1.blocker')}</dt><dd>{workflowSummary.blockerCount}</dd></div><div><dt>{t('p1.warning')}</dt><dd>{workflowSummary.warningCount}</dd></div><div><dt>{t('recorder.retainedPreviousShort')}</dt><dd>{retainedPreviousWarningCount}</dd></div></dl><div className="export-scope-control" role="group" aria-label={t('p1.exportScopeTitle')}><button className={exportScope === 'confirmed_only' ? 'active' : ''} onClick={() => { setExportScope('confirmed_only'); setAcknowledgedExportWarnings([]); }}><strong>{t('p1.confirmedOnly')}</strong><small>{t('p1.confirmedOnlyHint')}</small></button><button className={exportScope === 'complete_task' ? 'active' : ''} onClick={() => { setExportScope('complete_task'); setAcknowledgedExportWarnings([]); }}><strong>{t('p1.completeTask')}</strong><small>{t('p1.completeTaskHint')}</small></button></div><div className={`export-readiness ${cutsReadiness.health}`}><strong>{cutsReadiness.ready ? t('p1.exportReady') : t('p1.exportNotReady')}</strong><span>{t('p1.exportReadinessCounts', { included: cutsReadiness.includedItemIds.length, excluded: cutsReadiness.excluded.length, blockers: cutsReadiness.blockers.length })}</span></div>{cutsReadiness.warningCodes.length > 0 && <div className="export-warning-acks"><strong>{t('p1.exportWarningsTitle')}</strong>{cutsReadiness.warningCodes.map((code) => <label key={code}><input type="checkbox" checked={acknowledgedExportWarnings.includes(code)} onChange={(event) => setAcknowledgedExportWarnings((current) => event.target.checked ? [...new Set([...current, code])] : current.filter((value) => value !== code))} /><span>{t(`p1.warningCode.${code}`)}</span></label>)}</div>}{exportDestinationPicker(sessionDir)}<div>
               <button onClick={() => void exportRecordingArtifact({ session_id: snapshot.session_id, session_dir: sessionDir }, 'full_track')} disabled={Boolean(busy) || recording}><Icon name="meter" /><span><strong>{t('recorder.fullTrackShort')}</strong><small>{artifactStatusCopy(workspaceRecording, 'full_track')}</small></span></button>
               <button onClick={() => void exportRecordingArtifact({ session_id: snapshot.session_id, session_dir: sessionDir }, 'timestamps_json')} disabled={Boolean(busy) || recording}><Icon name="file" /><span><strong>{t('recorder.timestampsShort')}</strong><small>{artifactStatusCopy(workspaceRecording, 'timestamps_json')}</small></span></button>
-              <button onClick={() => void exportRecordingArtifact({ session_id: snapshot.session_id, session_dir: sessionDir }, 'cuts_zip')} disabled={Boolean(busy) || recording || captureFault || workspaceFaulted || reviewCount > 0}><Icon name="export" /><span><strong>{t('recorder.cutsShort')}</strong><small>{captureFault || workspaceFaulted ? t('exportDialog.cutsBlocked') : reviewCount > 0 ? t('exportDialog.cutsBlockedReview') : artifactStatusCopy(workspaceRecording, 'cuts_zip')}</small></span></button>
+              <button onClick={() => void exportRecordingArtifact({ session_id: snapshot.session_id, session_dir: sessionDir }, 'cuts_zip', exportScope)} disabled={Boolean(busy) || recording || captureFault || workspaceFaulted || !cutsReadiness.ready || !exportWarningsAcknowledged}><Icon name="export" /><span><strong>{t('recorder.cutsShort')}</strong><small>{!cutsReadiness.ready ? t('p1.exportBlockedSummary', { count: cutsReadiness.blockers.length }) : !exportWarningsAcknowledged ? t('p1.exportAcknowledgeFirst') : artifactStatusCopy(workspaceRecording, 'cuts_zip')}</small></span></button>
             </div></section>}
-            {monitorPanelTab === 'issues' && <section className="monitor-section monitor-issues"><h3>{t('recorder.issuesTitle')}</h3>{captureFault && <p><strong>{captureFaultCopy.title}</strong><span>{captureFaultCopy.detail}</span></p>}{discontinuityWarning && <p><strong>{t('issues.discontinuityTitle')}</strong><span>{discontinuityWarning}。</span></p>}{workspaceFaulted && <p><strong>{t('issues.readonlyTitle')}</strong><span>{t('issues.readonlyBody')}</span></p>}{qualityWarning && <p><strong>{t('quality.bannerTitle')}</strong><span>{qualityWarning}</span></p>}{meter.storage_status !== 'healthy' && <p><strong>{t('issues.storageTitle')}</strong><span>{meter.storage_status === 'warning' ? t('issues.storageWarning', { minutes: Math.max(0, Math.floor(meter.storage_safe_remaining_seconds / 60)) }) : t('issues.storageCritical')}</span></p>}</section>}
+            {monitorPanelTab === 'issues' && <section className="monitor-section monitor-issues issue-workbench" data-testid="issue-workbench">
+              <header><div><h3>{t('recorder.issuesTitle')}</h3><small>{t('p1.issueSummary', { blockers: workbenchIssues.filter((issue) => issue.severity === 'blocker').length, warnings: workbenchIssues.filter((issue) => issue.severity === 'warning').length })}</small></div><div className="issue-navigation"><button onClick={() => moveWorkbenchIssue(-1)} disabled={recording || visibleWorkbenchIssues.length === 0} title={t('p1.previousIssue')}><Icon name="chevron-left" size={12} /></button><button onClick={() => moveWorkbenchIssue(1)} disabled={recording || visibleWorkbenchIssues.length === 0} title={t('p1.nextIssue')}><Icon name="chevron-right" size={12} /></button></div></header>
+              <div className="issue-filters" role="group" aria-label={t('p1.issueFilterAria')}>{(['all', 'blocker', 'warning'] as const).map((filter) => <button key={filter} className={issueFilter === filter ? 'active' : ''} onClick={() => { setIssueFilter(filter); setSelectedIssueId(null); }}>{t(`p1.issueFilter.${filter}`)}</button>)}</div>
+              {qualityWarning && <p><strong>{t('quality.bannerTitle')}</strong><span>{qualityWarning}</span></p>}
+              {visibleWorkbenchIssues.length === 0 ? <div className="issue-empty"><Icon name="check" size={14} />{t('p1.noIssuesInFilter')}</div> : <div className="issue-list">{visibleWorkbenchIssues.map((issue) => <button key={issue.id} className={`${issue.severity}${selectedIssueId === issue.id ? ' active' : ''}`} onClick={() => locateWorkbenchIssue(issue)} disabled={recording}>
+                <i />
+                <span><strong>{t(`p1.issueKind.${issue.kind}`)}</strong><small>{issue.itemId ? t('p1.issueItem', { id: issue.itemId }) : t('p1.issueTaskLevel')}</small></span>
+                <em>{issue.severity === 'blocker' ? t('p1.blocker') : t('p1.warning')}</em>
+              </button>)}</div>}
+              <footer>{t('p1.issueNavigationHint')}</footer>
+            </section>}
           </div>
           <nav className="monitor-tabs" aria-label={t('recorder.tabsAria')}>
             <button className={monitorPanelTab === 'monitor' ? 'active' : ''} onClick={() => setMonitorPanelTab('monitor')} title={t('recorder.tabMonitor')}><Icon name="headphones" /><span>{t('recorder.tabMonitor')}</span></button>
@@ -4237,7 +4569,6 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     </div>}
     {previewOpen && audioUrl && <PreviewPlayer
       url={audioUrl}
-      attemptId={previewingAttemptId}
       itemId={currentItem?.id ?? ''}
       itemText={currentItem?.text ?? ''}
       itemLabel={currentItem?.label}

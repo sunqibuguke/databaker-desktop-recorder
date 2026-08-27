@@ -15,7 +15,10 @@ use crate::storage_guard::{
     AtomicExportStep, StorageReport, StorageStatus, check_storage, evaluate_atomic_export_space,
 };
 use crate::vad::{
-    DETECTOR_ENERGY, DETECTOR_VAD, VadAnalysisMessage, VadAnnotationSink, run_vad_analysis_thread,
+    DETECTOR_ENERGY, DETECTOR_VAD, VAD_HEALTH_DEGRADED, VAD_HEALTH_HEALTHY, VAD_HEALTH_UNAVAILABLE,
+    VAD_ISSUE_CLASSIFIER_FAILURE, VAD_ISSUE_FLUSH_TIMEOUT, VAD_ISSUE_QUEUE_OVERFLOW,
+    VAD_ISSUE_WORKER_DISCONNECTED, VAD_QUEUE_LAGGING_MILLIS, VadAnalysisBlock, VadAnnotationSink,
+    VadControlMessage, VadFlushOutcome, VadQueueBudget, VadTelemetry, run_vad_analysis_thread,
     trimmed_speech_bounds,
 };
 use crate::wav::{
@@ -30,9 +33,10 @@ use cpal::{
     Device, I24, SampleFormat, ShareMode, SizedSample, Stream, StreamConfig, SupportedStreamConfig,
     U24,
 };
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 #[cfg(test)]
 use std::collections::VecDeque;
@@ -211,6 +215,31 @@ pub struct Attempt {
     pub required_tail_silence_samples: u64,
     pub status: String,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quality_issues: Vec<AttemptQualityIssue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttemptQualityIssue {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_sample: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_sample: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detector_generation: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VadDiagnostics {
+    pub queue_capacity_samples: u64,
+    pub queue_capacity_blocks: u64,
+    pub queue_high_water_samples: u64,
+    pub overflow_count: u64,
+    pub dropped_samples: u64,
+    pub classifier_failure_count: u64,
+    pub flush_timeout_count: u64,
+    pub worker_disconnect_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -310,6 +339,8 @@ pub struct SessionSnapshot {
     /// Missing on pre-VAD snapshots; those keep the energy gate.
     #[serde(default = "default_silence_detector_legacy")]
     pub silence_detector: SilenceDetector,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vad_diagnostics: Option<VadDiagnostics>,
     pub items: Vec<ItemState>,
 }
 
@@ -367,6 +398,25 @@ pub struct SystemTestStartSessionPayload {
     pub segment_frames: u64,
 }
 
+#[cfg(feature = "system-test")]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemTestSignalPattern {
+    Silence,
+    #[default]
+    Speech,
+}
+
+#[cfg(feature = "system-test")]
+impl SystemTestSignalPattern {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Silence => "silence",
+            Self::Speech => "speech",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ResumeSessionPayload {
     pub session_dir: String,
@@ -379,6 +429,24 @@ pub enum ExportArtifact {
     FullTrack,
     CutsZip,
     TimestampsJson,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportScope {
+    #[default]
+    ConfirmedOnly,
+    CompleteTask,
+}
+
+#[derive(Debug)]
+struct ExportSessionOptions<'a> {
+    expected_session_id: Option<&'a str>,
+    available_bytes_override: Option<u64>,
+    requested_artifact: Option<ExportArtifact>,
+    export_scope: ExportScope,
+    expected_journal_seq: Option<u64>,
+    acknowledged_warning_codes: &'a [String],
 }
 
 #[derive(Debug, Deserialize)]
@@ -531,6 +599,60 @@ fn default_silence_detector_new() -> SilenceDetector {
     SilenceDetector::Vad
 }
 
+fn vad_issue_code_name(code: u32) -> &'static str {
+    match code {
+        VAD_ISSUE_QUEUE_OVERFLOW => "vad_queue_overflow",
+        VAD_ISSUE_CLASSIFIER_FAILURE => "vad_classifier_failure",
+        VAD_ISSUE_FLUSH_TIMEOUT => "vad_flush_timeout",
+        VAD_ISSUE_WORKER_DISCONNECTED => "vad_worker_disconnected",
+        _ => "vad_worker_disconnected",
+    }
+}
+
+fn known_quality_issue_code(code: &str) -> bool {
+    matches!(
+        code,
+        "input_discontinuity"
+            | "vad_queue_overflow"
+            | "vad_classifier_failure"
+            | "vad_flush_timeout"
+            | "vad_worker_disconnected"
+    )
+}
+
+#[cfg(feature = "system-test")]
+fn system_test_sample(
+    pattern: SystemTestSignalPattern,
+    seed: u64,
+    index: u64,
+    sample_rate: u32,
+) -> f32 {
+    match pattern {
+        SystemTestSignalPattern::Silence => 0.0,
+        SystemTestSignalPattern::Speech => {
+            // A deterministic voiced signal with a slowly varying pitch and
+            // syllabic envelope. White noise is not speech and the production
+            // VAD correctly rejects it, which made the old E2E "speech"
+            // pattern nondeterministic under worker scheduling. Keep this
+            // system-test-only signal rich in harmonics so Earshot reliably
+            // classifies it as voice after the normal 16 kHz downsampling path.
+            let time = index as f64 / f64::from(sample_rate.max(1));
+            let phase = (seed % 65_521) as f64 / 65_521.0;
+            let fundamental = 125.0 + 18.0 * (std::f64::consts::TAU * 2.3 * time).sin();
+            let envelope = 0.55 + 0.45 * (std::f64::consts::TAU * 3.7 * time).sin().abs();
+            let mut sample = 0.0;
+            for harmonic in 1..=12 {
+                let harmonic = f64::from(harmonic);
+                sample += (std::f64::consts::TAU
+                    * (fundamental * harmonic * time + phase * harmonic))
+                    .sin()
+                    / harmonic;
+            }
+            (sample * envelope * 0.18).clamp(-1.0, 1.0) as f32
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SilenceDetector {
@@ -673,7 +795,9 @@ fn append_waveform_packet(
 struct SilenceAnalysisPorts {
     detector_kind: Arc<AtomicU32>,
     generation: Arc<AtomicU64>,
-    tx: Option<Sender<VadAnalysisMessage>>,
+    tx: Option<Sender<VadAnalysisBlock>>,
+    queue: VadQueueBudget,
+    telemetry: VadTelemetry,
 }
 
 impl SilenceAnalysisPorts {
@@ -683,11 +807,50 @@ impl SilenceAnalysisPorts {
             detector_kind: Arc::new(AtomicU32::new(DETECTOR_ENERGY)),
             generation: Arc::new(AtomicU64::new(0)),
             tx: None,
+            queue: VadQueueBudget::new(default_sample_rate()),
+            telemetry: VadTelemetry::default(),
         }
     }
 
     fn uses_vad(&self) -> bool {
         self.detector_kind.load(Ordering::Acquire) == DETECTOR_VAD && self.tx.is_some()
+    }
+
+    fn generation_is_degraded(&self, generation: u64) -> bool {
+        self.telemetry.issue_for_generation(generation).is_some()
+    }
+
+    fn health_name(&self, sample_rate: u32) -> &'static str {
+        match self.telemetry.health.load(Ordering::Acquire) {
+            VAD_HEALTH_UNAVAILABLE => "unavailable",
+            VAD_HEALTH_DEGRADED => "degraded",
+            _ if self.queue.queued_samples()
+                >= u64::from(sample_rate).saturating_mul(VAD_QUEUE_LAGGING_MILLIS) / 1_000 =>
+            {
+                "lagging"
+            }
+            VAD_HEALTH_HEALTHY => "healthy",
+            _ => "healthy",
+        }
+    }
+
+    fn diagnostics(&self) -> VadDiagnostics {
+        VadDiagnostics {
+            queue_capacity_samples: self.queue.max_samples(),
+            queue_capacity_blocks: self.queue.max_blocks(),
+            queue_high_water_samples: self.queue.high_water_samples(),
+            overflow_count: self.telemetry.overflow_count.load(Ordering::Acquire),
+            dropped_samples: self.telemetry.dropped_samples.load(Ordering::Acquire),
+            classifier_failure_count: self
+                .telemetry
+                .classifier_failure_count
+                .load(Ordering::Acquire),
+            flush_timeout_count: self.telemetry.flush_timeout_count.load(Ordering::Acquire),
+            worker_disconnect_count: self
+                .telemetry
+                .worker_disconnect_count
+                .load(Ordering::Acquire),
+        }
     }
 }
 
@@ -1335,7 +1498,7 @@ impl AudioWriterBackend {
                 }
                 let bytes = writer.read_encoded_frames(start_frame, end_frame)?;
                 if bytes.len() as u64 > LEGACY_PREVIEW_MAX_SNAPSHOT_BYTES {
-                    bail!("旧版母轨试听快照超过 256 MiB，请先安全结束录制后再导出");
+                    bail!("旧格式母轨试听快照超过 256 MiB，请先安全结束录制后再导出");
                 }
                 PreparedWavExport::from_encoded_frames(
                     destination,
@@ -1392,7 +1555,7 @@ pub struct RecordingSession {
     head_silence: HeadSilenceMonitor,
     bandwidth: crate::bandwidth::BandwidthProbe,
     silence_analysis: SilenceAnalysisPorts,
-    vad_tx: Option<Sender<VadAnalysisMessage>>,
+    vad_tx: Option<Sender<VadControlMessage>>,
     vad_join: Option<JoinHandle<()>>,
     active_attempt: Option<ActiveAttempt>,
     metadata_fault: Option<String>,
@@ -1661,6 +1824,7 @@ impl Engine {
             silence_duration_ms: existing.silence_duration_ms,
             silence_threshold_dbfs: existing.silence_threshold_dbfs,
             silence_detector: existing.silence_detector,
+            vad_diagnostics: None,
             items: existing
                 .items
                 .into_iter()
@@ -1831,6 +1995,7 @@ impl Engine {
             silence_duration_ms: payload.silence_duration_ms,
             silence_threshold_dbfs: payload.silence_threshold_dbfs,
             silence_detector: payload.silence_detector,
+            vad_diagnostics: None,
             items: payload
                 .items
                 .into_iter()
@@ -1849,6 +2014,19 @@ impl Engine {
     }
 
     pub fn resume_session(&mut self, payload: ResumeSessionPayload) -> Result<Value> {
+        self.resume_session_with_activation(payload, live_capture_activation())
+    }
+
+    #[cfg(feature = "system-test")]
+    pub fn test_activate_session(&mut self, payload: ResumeSessionPayload) -> Result<Value> {
+        self.resume_session_with_activation(payload, CaptureActivation::SystemTestSynthetic)
+    }
+
+    fn resume_session_with_activation(
+        &mut self,
+        payload: ResumeSessionPayload,
+        capture_activation: CaptureActivation,
+    ) -> Result<Value> {
         if self.session.is_some() {
             bail!("当前已有录制进行中");
         }
@@ -1926,7 +2104,7 @@ impl Engine {
             "session_resumed",
             Some(session_lock),
             Some(journal),
-            live_capture_activation(),
+            capture_activation,
         )?;
         if let Some(object) = result.as_object_mut() {
             object.insert("previous_status".to_string(), json!(previous_status));
@@ -1991,23 +2169,7 @@ impl Engine {
             &mut journal,
             Some(expected_session_id.trim()),
         )?;
-        let attempt = snapshot
-            .items
-            .iter()
-            .find(|item| item.id == item_id)
-            .and_then(|item| {
-                item.attempts
-                    .iter()
-                    .find(|attempt| attempt.attempt_id == attempt_id)
-            })
-            .cloned()
-            .ok_or_else(|| anyhow!("录音版本不存在"))?;
-        if matches!(attempt.status.as_str(), "interrupted" | "needs_rerecord")
-            || attempt.end_sample <= attempt.start_sample
-            || attempt.end_sample > snapshot.committed_samples
-        {
-            bail!("异常中断或样本边界越界的录音版本不能试听");
-        }
+        let attempt = usable_preview_attempt(&snapshot, item_id, attempt_id)?.clone();
         let preview_dir = session_dir.join("preview");
         match std::fs::symlink_metadata(&preview_dir) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
@@ -2067,13 +2229,14 @@ impl Engine {
         expected_session_id: &str,
         item_id: &str,
         attempt_id: &str,
+        expected_journal_seq: u64,
     ) -> Result<Value> {
         if self.session.is_some() {
-            bail!("当前已有录制进行中，请先安全暂停再切换版本");
+            bail!("当前已有录制进行中，请先安全暂停再切换当前使用录音");
         }
         validate_offline_session_tree(session_dir)?;
         let _session_lock = SessionLock::acquire(session_dir, &Utc::now().to_rfc3339())?;
-        ensure_no_audio_fault_marker(session_dir, "切换录音版本")?;
+        ensure_no_audio_fault_marker(session_dir, "切换当前使用录音")?;
         let mut journal = read_journal(session_dir)?;
         let mut snapshot = load_recovery_snapshot_for_session(
             session_dir,
@@ -2081,24 +2244,41 @@ impl Engine {
             Some(expected_session_id.trim()),
         )?;
         if snapshot.status != "stopped" {
-            bail!("任务尚未安全暂停，不能离线切换录音版本");
+            bail!("任务尚未安全暂停，不能离线切换当前使用录音");
         }
-        let item = snapshot
+        if snapshot.overflow_samples > 0 {
+            bail!("任务存在音频写盘溢出，不能离线切换当前使用录音");
+        }
+        if snapshot.journal_seq != expected_journal_seq {
+            bail!(
+                "任务已在其他窗口变更：期望 journal_seq={expected_journal_seq}，当前={}；请刷新后重试",
+                snapshot.journal_seq
+            );
+        }
+        validate_snapshot_identifiers(&snapshot)?;
+        validate_attempt_boundaries(&snapshot, snapshot.committed_samples)?;
+        validate_capture_provenance(&snapshot, snapshot.committed_samples, true)?;
+        let item_index = snapshot
             .items
-            .iter_mut()
-            .find(|item| item.id == item_id)
+            .iter()
+            .position(|item| item.id == item_id)
             .ok_or_else(|| anyhow!("条目不存在"))?;
-        let selected = item
+        let selected = snapshot.items[item_index]
             .attempts
             .iter()
             .find(|attempt| attempt.attempt_id == attempt_id)
-            .ok_or_else(|| anyhow!("录音版本不存在"))?;
-        if matches!(selected.status.as_str(), "interrupted" | "needs_rerecord")
-            || selected.end_sample <= selected.start_sample
-            || selected.end_sample > snapshot.committed_samples
-        {
-            bail!("异常中断或样本边界越界的录音版本不能设为当前版本");
+            .ok_or_else(|| anyhow!("指定录音不存在"))?;
+        if !attempt_is_delivery_safe(&snapshot, selected)? {
+            bail!("异常中断或样本边界越界的录音不能设为当前使用录音");
         }
+        waveform_offline_range(
+            session_dir,
+            &snapshot,
+            selected.start_sample,
+            selected.end_sample,
+        )
+        .context("指定录音的物理音频校验失败，不能设为当前使用录音")?;
+        let item = &mut snapshot.items[item_index];
         for attempt in &mut item.attempts {
             if attempt.attempt_id == attempt_id {
                 attempt.status = "accepted".to_string();
@@ -2112,7 +2292,11 @@ impl Engine {
             session_dir,
             &mut snapshot,
             "attempt_selected_offline",
-            json!({ "item_id": item_id, "attempt_id": attempt_id }),
+            json!({
+                "item_id": item_id,
+                "attempt_id": attempt_id,
+                "expected_journal_seq": expected_journal_seq,
+            }),
         )?;
         Ok(json!({
             "snapshot": snapshot,
@@ -2395,15 +2579,37 @@ impl Engine {
             .saturating_mul(u64::from(snapshot.silence_duration_ms))
             / 1_000;
         let head_silence = HeadSilenceMonitor::new(required_head_silence_samples);
-        // Unbounded like the writer channel: system-test and exclusive capture
-        // can enqueue many small blocks before the analysis thread is scheduled.
-        // Earshot is faster than realtime, so the backlog should not grow in
-        // production. Disconnect still fail-closes the capture timeline.
-        let (vad_tx, vad_rx) = unbounded::<VadAnalysisMessage>();
+        // VAD inference is deliberately isolated from the authoritative writer.
+        // The callback never blocks: one second of PCM and 1,024 messages are
+        // hard limits, while lifecycle controls use a separate priority lane.
+        let (vad_data_tx, vad_data_rx) = bounded::<VadAnalysisBlock>(1_024);
+        let (vad_tx, vad_control_rx) = bounded::<VadControlMessage>(8);
+        let vad_queue = VadQueueBudget::new(snapshot.audio_format.sample_rate);
+        let vad_telemetry = VadTelemetry::default();
+        if let Some(previous) = snapshot.vad_diagnostics.as_ref() {
+            vad_queue.restore_high_water_samples(previous.queue_high_water_samples);
+            vad_telemetry
+                .overflow_count
+                .store(previous.overflow_count, Ordering::Release);
+            vad_telemetry
+                .dropped_samples
+                .store(previous.dropped_samples, Ordering::Release);
+            vad_telemetry
+                .classifier_failure_count
+                .store(previous.classifier_failure_count, Ordering::Release);
+            vad_telemetry
+                .flush_timeout_count
+                .store(previous.flush_timeout_count, Ordering::Release);
+            vad_telemetry
+                .worker_disconnect_count
+                .store(previous.worker_disconnect_count, Ordering::Release);
+        }
         let silence_analysis = SilenceAnalysisPorts {
             detector_kind: Arc::new(AtomicU32::new(snapshot.silence_detector.as_u32())),
             generation: Arc::new(AtomicU64::new(1)),
-            tx: Some(vad_tx.clone()),
+            tx: Some(vad_data_tx),
+            queue: vad_queue.clone(),
+            telemetry: vad_telemetry.clone(),
         };
         let vad_sink = VadAnnotationSink {
             head_silence: head_silence.clone(),
@@ -2413,12 +2619,21 @@ impl Engine {
             analyzed_samples: Arc::clone(&analyzed_samples),
             analysis_epoch: Arc::clone(&analysis_epoch),
             generation: Arc::clone(&silence_analysis.generation),
+            telemetry: vad_telemetry,
         };
         let vad_sample_rate = snapshot.audio_format.sample_rate;
         let vad_join = thread::Builder::new()
             .name("speech-vad".to_string())
             .stack_size(2 * 1024 * 1024)
-            .spawn(move || run_vad_analysis_thread(vad_rx, vad_sample_rate, vad_sink))
+            .spawn(move || {
+                run_vad_analysis_thread(
+                    vad_data_rx,
+                    vad_control_rx,
+                    vad_sample_rate,
+                    vad_sink,
+                    vad_queue,
+                )
+            })
             .context("start speech VAD analysis thread")?;
         let (waveform_tx, waveform_rx) = bounded::<WaveformPacket>(128);
         // Production preview leaves the callback only through this bounded,
@@ -2717,6 +2932,7 @@ impl Engine {
         let head_silence_thread = session.head_silence.clone();
         let silence_duration_ms_thread = Arc::clone(&session.silence_duration_ms);
         let silence_detector_thread = Arc::clone(&session.silence_analysis.detector_kind);
+        let vad_analysis_thread = session.silence_analysis.clone();
         let telemetry_session_dir = session.session_dir.clone();
         let capture_share_mode = session.snapshot.capture_share_mode.as_str();
         let telemetry_join = match thread::Builder::new()
@@ -2796,6 +3012,17 @@ impl Engine {
                             "silence_detector": SilenceDetector::from_u32(
                                 silence_detector_thread.load(Ordering::Acquire)
                             ),
+                            "vad_health": vad_analysis_thread.health_name(sample_rate),
+                            "vad_backlog_samples": vad_analysis_thread.queue.queued_samples(),
+                            "vad_backlog_blocks": vad_analysis_thread.queue.queued_blocks(),
+                            "vad_capacity_samples": vad_analysis_thread.queue.max_samples(),
+                            "vad_capacity_blocks": vad_analysis_thread.queue.max_blocks(),
+                            "vad_high_water_samples": vad_analysis_thread.queue.high_water_samples(),
+                            "vad_overflow_count": vad_analysis_thread.telemetry.overflow_count.load(Ordering::Acquire),
+                            "vad_dropped_samples": vad_analysis_thread.telemetry.dropped_samples.load(Ordering::Acquire),
+                            "vad_classifier_failure_count": vad_analysis_thread.telemetry.classifier_failure_count.load(Ordering::Acquire),
+                            "vad_flush_timeout_count": vad_analysis_thread.telemetry.flush_timeout_count.load(Ordering::Acquire),
+                            "vad_worker_disconnect_count": vad_analysis_thread.telemetry.worker_disconnect_count.load(Ordering::Acquire),
                             "head_silence_phase": head_silence_phase_name(
                                 head_silence_thread.phase.load(Ordering::Acquire)
                             ),
@@ -2899,6 +3126,7 @@ impl Engine {
         frames: u64,
         seed: u64,
         block_frames: usize,
+        pattern: SystemTestSignalPattern,
     ) -> Result<Value> {
         let session = self.active_system_test_session_mut()?;
         session.ensure_metadata_mutation_allowed()?;
@@ -2945,11 +3173,12 @@ impl Engine {
             let mut samples = Vec::with_capacity(chunk_frames);
             for offset in 0..chunk_frames {
                 let index = global_start + offset as u64;
-                let word = seed
-                    .wrapping_add(index.wrapping_mul(6_364_136_223_846_793_005))
-                    .rotate_left(17);
-                let normalized = ((word >> 40) as f32 / 16_777_215.0) * 0.5 - 0.25;
-                samples.push(normalized);
+                samples.push(system_test_sample(
+                    pattern,
+                    seed,
+                    index,
+                    session.snapshot.audio_format.sample_rate,
+                ));
             }
             saturating_atomic_add(&session.capture_heartbeat, 1);
             publish_block(
@@ -2976,6 +3205,13 @@ impl Engine {
             "captured_samples": session.captured.load(Ordering::Acquire),
             "committed_samples": session.committed.load(Ordering::Acquire),
             "queued_frames": session.writer_queue.queued_frames.load(Ordering::Acquire),
+            "pattern": pattern.as_str(),
+            "silence_samples": session.silence_samples.load(Ordering::Acquire),
+            "last_signal_sample": session.last_signal_sample.load(Ordering::Acquire),
+            "analyzed_samples": session.analyzed_samples.load(Ordering::Acquire),
+            "head_silence_phase": head_silence_phase_name(
+                session.head_silence.phase.load(Ordering::Acquire)
+            ),
         }))
     }
 
@@ -3138,6 +3374,15 @@ impl Engine {
             session.head_silence.set_enforce(enforce_silence);
         }
         if let Some(detector) = payload.silence_detector {
+            if detector != session.snapshot.silence_detector {
+                // Creating an offline task is the only detector-selection
+                // phase. Once capture is activated, callbacks, generations,
+                // diagnostics, and every attempt must keep one detector
+                // contract for the lifetime of that activation. In
+                // particular, a failed VAD worker must never be bypassed by a
+                // raw IPC switch to Energy between sentences.
+                bail!("录制任务启动后不能切换静音检测器；请安全退出后重新配置任务");
+            }
             session.snapshot.silence_detector = detector;
             session
                 .silence_analysis
@@ -3148,7 +3393,9 @@ impl Engine {
             session.apply_silence_settings(payload.threshold_dbfs, payload.silence_duration_ms);
         session.snapshot.silence_threshold_dbfs = payload.threshold_dbfs;
         session.snapshot.silence_duration_ms = payload.silence_duration_ms;
-        session.reset_vad_analysis();
+        if session.active_attempt.is_none() {
+            session.reset_vad_analysis()?;
+        }
         session.persist(
             "silence_settings_changed",
             json!({
@@ -3202,7 +3449,7 @@ impl Engine {
         // click does not count. Non-enforced takes still count elapsed time;
         // enforced takes require consecutive silence after the click.
         session.head_silence.set_enforce(enforce_silence);
-        let recording_started_sample = session.arm_attempt_analysis();
+        let recording_started_sample = session.arm_attempt_analysis()?;
         let start_sample = recording_started_sample;
         session.active_attempt = Some(ActiveAttempt {
             item_id: item_id.to_string(),
@@ -3283,7 +3530,35 @@ impl Engine {
         // advance to a callback that was already being analyzed, but its final
         // boundary and signal fields always come from the same even epoch.
         let requested_boundary = session.captured.load(Ordering::Acquire);
-        session.flush_vad_analysis()?;
+        let generation = session.silence_analysis.generation.load(Ordering::Acquire);
+        let vad_outcome = session
+            .silence_analysis
+            .telemetry
+            .issue_for_generation(generation)
+            .map_or_else(
+                || session.flush_vad_analysis(requested_boundary),
+                |(code, _, _)| VadFlushOutcome::Degraded(code),
+            );
+        if vad_outcome != VadFlushOutcome::Complete {
+            let issue_code = match vad_outcome {
+                VadFlushOutcome::Degraded(code) => code,
+                VadFlushOutcome::Timeout => VAD_ISSUE_FLUSH_TIMEOUT,
+                VadFlushOutcome::Complete => unreachable!(),
+            };
+            let attempt = session.finish_vad_degraded_attempt(
+                &active,
+                requested_boundary,
+                generation,
+                issue_code,
+            )?;
+            return Ok(json!({
+                "item_id": active.item_id,
+                "attempt": attempt,
+                "forced": false,
+                "auto_selected": false,
+                "vad_degraded": true,
+            }));
+        }
         let analysis = session.wait_for_analysis_snapshot(requested_boundary)?;
         let captured_boundary = analysis.boundary;
         let observed_content_started_sample = analysis.content_started_sample;
@@ -3403,6 +3678,16 @@ impl Engine {
             .discontinuities
             .load(Ordering::Acquire)
             > active.input_discontinuity_count_at_start;
+        let quality_issues = if recovered_discontinuity {
+            vec![AttemptQualityIssue {
+                code: "input_discontinuity".to_string(),
+                start_sample: None,
+                end_sample: None,
+                detector_generation: Some(generation),
+            }]
+        } else {
+            Vec::new()
+        };
         let attempt = Attempt {
             attempt_id: active.attempt_id.clone(),
             // Energy gating starts the clip where the required head pad
@@ -3424,6 +3709,7 @@ impl Engine {
                 "recorded".to_string()
             },
             created_at: Utc::now().to_rfc3339(),
+            quality_issues,
         };
         let item = session
             .snapshot
@@ -3484,27 +3770,32 @@ impl Engine {
         if session.active_attempt.is_some() {
             bail!("cannot accept an attempt while another attempt is recording");
         }
-        let item = session
+        validate_snapshot_identifiers(&session.snapshot)?;
+        let item_index = session
             .snapshot
             .items
-            .iter_mut()
-            .find(|item| item.id == item_id)
+            .iter()
+            .position(|item| item.id == item_id)
             .ok_or_else(|| anyhow!("unknown item id {item_id}"))?;
-        let selected = item
+        let selected = session.snapshot.items[item_index]
             .attempts
             .iter()
             .find(|attempt| attempt.attempt_id == attempt_id)
+            .cloned()
             .ok_or_else(|| anyhow!("unknown attempt id {attempt_id}"))?;
-        if matches!(selected.status.as_str(), "interrupted" | "needs_rerecord")
-            || selected.end_sample <= selected.start_sample
-        {
-            bail!("异常中断的录音版本不能被确认或交付");
+        let live_snapshot = session.live_snapshot();
+        if !attempt_is_delivery_safe(&live_snapshot, &selected)? {
+            bail!("异常中断的录音不能被确认或交付");
         }
         let is_current_accepted = selected.status == "accepted"
-            && item.selected_attempt_id.as_deref() == Some(attempt_id);
+            && session.snapshot.items[item_index]
+                .selected_attempt_id
+                .as_deref()
+                == Some(attempt_id);
         if selected.status != "recorded" && !is_current_accepted {
-            bail!("只能确认待审核的新录音或保留当前已确认版本");
+            bail!("只能使用待确认录音或保留当前使用录音");
         }
+        let item = &mut session.snapshot.items[item_index];
         for attempt in &mut item.attempts {
             if attempt.attempt_id == attempt_id {
                 attempt.status = "accepted".to_string();
@@ -3541,6 +3832,7 @@ impl Engine {
 
     pub fn render_attempt(&mut self, item_id: &str, attempt_id: &str) -> Result<Value> {
         let session = self.active_session_mut()?;
+        validate_snapshot_identifiers(&session.snapshot)?;
         let attempt = session
             .snapshot
             .items
@@ -3549,10 +3841,8 @@ impl Engine {
             .and_then(|item| item.attempts.iter().find(|a| a.attempt_id == attempt_id))
             .cloned()
             .ok_or_else(|| anyhow!("attempt not found"))?;
-        if matches!(attempt.status.as_str(), "interrupted" | "needs_rerecord")
-            || attempt.end_sample <= attempt.start_sample
-        {
-            bail!("异常中断的录音版本不能试听或交付");
+        if !attempt_is_delivery_safe(&session.live_snapshot(), &attempt)? {
+            bail!("异常中断的录音不能试听或交付");
         }
         let destination = session
             .session_dir
@@ -3564,6 +3854,7 @@ impl Engine {
 
     pub fn preview_attempt_waveform(&mut self, item_id: &str, attempt_id: &str) -> Result<Value> {
         let session = self.active_session_mut()?;
+        validate_snapshot_identifiers(&session.snapshot)?;
         let attempt = session
             .snapshot
             .items
@@ -3572,10 +3863,8 @@ impl Engine {
             .and_then(|item| item.attempts.iter().find(|a| a.attempt_id == attempt_id))
             .cloned()
             .ok_or_else(|| anyhow!("attempt not found"))?;
-        if matches!(attempt.status.as_str(), "interrupted" | "needs_rerecord")
-            || attempt.end_sample <= attempt.start_sample
-        {
-            bail!("异常中断的录音版本不能试听或交付");
+        if !attempt_is_delivery_safe(&session.live_snapshot(), &attempt)? {
+            bail!("异常中断的录音不能试听或交付");
         }
         session.wait_until_committed(attempt.end_sample)?;
         let bins = session.waveform_range(attempt.start_sample, attempt.end_sample)?;
@@ -3947,7 +4236,21 @@ impl Engine {
 
     #[cfg(test)]
     fn export_session(&self, session_dir: &Path) -> Result<Value> {
-        self.export_session_inner_expected(session_dir, None, None, None)
+        self.export_session_inner_expected(
+            session_dir,
+            ExportSessionOptions {
+                expected_session_id: None,
+                available_bytes_override: None,
+                requested_artifact: None,
+                export_scope: ExportScope::ConfirmedOnly,
+                expected_journal_seq: None,
+                acknowledged_warning_codes: &[
+                    "retained_previous".to_string(),
+                    "head_silence_short".to_string(),
+                    "tail_silence_short".to_string(),
+                ],
+            },
+        )
     }
 
     pub fn export_session_expected(
@@ -3959,9 +4262,24 @@ impl Engine {
         if expected_session_id.is_empty() {
             bail!("导出需要明确的录制任务身份");
         }
-        self.export_session_inner_expected(session_dir, Some(expected_session_id), None, None)
+        self.export_session_inner_expected(
+            session_dir,
+            ExportSessionOptions {
+                expected_session_id: Some(expected_session_id),
+                available_bytes_override: None,
+                requested_artifact: None,
+                export_scope: ExportScope::ConfirmedOnly,
+                expected_journal_seq: None,
+                acknowledged_warning_codes: &[
+                    "retained_previous".to_string(),
+                    "head_silence_short".to_string(),
+                    "tail_silence_short".to_string(),
+                ],
+            },
+        )
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn export_session_artifact_expected(
         &self,
         session_dir: &Path,
@@ -3974,9 +4292,47 @@ impl Engine {
         }
         self.export_session_inner_expected(
             session_dir,
-            Some(expected_session_id),
-            None,
-            Some(artifact),
+            ExportSessionOptions {
+                expected_session_id: Some(expected_session_id),
+                available_bytes_override: None,
+                requested_artifact: Some(artifact),
+                export_scope: ExportScope::ConfirmedOnly,
+                expected_journal_seq: None,
+                acknowledged_warning_codes: &[
+                    "retained_previous".to_string(),
+                    "head_silence_short".to_string(),
+                    "tail_silence_short".to_string(),
+                ],
+            },
+        )
+    }
+
+    pub fn export_session_artifact_with_options_expected(
+        &self,
+        session_dir: &Path,
+        expected_session_id: &str,
+        artifact: ExportArtifact,
+        scope: ExportScope,
+        expected_journal_seq: Option<u64>,
+        acknowledged_warning_codes: &[String],
+    ) -> Result<Value> {
+        let expected_session_id = expected_session_id.trim();
+        if expected_session_id.is_empty() {
+            bail!("导出需要明确的录制任务身份");
+        }
+        if artifact == ExportArtifact::CutsZip && expected_journal_seq.is_none() {
+            bail!("导出切片需要 expected_journal_seq，以防止误交付过期状态下选择的录音");
+        }
+        self.export_session_inner_expected(
+            session_dir,
+            ExportSessionOptions {
+                expected_session_id: Some(expected_session_id),
+                available_bytes_override: None,
+                requested_artifact: Some(artifact),
+                export_scope: scope,
+                expected_journal_seq,
+                acknowledged_warning_codes,
+            },
         )
     }
 
@@ -3986,16 +4342,36 @@ impl Engine {
         session_dir: &Path,
         available_bytes_override: Option<u64>,
     ) -> Result<Value> {
-        self.export_session_inner_expected(session_dir, None, available_bytes_override, None)
+        self.export_session_inner_expected(
+            session_dir,
+            ExportSessionOptions {
+                expected_session_id: None,
+                available_bytes_override,
+                requested_artifact: None,
+                export_scope: ExportScope::ConfirmedOnly,
+                expected_journal_seq: None,
+                acknowledged_warning_codes: &[
+                    "retained_previous".to_string(),
+                    "head_silence_short".to_string(),
+                    "tail_silence_short".to_string(),
+                ],
+            },
+        )
     }
 
     fn export_session_inner_expected(
         &self,
         session_dir: &Path,
-        expected_session_id: Option<&str>,
-        available_bytes_override: Option<u64>,
-        requested_artifact: Option<ExportArtifact>,
+        options: ExportSessionOptions<'_>,
     ) -> Result<Value> {
+        let ExportSessionOptions {
+            expected_session_id,
+            available_bytes_override,
+            requested_artifact,
+            export_scope,
+            expected_journal_seq,
+            acknowledged_warning_codes,
+        } = options;
         let session_metadata = std::fs::symlink_metadata(session_dir)
             .with_context(|| format!("inspect recording directory {}", session_dir.display()))?;
         if !session_metadata.is_dir() || session_metadata.file_type().is_symlink() {
@@ -4018,6 +4394,7 @@ impl Engine {
             requested_artifact.is_none_or(|artifact| artifact == ExportArtifact::CutsZip);
         let export_timestamps =
             requested_artifact.is_none_or(|artifact| artifact == ExportArtifact::TimestampsJson);
+        let mut effective_acknowledged_warning_codes = Vec::<String>::new();
         if export_cuts {
             ensure_no_audio_fault_marker(
                 session_dir,
@@ -4032,7 +4409,19 @@ impl Engine {
         let snapshot =
             load_recovery_snapshot_for_session(session_dir, &mut journal, expected_session_id)?;
         let recovery_warnings = journal.warnings;
-        validate_snapshot_for_artifact(&snapshot, requested_artifact)?;
+        if export_cuts {
+            if let Some(expected) = expected_journal_seq
+                && expected != snapshot.journal_seq
+            {
+                bail!(
+                    "任务已在导出前变更：期望 journal_seq={expected}，当前={}；请重新检查并确认告警",
+                    snapshot.journal_seq
+                );
+            }
+            validate_snapshot_for_cut_scope(&snapshot, export_scope)?;
+        } else {
+            validate_snapshot_for_artifact(&snapshot, requested_artifact)?;
+        }
         let storage_kind = MasterStorageKind::from_snapshot(&snapshot)?;
         let master_relative = Path::new(&snapshot.master_audio);
         if master_relative.is_absolute()
@@ -4140,13 +4529,22 @@ impl Engine {
             "status": "in_progress",
             "export_id": export_id,
             "session_id": snapshot.session_id,
+            "scope": export_cuts.then_some(export_scope),
             "source": export_source,
             "started_at": export_started_at,
         });
         let mut sentence_plans = Vec::<SentenceExportPlan>::new();
         let mut skipped = Vec::<Value>::new();
+        let mut export_warnings = Vec::<Value>::new();
         let mut used_file_names = std::collections::HashSet::<String>::new();
         for (item_index, item) in snapshot.items.iter().enumerate() {
+            if export_cuts && item.status != "accepted" {
+                skipped.push(json!({
+                    "id": item.id,
+                    "reason": cut_exclusion_reason(item),
+                }));
+                continue;
+            }
             let Some(selected) = item.selected_attempt_id.as_deref() else {
                 skipped.push(json!({ "id": item.id, "reason": item.status }));
                 continue;
@@ -4157,21 +4555,34 @@ impl Engine {
                 .position(|attempt| attempt.attempt_id == selected)
             else {
                 if export_cuts {
-                    bail!("条目 {} 选中的录音版本不存在", item.id);
+                    bail!("条目 {} 的当前使用录音不存在", item.id);
                 }
                 skipped.push(json!({ "id": item.id, "reason": "selected_attempt_missing" }));
                 continue;
             };
             let attempt = &item.attempts[attempt_index];
-            if matches!(attempt.status.as_str(), "interrupted" | "needs_rerecord")
+            if (export_cuts && attempt.status != "accepted")
+                || matches!(attempt.status.as_str(), "interrupted" | "needs_rerecord")
                 || attempt.end_sample <= attempt.start_sample
                 || attempt.end_sample > snapshot.committed_samples
+                || !attempt_range_has_provenance(&snapshot, attempt)
+                || !attempt.quality_issues.is_empty()
             {
                 if export_cuts {
-                    bail!("条目 {} 选中的录音版本不可安全导出", item.id);
+                    bail!("条目 {} 的当前使用录音不可安全导出", item.id);
                 }
                 skipped.push(json!({ "id": item.id, "reason": "selected_attempt_unsafe" }));
                 continue;
+            }
+            if export_cuts {
+                export_warnings.extend(cut_export_warning_codes(item, attempt).into_iter().map(
+                    |code| {
+                        json!({
+                            "code": code,
+                            "item_id": item.id,
+                        })
+                    },
+                ));
             }
             let file_name =
                 allocate_sentence_file_name(&item.id, item_index, &mut used_file_names)?;
@@ -4187,6 +4598,42 @@ impl Engine {
                 file_bytes,
             });
         }
+        if export_cuts {
+            let known_warning_codes = [
+                "retained_previous",
+                "head_silence_short",
+                "tail_silence_short",
+            ];
+            let present_warning_codes = export_warnings
+                .iter()
+                .filter_map(|warning| warning["code"].as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            for acknowledged in acknowledged_warning_codes {
+                if !known_warning_codes.contains(&acknowledged.as_str()) {
+                    bail!("导出请求包含未知告警确认码 {acknowledged}");
+                }
+                if present_warning_codes.contains(acknowledged.as_str()) {
+                    effective_acknowledged_warning_codes.push(acknowledged.clone());
+                } else if expected_journal_seq.is_some() {
+                    bail!("导出请求确认了当前快照中不存在的告警 {acknowledged}");
+                }
+            }
+            let missing = present_warning_codes
+                .iter()
+                .copied()
+                .filter(|code| {
+                    !effective_acknowledged_warning_codes
+                        .iter()
+                        .any(|acknowledged| acknowledged == code)
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            if !missing.is_empty() {
+                bail!(
+                    "导出前必须确认当前任务快照中的告警：{}",
+                    missing.into_iter().collect::<Vec<_>>().join(", ")
+                );
+            }
+        }
 
         let master_output = export_dir.join("full-track.wav");
         let export_status_path = export_dir.join(match requested_artifact {
@@ -4200,6 +4647,7 @@ impl Engine {
         let legacy_export_metadata_path = export_dir.join("metadata.json");
         let legacy_export_csv_path = export_dir.join("metadata.csv");
         let cuts_archive_path = export_dir.join("cuts.zip");
+        let cuts_manifest_path = export_dir.join("cuts-manifest.json");
         let planned_master_bytes =
             automatic_wav_file_size(physical_frames, 1, snapshot.audio_format.bit_depth)?
                 .max(source_metadata.as_ref().map_or(0, std::fs::Metadata::len));
@@ -4240,12 +4688,22 @@ impl Engine {
                     replaced_bytes: 0,
                 });
             }
-            let planned_archive_bytes = stored_zip_size(&sentence_plans)?;
+            let planned_archive_bytes = stored_zip_size(
+                &sentence_plans,
+                Some(("manifest.json", EXPORT_METADATA_BASE_HEADROOM_BYTES)),
+            )?;
             storage_steps.push(AtomicExportStep {
                 new_bytes: planned_export_allocation(planned_archive_bytes)?,
                 replaced_bytes: existing_export_allocation(existing_export_file_size(
                     &cuts_archive_path,
                     "已有切片压缩包",
+                )?),
+            });
+            storage_steps.push(AtomicExportStep {
+                new_bytes: export_metadata_headroom(&snapshot)?,
+                replaced_bytes: existing_export_allocation(existing_export_file_size(
+                    &cuts_manifest_path,
+                    "已有切片清单",
                 )?),
             });
         }
@@ -4328,6 +4786,9 @@ impl Engine {
                     }
                 }
             }
+            let slice_sha256 = export_cuts
+                .then(|| sha256_file(&sentences_dir.join(&plan.file_name)))
+                .transpose()?;
             exported.push(json!({
                 "id": item.id,
                 "text": item.text,
@@ -4347,6 +4808,7 @@ impl Engine {
                 "forced_without_tail_silence": attempt.forced_without_tail_silence,
                 "tail_silence_samples": attempt.tail_silence_samples,
                 "required_tail_silence_samples": attempt.required_tail_silence_samples,
+                "sha256": slice_sha256,
             }));
         }
         let mut risk_warnings = Vec::<String>::new();
@@ -4402,12 +4864,61 @@ impl Engine {
             atomic_json(&legacy_export_metadata_path, &metadata)?;
             write_csv(&legacy_export_csv_path, &metadata["exported"])?;
         }
+        let mut cuts_sha256 = None::<String>;
         if export_cuts {
-            write_stored_zip(&cuts_archive_path, &sentences_dir, &sentence_plans)?;
+            let manifest_included = metadata["exported"]
+                .as_array()
+                .context("cuts manifest included rows must be an array")?
+                .iter()
+                .cloned()
+                .map(|mut row| -> Result<Value> {
+                    let object = row
+                        .as_object_mut()
+                        .context("cuts manifest included row must be an object")?;
+                    let sentence_file = object
+                        .get("file")
+                        .and_then(Value::as_str)
+                        .and_then(|file| file.strip_prefix("sentences/"))
+                        .context("cuts manifest row has an invalid sentence path")?;
+                    object.insert("file".to_string(), json!(format!("cuts/{sentence_file}")));
+                    Ok(row)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let manifest = json!({
+                "schema_version": 1,
+                "engine_version": env!("CARGO_PKG_VERSION"),
+                "app_version": option_env!("DATABAKER_APP_VERSION").unwrap_or("unknown"),
+                "session_id": snapshot.session_id,
+                "export_id": export_id,
+                "scope": export_scope,
+                "journal_seq": snapshot.journal_seq,
+                "committed_samples": snapshot.committed_samples,
+                "generated_at": Utc::now().to_rfc3339(),
+                "included": manifest_included,
+                "excluded": metadata["skipped"],
+                "warnings": export_warnings,
+                "acknowledged_warning_codes": effective_acknowledged_warning_codes,
+            });
+            atomic_json(&cuts_manifest_path, &manifest)?;
+            let manifest_bytes =
+                std::fs::read(&cuts_manifest_path).context("read the committed cuts manifest")?;
+            write_stored_zip(
+                &cuts_archive_path,
+                &sentences_dir,
+                &sentence_plans,
+                Some(("manifest.json", manifest_bytes.as_slice())),
+            )?;
+            cuts_sha256 = Some(sha256_file(&cuts_archive_path)?);
             if requested_artifact.is_some() {
                 remove_all_sentence_wavs(&sentences_dir)?;
             }
         }
+        let artifact_sha256 = match requested_artifact {
+            Some(ExportArtifact::FullTrack) => Some(sha256_file(&master_output)?),
+            Some(ExportArtifact::CutsZip) => cuts_sha256.clone(),
+            Some(ExportArtifact::TimestampsJson) => Some(sha256_file(&export_metadata_path)?),
+            None => None,
+        };
         let exported_count = metadata["exported"].as_array().map_or(0, Vec::len);
         let skipped_count = metadata["skipped"].as_array().map_or(0, Vec::len);
         // This small commit marker is always the last published file. Readers
@@ -4425,7 +4936,10 @@ impl Engine {
                     ExportArtifact::CutsZip => "cuts_zip",
                     ExportArtifact::TimestampsJson => "timestamps_json",
                 }),
+                "scope": export_cuts.then_some(export_scope),
                 "source": export_source,
+                "manifest_file": export_cuts.then_some("cuts-manifest.json"),
+                "sha256": artifact_sha256,
                 "started_at": export_started_at,
                 "completed_at": Utc::now().to_rfc3339(),
                 "exported_count": exported_count,
@@ -4438,6 +4952,11 @@ impl Engine {
                 ExportArtifact::CutsZip => "cuts_zip",
                 ExportArtifact::TimestampsJson => "timestamps_json",
             }),
+            "export_id": export_id,
+            "scope": export_cuts.then_some(export_scope),
+            "source": export_source,
+            "manifest_file": export_cuts.then_some(cuts_manifest_path),
+            "sha256": artifact_sha256,
             "export_dir": export_dir,
             "master_file": export_full_track.then_some(master_output),
             "master_container": full_track_container,
@@ -4693,16 +5212,8 @@ fn render_offline_range(
     start_sample: u64,
     end_sample: u64,
 ) -> Result<u64> {
-    let master_relative = Path::new(&snapshot.master_audio);
-    if master_relative.is_absolute()
-        || master_relative
-            .components()
-            .any(|component| !matches!(component, std::path::Component::Normal(_)))
-    {
-        bail!("snapshot master_audio must be a safe relative path");
-    }
-    let source = session_dir.join(master_relative);
-    match MasterStorageKind::from_snapshot(snapshot)? {
+    let (source, storage_kind) = validated_offline_master_source(session_dir, snapshot)?;
+    match storage_kind {
         MasterStorageKind::LegacySingleWav => {
             slice_wav_mono(
                 &source,
@@ -4733,16 +5244,8 @@ fn waveform_offline_range(
     start_sample: u64,
     end_sample: u64,
 ) -> Result<Vec<[f32; 2]>> {
-    let master_relative = Path::new(&snapshot.master_audio);
-    if master_relative.is_absolute()
-        || master_relative
-            .components()
-            .any(|component| !matches!(component, std::path::Component::Normal(_)))
-    {
-        bail!("snapshot master_audio must be a safe relative path");
-    }
-    let source = session_dir.join(master_relative);
-    match MasterStorageKind::from_snapshot(snapshot)? {
+    let (source, storage_kind) = validated_offline_master_source(session_dir, snapshot)?;
+    match storage_kind {
         MasterStorageKind::LegacySingleWav => waveform_wav_mono(
             &source,
             snapshot.audio_format.sample_rate,
@@ -4766,11 +5269,39 @@ fn waveform_offline_range(
     }
 }
 
+fn validated_offline_master_source(
+    session_dir: &Path,
+    snapshot: &SessionSnapshot,
+) -> Result<(PathBuf, MasterStorageKind)> {
+    let master_relative = Path::new(&snapshot.master_audio);
+    if master_relative.is_absolute()
+        || master_relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("snapshot master_audio must be a safe relative path");
+    }
+    let source = session_dir.join(master_relative);
+    let storage_kind = MasterStorageKind::from_snapshot(snapshot)?;
+    let metadata = std::fs::symlink_metadata(&source)
+        .with_context(|| format!("inspect source audio {}", source.display()))?;
+    let expected_type = match storage_kind {
+        MasterStorageKind::LegacySingleWav => metadata.is_file(),
+        MasterStorageKind::SegmentedWav => metadata.is_dir(),
+    };
+    if metadata.file_type().is_symlink() || !expected_type {
+        bail!("recording source audio has an invalid type");
+    }
+    Ok((source, storage_kind))
+}
+
 fn usable_preview_attempt<'a>(
     snapshot: &'a SessionSnapshot,
     item_id: &str,
     attempt_id: &str,
 ) -> Result<&'a Attempt> {
+    validate_snapshot_identifiers(snapshot)?;
+    validate_capture_provenance(snapshot, snapshot.committed_samples, true)?;
     let attempt = snapshot
         .items
         .iter()
@@ -4780,12 +5311,11 @@ fn usable_preview_attempt<'a>(
                 .iter()
                 .find(|attempt| attempt.attempt_id == attempt_id)
         })
-        .ok_or_else(|| anyhow!("录音版本不存在"))?;
-    if matches!(attempt.status.as_str(), "interrupted" | "needs_rerecord")
-        || attempt.end_sample <= attempt.start_sample
-        || attempt.end_sample > snapshot.committed_samples
+        .ok_or_else(|| anyhow!("指定录音不存在"))?;
+    if !attempt_boundaries_are_valid(snapshot, attempt, snapshot.committed_samples)
+        || !attempt_is_delivery_safe(snapshot, attempt)?
     {
-        bail!("异常中断或样本边界越界的录音版本不能试听");
+        bail!("异常中断或样本边界越界的录音不能试听");
     }
     Ok(attempt)
 }
@@ -4847,42 +5377,120 @@ fn validate_offline_seal_snapshot(snapshot: &SessionSnapshot) -> Result<()> {
     Ok(())
 }
 
+fn attempt_boundaries_are_valid(
+    snapshot: &SessionSnapshot,
+    attempt: &Attempt,
+    durable_frames: u64,
+) -> bool {
+    let abnormal = matches!(attempt.status.as_str(), "interrupted" | "needs_rerecord");
+    let head_silence_invalid = if attempt.head_silence_passed_sample == 0 {
+        !abnormal
+            && (attempt.head_silence_armed_sample != 0
+                || attempt.required_head_silence_samples != 0)
+    } else {
+        !abnormal
+            && (attempt.head_silence_armed_sample > attempt.head_silence_passed_sample
+                || attempt.required_head_silence_samples == 0
+                || attempt
+                    .head_silence_passed_sample
+                    .saturating_sub(attempt.head_silence_armed_sample)
+                    < attempt.required_head_silence_samples
+                || attempt.recording_started_sample != attempt.head_silence_armed_sample
+                || !valid_completed_attempt_start(attempt, snapshot.silence_detector))
+    };
+    attempt.start_sample <= durable_frames
+        && attempt.recording_started_sample <= durable_frames
+        && attempt.head_silence_armed_sample <= durable_frames
+        && attempt.head_silence_passed_sample <= durable_frames
+        && attempt.content_started_sample <= durable_frames
+        && attempt.end_sample <= durable_frames
+        && attempt_sample_order_is_valid(attempt)
+        && !head_silence_invalid
+        && (!abnormal || attempt.end_sample >= attempt.start_sample)
+        && (abnormal || attempt.end_sample > attempt.start_sample)
+}
+
 fn validate_attempt_boundaries(snapshot: &SessionSnapshot, durable_frames: u64) -> Result<()> {
     let invalid = snapshot
         .items
         .iter()
         .flat_map(|item| item.attempts.iter())
-        .any(|attempt| {
-            let head_silence_invalid = if attempt.head_silence_passed_sample == 0 {
-                attempt.status != "interrupted"
-                    && (attempt.head_silence_armed_sample != 0
-                        || attempt.required_head_silence_samples != 0)
-            } else {
-                attempt.head_silence_armed_sample > attempt.head_silence_passed_sample
-                    || attempt.required_head_silence_samples == 0
-                    || attempt
-                        .head_silence_passed_sample
-                        .saturating_sub(attempt.head_silence_armed_sample)
-                        < attempt.required_head_silence_samples
-                    || (attempt.status != "interrupted"
-                        && (attempt.recording_started_sample != attempt.head_silence_armed_sample
-                            || !valid_completed_attempt_start(attempt, snapshot.silence_detector)))
-            };
-            attempt.start_sample > durable_frames
-                || attempt.recording_started_sample > durable_frames
-                || attempt.head_silence_armed_sample > durable_frames
-                || attempt.head_silence_passed_sample > durable_frames
-                || attempt.content_started_sample > durable_frames
-                || attempt.end_sample > durable_frames
-                || attempt.content_started_sample > attempt.end_sample
-                || head_silence_invalid
-                || (attempt.status == "interrupted" && attempt.end_sample < attempt.start_sample)
-                || (attempt.status != "interrupted" && attempt.end_sample <= attempt.start_sample)
-        });
+        .any(|attempt| !attempt_boundaries_are_valid(snapshot, attempt, durable_frames));
     if invalid {
         bail!("录制任务包含超出母音频范围或长度无效的句子时间戳");
     }
     Ok(())
+}
+
+fn validate_attempt_quality_issues(attempt: &Attempt) -> Result<()> {
+    for issue in &attempt.quality_issues {
+        if !known_quality_issue_code(issue.code.as_str()) {
+            bail!(
+                "录音 {} 包含未知质量问题码 {}，已按不可交付处理",
+                attempt.attempt_id,
+                issue.code
+            );
+        }
+        match (issue.start_sample, issue.end_sample) {
+            (Some(start), Some(end))
+                if start <= end
+                    && start >= attempt.recording_started_sample
+                    && end <= attempt.end_sample => {}
+            (None, None) => {}
+            _ => bail!("录音 {} 的质量问题区间无效", attempt.attempt_id),
+        }
+    }
+    Ok(())
+}
+
+fn attempt_range_has_provenance(snapshot: &SessionSnapshot, attempt: &Attempt) -> bool {
+    if snapshot.capture_provenance.is_empty() {
+        // Missing evidence is not evidence of coverage. Older tasks remain
+        // readable and their full track/diagnostics stay exportable, but
+        // sentence delivery is fail-closed until provenance is repaired.
+        return false;
+    }
+    let mut cursor = attempt.start_sample;
+    for span in &snapshot.capture_provenance {
+        if span.end_sample <= cursor || span.start_sample >= attempt.end_sample {
+            continue;
+        }
+        if span.start_sample > cursor {
+            return false;
+        }
+        cursor = cursor.max(span.end_sample.min(attempt.end_sample));
+        if cursor >= attempt.end_sample {
+            return true;
+        }
+    }
+    false
+}
+
+fn attempt_is_delivery_safe(snapshot: &SessionSnapshot, attempt: &Attempt) -> Result<bool> {
+    validate_attempt_quality_issues(attempt)?;
+    Ok(matches!(
+        attempt.status.as_str(),
+        "recorded" | "accepted" | "rejected_by_operator"
+    ) && attempt.quality_issues.is_empty()
+        && attempt_sample_order_is_valid(attempt)
+        && attempt.end_sample > attempt.start_sample
+        && attempt.end_sample <= snapshot.committed_samples
+        && attempt_range_has_provenance(snapshot, attempt))
+}
+
+fn attempt_sample_order_is_valid(attempt: &Attempt) -> bool {
+    attempt.recording_started_sample <= attempt.start_sample
+        && attempt.recording_started_sample <= attempt.end_sample
+        && (attempt.head_silence_armed_sample == 0
+            || (attempt.recording_started_sample <= attempt.head_silence_armed_sample
+                && attempt.head_silence_armed_sample <= attempt.end_sample))
+        && (attempt.head_silence_passed_sample == 0
+            || (attempt.head_silence_armed_sample <= attempt.head_silence_passed_sample
+                && attempt.head_silence_passed_sample <= attempt.end_sample))
+        && (attempt.content_started_sample == 0
+            || (attempt.start_sample <= attempt.content_started_sample
+                && attempt.recording_started_sample <= attempt.content_started_sample
+                && attempt.content_started_sample <= attempt.end_sample))
 }
 
 fn valid_completed_attempt_start(attempt: &Attempt, detector: SilenceDetector) -> bool {
@@ -4960,7 +5568,10 @@ fn validate_capture_provenance(
         }
         cursor = span.end_sample;
     }
-    if require_complete && !snapshot.capture_provenance.is_empty() && cursor != durable_frames {
+    if require_complete && durable_frames > 0 && snapshot.capture_provenance.is_empty() {
+        bail!("采集来源缺失，无法证明持久母轨的样本覆盖关系");
+    }
+    if require_complete && cursor != durable_frames {
         bail!("采集来源区间未完整覆盖持久母轨");
     }
     Ok(())
@@ -5051,6 +5662,7 @@ fn session_summary_value(snapshot: &SessionSnapshot) -> Value {
         "silence_duration_ms": snapshot.silence_duration_ms,
         "silence_threshold_dbfs": snapshot.silence_threshold_dbfs,
         "silence_detector": snapshot.silence_detector,
+        "vad_diagnostics": snapshot.vad_diagnostics,
         "started_at": snapshot.started_at,
         "updated_at": snapshot.updated_at,
     })
@@ -5068,19 +5680,19 @@ fn validate_snapshot_for_export(snapshot: &SessionSnapshot) -> Result<()> {
     for item in &snapshot.items {
         if item.status == "review" {
             bail!(
-                "条目 {} 存在待确认或需重录的录音版本，无法导出切片。",
+                "条目 {} 存在待确认录音或需要重录，无法导出切片。",
                 item.id
             );
         }
         if item.status == "accepted" && item.selected_attempt_id.is_none() {
             bail!(
-                "条目 {} 已标记为确认，但没有选中的录音版本，无法导出切片。",
+                "条目 {} 已标记为确认，但没有当前使用录音，无法导出切片。",
                 item.id
             );
         }
         if item.status == "skipped" && item.selected_attempt_id.is_some() {
             bail!(
-                "条目 {} 已标记为跳过，但仍保留选中的录音版本，无法导出切片。",
+                "条目 {} 已标记为跳过，但仍保留当前使用录音，无法导出切片。",
                 item.id
             );
         }
@@ -5091,7 +5703,7 @@ fn validate_snapshot_for_export(snapshot: &SessionSnapshot) -> Result<()> {
             .attempts
             .iter()
             .find(|attempt| attempt.attempt_id == selected_id)
-            .with_context(|| format!("条目 {} 选中的录音版本不存在，无法导出切片。", item.id))?;
+            .with_context(|| format!("条目 {} 的当前使用录音不存在，无法导出切片。", item.id))?;
         let outside_durable_audio = attempt.end_sample <= attempt.start_sample
             || attempt.start_sample > snapshot.committed_samples
             || attempt.recording_started_sample > snapshot.committed_samples
@@ -5103,7 +5715,7 @@ fn validate_snapshot_for_export(snapshot: &SessionSnapshot) -> Result<()> {
             || outside_durable_audio
         {
             bail!(
-                "条目 {} 选中的录音版本异常中断或样本边界越界，无法导出切片。",
+                "条目 {} 的当前使用录音异常中断或样本边界越界，无法导出切片。",
                 item.id
             );
         }
@@ -5135,7 +5747,7 @@ fn validate_snapshot_for_artifact(
     for item in &snapshot.items {
         if item.status == "review" {
             bail!(
-                "条目 {} 存在待确认或需重录的录音版本，无法导出切片。",
+                "条目 {} 存在待确认录音或需要重录，无法导出切片。",
                 item.id
             );
         }
@@ -5146,15 +5758,194 @@ fn validate_snapshot_for_artifact(
             .attempts
             .iter()
             .find(|attempt| attempt.attempt_id == selected_id)
-            .with_context(|| format!("条目 {} 选中的录音版本不存在，无法导出切片。", item.id))?;
+            .with_context(|| format!("条目 {} 的当前使用录音不存在，无法导出切片。", item.id))?;
         if matches!(attempt.status.as_str(), "interrupted" | "needs_rerecord")
             || attempt.end_sample <= attempt.start_sample
             || attempt.end_sample > snapshot.committed_samples
         {
-            bail!("条目 {} 选中的录音版本不可用，无法导出切片。", item.id);
+            bail!("条目 {} 的当前使用录音不可用，无法导出切片。", item.id);
         }
     }
     Ok(())
+}
+
+fn validate_snapshot_for_cut_scope(snapshot: &SessionSnapshot, scope: ExportScope) -> Result<()> {
+    if snapshot.status != "stopped" {
+        bail!("录制尚未安全结束，请先暂停或修复中断任务后再导出。");
+    }
+    if snapshot.overflow_samples > 0 {
+        bail!("异常任务修复并检查前不能导出分段 ZIP；可先导出原始整轨或时间戳 JSON。");
+    }
+    validate_snapshot_identifiers(snapshot)?;
+    validate_attempt_boundaries(snapshot, snapshot.committed_samples)?;
+    validate_capture_provenance(snapshot, snapshot.committed_samples, true)?;
+    let mut safe_selected_count = 0usize;
+    for item in &snapshot.items {
+        if !matches!(
+            item.status.as_str(),
+            "pending" | "review" | "accepted" | "skipped"
+        ) {
+            bail!(
+                "条目 {} 包含未知状态 {}，已按不可交付处理",
+                item.id,
+                item.status
+            );
+        }
+        for attempt in &item.attempts {
+            if !matches!(
+                attempt.status.as_str(),
+                "recorded" | "accepted" | "rejected_by_operator" | "interrupted" | "needs_rerecord"
+            ) {
+                bail!(
+                    "条目 {} 的录音 {} 包含未知状态 {}",
+                    item.id,
+                    attempt.attempt_id,
+                    attempt.status
+                );
+            }
+            validate_attempt_quality_issues(attempt)?;
+        }
+        let selected = match item.selected_attempt_id.as_deref() {
+            Some(id) => Some(
+                item.attempts
+                    .iter()
+                    .find(|attempt| attempt.attempt_id == id)
+                    .with_context(|| format!("条目 {} 的当前使用录音不存在", item.id))?,
+            ),
+            None => None,
+        };
+        if matches!(item.status.as_str(), "pending" | "skipped") && selected.is_some() {
+            bail!("条目 {} 的状态与当前使用录音矛盾", item.id);
+        }
+        if item.status == "accepted" && selected.is_none() {
+            bail!("条目 {} 已确认但没有当前使用录音", item.id);
+        }
+        if let Some(selected) = selected {
+            if selected.status != "accepted" || !attempt_is_delivery_safe(snapshot, selected)? {
+                bail!("条目 {} 的当前使用录音不可安全交付", item.id);
+            }
+            if item
+                .attempts
+                .iter()
+                .filter(|attempt| attempt.status == "accepted")
+                .count()
+                != 1
+            {
+                bail!("条目 {} 同时存在多条已确认录音", item.id);
+            }
+            if item.status == "accepted" {
+                safe_selected_count += 1;
+            }
+        }
+        if item.status != "accepted"
+            && selected.is_some_and(|attempt| attempt.status == "accepted")
+            && item
+                .attempts
+                .last()
+                .is_some_and(|attempt| attempt.status == "needs_rerecord")
+        {
+            bail!("条目 {} 保留原录音但条目状态不是 accepted", item.id);
+        }
+        if item.status == "review" {
+            let has_recorded_candidate = item
+                .attempts
+                .iter()
+                .any(|attempt| attempt.status == "recorded");
+            let latest_needs_rerecord = item
+                .attempts
+                .last()
+                .is_some_and(|attempt| attempt.status == "needs_rerecord");
+            let valid_review_state = match selected {
+                Some(_) => has_recorded_candidate && !latest_needs_rerecord,
+                None => has_recorded_candidate || latest_needs_rerecord,
+            };
+            if !valid_review_state {
+                bail!("条目 {} 的 review 状态缺少待确认录音或需重录记录", item.id);
+            }
+        }
+        if scope == ExportScope::CompleteTask && item.status != "accepted" {
+            bail!(
+                "complete_task 要求每句都有已确认录音；条目 {} 当前为 {}",
+                item.id,
+                item.status
+            );
+        }
+        if item.status == "accepted"
+            && item
+                .attempts
+                .iter()
+                .any(|attempt| attempt.status == "recorded")
+        {
+            bail!("条目 {} 已确认但仍有待决策录音", item.id);
+        }
+    }
+    if safe_selected_count == 0 {
+        bail!("当前任务没有可安全导出的已确认录音");
+    }
+    Ok(())
+}
+
+fn validate_snapshot_identifiers(snapshot: &SessionSnapshot) -> Result<()> {
+    let mut item_ids = std::collections::HashSet::<&str>::new();
+    for item in &snapshot.items {
+        if item.id.trim().is_empty() || !item_ids.insert(item.id.as_str()) {
+            bail!("录制任务包含空或重复的条目 ID，已按不可交付处理");
+        }
+        let mut attempt_ids = std::collections::HashSet::<&str>::new();
+        for attempt in &item.attempts {
+            if attempt.attempt_id.trim().is_empty()
+                || !attempt_ids.insert(attempt.attempt_id.as_str())
+            {
+                bail!("条目 {} 包含空或重复的录音 ID", item.id);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cut_export_warning_codes(item: &ItemState, selected: &Attempt) -> Vec<&'static str> {
+    let mut warnings = Vec::new();
+    if selected.status == "accepted"
+        && item.attempts.last().is_some_and(|candidate| {
+            candidate.status == "needs_rerecord"
+                && Some(candidate.attempt_id.as_str()) != item.selected_attempt_id.as_deref()
+        })
+    {
+        warnings.push("retained_previous");
+    }
+    if selected.required_head_silence_samples > 0
+        && selected.content_started_sample > 0
+        && selected
+            .content_started_sample
+            .saturating_sub(selected.recording_started_sample)
+            < selected.required_head_silence_samples
+    {
+        warnings.push("head_silence_short");
+    }
+    if selected.required_tail_silence_samples > 0
+        && selected.tail_silence_samples < selected.required_tail_silence_samples
+    {
+        warnings.push("tail_silence_short");
+    }
+    warnings
+}
+
+fn cut_exclusion_reason(item: &ItemState) -> &'static str {
+    match item.status.as_str() {
+        "pending" => "unrecorded",
+        "skipped" => "skipped",
+        "review"
+            if item
+                .attempts
+                .last()
+                .is_some_and(|attempt| attempt.status == "needs_rerecord") =>
+        {
+            "rerecord_required"
+        }
+        "review" if item.selected_attempt_id.is_some() => "retake_review",
+        "review" => "first_take_review",
+        _ => "inconsistent",
+    }
 }
 
 fn is_pristine_bootstrap(snapshot: &SessionSnapshot) -> bool {
@@ -5736,11 +6527,19 @@ fn recover_interrupted_attempts(
             ));
             continue;
         };
-        let start_sample = active.start_sample.min(durable_frames);
+        // Interrupted/diagnostic takes preserve the raw operator recording
+        // range. Older journals could carry a pre-arm `start_sample`; never
+        // publish a recovered attempt whose clip starts before the recording
+        // actually began.
+        let recording_started_sample = active.recording_started_sample.min(durable_frames);
+        let start_sample = active
+            .start_sample
+            .max(recording_started_sample)
+            .min(durable_frames);
         item.attempts.push(Attempt {
             attempt_id: active.attempt_id.clone(),
             start_sample,
-            recording_started_sample: active.recording_started_sample.min(durable_frames),
+            recording_started_sample,
             head_silence_armed_sample: active.head_silence_armed_sample.min(durable_frames),
             head_silence_passed_sample: 0,
             required_head_silence_samples: active.required_head_silence_samples,
@@ -5751,6 +6550,7 @@ fn recover_interrupted_attempts(
             required_tail_silence_samples: 0,
             status: "interrupted".to_string(),
             created_at: active.created_at,
+            quality_issues: Vec::new(),
         });
         warnings.push(format!(
             "{} 的录音 {} 在上次退出时未完成，已保留母轨并标记为不可交付。",
@@ -5808,6 +6608,7 @@ fn mark_active_attempt_interrupted(
         required_tail_silence_samples: 0,
         status: "interrupted".to_string(),
         created_at: Utc::now().to_rfc3339(),
+        quality_issues: Vec::new(),
     };
     item.attempts.push(attempt.clone());
     Ok(attempt)
@@ -5820,7 +6621,11 @@ impl RecordingSession {
             / 1_000
     }
 
-    fn arm_attempt_analysis(&self) -> u64 {
+    fn arm_attempt_analysis(&self) -> Result<u64> {
+        // Establish a clean worker generation before the click boundary. Any
+        // audio processed while the worker resets belongs to idle room tone,
+        // not to the take that is about to be armed.
+        self.reset_vad_analysis()?;
         // Serialize the click boundary with callback analysis. A callback may
         // already have reserved and queued a block; loading `captured` while
         // holding this guard puts that complete block before the click, so its
@@ -5834,8 +6639,7 @@ impl RecordingSession {
         self.last_signal_sample.store(0, Ordering::Release);
         self.head_silence.arm(armed_sample);
         drop(analysis_write);
-        self.reset_vad_analysis();
-        armed_sample
+        Ok(armed_sample)
     }
 
     fn apply_silence_settings(
@@ -5891,48 +6695,236 @@ impl RecordingSession {
         self.attempt_signal_start_sample.store(0, Ordering::Release);
         self.last_signal_sample.store(0, Ordering::Release);
         drop(analysis_write);
-        self.reset_vad_analysis();
     }
 
-    fn reset_vad_analysis(&self) {
-        let Some(tx) = self.vad_tx.as_ref() else {
-            return;
-        };
-        let generation = self
-            .silence_analysis
-            .generation
-            .fetch_add(1, Ordering::AcqRel)
-            + 1;
-        let _ = tx.try_send(VadAnalysisMessage::Reset { generation });
-    }
-
-    fn flush_vad_analysis(&self) -> Result<()> {
+    fn reset_vad_analysis(&self) -> Result<()> {
         let Some(tx) = self.vad_tx.as_ref() else {
             return Ok(());
         };
         if self.silence_analysis.detector_kind.load(Ordering::Acquire) != DETECTOR_VAD {
             return Ok(());
         }
+        let generation = self
+            .silence_analysis
+            .generation
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
+        let boundary = self.captured.load(Ordering::Acquire);
         let (done_tx, done_rx) = bounded(1);
-        let generation = self.silence_analysis.generation.load(Ordering::Acquire);
-        tx.send(VadAnalysisMessage::Flush {
-            generation,
-            done: done_tx,
-        })
-        .context("speech VAD analysis thread is unavailable")?;
-        done_rx
-            .recv_timeout(CAPTURE_ANALYSIS_TIMEOUT)
-            .context("speech VAD analysis did not flush before the stop boundary")?;
-        Ok(())
+        if tx
+            .send_timeout(
+                VadControlMessage::Reset {
+                    generation,
+                    boundary,
+                    done: done_tx,
+                },
+                CAPTURE_ANALYSIS_TIMEOUT,
+            )
+            .is_err()
+        {
+            self.silence_analysis.telemetry.latch_issue(
+                generation,
+                VAD_ISSUE_WORKER_DISCONNECTED,
+                boundary,
+                boundary,
+            );
+            bail!("speech VAD reset control queue is unavailable");
+        }
+        match done_rx.recv_timeout(CAPTURE_ANALYSIS_TIMEOUT) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => {
+                self.silence_analysis.telemetry.latch_issue(
+                    generation,
+                    VAD_ISSUE_WORKER_DISCONNECTED,
+                    boundary,
+                    boundary,
+                );
+                Err(anyhow!(message).context("speech VAD reset was rejected"))
+            }
+            Err(error) => {
+                self.silence_analysis.telemetry.latch_issue(
+                    generation,
+                    VAD_ISSUE_WORKER_DISCONNECTED,
+                    boundary,
+                    boundary,
+                );
+                Err(anyhow!(error).context("speech VAD reset did not acknowledge before recording"))
+            }
+        }
     }
 
-    fn shutdown_vad_analysis(&mut self) {
-        if let Some(tx) = self.vad_tx.take() {
-            let _ = tx.send(VadAnalysisMessage::Shutdown);
+    fn flush_vad_analysis(&self, target_sample: u64) -> VadFlushOutcome {
+        let Some(tx) = self.vad_tx.as_ref() else {
+            return VadFlushOutcome::Complete;
+        };
+        if self.silence_analysis.detector_kind.load(Ordering::Acquire) != DETECTOR_VAD {
+            return VadFlushOutcome::Complete;
         }
-        if let Some(join) = self.vad_join.take() {
-            let _ = join.join();
+        let (done_tx, done_rx) = bounded(1);
+        let generation = self.silence_analysis.generation.load(Ordering::Acquire);
+        let deadline = Instant::now() + CAPTURE_ANALYSIS_TIMEOUT;
+        if tx
+            .send_timeout(
+                VadControlMessage::Flush {
+                    generation,
+                    target_sample,
+                    deadline,
+                    done: done_tx,
+                },
+                CAPTURE_ANALYSIS_TIMEOUT,
+            )
+            .is_err()
+        {
+            self.silence_analysis.telemetry.latch_issue(
+                generation,
+                VAD_ISSUE_WORKER_DISCONNECTED,
+                self.analyzed_samples.load(Ordering::Acquire),
+                target_sample,
+            );
+            return VadFlushOutcome::Degraded(VAD_ISSUE_WORKER_DISCONNECTED);
         }
+        match done_rx.recv_timeout(CAPTURE_ANALYSIS_TIMEOUT) {
+            Ok(VadFlushOutcome::Timeout) | Err(_) => {
+                self.silence_analysis.telemetry.latch_issue(
+                    generation,
+                    VAD_ISSUE_FLUSH_TIMEOUT,
+                    self.analyzed_samples.load(Ordering::Acquire),
+                    target_sample,
+                );
+                VadFlushOutcome::Degraded(VAD_ISSUE_FLUSH_TIMEOUT)
+            }
+            Ok(outcome) => outcome,
+        }
+    }
+
+    fn shutdown_vad_analysis_until(&mut self, deadline: Instant) -> bool {
+        if self.vad_join.as_ref().is_some_and(JoinHandle::is_finished) {
+            let join = self
+                .vad_join
+                .take()
+                .expect("finished VAD worker disappeared");
+            self.vad_tx.take();
+            return join.join().is_ok();
+        }
+        let Some(tx) = self.vad_tx.as_ref() else {
+            return self.vad_join.is_none();
+        };
+        let (done_tx, done_rx) = bounded(1);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if tx
+            .send_timeout(VadControlMessage::Shutdown { done: done_tx }, remaining)
+            .is_err()
+        {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if done_rx.recv_timeout(remaining).is_err() {
+            return false;
+        }
+        while self
+            .vad_join
+            .as_ref()
+            .is_some_and(|join| !join.is_finished())
+        {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        let joined = self.vad_join.take().is_none_or(|join| join.join().is_ok());
+        self.vad_tx.take();
+        joined
+    }
+
+    fn finish_vad_degraded_attempt(
+        &mut self,
+        active: &ActiveAttempt,
+        requested_boundary: u64,
+        detector_generation: u64,
+        issue_code: u32,
+    ) -> Result<Attempt> {
+        self.wait_until_committed(requested_boundary)?;
+        let (_, gap_start, gap_end) = self
+            .silence_analysis
+            .telemetry
+            .issue_for_generation(detector_generation)
+            .unwrap_or((issue_code, requested_boundary, requested_boundary));
+        let end_sample = requested_boundary.max(active.recording_started_sample);
+        let issue_start = gap_start.clamp(active.recording_started_sample, end_sample);
+        let issue_end = gap_end.max(gap_start).clamp(issue_start, end_sample);
+        let issue = AttemptQualityIssue {
+            code: vad_issue_code_name(issue_code).to_string(),
+            start_sample: Some(issue_start),
+            end_sample: Some(issue_end),
+            detector_generation: Some(detector_generation),
+        };
+        let attempt = Attempt {
+            attempt_id: active.attempt_id.clone(),
+            start_sample: active.recording_started_sample.min(end_sample),
+            recording_started_sample: active.recording_started_sample.min(end_sample),
+            head_silence_armed_sample: self
+                .head_silence
+                .armed_sample
+                .load(Ordering::Acquire)
+                .min(end_sample),
+            head_silence_passed_sample: self
+                .head_silence
+                .passed_sample
+                .load(Ordering::Acquire)
+                .min(end_sample),
+            required_head_silence_samples: self.head_silence.required_samples(),
+            content_started_sample: self
+                .attempt_signal_start_sample
+                .load(Ordering::Acquire)
+                .min(end_sample),
+            end_sample,
+            forced_without_tail_silence: false,
+            tail_silence_samples: 0,
+            required_tail_silence_samples: self.required_silence_samples(),
+            status: "needs_rerecord".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            quality_issues: vec![issue],
+        };
+        let item = self
+            .snapshot
+            .items
+            .iter_mut()
+            .find(|item| item.id == active.item_id)
+            .ok_or_else(|| anyhow!("item disappeared while recording"))?;
+        let has_accepted_selection =
+            item.selected_attempt_id
+                .as_deref()
+                .is_some_and(|selected_id| {
+                    item.attempts.iter().any(|previous| {
+                        previous.attempt_id == selected_id
+                            && previous.status == "accepted"
+                            && previous.end_sample > previous.start_sample
+                            && previous.quality_issues.is_empty()
+                    })
+                });
+        item.status = if has_accepted_selection {
+            "accepted".to_string()
+        } else {
+            "review".to_string()
+        };
+        if !has_accepted_selection {
+            item.selected_attempt_id = None;
+        }
+        item.attempts.push(attempt.clone());
+        self.active_attempt = None;
+        self.persist(
+            "attempt_stopped",
+            json!({
+                "item_id": active.item_id,
+                "attempt": &attempt,
+                "forced": false,
+                "auto_selected": false,
+                "vad_degraded": true,
+                "quality_issue": vad_issue_code_name(issue_code),
+            }),
+        )?;
+        self.disarm_attempt_analysis();
+        Ok(attempt)
     }
 
     fn interrupt_attempt(
@@ -6113,6 +7105,9 @@ impl RecordingSession {
             .capture_recovery
             .inserted_silence_frames
             .load(Ordering::Acquire);
+        if snapshot.silence_detector == SilenceDetector::Vad || snapshot.vad_diagnostics.is_some() {
+            snapshot.vad_diagnostics = Some(self.silence_analysis.diagnostics());
+        }
         snapshot.updated_at = Utc::now().to_rfc3339();
         snapshot
     }
@@ -6161,7 +7156,6 @@ impl RecordingSession {
             self.stream_reaper.close_input();
         }
         self.telemetry_stop.store(true, Ordering::Release);
-        self.shutdown_vad_analysis();
         let telemetry_joined = match self.telemetry_join.as_ref() {
             None => true,
             Some(join) if wait_for_thread_until(join, deadline) => {
@@ -6258,6 +7252,15 @@ impl RecordingSession {
                 false
             }
         };
+        // VAD is advisory; the master writer is authoritative. Never spend the
+        // shared shutdown budget waiting for analysis before the accepted PCM
+        // timeline has been drained and durably finalized.
+        let vad_joined = self.shutdown_vad_analysis_until(deadline);
+        if !vad_joined {
+            warnings.push(
+                "speech VAD analysis worker is still stopping; its handle was retained".to_string(),
+            );
+        }
         let stream_reaper_joined = match self.stream_reaper.finish_until(deadline) {
             DropReaperProgress::Joined => true,
             DropReaperProgress::Pending => {
@@ -6279,6 +7282,7 @@ impl RecordingSession {
         self.stream_reaper.drain_warnings(&mut warnings);
         let capture_resources_joined = callback_gate_drained
             && stream_reaper_joined
+            && vad_joined
             && telemetry_joined
             && capture_watchdog_joined
             && writer_joined;
@@ -6657,7 +7661,7 @@ fn validate_live_preview_range(sample_rate: u32, start_frame: u64, end_frame: u6
         .checked_mul(LIVE_PREVIEW_MAX_SECONDS)
         .context("preview duration overflow")?;
     if end_frame - start_frame > maximum_frames {
-        bail!("单次实时试听最长支持 10 分钟，请缩短录音版本后重试");
+        bail!("单次实时试听最长支持 10 分钟，请缩短录音后重试");
     }
     Ok(())
 }
@@ -8457,7 +9461,17 @@ fn publish_leased_block_with_preview(
     } else {
         (square_sum / mono.len() as f64).sqrt() as f32
     };
+    let vad_generation = silence.analysis.generation.load(Ordering::Acquire);
+    let vad_wants_block =
+        silence.analysis.uses_vad() && !silence.analysis.generation_is_degraded(vad_generation);
+    // Reserve both hard limits before copying PCM. A full analysis queue is
+    // isolated to VAD diagnostics and never delays or rejects the master write.
+    let vad_reserved = vad_wants_block && silence.analysis.queue.try_reserve(frames);
+    let vad_copy = vad_reserved.then(|| mono.clone());
     if !queue.reserve(frames) {
+        if vad_reserved {
+            silence.analysis.queue.release(frames);
+        }
         fail_capture_block(
             "audio writer queue exceeded its 20 second frame budget".to_string(),
             frames,
@@ -8472,6 +9486,9 @@ fn publish_leased_block_with_preview(
     }
     let Some((block_start, block_end)) = reserve_counter_range(captured, frames) else {
         queue.release(frames);
+        if vad_reserved {
+            silence.analysis.queue.release(frames);
+        }
         fail_capture_block(
             "audio capture timeline counter overflow".to_string(),
             frames,
@@ -8487,9 +9504,11 @@ fn publish_leased_block_with_preview(
     let waveform_packet = waveform_preview
         .as_deref_mut()
         .and_then(|preview| preview.prepare(block_start, &mono));
-    let vad_copy = silence.analysis.uses_vad().then(|| mono.clone());
     if writer.try_send(WriterMessage::Samples(mono)).is_err() {
         queue.release(frames);
+        if vad_reserved {
+            silence.analysis.queue.release(frames);
+        }
         let rollback_succeeded = captured
             .compare_exchange(block_end, block_start, Ordering::AcqRel, Ordering::Acquire)
             .is_ok();
@@ -8526,40 +9545,53 @@ fn publish_leased_block_with_preview(
     let use_vad = silence.analysis.uses_vad();
     if use_vad {
         drop(analysis_write);
-        let generation = silence.analysis.generation.load(Ordering::Acquire);
-        let Some(tx) = silence.analysis.tx.as_ref() else {
-            fail_capture_block(
-                "speech VAD analysis channel is missing".to_string(),
-                frames,
-                writer,
-                overflow,
-                faulted,
-                queue,
-                enqueue_lease,
-                fault_persistence,
-            );
-            return;
-        };
-        if tx
-            .try_send(VadAnalysisMessage::Block {
-                samples: vad_copy.unwrap_or_default(),
+        if vad_wants_block && !vad_reserved {
+            silence.analysis.telemetry.latch_issue(
+                vad_generation,
+                VAD_ISSUE_QUEUE_OVERFLOW,
                 block_start,
                 block_end,
-                generation,
-            })
-            .is_err()
-        {
-            fail_capture_block(
-                "speech VAD analysis thread disconnected before accepting a capture block"
-                    .to_string(),
-                frames,
-                writer,
-                overflow,
-                faulted,
-                queue,
-                enqueue_lease,
-                fault_persistence,
             );
+        }
+        if let Some(samples) = vad_copy {
+            let generation = vad_generation;
+            let vad_frames = block_end.saturating_sub(block_start);
+            if let Some(tx) = silence.analysis.tx.as_ref() {
+                match tx.try_send(VadAnalysisBlock {
+                    samples,
+                    block_start,
+                    block_end,
+                    generation,
+                }) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(block)) => {
+                        silence.analysis.queue.release(vad_frames);
+                        silence.analysis.telemetry.latch_issue(
+                            generation,
+                            VAD_ISSUE_QUEUE_OVERFLOW,
+                            block.block_start,
+                            block.block_end,
+                        );
+                    }
+                    Err(TrySendError::Disconnected(block)) => {
+                        silence.analysis.queue.release(vad_frames);
+                        silence.analysis.telemetry.latch_issue(
+                            generation,
+                            VAD_ISSUE_WORKER_DISCONNECTED,
+                            block.block_start,
+                            block.block_end,
+                        );
+                    }
+                }
+            } else {
+                silence.analysis.queue.release(vad_frames);
+                silence.analysis.telemetry.latch_issue(
+                    generation,
+                    VAD_ISSUE_WORKER_DISCONNECTED,
+                    block_start,
+                    block_end,
+                );
+            }
         }
         let previous_peak = f32::from_bits(peak_bits.load(Ordering::Relaxed));
         let previous_rms = f32::from_bits(rms_bits.load(Ordering::Relaxed));
@@ -8572,6 +9604,10 @@ fn publish_leased_block_with_preview(
         peak_bits.store(smoothed_peak.to_bits(), Ordering::Relaxed);
         rms_bits.store(smoothed_rms.to_bits(), Ordering::Relaxed);
         return;
+    }
+    if vad_reserved {
+        // Detector selection changed between reservation and publication.
+        silence.analysis.queue.release(frames);
     }
     annotate_attempt_block(
         &silence.head_silence,
@@ -9298,13 +10334,20 @@ fn write_csv(path: &Path, exported: &Value) -> Result<()> {
     result
 }
 
-fn stored_zip_size(plans: &[SentenceExportPlan]) -> Result<u64> {
+fn stored_zip_size(plans: &[SentenceExportPlan], extra: Option<(&str, u64)>) -> Result<u64> {
     let mut total = 22u64;
     for plan in plans {
         let name_len = u64::try_from("cuts/".len() + plan.file_name.len())
             .context("ZIP file name too long")?;
         total = total
             .checked_add(30 + name_len + plan.file_bytes)
+            .and_then(|value| value.checked_add(46 + name_len))
+            .context("ZIP archive size overflow")?;
+    }
+    if let Some((name, bytes)) = extra {
+        let name_len = u64::try_from(name.len()).context("ZIP file name too long")?;
+        total = total
+            .checked_add(30 + name_len + bytes)
             .and_then(|value| value.checked_add(46 + name_len))
             .context("ZIP archive size overflow")?;
     }
@@ -9322,7 +10365,41 @@ fn crc32(bytes: &[u8]) -> u32 {
     !crc
 }
 
-fn write_stored_zip(path: &Path, sentences_dir: &Path, plans: &[SentenceExportPlan]) -> Result<()> {
+fn write_stored_zip_entry(
+    file: &mut File,
+    central_entries: &mut Vec<(String, u32, u32, u32)>,
+    name: String,
+    bytes: &[u8],
+) -> Result<()> {
+    let size = u32::try_from(bytes.len()).context("ZIP entry is too large for ZIP32")?;
+    let name_bytes = name.as_bytes();
+    let name_len = u16::try_from(name_bytes.len()).context("ZIP file name too long")?;
+    let checksum = crc32(bytes);
+    let offset =
+        u32::try_from(file.stream_position()?).context("ZIP archive exceeds ZIP32 limit")?;
+    file.write_all(&0x04034b50u32.to_le_bytes())?;
+    file.write_all(&20u16.to_le_bytes())?;
+    file.write_all(&0u16.to_le_bytes())?;
+    file.write_all(&0u16.to_le_bytes())?;
+    file.write_all(&0u16.to_le_bytes())?;
+    file.write_all(&0u16.to_le_bytes())?;
+    file.write_all(&checksum.to_le_bytes())?;
+    file.write_all(&size.to_le_bytes())?;
+    file.write_all(&size.to_le_bytes())?;
+    file.write_all(&name_len.to_le_bytes())?;
+    file.write_all(&0u16.to_le_bytes())?;
+    file.write_all(name_bytes)?;
+    file.write_all(bytes)?;
+    central_entries.push((name, checksum, size, offset));
+    Ok(())
+}
+
+fn write_stored_zip(
+    path: &Path,
+    sentences_dir: &Path,
+    plans: &[SentenceExportPlan],
+    extra: Option<(&str, &[u8])>,
+) -> Result<()> {
     let (temporary, mut file) = create_unique_temporary_file(path, "zip")?;
     let result = (|| -> Result<()> {
         let mut central_entries = Vec::<(String, u32, u32, u32)>::new();
@@ -9330,27 +10407,11 @@ fn write_stored_zip(path: &Path, sentences_dir: &Path, plans: &[SentenceExportPl
             let source = sentences_dir.join(&plan.file_name);
             let bytes = std::fs::read(&source)
                 .with_context(|| format!("read exported cut {}", source.display()))?;
-            let size = u32::try_from(bytes.len()).context("WAV cut is too large for ZIP32")?;
             let name = format!("cuts/{}", plan.file_name);
-            let name_bytes = name.as_bytes();
-            let name_len = u16::try_from(name_bytes.len()).context("ZIP file name too long")?;
-            let checksum = crc32(&bytes);
-            let offset = u32::try_from(file.stream_position()?)
-                .context("ZIP archive exceeds ZIP32 limit")?;
-            file.write_all(&0x04034b50u32.to_le_bytes())?;
-            file.write_all(&20u16.to_le_bytes())?;
-            file.write_all(&0u16.to_le_bytes())?;
-            file.write_all(&0u16.to_le_bytes())?;
-            file.write_all(&0u16.to_le_bytes())?;
-            file.write_all(&0u16.to_le_bytes())?;
-            file.write_all(&checksum.to_le_bytes())?;
-            file.write_all(&size.to_le_bytes())?;
-            file.write_all(&size.to_le_bytes())?;
-            file.write_all(&name_len.to_le_bytes())?;
-            file.write_all(&0u16.to_le_bytes())?;
-            file.write_all(name_bytes)?;
-            file.write_all(&bytes)?;
-            central_entries.push((name, checksum, size, offset));
+            write_stored_zip_entry(&mut file, &mut central_entries, name, &bytes)?;
+        }
+        if let Some((name, bytes)) = extra {
+            write_stored_zip_entry(&mut file, &mut central_entries, name.to_string(), bytes)?;
         }
         let central_offset =
             u32::try_from(file.stream_position()?).context("ZIP archive exceeds ZIP32 limit")?;
@@ -9401,6 +10462,23 @@ fn write_stored_zip(path: &Path, sentences_dir: &Path, plans: &[SentenceExportPl
     result
 }
 
+fn sha256_file(path: &Path) -> Result<String> {
+    let mut file =
+        File::open(path).with_context(|| format!("open {} for SHA-256", path.display()))?;
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read {} for SHA-256", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
 fn csv_cell(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
@@ -9412,6 +10490,115 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static DEV_WEB_CAPTURE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(feature = "system-test")]
+    #[test]
+    fn system_test_signal_patterns_are_exact_and_deterministic() {
+        assert_eq!(
+            system_test_sample(SystemTestSignalPattern::Silence, 9, 42, 48_000),
+            0.0
+        );
+        let first = system_test_sample(SystemTestSignalPattern::Speech, 9, 42, 48_000);
+        let second = system_test_sample(SystemTestSignalPattern::Speech, 9, 42, 48_000);
+        assert_eq!(first, second);
+        assert_ne!(first, 0.0);
+        assert!((-1.0..=1.0).contains(&first));
+    }
+
+    #[cfg(feature = "system-test")]
+    #[test]
+    fn system_test_speech_pattern_is_recognized_as_voice() {
+        let mut detector = earshot::Detector::default_boxed();
+        for _ in 0..94 {
+            let silence = [0.0; crate::vad::VAD_FRAME_SAMPLES];
+            let _ = detector.predict_f32(&silence);
+        }
+        let mut speech_frames = 0usize;
+        for frame_index in 0..96usize {
+            let frame: Vec<f32> = (0..crate::vad::VAD_FRAME_SAMPLES)
+                .map(|offset| {
+                    let index = frame_index * crate::vad::VAD_FRAME_SAMPLES + offset;
+                    system_test_sample(
+                        SystemTestSignalPattern::Speech,
+                        0x5a17,
+                        index as u64,
+                        16_000,
+                    )
+                })
+                .collect();
+            if detector.predict_f32(&frame) > 0.5 {
+                speech_frames += 1;
+            }
+        }
+        assert!(
+            speech_frames >= 80,
+            "system-test speech must be stably classified as voice; got {speech_frames}/96 frames"
+        );
+    }
+
+    #[cfg(feature = "system-test")]
+    #[test]
+    fn system_test_feed_returns_authoritative_analysis_diagnostics() {
+        let root = test_root("system-test-feed-diagnostics");
+        std::fs::remove_dir_all(&root).unwrap();
+        let mut engine = Engine::new(Emitter::new());
+        engine
+            .start_system_test_session(SystemTestStartSessionPayload {
+                session: StartSessionPayload {
+                    session_dir: root.to_string_lossy().into_owned(),
+                    session_id: "system-test-feed-diagnostics".to_string(),
+                    script_name: "script.csv".to_string(),
+                    device_id: None,
+                    device_name: None,
+                    sample_rate: 48_000,
+                    bit_depth: 24,
+                    input_sample_format: "f32".to_string(),
+                    input_channel: 1,
+                    capture_share_mode: CaptureShareMode::Shared,
+                    silence_duration_ms: 200,
+                    noise_threshold_dbfs: Some(-42.0),
+                    silence_threshold_dbfs: -42.0,
+                    silence_detector: SilenceDetector::Energy,
+                    items: vec![ScriptItem {
+                        id: "001".to_string(),
+                        text: "第一句".to_string(),
+                        label: String::new(),
+                    }],
+                },
+                segment_frames: 48_000,
+            })
+            .unwrap();
+        engine.start_attempt("001", false).unwrap();
+
+        let silence = engine
+            .system_test_feed(9_600, 7, 256, SystemTestSignalPattern::Silence)
+            .unwrap();
+        assert_eq!(silence["pattern"], "silence");
+        assert_eq!(silence["silence_samples"], 9_600);
+        assert_eq!(silence["last_signal_sample"], 0);
+        assert_eq!(silence["analyzed_samples"], 9_600);
+        assert_eq!(silence["head_silence_phase"], "ready_for_speech");
+
+        let speech = engine
+            .system_test_feed(256, 7, 256, SystemTestSignalPattern::Speech)
+            .unwrap();
+        assert_eq!(speech["pattern"], "speech");
+        assert_eq!(speech["silence_samples"], 0);
+        assert_eq!(speech["last_signal_sample"], 9_856);
+        assert_eq!(speech["analyzed_samples"], 9_856);
+        assert_eq!(speech["head_silence_phase"], "speech_started");
+
+        let tail = engine
+            .system_test_feed(9_600, 8, 256, SystemTestSignalPattern::Silence)
+            .unwrap();
+        assert_eq!(tail["silence_samples"], 9_600);
+        assert_eq!(tail["last_signal_sample"], 9_856);
+        assert_eq!(tail["analyzed_samples"], 19_456);
+        assert_eq!(tail["head_silence_phase"], "speech_started");
+        engine.stop_attempt(false, false, false).unwrap();
+        engine.stop_session().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     fn test_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -9435,6 +10622,277 @@ mod tests {
 
     fn test_head_silence_monitor() -> HeadSilenceMonitor {
         HeadSilenceMonitor::new(48_000)
+    }
+
+    #[test]
+    fn full_vad_budget_does_not_enqueue_a_block_or_fault_master_capture() {
+        let vad_queue = VadQueueBudget::new(48_000);
+        assert!(vad_queue.try_reserve(vad_queue.max_samples()));
+        let (vad_tx, vad_rx) = bounded::<VadAnalysisBlock>(1_024);
+        let telemetry = VadTelemetry::default();
+        let silence = SilenceMonitor {
+            silence_samples: Arc::new(AtomicU64::new(0)),
+            digital_silence_samples: Arc::new(AtomicU64::new(0)),
+            last_signal_sample: Arc::new(AtomicU64::new(0)),
+            attempt_signal_start_sample: Arc::new(AtomicU64::new(0)),
+            analyzed_samples: Arc::new(AtomicU64::new(0)),
+            analysis_epoch: Arc::new(AtomicU64::new(0)),
+            threshold_bits: Arc::new(AtomicU32::new((-42.0f32).to_bits())),
+            capture_heartbeat: Arc::new(AtomicU64::new(0)),
+            head_silence: test_head_silence_monitor(),
+            bandwidth: crate::bandwidth::BandwidthProbe::default(),
+            analysis: SilenceAnalysisPorts {
+                detector_kind: Arc::new(AtomicU32::new(DETECTOR_VAD)),
+                generation: Arc::new(AtomicU64::new(7)),
+                tx: Some(vad_tx),
+                queue: vad_queue.clone(),
+                telemetry: telemetry.clone(),
+            },
+        };
+        let (writer_tx, writer_rx) = unbounded::<WriterMessage>();
+        let captured = AtomicU64::new(0);
+        let overflow = AtomicU64::new(0);
+        let faulted = AtomicBool::new(false);
+        let peak = AtomicU32::new(0f32.to_bits());
+        let rms = AtomicU32::new(0f32.to_bits());
+        let writer_queue = test_writer_queue();
+
+        publish_block(
+            vec![0.125; 256],
+            &writer_tx,
+            &captured,
+            &overflow,
+            &faulted,
+            &peak,
+            &rms,
+            &writer_queue,
+            &silence,
+        );
+
+        assert!(
+            matches!(writer_rx.try_recv(), Ok(WriterMessage::Samples(samples)) if samples.len() == 256)
+        );
+        assert!(
+            vad_rx.try_recv().is_err(),
+            "full VAD queue must not receive PCM"
+        );
+        assert!(!faulted.load(Ordering::Acquire));
+        assert_eq!(overflow.load(Ordering::Acquire), 0);
+        assert_eq!(telemetry.overflow_count.load(Ordering::Acquire), 1);
+        assert_eq!(vad_queue.queued_samples(), vad_queue.max_samples());
+        vad_queue.release(vad_queue.max_samples());
+        assert_eq!(vad_queue.queued_samples(), 0);
+        assert_eq!(vad_queue.queued_blocks(), 0);
+        writer_queue.release(256);
+    }
+
+    #[test]
+    fn vad_health_reports_lagging_degraded_and_unavailable_in_priority_order() {
+        let queue = VadQueueBudget::new(48_000);
+        let (tx, _rx) = bounded::<VadAnalysisBlock>(1);
+        let analysis = SilenceAnalysisPorts {
+            detector_kind: Arc::new(AtomicU32::new(DETECTOR_VAD)),
+            generation: Arc::new(AtomicU64::new(1)),
+            tx: Some(tx),
+            queue: queue.clone(),
+            telemetry: VadTelemetry::default(),
+        };
+        assert_eq!(analysis.health_name(48_000), "healthy");
+        assert!(queue.try_reserve(23_999));
+        assert_eq!(analysis.health_name(48_000), "healthy");
+        assert!(queue.try_reserve(1));
+        assert_eq!(analysis.health_name(48_000), "lagging");
+
+        analysis
+            .telemetry
+            .latch_issue(1, VAD_ISSUE_CLASSIFIER_FAILURE, 20_000, 24_000);
+        assert_eq!(analysis.health_name(48_000), "degraded");
+        analysis
+            .telemetry
+            .latch_issue(1, VAD_ISSUE_WORKER_DISCONNECTED, 24_000, 24_000);
+        assert_eq!(analysis.health_name(48_000), "unavailable");
+
+        queue.release(1);
+        queue.release(23_999);
+    }
+
+    #[test]
+    fn vad_degradation_isolated_to_the_active_take_and_retains_a_good_old_version() {
+        for has_old_version in [false, true] {
+            let root = test_root(if has_old_version {
+                "vad-degraded-retains-old"
+            } else {
+                "vad-degraded-first-take"
+            });
+            std::fs::create_dir_all(root.join("script")).unwrap();
+            let mut session = prepare_metadata_test_session(&root);
+            session.snapshot.silence_detector = SilenceDetector::Vad;
+            session
+                .silence_analysis
+                .detector_kind
+                .store(DETECTOR_VAD, Ordering::Release);
+            session
+                .silence_analysis
+                .generation
+                .store(7, Ordering::Release);
+            session
+                .silence_analysis
+                .telemetry
+                .latch_issue(7, VAD_ISSUE_QUEUE_OVERFLOW, 40, 50);
+            session.captured.store(100, Ordering::Release);
+            session.committed.store(100, Ordering::Release);
+            session.active_attempt = Some(ActiveAttempt {
+                item_id: "001".to_string(),
+                attempt_id: "001-a2".to_string(),
+                start_sample: 20,
+                recording_started_sample: 20,
+                input_discontinuity_count_at_start: 0,
+            });
+            if has_old_version {
+                session.snapshot.items[0].status = "accepted".to_string();
+                session.snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
+                session.snapshot.items[0].attempts =
+                    vec![test_attempt("001-a1", 0, 10, "accepted")];
+            }
+            let (writer_tx, writer_rx) = bounded::<WriterMessage>(1);
+            session.writer_tx = writer_tx;
+            let writer_join = thread::spawn(move || {
+                if let Ok(WriterMessage::Checkpoint(reply)) = writer_rx.recv() {
+                    let _ = reply.send(Ok(100));
+                }
+            });
+            let mut engine = Engine::new(Emitter::new());
+            engine.session = Some(session);
+
+            let stopped = engine.stop_attempt(true, true, false).unwrap();
+            assert_eq!(stopped["attempt"]["status"], "needs_rerecord");
+            assert_eq!(
+                stopped["attempt"]["quality_issues"][0]["code"],
+                "vad_queue_overflow"
+            );
+            let item = &engine.session.as_ref().unwrap().snapshot.items[0];
+            if has_old_version {
+                assert_eq!(item.status, "accepted");
+                assert_eq!(item.selected_attempt_id.as_deref(), Some("001-a1"));
+            } else {
+                assert_eq!(item.status, "review");
+                assert!(item.selected_attempt_id.is_none());
+            }
+            writer_join.join().unwrap();
+            drop(engine);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn flush_timeout_counter_is_persisted_on_the_non_deliverable_take() {
+        let root = test_root("vad-flush-timeout-attempt");
+        std::fs::create_dir_all(root.join("script")).unwrap();
+        let mut session = prepare_metadata_test_session(&root);
+        session.snapshot.silence_detector = SilenceDetector::Vad;
+        session
+            .silence_analysis
+            .detector_kind
+            .store(DETECTOR_VAD, Ordering::Release);
+        session
+            .silence_analysis
+            .generation
+            .store(11, Ordering::Release);
+        session.captured.store(100, Ordering::Release);
+        session.committed.store(100, Ordering::Release);
+        session.active_attempt = Some(ActiveAttempt {
+            item_id: "001".to_string(),
+            attempt_id: "001-a1".to_string(),
+            start_sample: 20,
+            recording_started_sample: 20,
+            input_discontinuity_count_at_start: 0,
+        });
+        let (vad_control_tx, vad_control_rx) = bounded::<VadControlMessage>(1);
+        session.vad_tx = Some(vad_control_tx);
+        let vad_control_join = thread::spawn(move || {
+            let VadControlMessage::Flush { done, .. } = vad_control_rx.recv().unwrap() else {
+                panic!("stop attempt must issue a VAD flush");
+            };
+            done.send(VadFlushOutcome::Timeout).unwrap();
+        });
+        let (writer_tx, writer_rx) = bounded::<WriterMessage>(1);
+        session.writer_tx = writer_tx;
+        let writer_join = thread::spawn(move || {
+            if let Ok(WriterMessage::Checkpoint(reply)) = writer_rx.recv() {
+                let _ = reply.send(Ok(100));
+            }
+        });
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+
+        let stopped = engine.stop_attempt(true, true, false).unwrap();
+        assert_eq!(stopped["attempt"]["status"], "needs_rerecord");
+        assert_eq!(
+            stopped["attempt"]["quality_issues"][0]["code"],
+            "vad_flush_timeout"
+        );
+        let session = engine.session.as_ref().unwrap();
+        assert_eq!(
+            session
+                .silence_analysis
+                .telemetry
+                .flush_timeout_count
+                .load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            session
+                .snapshot
+                .vad_diagnostics
+                .as_ref()
+                .unwrap()
+                .flush_timeout_count,
+            1
+        );
+        vad_control_join.join().unwrap();
+        writer_join.join().unwrap();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn idle_vad_degradation_does_not_contaminate_the_next_generation() {
+        let telemetry = VadTelemetry::default();
+        telemetry.latch_issue(3, VAD_ISSUE_QUEUE_OVERFLOW, 100, 120);
+        assert!(telemetry.issue_for_generation(3).is_some());
+        telemetry.clear_generation(4);
+        assert!(telemetry.issue_for_generation(3).is_none());
+        assert!(telemetry.issue_for_generation(4).is_none());
+        assert_eq!(telemetry.overflow_count.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn disconnected_vad_reset_marks_unavailable_and_prevents_recording() {
+        let root = test_root("vad-reset-disconnected");
+        std::fs::create_dir_all(root.join("script")).unwrap();
+        let mut session = prepare_metadata_test_session(&root);
+        session.snapshot.silence_detector = SilenceDetector::Vad;
+        session
+            .silence_analysis
+            .detector_kind
+            .store(DETECTOR_VAD, Ordering::Release);
+        let (control_tx, control_rx) = bounded::<VadControlMessage>(8);
+        drop(control_rx);
+        session.vad_tx = Some(control_tx);
+        let telemetry = session.silence_analysis.telemetry.clone();
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+
+        let error = engine.start_attempt("001", false).unwrap_err();
+        assert!(format!("{error:#}").contains("VAD reset"));
+        assert!(engine.session.as_ref().unwrap().active_attempt.is_none());
+        assert_eq!(
+            telemetry.health.load(Ordering::Acquire),
+            VAD_HEALTH_UNAVAILABLE
+        );
+        assert_eq!(telemetry.worker_disconnect_count.load(Ordering::Acquire), 1);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn test_stream_reaper() -> StreamReaper {
@@ -9859,6 +11317,7 @@ mod tests {
             silence_duration_ms: 1_000,
             silence_threshold_dbfs: -42.0,
             silence_detector: SilenceDetector::Energy,
+            vad_diagnostics: None,
             items: vec![ItemState {
                 id: "001".to_string(),
                 text: "测试文本".to_string(),
@@ -9885,7 +11344,28 @@ mod tests {
             required_tail_silence_samples: 0,
             status: status.to_string(),
             created_at: "2026-08-11T00:00:00Z".to_string(),
+            quality_issues: Vec::new(),
         }
+    }
+
+    fn select_safe_first_attempt(snapshot: &mut SessionSnapshot, end_sample: u64) {
+        cover_committed_test_audio(snapshot);
+        let item = &mut snapshot.items[0];
+        item.status = "accepted".to_string();
+        item.selected_attempt_id = Some("001-a1".to_string());
+        item.attempts = vec![test_attempt("001-a1", 0, end_sample, "accepted")];
+    }
+
+    fn cover_committed_test_audio(snapshot: &mut SessionSnapshot) {
+        snapshot.capture_provenance = if snapshot.committed_samples == 0 {
+            Vec::new()
+        } else {
+            vec![capture_span_from_snapshot(
+                snapshot,
+                0,
+                snapshot.committed_samples,
+            )]
+        };
     }
 
     fn sequenced_event(kind: &str, snapshot: &SessionSnapshot) -> Value {
@@ -9898,6 +11378,162 @@ mod tests {
             "committed_samples": snapshot.committed_samples,
             "snapshot": snapshot,
         })
+    }
+
+    #[test]
+    fn rust_export_scope_matches_the_normative_p1_workflow_fixture() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../scripts/fixtures/p1-workflow-matrix.json"
+        ))
+        .unwrap();
+        let cases = fixture["cases"].as_array().unwrap();
+        let selected_names = fixture["scope_case"]["item_names"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>();
+        let mut snapshot = test_snapshot();
+        snapshot.status = "stopped".to_string();
+        snapshot.captured_samples = fixture["committed_samples"].as_u64().unwrap();
+        snapshot.committed_samples = snapshot.captured_samples;
+        cover_committed_test_audio(&mut snapshot);
+        snapshot.items = selected_names
+            .iter()
+            .map(|name| {
+                let case = cases
+                    .iter()
+                    .find(|case| case["name"].as_str() == Some(*name))
+                    .unwrap();
+                serde_json::from_value::<ItemState>(case["item"].clone()).unwrap()
+            })
+            .collect();
+
+        validate_snapshot_for_cut_scope(&snapshot, ExportScope::ConfirmedOnly).unwrap();
+        let included = snapshot
+            .items
+            .iter()
+            .filter(|item| item.status == "accepted")
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>();
+        let excluded = snapshot
+            .items
+            .iter()
+            .filter(|item| item.status != "accepted")
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>();
+        let expected_included = fixture["scope_case"]["confirmed_only"]["included"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>();
+        let expected_excluded = fixture["scope_case"]["confirmed_only"]["excluded"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(included, expected_included);
+        assert_eq!(excluded, expected_excluded);
+        assert!(validate_snapshot_for_cut_scope(&snapshot, ExportScope::CompleteTask).is_err());
+
+        let unknown_item: ItemState = serde_json::from_value(
+            cases
+                .iter()
+                .find(|case| case["name"] == "unknown quality code fails closed")
+                .unwrap()["item"]
+                .clone(),
+        )
+        .unwrap();
+        snapshot.items = vec![unknown_item];
+        assert!(validate_snapshot_for_cut_scope(&snapshot, ExportScope::ConfirmedOnly).is_err());
+
+        let retained_with_review_status: ItemState = serde_json::from_value(
+            cases
+                .iter()
+                .find(|case| case["name"] == "retained previous requires accepted item status")
+                .unwrap()["item"]
+                .clone(),
+        )
+        .unwrap();
+        snapshot.items = vec![retained_with_review_status];
+        assert!(validate_snapshot_for_cut_scope(&snapshot, ExportScope::ConfirmedOnly).is_err());
+
+        let review_without_candidate: ItemState = serde_json::from_value(
+            cases
+                .iter()
+                .find(|case| {
+                    case["name"] == "review with selected version but no candidate fails closed"
+                })
+                .unwrap()["item"]
+                .clone(),
+        )
+        .unwrap();
+        snapshot.items = vec![review_without_candidate];
+        assert!(validate_snapshot_for_cut_scope(&snapshot, ExportScope::ConfirmedOnly).is_err());
+
+        let selected_clean: ItemState = serde_json::from_value(
+            cases
+                .iter()
+                .find(|case| case["name"] == "selected clean version")
+                .unwrap()["item"]
+                .clone(),
+        )
+        .unwrap();
+        for provenance_case in fixture["task_provenance_cases"].as_array().unwrap() {
+            let mut provenance_snapshot = test_snapshot();
+            provenance_snapshot.status = "stopped".to_string();
+            provenance_snapshot.captured_samples = fixture["committed_samples"].as_u64().unwrap();
+            provenance_snapshot.committed_samples = provenance_snapshot.captured_samples;
+            provenance_snapshot.items = vec![selected_clean.clone()];
+            provenance_snapshot.capture_provenance = provenance_case
+                .get("capture_provenance")
+                .map(|value| serde_json::from_value(value.clone()).unwrap())
+                .unwrap_or_default();
+            let actual =
+                validate_snapshot_for_cut_scope(&provenance_snapshot, ExportScope::ConfirmedOnly)
+                    .is_ok();
+            assert_eq!(
+                actual,
+                provenance_case["expected_ready"].as_bool().unwrap(),
+                "{}",
+                provenance_case["name"].as_str().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn retained_previous_warning_only_tracks_the_latest_unresolved_bad_retake() {
+        let mut old = test_attempt("001-a1", 0, 10, "accepted");
+        let bad = Attempt {
+            quality_issues: vec![AttemptQualityIssue {
+                code: "vad_queue_overflow".to_string(),
+                start_sample: Some(10),
+                end_sample: Some(20),
+                detector_generation: Some(2),
+            }],
+            ..test_attempt("001-a2", 10, 20, "needs_rerecord")
+        };
+        let mut item = ItemState {
+            id: "001".to_string(),
+            text: "测试文本".to_string(),
+            label: String::new(),
+            status: "accepted".to_string(),
+            attempts: vec![old.clone(), bad],
+            selected_attempt_id: Some("001-a1".to_string()),
+        };
+        assert!(cut_export_warning_codes(&item, &old).contains(&"retained_previous"));
+
+        old.status = "rejected_by_operator".to_string();
+        item.attempts[0] = old;
+        let clean = test_attempt("001-a3", 20, 30, "accepted");
+        item.attempts.push(clean.clone());
+        item.selected_attempt_id = Some(clean.attempt_id.clone());
+        assert!(
+            !cut_export_warning_codes(&item, &clean).contains(&"retained_previous"),
+            "a historical bad take followed by a clean selected take is no longer unresolved"
+        );
     }
 
     fn write_journal(root: &Path, entries: &[Value]) {
@@ -10038,6 +11674,7 @@ mod tests {
             required_tail_silence_samples: 5,
             status: "recorded".to_string(),
             created_at: "2026-08-11T00:00:00Z".to_string(),
+            quality_issues: Vec::new(),
         };
         session.snapshot.items[0].status = "review".to_string();
         session.snapshot.items[0].attempts.push(attempt.clone());
@@ -10108,6 +11745,11 @@ mod tests {
             test_attempt("001-a2", 10, 20, "recorded"),
             test_attempt("001-a3", 20, 30, "recorded"),
         ];
+        session.snapshot.captured_samples = 30;
+        session.snapshot.committed_samples = 30;
+        cover_committed_test_audio(&mut session.snapshot);
+        session.captured.store(30, Ordering::Release);
+        session.committed.store(30, Ordering::Release);
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
 
@@ -10679,6 +12321,31 @@ mod tests {
     }
 
     #[test]
+    fn active_capture_locks_the_detector_between_attempts() {
+        let root = test_root("detector-task-lock");
+        let session = prepare_metadata_test_session(&root);
+        assert!(session.active_attempt.is_none());
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+
+        let error = engine
+            .set_silence_settings(SetSilenceSettingsPayload {
+                threshold_dbfs: -42.0,
+                silence_duration_ms: 1_000,
+                enforce_silence: None,
+                silence_detector: Some(SilenceDetector::Vad),
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("任务启动后"));
+        assert_eq!(
+            engine.session.as_ref().unwrap().snapshot.silence_detector,
+            SilenceDetector::Energy
+        );
+        drop(engine.session.take());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn vad_stop_trims_pad_around_detected_speech() {
         let root = test_root("vad-stop-trims-pad");
         let mut session = prepare_metadata_test_session(&root);
@@ -10748,8 +12415,12 @@ mod tests {
             required_tail_silence_samples: 5,
             status: "accepted".to_string(),
             created_at: "2026-08-11T00:00:00Z".to_string(),
+            quality_issues: Vec::new(),
         });
         session.head_silence = HeadSilenceMonitor::new(20);
+        session.snapshot.captured_samples = 100;
+        session.snapshot.committed_samples = 100;
+        cover_committed_test_audio(&mut session.snapshot);
         session.captured.store(100, Ordering::Release);
         session.committed.store(100, Ordering::Release);
         session.analyzed_samples.store(100, Ordering::Release);
@@ -10973,12 +12644,16 @@ mod tests {
             required_tail_silence_samples: 5,
             status: "accepted".to_string(),
             created_at: "2026-08-11T00:00:00Z".to_string(),
+            quality_issues: Vec::new(),
         });
         session
             .capture_recovery
             .discontinuities
             .store(1, Ordering::Release);
         session.head_silence = HeadSilenceMonitor::new(20);
+        session.snapshot.captured_samples = 100;
+        session.snapshot.committed_samples = 100;
+        cover_committed_test_audio(&mut session.snapshot);
         session.captured.store(100, Ordering::Release);
         session.committed.store(100, Ordering::Release);
         session.analyzed_samples.store(100, Ordering::Release);
@@ -13545,6 +15220,7 @@ mod tests {
         assert!(validate_snapshot_for_export(&snapshot).is_err());
 
         snapshot.committed_samples = 100;
+        cover_committed_test_audio(&mut snapshot);
         snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
         snapshot.items[0].attempts.push(Attempt {
             attempt_id: "001-a1".to_string(),
@@ -13560,6 +15236,7 @@ mod tests {
             required_tail_silence_samples: 0,
             status: "interrupted".to_string(),
             created_at: "2026-08-11T00:00:00Z".to_string(),
+            quality_issues: Vec::new(),
         });
         assert!(validate_snapshot_for_export(&snapshot).is_err());
 
@@ -13568,6 +15245,8 @@ mod tests {
         assert!(validate_snapshot_for_export(&snapshot).is_err());
 
         snapshot.items[0].attempts[0].end_sample = 100;
+        assert!(validate_attempt_boundaries(&snapshot, snapshot.committed_samples).is_err());
+        snapshot.items[0].attempts[0].recording_started_sample = 10;
         assert!(validate_snapshot_for_export(&snapshot).is_ok());
 
         snapshot.items[0].status = "skipped".to_string();
@@ -13578,11 +15257,66 @@ mod tests {
     }
 
     #[test]
+    fn sentence_delivery_requires_explicit_provenance_coverage() {
+        let mut snapshot = test_snapshot();
+        snapshot.status = "stopped".to_string();
+        snapshot.captured_samples = 10;
+        snapshot.committed_samples = 10;
+        select_safe_first_attempt(&mut snapshot, 10);
+        snapshot.capture_provenance.clear();
+
+        assert!(!attempt_range_has_provenance(
+            &snapshot,
+            &snapshot.items[0].attempts[0]
+        ));
+        assert!(validate_snapshot_for_cut_scope(&snapshot, ExportScope::ConfirmedOnly).is_err());
+        assert!(usable_preview_attempt(&snapshot, "001", "001-a1").is_err());
+
+        cover_committed_test_audio(&mut snapshot);
+        validate_snapshot_for_cut_scope(&snapshot, ExportScope::ConfirmedOnly).unwrap();
+        usable_preview_attempt(&snapshot, "001", "001-a1").unwrap();
+    }
+
+    #[test]
+    fn offline_preview_enforces_the_complete_head_silence_contract() {
+        let mut snapshot = test_snapshot();
+        snapshot.status = "stopped".to_string();
+        snapshot.captured_samples = 1_000;
+        snapshot.committed_samples = 1_000;
+        cover_committed_test_audio(&mut snapshot);
+        snapshot.items[0].status = "accepted".to_string();
+        snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
+        snapshot.items[0].attempts = vec![Attempt {
+            attempt_id: "001-a1".to_string(),
+            start_sample: 100,
+            recording_started_sample: 100,
+            head_silence_armed_sample: 100,
+            head_silence_passed_sample: 200,
+            required_head_silence_samples: 1_000,
+            content_started_sample: 300,
+            end_sample: 800,
+            forced_without_tail_silence: false,
+            tail_silence_samples: 100,
+            required_tail_silence_samples: 100,
+            status: "accepted".to_string(),
+            created_at: "2026-08-27T00:00:00Z".to_string(),
+            quality_issues: Vec::new(),
+        }];
+
+        assert!(attempt_is_delivery_safe(&snapshot, &snapshot.items[0].attempts[0]).unwrap());
+        assert!(usable_preview_attempt(&snapshot, "001", "001-a1").is_err());
+
+        snapshot.items[0].attempts[0].required_head_silence_samples = 100;
+        usable_preview_attempt(&snapshot, "001", "001-a1").unwrap();
+    }
+
+    #[test]
     fn cuts_block_review_but_allow_an_accepted_previous_version_after_a_bad_retake() {
         let mut snapshot = test_snapshot();
         snapshot.status = "stopped".to_string();
         snapshot.captured_samples = 30;
         snapshot.committed_samples = 30;
+        cover_committed_test_audio(&mut snapshot);
         snapshot.items[0].status = "review".to_string();
         snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
         snapshot.items[0].attempts = vec![
@@ -13606,10 +15340,35 @@ mod tests {
     }
 
     #[test]
+    fn zero_length_vad_diagnostic_does_not_block_a_safe_selected_old_version() {
+        let mut snapshot = test_snapshot();
+        snapshot.status = "stopped".to_string();
+        snapshot.captured_samples = 10;
+        snapshot.committed_samples = 10;
+        cover_committed_test_audio(&mut snapshot);
+        snapshot.items[0].status = "accepted".to_string();
+        snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
+        let mut diagnostic = test_attempt("001-a2", 10, 10, "needs_rerecord");
+        diagnostic.quality_issues = vec![AttemptQualityIssue {
+            code: "vad_queue_overflow".to_string(),
+            start_sample: Some(10),
+            end_sample: Some(10),
+            detector_generation: Some(2),
+        }];
+        snapshot.items[0].attempts = vec![test_attempt("001-a1", 0, 10, "accepted"), diagnostic];
+
+        validate_attempt_boundaries(&snapshot, snapshot.committed_samples).unwrap();
+        validate_snapshot_for_cut_scope(&snapshot, ExportScope::ConfirmedOnly).unwrap();
+        assert!(usable_preview_attempt(&snapshot, "001", "001-a2").is_err());
+        assert!(!attempt_is_delivery_safe(&snapshot, &snapshot.items[0].attempts[1]).unwrap());
+    }
+
+    #[test]
     fn validate_attempt_boundaries_accepts_clip_start_after_required_head_silence() {
         let mut snapshot = test_snapshot();
         snapshot.status = "stopped".to_string();
         snapshot.committed_samples = 5_144_640;
+        cover_committed_test_audio(&mut snapshot);
         snapshot.items[0].id = "0001".to_string();
         snapshot.items[0].status = "accepted".to_string();
         snapshot.items[0].selected_attempt_id = Some("0001-a1".to_string());
@@ -13627,6 +15386,7 @@ mod tests {
             required_tail_silence_samples: 48_000,
             status: "accepted".to_string(),
             created_at: "2026-08-18T06:28:39Z".to_string(),
+            quality_issues: Vec::new(),
         });
         snapshot.items.push(ItemState {
             id: "0003".to_string(),
@@ -13647,6 +15407,7 @@ mod tests {
                 required_tail_silence_samples: 48_000,
                 status: "accepted".to_string(),
                 created_at: "2026-08-18T06:29:35Z".to_string(),
+                quality_issues: Vec::new(),
             }],
             selected_attempt_id: Some("0003-a1".to_string()),
         });
@@ -13665,6 +15426,7 @@ mod tests {
         snapshot.status = "stopped".to_string();
         snapshot.silence_detector = SilenceDetector::Vad;
         snapshot.committed_samples = 5_144_640;
+        cover_committed_test_audio(&mut snapshot);
         snapshot.items[0].id = "0001".to_string();
         snapshot.items[0].status = "accepted".to_string();
         snapshot.items[0].selected_attempt_id = Some("0001-a1".to_string());
@@ -13684,6 +15446,7 @@ mod tests {
             required_tail_silence_samples: 48_000,
             status: "accepted".to_string(),
             created_at: "2026-08-20T10:50:00Z".to_string(),
+            quality_issues: Vec::new(),
         });
 
         validate_attempt_boundaries(&snapshot, snapshot.committed_samples).unwrap();
@@ -13752,10 +15515,11 @@ mod tests {
             )
             .unwrap();
         assert!(root.join("export/timestamps.json").is_file());
-        engine
+        let error = engine
             .export_session_artifact_expected(&root, "offline-create", ExportArtifact::CutsZip)
-            .unwrap();
-        assert!(root.join("export/cuts.zip").is_file());
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("没有可安全导出"));
+        assert!(!root.join("export/cuts.zip").exists());
         engine
             .export_session_artifact_expected(&root, "offline-create", ExportArtifact::FullTrack)
             .unwrap();
@@ -13810,6 +15574,7 @@ mod tests {
             required_tail_silence_samples: 0,
             status: "accepted".to_string(),
             created_at: "2026-08-10T12:00:00Z".to_string(),
+            quality_issues: Vec::new(),
         }];
         write_snapshot_file(&root.join("metadata/items.snapshot.json"), &snapshot);
         write_snapshot_file(&root.join("metadata/items.snapshot.prev"), &snapshot);
@@ -13895,6 +15660,7 @@ mod tests {
         snapshot.journal_seq = 1;
         snapshot.captured_samples = 4;
         snapshot.committed_samples = 4;
+        cover_committed_test_audio(&mut snapshot);
         snapshot.items[0].status = "review".to_string();
         snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
         snapshot.items[0].attempts = vec![
@@ -13912,13 +15678,14 @@ mod tests {
                 required_tail_silence_samples: 0,
                 status: "accepted".to_string(),
                 created_at: "2026-08-11T00:00:00Z".to_string(),
+                quality_issues: Vec::new(),
             },
             Attempt {
                 attempt_id: "001-a2".to_string(),
                 start_sample: 2,
                 recording_started_sample: 2,
-                head_silence_armed_sample: 2,
-                head_silence_passed_sample: 2,
+                head_silence_armed_sample: 0,
+                head_silence_passed_sample: 0,
                 required_head_silence_samples: 0,
                 content_started_sample: 2,
                 end_sample: 4,
@@ -13927,6 +15694,7 @@ mod tests {
                 required_tail_silence_samples: 0,
                 status: "recorded".to_string(),
                 created_at: "2026-08-11T00:01:00Z".to_string(),
+                quality_issues: Vec::new(),
             },
             Attempt {
                 attempt_id: "001-a3".to_string(),
@@ -13942,6 +15710,7 @@ mod tests {
                 required_tail_silence_samples: 0,
                 status: "needs_rerecord".to_string(),
                 created_at: "2026-08-11T00:02:00Z".to_string(),
+                quality_issues: Vec::new(),
             },
         ];
         write_journal(&root, &[sequenced_event("session_stopped", &snapshot)]);
@@ -13959,11 +15728,20 @@ mod tests {
         );
         assert!(
             engine
-                .select_session_attempt_expected(&root, "resume-test", "001", "001-a3")
+                .select_session_attempt_expected(&root, "resume-test", "001", "001-a3", 1)
                 .is_err()
         );
+        let journal_before_stale = std::fs::read(root.join("metadata/events.jsonl")).unwrap();
+        let stale = engine
+            .select_session_attempt_expected(&root, "resume-test", "001", "001-a2", 0)
+            .unwrap_err();
+        assert!(format!("{stale:#}").contains("journal_seq"));
+        assert_eq!(
+            std::fs::read(root.join("metadata/events.jsonl")).unwrap(),
+            journal_before_stale
+        );
         let selected = engine
-            .select_session_attempt_expected(&root, "resume-test", "001", "001-a2")
+            .select_session_attempt_expected(&root, "resume-test", "001", "001-a2", 1)
             .unwrap();
         assert_eq!(
             selected["snapshot"]["items"][0]["selected_attempt_id"],
@@ -13994,6 +15772,21 @@ mod tests {
             journal.entries.last().unwrap()["event"],
             "attempt_selected_offline"
         );
+        let journal_before_physical_failure =
+            std::fs::read(root.join("metadata/events.jsonl")).unwrap();
+        std::fs::write(&master, b"corrupt wav").unwrap();
+        let physical_failure = engine
+            .select_session_attempt_expected(&root, "resume-test", "001", "001-a1", 2)
+            .unwrap_err();
+        assert!(
+            format!("{physical_failure:#}").contains("物理音频校验失败"),
+            "{physical_failure:#}"
+        );
+        assert_eq!(
+            std::fs::read(root.join("metadata/events.jsonl")).unwrap(),
+            journal_before_physical_failure,
+            "failed physical validation must not change selected state"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -14011,6 +15804,7 @@ mod tests {
         snapshot.journal_seq = 1;
         snapshot.captured_samples = 4;
         snapshot.committed_samples = 4;
+        cover_committed_test_audio(&mut snapshot);
         snapshot.status = "stopped".to_string();
         snapshot.items[0].status = "accepted".to_string();
         snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
@@ -14028,6 +15822,7 @@ mod tests {
             required_tail_silence_samples: 0,
             status: "accepted".to_string(),
             created_at: "2026-08-11T00:00:00Z".to_string(),
+            quality_issues: Vec::new(),
         }];
         write_journal(&root, &[sequenced_event("session_stopped", &snapshot)]);
         write_snapshot_file(&root.join("metadata/items.snapshot.json"), &snapshot);
@@ -14063,32 +15858,181 @@ mod tests {
         stopped.status = "stopped".to_string();
         stopped.captured_samples = 4;
         stopped.committed_samples = 4;
-        stopped.items[0].status = "skipped".to_string();
+        select_safe_first_attempt(&mut stopped, 4);
+        stopped.items.push(ItemState {
+            id: "002".to_string(),
+            text: "明确跳过".to_string(),
+            label: String::new(),
+            status: "skipped".to_string(),
+            attempts: Vec::new(),
+            selected_attempt_id: None,
+        });
         write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
         write_snapshot_file(&root.join("metadata/items.snapshot.json"), &stopped);
         let engine = Engine::new(Emitter::new());
 
-        engine
+        let full_track = engine
             .export_session_artifact_expected(&root, "resume-test", ExportArtifact::FullTrack)
             .unwrap();
+        assert_eq!(
+            full_track["sha256"],
+            sha256_file(&root.join("export/full-track.wav")).unwrap()
+        );
         assert!(root.join("export/full-track.wav").is_file());
         assert!(root.join("export/status-full-track.json").is_file());
         assert!(!root.join("export/timestamps.json").exists());
         assert!(!root.join("export/cuts.zip").exists());
 
-        engine
+        let timestamps = engine
             .export_session_artifact_expected(&root, "resume-test", ExportArtifact::TimestampsJson)
             .unwrap();
+        assert_eq!(
+            timestamps["sha256"],
+            sha256_file(&root.join("export/timestamps.json")).unwrap()
+        );
         assert!(root.join("export/timestamps.json").is_file());
         assert!(root.join("export/status-timestamps-json.json").is_file());
         assert!(!root.join("export/cuts.zip").exists());
 
-        engine
-            .export_session_artifact_expected(&root, "resume-test", ExportArtifact::CutsZip)
+        let cuts = engine
+            .export_session_artifact_with_options_expected(
+                &root,
+                "resume-test",
+                ExportArtifact::CutsZip,
+                ExportScope::ConfirmedOnly,
+                Some(1),
+                &[],
+            )
             .unwrap();
+        assert_eq!(cuts["scope"], "confirmed_only");
+        assert_eq!(
+            cuts["sha256"],
+            sha256_file(&root.join("export/cuts.zip")).unwrap()
+        );
+        assert!(root.join("export/cuts-manifest.json").is_file());
+        let status: Value = serde_json::from_slice(
+            &std::fs::read(root.join("export/status-cuts-zip.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(status["sha256"], cuts["sha256"]);
+        assert_eq!(status["export_id"], cuts["export_id"]);
+        assert_eq!(status["source"], cuts["source"]);
+        assert_eq!(status["manifest_file"], "cuts-manifest.json");
+        assert!(
+            engine
+                .export_session_artifact_with_options_expected(
+                    &root,
+                    "resume-test",
+                    ExportArtifact::CutsZip,
+                    ExportScope::CompleteTask,
+                    Some(1),
+                    &[],
+                )
+                .is_err()
+        );
+        assert!(
+            engine
+                .export_session_artifact_with_options_expected(
+                    &root,
+                    "resume-test",
+                    ExportArtifact::CutsZip,
+                    ExportScope::ConfirmedOnly,
+                    Some(0),
+                    &[],
+                )
+                .is_err()
+        );
         assert!(root.join("export/cuts.zip").is_file());
         assert!(root.join("export/status-cuts-zip.json").is_file());
         assert!(!root.join("export/status.json").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cut_warning_acknowledgements_are_explicit_and_bound_to_journal_sequence() {
+        let root = test_root("cut-warning-acknowledgements");
+        for directory in ["audio", "metadata", "script", "preview", "export"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        let master = root.join(LEGACY_MASTER_AUDIO);
+        let mut writer = RecoverableWav::create(&master, 48_000, 1, 24).unwrap();
+        writer.write_samples(&[0.1; 16]).unwrap();
+        writer.finalize().unwrap();
+
+        let mut stopped = test_snapshot();
+        stopped.journal_seq = 1;
+        stopped.status = "stopped".to_string();
+        stopped.captured_samples = 16;
+        stopped.committed_samples = 16;
+        select_safe_first_attempt(&mut stopped, 16);
+        let selected = &mut stopped.items[0].attempts[0];
+        selected.head_silence_armed_sample = 0;
+        selected.head_silence_passed_sample = 2;
+        selected.required_head_silence_samples = 2;
+        selected.content_started_sample = 1;
+        selected.tail_silence_samples = 1;
+        selected.required_tail_silence_samples = 2;
+        write_snapshot_file(&root.join("metadata/items.snapshot.json"), &stopped);
+        write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
+        let engine = Engine::new(Emitter::new());
+
+        let missing = engine
+            .export_session_artifact_with_options_expected(
+                &root,
+                "resume-test",
+                ExportArtifact::CutsZip,
+                ExportScope::ConfirmedOnly,
+                Some(1),
+                &[],
+            )
+            .unwrap_err();
+        let missing = format!("{missing:#}");
+        assert!(missing.contains("head_silence_short"), "{missing}");
+        assert!(missing.contains("tail_silence_short"), "{missing}");
+
+        let acknowledgements = [
+            "head_silence_short".to_string(),
+            "tail_silence_short".to_string(),
+        ];
+        engine
+            .export_session_artifact_with_options_expected(
+                &root,
+                "resume-test",
+                ExportArtifact::CutsZip,
+                ExportScope::ConfirmedOnly,
+                Some(1),
+                &acknowledgements,
+            )
+            .unwrap();
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(root.join("export/cuts-manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            manifest["warnings"],
+            json!([
+                { "code": "head_silence_short", "item_id": "001" },
+                { "code": "tail_silence_short", "item_id": "001" },
+            ])
+        );
+        assert_eq!(
+            manifest["acknowledged_warning_codes"],
+            json!(acknowledgements)
+        );
+
+        stopped.journal_seq = 2;
+        write_snapshot_file(&root.join("metadata/items.snapshot.json"), &stopped);
+        write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
+        let stale = engine
+            .export_session_artifact_with_options_expected(
+                &root,
+                "resume-test",
+                ExportArtifact::CutsZip,
+                ExportScope::ConfirmedOnly,
+                Some(1),
+                &acknowledgements,
+            )
+            .unwrap_err();
+        assert!(format!("{stale:#}").contains("journal_seq"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -14110,7 +16054,7 @@ mod tests {
         stopped.status = "stopped".to_string();
         stopped.captured_samples = 4;
         stopped.committed_samples = 4;
-        stopped.items[0].status = "skipped".to_string();
+        select_safe_first_attempt(&mut stopped, 4);
         write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
         std::fs::write(
             root.join("metadata/items.snapshot.json"),
@@ -14125,9 +16069,11 @@ mod tests {
         assert!(root.join("export/timestamps.json").is_file());
         assert!(root.join("export/timestamps.csv").is_file());
         assert!(root.join("export/cuts.zip").is_file());
-        assert_eq!(
-            &std::fs::read(root.join("export/cuts.zip")).unwrap()[..4],
-            b"PK\x05\x06"
+        let cuts = std::fs::read(root.join("export/cuts.zip")).unwrap();
+        assert!(cuts.starts_with(b"PK\x03\x04"));
+        assert!(
+            cuts.windows("manifest.json".len())
+                .any(|entry| entry == b"manifest.json")
         );
         assert!(root.join("export/metadata.csv").is_file());
         assert!(!root.join("export/sentences/stale.wav").exists());
@@ -14144,7 +16090,7 @@ mod tests {
         );
         assert_eq!(
             status["source"]["selected_attempts"],
-            json!([{ "id": "001", "attempt_id": null }])
+            json!([{ "id": "001", "attempt_id": "001-a1" }])
         );
         assert!(
             status["export_id"]
@@ -14220,7 +16166,7 @@ mod tests {
         stopped.status = "stopped".to_string();
         stopped.captured_samples = 4;
         stopped.committed_samples = 4;
-        stopped.items[0].status = "skipped".to_string();
+        select_safe_first_attempt(&mut stopped, 4);
         write_snapshot_file(&root.join("metadata/items.snapshot.json"), &stopped);
         write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
 
@@ -14253,7 +16199,7 @@ mod tests {
         stopped.status = "stopped".to_string();
         stopped.captured_samples = 4;
         stopped.committed_samples = 4;
-        stopped.items[0].status = "skipped".to_string();
+        select_safe_first_attempt(&mut stopped, 4);
         write_snapshot_file(&root.join("metadata/items.snapshot.json"), &stopped);
         write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
 
@@ -14352,6 +16298,7 @@ mod tests {
         stopped.segment_frames = Some(10);
         stopped.captured_samples = 25;
         stopped.committed_samples = 25;
+        cover_committed_test_audio(&mut stopped);
         stopped.items[0].status = "accepted".to_string();
         stopped.items[0].selected_attempt_id = Some("001-a1".to_string());
         stopped.items[0].attempts.push(Attempt {
@@ -14368,12 +16315,26 @@ mod tests {
             required_tail_silence_samples: 10,
             status: "accepted".to_string(),
             created_at: "2026-08-11T00:00:00Z".to_string(),
+            quality_issues: Vec::new(),
         });
         write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
 
         let result = Engine::new(Emitter::new()).export_session(&root).unwrap();
 
         assert_eq!(result["exported_count"].as_u64(), Some(1));
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(root.join("export/cuts-manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["scope"], "confirmed_only");
+        assert_eq!(manifest["engine_version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            manifest["included"][0]["sha256"],
+            sha256_file(&root.join("export/sentences/000001-001.wav")).unwrap()
+        );
+        assert_eq!(
+            manifest["included"][0]["file"], "cuts/000001-001.wav",
+            "the manifest path must name the actual ZIP entry"
+        );
         assert!(root.join("export/full-track.wav").is_file());
         let cuts_archive = std::fs::read(root.join("export/cuts.zip")).unwrap();
         assert!(cuts_archive.starts_with(b"PK\x03\x04"));
@@ -14421,6 +16382,7 @@ mod tests {
         stopped.segment_frames = Some(10);
         stopped.captured_samples = 25;
         stopped.committed_samples = 25;
+        cover_committed_test_audio(&mut stopped);
         stopped.items[0].status = "accepted".to_string();
         stopped.items[0].selected_attempt_id = Some("001-a1".to_string());
         stopped.items[0].attempts.push(Attempt {
@@ -14437,6 +16399,7 @@ mod tests {
             required_tail_silence_samples: 10,
             status: "accepted".to_string(),
             created_at: "2026-08-11T00:00:00Z".to_string(),
+            quality_issues: Vec::new(),
         });
         write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
 
@@ -14471,6 +16434,7 @@ mod tests {
         stopped.segment_frames = Some(10);
         stopped.captured_samples = 25;
         stopped.committed_samples = 25;
+        cover_committed_test_audio(&mut stopped);
         stopped.items[0].status = "accepted".to_string();
         stopped.items[0].selected_attempt_id = Some("001-a1".to_string());
         stopped.items[0].attempts.push(Attempt {
@@ -14487,6 +16451,7 @@ mod tests {
             required_tail_silence_samples: 2,
             status: "accepted".to_string(),
             created_at: "2026-08-20T00:00:00Z".to_string(),
+            quality_issues: Vec::new(),
         });
         write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
 
@@ -15137,6 +17102,66 @@ mod tests {
         // The first shutdown physically stopped and removed the session even
         // though sealing metadata failed, so stdin EOF cannot stop it twice.
         engine.shutdown().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn blocked_vad_shutdown_cannot_starve_master_writer_finalization() {
+        let root = test_root("blocked-vad-does-not-starve-writer");
+        std::fs::create_dir_all(root.join("script")).unwrap();
+        let mut session = metadata_test_session(&root);
+        session.captured.store(4, Ordering::Release);
+
+        let writer_finalized = Arc::new(AtomicBool::new(false));
+        let writer_finalized_thread = Arc::clone(&writer_finalized);
+        let committed = Arc::clone(&session.committed);
+        let (writer_tx, writer_rx) = unbounded::<WriterMessage>();
+        session.writer_tx = writer_tx;
+        session.writer_join = Some(thread::spawn(move || match writer_rx.recv().unwrap() {
+            WriterMessage::Stop(reply) => {
+                committed.store(4, Ordering::Release);
+                writer_finalized_thread.store(true, Ordering::Release);
+                reply.send(Ok(4)).unwrap();
+            }
+            _ => panic!("expected writer Stop before VAD shutdown"),
+        }));
+
+        let (vad_tx, vad_rx) = bounded::<VadControlMessage>(8);
+        let (vad_entered_tx, vad_entered_rx) = bounded::<()>(1);
+        let (vad_release_tx, vad_release_rx) = bounded::<()>(0);
+        let writer_finalized_for_vad = Arc::clone(&writer_finalized);
+        session.vad_tx = Some(vad_tx);
+        session.vad_join = Some(thread::spawn(move || {
+            let VadControlMessage::Shutdown { done } = vad_rx.recv().unwrap() else {
+                panic!("expected VAD Shutdown");
+            };
+            assert!(
+                writer_finalized_for_vad.load(Ordering::Acquire),
+                "master writer must finalize before waiting on advisory VAD"
+            );
+            vad_entered_tx.send(()).unwrap();
+            vad_release_rx.recv().unwrap();
+            let _ = done.send(());
+        }));
+
+        let first = session.progress_capture_shutdown_with_timeout(Duration::from_millis(100));
+        vad_entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(first.committed_samples, 4);
+        assert!(writer_finalized.load(Ordering::Acquire));
+        assert!(session.writer_join.is_none());
+        assert!(session.vad_join.is_some());
+        assert!(!session.capture_stopped);
+
+        vad_release_tx.send(()).unwrap();
+        assert!(wait_for_thread_until(
+            session.vad_join.as_ref().unwrap(),
+            Instant::now() + Duration::from_secs(1),
+        ));
+        let second = session.progress_capture_shutdown_with_timeout(Duration::from_secs(1));
+        assert!(second.capture_resources_joined);
+        assert!(second.audio_safe);
+        assert!(session.capture_stopped);
+        drop(session);
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -15801,7 +17826,7 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert_eq!(snapshot.items[0].attempts.len(), 1);
         assert_eq!(snapshot.items[0].attempts[0].status, "interrupted");
-        assert_eq!(snapshot.items[0].attempts[0].start_sample, 100);
+        assert_eq!(snapshot.items[0].attempts[0].start_sample, 110);
         assert_eq!(snapshot.items[0].attempts[0].head_silence_armed_sample, 110);
         assert_eq!(
             snapshot.items[0].attempts[0].required_head_silence_samples,
@@ -15861,7 +17886,7 @@ mod tests {
         assert_eq!(sealed.items[0].attempts.len(), 1);
         let attempt = &sealed.items[0].attempts[0];
         assert_eq!(attempt.status, "interrupted");
-        assert_eq!(attempt.start_sample, 1);
+        assert_eq!(attempt.start_sample, 2);
         assert_eq!(attempt.recording_started_sample, 2);
         assert_eq!(attempt.head_silence_armed_sample, 2);
         assert_eq!(attempt.head_silence_passed_sample, 0);

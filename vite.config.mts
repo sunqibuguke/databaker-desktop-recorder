@@ -10,6 +10,7 @@ export default defineConfig({
     },
   },
   plugins: [react(), sentryVitePlugin({
+    disable: process.env.DATABAKER_SENTRY_PLUGIN_DISABLED === '1',
     org: "vsoul",
     project: "databaker-record-desktop",
     telemetry: false,

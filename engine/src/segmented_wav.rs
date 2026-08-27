@@ -441,7 +441,7 @@ impl SegmentedWav {
                             max_frames_per_segment,
                         )?;
                         let warning = format!(
-                            "活动母轨分段 {} 是旧版无描述符格式，已根据可验证的 WAV 头与会话参数补建恢复描述符。",
+                            "活动母轨分段 {} 是早期无描述符格式，已根据可验证的 WAV 头与会话参数补建恢复描述符。",
                             active_path.display()
                         );
                         eprintln!("{warning}");

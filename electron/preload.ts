@@ -44,12 +44,19 @@ contextBridge.exposeInMainWorld('recorder', {
   chooseExportDir: (defaultPath?: string, title?: string) => (
     ipcRenderer.invoke('dialog:choose-export-dir', { defaultPath, title })
   ),
-  deliverExportArtifact: (sourceFile: string, destinationDir: string) => (
-    ipcRenderer.invoke('export:deliver-artifact', {
-      source_file: sourceFile,
-      destination_dir: destinationDir,
-    })
+  deliverExportArtifact: (request: unknown) => ipcRenderer.invoke('export:deliver-artifact', request),
+  cancelExportDelivery: (requestId: string) => (
+    ipcRenderer.invoke('export:cancel-delivery', requestId)
   ),
+  verifyExportDelivery: (request: unknown) => (
+    ipcRenderer.invoke('export:verify-delivery', request)
+  ),
+  onExportDeliveryProgress: (listener: (progress: unknown) => void) => {
+    const wrapped = (_event: Electron.IpcRendererEvent, progress: unknown) => listener(progress);
+    ipcRenderer.on('export:delivery-progress', wrapped);
+    return () => ipcRenderer.removeListener('export:delivery-progress', wrapped);
+  },
+  e2eFeedPcm: (payload: unknown) => ipcRenderer.invoke('e2e:test-feed-pcm', payload),
   defaultOutput: () => ipcRenderer.invoke('app:default-output'),
   getLicenseStatus: () => ipcRenderer.invoke('license:status'),
   activateLicense: (ticket: string) => ipcRenderer.invoke('license:activate', ticket),

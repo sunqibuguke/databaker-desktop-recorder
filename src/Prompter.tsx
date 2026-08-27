@@ -82,14 +82,14 @@ export function PrompterView() {
   const readerLabel = state?.readerCueLabel || state?.cueLabel || t('prompter.waitTask');
   const qualityWarning = cue === 'fault' ? '' : state?.qualityWarning ?? '';
   const visibleLabelTransition = state?.labelTransition?.changed ? state.labelTransition : null;
-  const transitionFrom = visibleLabelTransition?.fromLabel || t('prompter.none');
-  const transitionTo = visibleLabelTransition?.toLabel || t('prompter.none');
   const copyLength = Array.from(state?.text ?? '').length;
   const copyDensity = copyLength > 180 ? 'dense' : copyLength > 90 ? 'long' : '';
   return <main
     className={`prompter-shell ${cue} ${qualityWarning ? 'has-quality-warning' : ''}`}
     data-testid="prompter-shell"
     data-cue={cue}
+    data-item-disposition={state?.itemDisposition ?? 'unrecorded'}
+    data-delivery-health={state?.deliveryHealth ?? 'blocked'}
     aria-label={readerLabel}
     style={{
       ['--prompter-copy-size' as string]: prompterFontSizeRem(appearance.fontSize),
@@ -111,11 +111,10 @@ export function PrompterView() {
     {qualityWarning && <div className="prompter-quality-warning" role="alert"><i />{qualityWarning}</div>}
     <article className="prompter-content">
       <p ref={copyRef} className={`${copyDensity} ${cue === 'recording' ? 'live' : ''}`.trim()}>{state?.text || t('prompter.noText')}</p>
-      {visibleLabelTransition && <div className="prompter-label-transition" role="status" aria-live="polite" aria-atomic="true">
+      {visibleLabelTransition && <div key={`transition:${state?.id ?? 'none'}:${state?.label ?? ''}`} className="prompter-label-transition" role="status" aria-live="polite" aria-atomic="true">
         <span>{t('prompter.labelChanged')}</span>
-        <strong>{t('prompter.labelChangedFromTo', { from: transitionFrom, to: transitionTo })}</strong>
       </div>}
-      <aside ref={labelRef} className={`prompter-label ${state?.label ? '' : 'empty'}${visibleLabelTransition ? ' changed' : ''}`}><span>{t('prompter.labelTitle')}</span><strong>{state?.label || t('prompter.none')}</strong></aside>
+      <aside key={`label:${state?.id ?? 'none'}:${state?.label ?? ''}`} ref={labelRef} className={`prompter-label ${state?.label ? '' : 'empty'}${visibleLabelTransition ? ' changed' : ''}`}><span>{t('prompter.labelTitle')}</span><strong>{state?.label || t('prompter.none')}</strong></aside>
     </article>
     <footer className="prompter-footer">
       <label className="prompter-type-size" data-testid="prompter-font-size">

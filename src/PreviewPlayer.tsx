@@ -13,7 +13,6 @@ function disposeAudioElement(audio: HTMLAudioElement | null) {
 
 type Props = {
   url: string;
-  attemptId: string;
   itemId: string;
   itemText: string;
   itemLabel?: string;
@@ -24,7 +23,6 @@ type Props = {
 
 export function PreviewPlayer({
   url,
-  attemptId,
   itemId,
   itemText,
   itemLabel,
@@ -141,10 +139,11 @@ export function PreviewPlayer({
         <span className="dialog-icon"><Icon name="headphones" size={18} /></span>
         <div>
           <h2 id="preview-player-title">{t('recorder.previewTitle')}</h2>
-          <small>{itemId} · {t('recorder.previewAttempt', { id: attemptId })}</small>
+          <small>{itemId}</small>
         </div>
         <button
           className="preview-player-close"
+          data-testid="preview-player-close"
           type="button"
           title={t('recorder.previewClose')}
           aria-label={t('recorder.previewClose')}

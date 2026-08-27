@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const { createHash } = require('node:crypto');
 const fs = require('node:fs/promises');
 const Module = require('node:module');
 const os = require('node:os');
@@ -30,6 +31,7 @@ const {
   assertAuthorizedSessionUnchanged,
   bindAuthorizedSession,
   hasCompleteExport,
+  inspectExportArtifact,
   loadHistorySnapshot,
 } = require('../dist-electron/main.js');
 Module._load = originalLoad;
@@ -219,6 +221,63 @@ async function main() {
       },
     });
     assert.equal(await hasCompleteExport(exportDir, exportSnapshot), true, 'committed export is visible');
+
+    const artifactExportDir = path.join(sessionDir, 'artifact-integrity-export');
+    const artifactFile = path.join(artifactExportDir, 'full-track.wav');
+    const artifactStatus = path.join(artifactExportDir, 'status-full-track.json');
+    const artifactBytes = Buffer.from('verified full-track artifact');
+    const artifactSha256 = createHash('sha256').update(artifactBytes).digest('hex');
+    const writeArtifactStatus = async (sha256 = artifactSha256, extra = {}) => writeJson(
+      artifactStatus,
+      {
+        schema_version: 2,
+        status: 'complete',
+        export_id: 'artifact-export-a',
+        session_id: 'session-a',
+        artifact: 'full_track',
+        source: { committed_samples: 0, capture_provenance: [] },
+        sha256,
+        completed_at: '2026-08-27T00:00:00.000Z',
+        exported_count: 0,
+        skipped_count: 1,
+        ...extra,
+      },
+    );
+    await fs.mkdir(artifactExportDir);
+    await fs.writeFile(artifactFile, artifactBytes);
+    await writeArtifactStatus();
+    assert.equal(
+      (await inspectExportArtifact(artifactExportDir, exportSnapshot, 'full_track')).state,
+      'current',
+      'history only reports a hash-verified task artifact as current',
+    );
+    await fs.writeFile(artifactFile, Buffer.from('tampered full-track artifact'));
+    assert.equal(
+      (await inspectExportArtifact(artifactExportDir, exportSnapshot, 'full_track')).state,
+      'failed',
+      'same-path artifact tampering revokes current state',
+    );
+    await fs.writeFile(artifactFile, artifactBytes);
+    await writeArtifactStatus(createHash('sha256').update('different status hash').digest('hex'));
+    assert.equal(
+      (await inspectExportArtifact(artifactExportDir, exportSnapshot, 'full_track')).state,
+      'failed',
+      'a status hash that does not match the task artifact fails closed',
+    );
+    await writeArtifactStatus(artifactSha256, { size_bytes: artifactBytes.length + 1 });
+    assert.equal(
+      (await inspectExportArtifact(artifactExportDir, exportSnapshot, 'full_track')).state,
+      'failed',
+      'a persisted artifact size mismatch fails closed when size is present',
+    );
+    await writeArtifactStatus();
+    await fs.unlink(artifactFile);
+    assert.equal(
+      (await inspectExportArtifact(artifactExportDir, exportSnapshot, 'full_track')).state,
+      'failed',
+      'deleting the task artifact revokes current state',
+    );
+
     assert.equal(
       await hasCompleteExport(exportDir, { ...exportSnapshot, status: 'faulted', audio_fault_marker: true }),
       false,

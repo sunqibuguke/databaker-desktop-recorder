@@ -38,6 +38,7 @@ async function main() {
     shouldAutoStartAfterAccept,
     viewShortcutAction,
     workflowShortcutAction,
+    workflowShortcutTargetAllowed,
     workspacePosture,
   } = await import(pathToFileURL(modulePath).href);
   const {
@@ -487,6 +488,21 @@ async function main() {
   assert.equal(viewShortcutAction('KeyP', 'p'), 'preview');
   assert.equal(viewShortcutAction('KeyR', 'r'), 'enter-capture');
   assert.equal(viewShortcutAction('KeyS', 's'), 'none');
+  assert.equal(workflowShortcutTargetAllowed({
+    modalOpen: false, formControl: false, button: false, professionalItem: false,
+  }), true, 'workspace shortcuts remain available when focus is on the workspace surface');
+  assert.equal(workflowShortcutTargetAllowed({
+    modalOpen: false, formControl: false, button: true, professionalItem: true,
+  }), true, 'a focused sentence row must keep R/P/S/Space available');
+  assert.equal(workflowShortcutTargetAllowed({
+    modalOpen: false, formControl: false, button: true, professionalItem: false,
+  }), false, 'ordinary buttons keep their native keyboard action');
+  assert.equal(workflowShortcutTargetAllowed({
+    modalOpen: false, formControl: true, button: false, professionalItem: false,
+  }), false, 'form controls must never leak keys into recording shortcuts');
+  assert.equal(workflowShortcutTargetAllowed({
+    modalOpen: true, formControl: false, button: true, professionalItem: true,
+  }), false, 'a modal blocks shortcuts even if the prior focused node was a sentence row');
   assert.equal(
     resolveRunningItemIndex(
       [{ id: 'a', status: 'accepted' }, { id: 'b', status: 'accepted' }, { id: 'c', status: 'accepted' }],

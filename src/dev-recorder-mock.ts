@@ -1,6 +1,6 @@
 import type { DebugLogDraft, DebugLogEntry, DebugLogSnapshot } from './debug-log';
 import { formatDebugLogText } from './debug-log';
-import type { Attempt, AudioDevice, CapturePresetDraft, CapturePresetStore, HeadSilencePhase, LicenseStatus, Meter, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SessionSnapshot } from './types';
+import type { Attempt, AudioDevice, CapturePresetDraft, CapturePresetStore, ExportDeliveryProgress, ExportDeliveryRequest, HeadSilencePhase, LicenseStatus, Meter, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SessionSnapshot } from './types';
 
 type MockActiveAttempt = {
   item_id: string;
@@ -77,6 +77,7 @@ export function installDevRecorderMock() {
   const prompterStatusListeners = new Set<(status: { open: boolean; ready: boolean }) => void>();
   const debugLogListeners = new Set<(entry: DebugLogEntry) => void>();
   const localeListeners = new Set<(locale: string) => void>();
+  const deliveryProgressListeners = new Set<(progress: ExportDeliveryProgress) => void>();
   const previewLocked = new URLSearchParams(globalThis.location?.search ?? '').get('license') === 'locked';
   let previewLicense: LicenseStatus = previewLocked
     ? {
@@ -265,15 +266,28 @@ export function installDevRecorderMock() {
       const attemptId = `${String(index + 1).padStart(3, '0')}-a1`;
       const startSample = Math.min(index * itemFrames, Math.max(0, recording.captured_samples - 1));
       const endSample = Math.min(recording.captured_samples, startSample + itemFrames);
+      const requiredSilence = Math.min(
+        recording.sample_rate,
+        Math.max(0, Math.floor((endSample - startSample) / 4)),
+      );
+      const contentStartedSample = Math.min(
+        endSample,
+        startSample + requiredSilence + Math.min(
+          Math.round(recording.sample_rate * 0.2),
+          Math.max(0, endSample - startSample - requiredSilence),
+        ),
+      );
       const attempts: Attempt[] = accepted ? [{
         attempt_id: attemptId,
         start_sample: startSample,
         recording_started_sample: startSample,
-        head_silence_armed_sample: 0,
-        head_silence_passed_sample: 0,
-        required_head_silence_samples: 0,
-        content_started_sample: 0,
+        head_silence_armed_sample: requiredSilence > 0 ? startSample : 0,
+        head_silence_passed_sample: requiredSilence > 0 ? startSample + requiredSilence : 0,
+        required_head_silence_samples: requiredSilence,
+        content_started_sample: contentStartedSample,
         end_sample: endSample,
+        tail_silence_samples: requiredSilence,
+        required_tail_silence_samples: requiredSilence,
         status: 'accepted',
         created_at: recording.updated_at,
       }] : [];
@@ -291,6 +305,7 @@ export function installDevRecorderMock() {
   function snapshotForRecording(recording: RecordingHistoryEntry, status = recording.status): SessionSnapshot {
     return {
       schema_version: 1,
+      journal_seq: 1,
       session_id: recording.session_id,
       script_name: recording.script_name,
       status,
@@ -301,6 +316,16 @@ export function installDevRecorderMock() {
       audio_format: { sample_rate: recording.sample_rate, bit_depth: recording.bit_depth, encoding: recording.encoding, channels: 1, input_channels: 2, input_channel: recording.input_channel },
       master_audio: 'audio/master.wav', storage_layout_version: 1, segment_frames: recording.sample_rate * 300,
       captured_samples: recording.captured_samples, committed_samples: recording.captured_samples, overflow_samples: recording.overflow_samples,
+      capture_provenance: recording.captured_samples > 0 ? [{
+        start_sample: 0,
+        end_sample: recording.captured_samples,
+        device_name: recording.device_name,
+        device_id: mockDevices.find((device) => device.name === recording.device_name)?.id ?? mockDevices[0].id,
+        input_sample_format: 'f32',
+        input_channels: 2,
+        input_channel: recording.input_channel,
+        sample_rate: recording.sample_rate,
+      }] : [],
       started_at: recording.started_at, updated_at: recording.updated_at,
       noise_check: recording.noise_check,
       noise_threshold_dbfs: recording.noise_check?.threshold_dbfs ?? -42,
@@ -318,6 +343,19 @@ export function installDevRecorderMock() {
       snapshot.captured_samples = capturedSamples;
       snapshot.committed_samples = committedSamples;
       snapshot.updated_at = new Date().toISOString();
+      if (committedSamples > 0) {
+        const span = {
+          start_sample: 0,
+          end_sample: committedSamples,
+          device_name: snapshot.device_name,
+          device_id: snapshot.device_id ?? mockDevices[0].id,
+          input_sample_format: snapshot.input_sample_format ?? 'f32',
+          input_channels: snapshot.audio_format.input_channels,
+          input_channel: snapshot.audio_format.input_channel ?? 1,
+          sample_rate: snapshot.audio_format.sample_rate,
+        };
+        snapshot.capture_provenance = [span];
+      }
     }
     const newSamples = Math.max(0, capturedSamples - previousCapturedSamples);
     previousCapturedSamples = capturedSamples;
@@ -453,6 +491,7 @@ export function installDevRecorderMock() {
       const now = new Date().toISOString();
       snapshot = {
         schema_version: 1,
+        journal_seq: 1,
         session_id: String(data.session_id),
         script_name: String(data.script_name ?? ''),
         status: command === 'start_session' ? 'recording' : 'stopped',
@@ -462,6 +501,7 @@ export function installDevRecorderMock() {
         capture_share_mode: data.capture_share_mode === 'shared' ? 'shared' : 'exclusive',
         audio_format: { sample_rate: Number(data.sample_rate), bit_depth: Number(data.bit_depth ?? 24), encoding: Number(data.bit_depth ?? 24) === 32 ? 'float' : 'pcm', channels: 1, input_channels: 2, input_channel: Number(data.input_channel ?? 1) },
         master_audio: 'audio/master.wav', storage_layout_version: 1, segment_frames: Number(data.sample_rate) * 300, captured_samples: 0, committed_samples: 0, overflow_samples: 0,
+        capture_provenance: [],
         input_discontinuity_count: 0,
         input_discontinuity_silence_samples: 0,
         started_at: now, updated_at: now,
@@ -502,6 +542,7 @@ export function installDevRecorderMock() {
       recording.updated_at = new Date().toISOString();
       const sealedSnapshot: SessionSnapshot = {
         schema_version: 1,
+        journal_seq: 1,
         session_id: recording.session_id,
         script_name: recording.script_name,
         status: recording.status,
@@ -511,6 +552,16 @@ export function installDevRecorderMock() {
         audio_format: { sample_rate: recording.sample_rate, bit_depth: recording.bit_depth, encoding: recording.encoding, channels: 1, input_channels: 2, input_channel: recording.input_channel },
         master_audio: 'audio/master.wav', storage_layout_version: 1, segment_frames: recording.sample_rate * 300,
         captured_samples: recording.captured_samples, committed_samples: recording.captured_samples, overflow_samples: recording.overflow_samples,
+        capture_provenance: recording.captured_samples > 0 ? [{
+          start_sample: 0,
+          end_sample: recording.captured_samples,
+          device_name: recording.device_name,
+          device_id: mockDevices.find((device) => device.name === recording.device_name)?.id ?? mockDevices[0].id,
+          input_sample_format: 'f32',
+          input_channels: 2,
+          input_channel: recording.input_channel,
+          sample_rate: recording.sample_rate,
+        }] : [],
         started_at: recording.started_at, updated_at: recording.updated_at,
         noise_check: recording.noise_check,
         silence_duration_ms: 1_000,
@@ -583,22 +634,28 @@ export function installDevRecorderMock() {
       const validationSource = source ?? (historical ? snapshotForRecording(historical) : null);
       const artifact = String(data.artifact ?? '');
       if (!validationSource) throw new Error('Mock 中没有该录制任务');
+      if (data.expected_session_id && data.expected_session_id !== validationSource.session_id) {
+        throw new Error('Mock 录制任务身份不匹配');
+      }
       if (validationSource.status !== 'stopped' && validationSource.status !== 'faulted') {
         throw new Error('录制尚未安全结束，请先暂停后再导出');
       }
       if (artifact === 'cuts_zip' || !artifact) {
+        if (Number(data.expected_journal_seq) !== validationSource.journal_seq) {
+          throw new Error('任务已变化，请重新检查导出状态');
+        }
         if (validationSource.status === 'faulted' || validationSource.overflow_samples > 0) {
           throw new Error('异常任务修复并检查前不能导出分段 ZIP');
         }
         for (const item of validationSource.items) {
-          if (item.status === 'review') {
-            throw new Error('仍有待确认或需重录的句子，不能导出切片。');
+          if (data.scope === 'complete_task' && item.status !== 'accepted') {
+            throw new Error('完整任务导出仍有未完成或已跳过的句子。');
           }
-          if (!artifact && item.status === 'accepted' && !item.selected_attempt_id) {
-            throw new Error('已确认的句子没有选中的录音版本，不能导出切片。');
+          if (item.status === 'accepted' && !item.selected_attempt_id) {
+            throw new Error('已确认的句子没有当前使用录音，不能导出切片。');
           }
           if (!artifact && item.status === 'skipped' && item.selected_attempt_id) {
-            throw new Error('已跳过的句子仍有选中版本，不能导出切片。');
+            throw new Error('已跳过的句子仍有当前使用录音，不能导出切片。');
           }
           if (!item.selected_attempt_id) continue;
           const selected = item.attempts.find((attempt) => attempt.attempt_id === item.selected_attempt_id);
@@ -606,7 +663,7 @@ export function installDevRecorderMock() {
             || ['interrupted', 'needs_rerecord'].includes(selected.status)
             || selected.end_sample <= selected.start_sample
             || selected.end_sample > validationSource.committed_samples) {
-            throw new Error('选中的录音版本异常或越过已落盘边界，不能导出切片。');
+            throw new Error('当前使用录音异常或越过已落盘边界，不能导出切片。');
           }
         }
       }
@@ -615,14 +672,27 @@ export function installDevRecorderMock() {
         if (historical) historical.export_exists = true;
       }
       const exportedCount = source
-        ? source.items.filter((item) => item.status === 'accepted').length
+        ? source.items.filter((item) => item.status === 'accepted' && item.selected_attempt_id).length
         : historical?.accepted_items ?? 0;
       const total = source?.items.length
         ?? historical?.total_items
         ?? exportedCount;
       const exportDir = `${target || '/tmp/DataBaker Preview'}/export`;
+      const exportId = `preview-${validationSource.journal_seq}-${Date.now()}`;
+      const selectedAttempts = Object.fromEntries(validationSource.items
+        .filter((item) => item.selected_attempt_id)
+        .map((item) => [item.id, item.selected_attempt_id]));
       return {
         artifact: artifact || undefined,
+        export_id: exportId,
+        scope: artifact === 'cuts_zip' ? String(data.scope ?? 'confirmed_only') : undefined,
+        source: {
+          journal_seq: validationSource.journal_seq,
+          committed_samples: validationSource.committed_samples,
+          selected_attempts: selectedAttempts,
+        },
+        manifest_file: artifact === 'cuts_zip' ? `${exportDir}/manifest.json` : undefined,
+        sha256: 'preview-export-sha256',
         export_dir: exportDir,
         ...(artifact === 'full_track' || !artifact ? { master_file: `${exportDir}/full-track.wav` } : {}),
         ...(artifact === 'timestamps_json' || !artifact ? { timestamps_json: `${exportDir}/timestamps.json` } : {}),
@@ -717,7 +787,7 @@ export function installDevRecorderMock() {
     }
     if (command === 'start_attempt') {
       if (!captureActive || snapshot.status !== 'recording') throw new Error('当前任务未进入采集状态');
-      if (activeAttempt) throw new Error('已有正在录制的版本');
+      if (activeAttempt) throw new Error('已有录音正在进行');
       enforceSilence = data.enforce_silence === true;
       const required = mockSampleRate * snapshot.silence_duration_ms / 1_000;
       const item = snapshot.items.find((candidate) => candidate.id === data.item_id);
@@ -740,7 +810,7 @@ export function installDevRecorderMock() {
       return { ...activeAttempt } as T;
     }
     if (command === 'stop_attempt') {
-      if (!activeAttempt) throw new Error('没有正在录制的版本');
+      if (!activeAttempt) throw new Error('当前没有正在进行的录音');
       // Sample at the command boundary instead of waiting for the 100 ms
       // telemetry timer. Rust freezes this captured boundary and waits for the
       // writer checkpoint before sealing the attempt.
@@ -782,7 +852,7 @@ export function installDevRecorderMock() {
         )
         : committedBoundary;
       if (attemptEnd <= attemptStart || firstAttemptSignalSample > attemptEnd) {
-        throw new Error('录音版本的 VAD 裁切边界无效');
+        throw new Error('本次录音的 VAD 裁切边界无效');
       }
       const attempt: Attempt = {
         attempt_id: activeAttempt.attempt_id,
@@ -814,6 +884,7 @@ export function installDevRecorderMock() {
       item.attempts.push(attempt);
       item.status = recoveredDiscontinuity && hasAcceptedSelection ? 'accepted' : 'review';
       if (!hasAcceptedSelection) item.selected_attempt_id = null;
+      snapshot.journal_seq += 1;
       activeAttempt = null;
       return {
         item_id: item.id,
@@ -825,7 +896,7 @@ export function installDevRecorderMock() {
     }
     if (command === 'accept_attempt') {
       if (!captureActive || snapshot.status !== 'recording') throw new Error('当前任务未进入采集状态');
-      if (activeAttempt) throw new Error('录制进行中不能确认版本');
+      if (activeAttempt) throw new Error('录制进行中不能确认本句录音');
       const item = snapshot.items.find((candidate) => candidate.id === data.item_id);
       if (!item) throw new Error('找不到指定句子');
       const selectedId = String(data.attempt_id);
@@ -834,11 +905,11 @@ export function installDevRecorderMock() {
         || ['interrupted', 'needs_rerecord'].includes(selected.status)
         || selected.end_sample <= selected.start_sample
         || selected.end_sample > snapshot.committed_samples) {
-        throw new Error('异常中断的录音版本不能被确认或交付');
+        throw new Error('异常中断的录音不能被确认或交付');
       }
       const isCurrentAccepted = selected.status === 'accepted' && item.selected_attempt_id === selectedId;
       if (selected.status !== 'recorded' && !isCurrentAccepted) {
-        throw new Error('只能确认待审核的新录音或保留当前已确认版本');
+        throw new Error('只能使用待确认录音或保留当前使用录音');
       }
       item.selected_attempt_id = selectedId;
       item.status = 'accepted';
@@ -848,6 +919,7 @@ export function installDevRecorderMock() {
           attempt.status = 'rejected_by_operator';
         }
       });
+      snapshot.journal_seq += 1;
       return { item_id: item.id, attempt_id: data.attempt_id } as T;
     }
     if (command === 'skip_item') {
@@ -857,6 +929,7 @@ export function installDevRecorderMock() {
       if (!item) throw new Error('找不到指定句子');
       item.status = 'skipped';
       item.selected_attempt_id = null;
+      snapshot.journal_seq += 1;
       return { item_id: item.id } as T;
     }
     if (command === 'get_state') return { snapshot: snapshotCopy(), session_dir: currentSessionDir, active_attempt: activeAttempt ? { ...activeAttempt } : null } as T;
@@ -870,7 +943,7 @@ export function installDevRecorderMock() {
         || ['interrupted', 'needs_rerecord'].includes(attempt.status)
         || attempt.end_sample <= attempt.start_sample
         || attempt.end_sample > snapshot.committed_samples) {
-        throw new Error('异常中断的录音版本不能试听或交付');
+        throw new Error('异常中断的录音不能试听或交付');
       }
       return { file_path: '/tmp/databaker-dev-preview.wav' } as T;
     }
@@ -884,7 +957,7 @@ export function installDevRecorderMock() {
         || ['interrupted', 'needs_rerecord'].includes(attempt.status)
         || attempt.end_sample <= attempt.start_sample
         || attempt.end_sample > snapshot.committed_samples) {
-        throw new Error('异常中断的录音版本不能预览波形');
+        throw new Error('异常中断的录音不能预览波形');
       }
       const bins = Array.from({ length: 80 }, (_, index): [number, number] => {
         const envelope = Math.sin((index + 1) / 12) * 0.55;
@@ -893,16 +966,17 @@ export function installDevRecorderMock() {
       return { bins, start_sample: attempt.start_sample, end_sample: attempt.end_sample, sample_rate: snapshot.audio_format.sample_rate } as T;
     }
     if (command === 'select_session_attempt') {
-      if (captureActive || activeAttempt) throw new Error('当前已有录制进行中，请先安全暂停再切换版本');
-      if (snapshot.status !== 'stopped') throw new Error('任务尚未安全暂停，不能离线切换录音版本');
-      if (snapshot.overflow_samples > 0) throw new Error('异常任务不能切换录音版本');
+      if (captureActive || activeAttempt) throw new Error('当前已有录制进行中，请先安全暂停再切换当前使用录音');
+      if (snapshot.status !== 'stopped') throw new Error('任务尚未安全暂停，不能离线切换当前使用录音');
+      if (snapshot.overflow_samples > 0) throw new Error('异常任务不能切换当前使用录音');
+      if (Number(data.expected_journal_seq) !== snapshot.journal_seq) throw new Error('任务已变化，请重新检查后再切换当前使用录音');
       const item = snapshot.items.find((candidate) => candidate.id === data.item_id);
       const attempt = item?.attempts.find((candidate) => candidate.attempt_id === data.attempt_id);
-      if (!item || !attempt) throw new Error('找不到指定录音版本');
+      if (!item || !attempt) throw new Error('找不到指定录音');
       if (['interrupted', 'needs_rerecord'].includes(attempt.status)
         || attempt.end_sample <= attempt.start_sample
         || attempt.end_sample > snapshot.committed_samples) {
-        throw new Error('异常中断的录音版本不能设为当前版本');
+        throw new Error('异常中断的录音不能设为当前使用录音');
       }
       item.selected_attempt_id = attempt.attempt_id;
       item.status = 'accepted';
@@ -912,6 +986,7 @@ export function installDevRecorderMock() {
           candidate.status = 'rejected_by_operator';
         }
       });
+      snapshot.journal_seq += 1;
       return { snapshot: snapshotCopy(), item_id: item.id, attempt_id: attempt.attempt_id } as T;
     }
     if (command === 'stop_session') {
@@ -921,6 +996,7 @@ export function installDevRecorderMock() {
       snapshot.captured_samples = capturedSamples;
       snapshot.committed_samples = capturedSamples;
       snapshot.updated_at = new Date().toISOString();
+      snapshot.journal_seq += 1;
       captureActive = false;
       return { snapshot: snapshotCopy(), session_dir: String(data.session_dir ?? '/tmp/DataBaker Preview') } as T;
     }
@@ -937,23 +1013,37 @@ export function installDevRecorderMock() {
       openScript: async () => null,
       chooseOutput: async () => '/tmp/DataBaker Recordings',
       chooseExportDir: async () => '/tmp/DataBaker Preview Export',
-      deliverExportArtifact: async (sourceFile: string, destinationDir: string) => {
-        const artifact = sourceFile.split(/[\\/]/).pop() ?? 'export.bin';
+      deliverExportArtifact: async (delivery: ExportDeliveryRequest) => {
+        const artifact = delivery.artifact === 'full_track'
+          ? 'full-track.wav'
+          : delivery.artifact === 'cuts_zip' ? 'cuts.zip' : 'timestamps.json';
         const extIndex = artifact.lastIndexOf('.');
         const stem = extIndex > 0 ? artifact.slice(0, extIndex) : artifact;
         const ext = extIndex > 0 ? artifact.slice(extIndex) : '';
-        const parts = sourceFile.split(/[\\/]/).filter(Boolean);
-        const exportIndex = parts.lastIndexOf('export');
-        const session = exportIndex > 0 ? parts[exportIndex - 1] : 'recording';
         const now = new Date();
         const pad = (value: number) => String(value).padStart(2, '0');
         const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+        deliveryProgressListeners.forEach((listener) => listener({ request_id: delivery.request_id, stage: 'copying', bytes_copied: 512, total_bytes: 1024 }));
+        const filePath = `${delivery.destination_dir.replace(/\/+$/, '')}/${delivery.session_id}-${stem}-${stamp}${ext}`;
         return {
-          directory: destinationDir,
-          file_path: `${destinationDir.replace(/\/+$/, '')}/${session}-${stem}-${stamp}${ext}`,
-          copied: true,
+          ...delivery,
+          directory: delivery.destination_dir,
+          file_path: filePath,
+          file_name: filePath.split('/').pop() ?? artifact,
+          size_bytes: 1024,
+          sha256: 'preview-sha256',
+          copied: true as const,
+          receipt_path: `${currentSessionDir || '/tmp/DataBaker Preview'}/export/delivery-receipts/${delivery.request_id}.json`,
+          completed_at: new Date().toISOString(),
+          verification: 'verified' as const,
         };
       },
+      cancelExportDelivery: async () => true,
+      onExportDeliveryProgress: (listener: (progress: ExportDeliveryProgress) => void) => {
+        deliveryProgressListeners.add(listener);
+        return () => deliveryProgressListeners.delete(listener);
+      },
+      verifyExportDelivery: async () => null,
       defaultOutput: async () => ({ outputRoot: '/tmp/DataBaker Recordings' }),
       getLocale: async () => previewLocale,
       setLocale: async (locale: string) => {

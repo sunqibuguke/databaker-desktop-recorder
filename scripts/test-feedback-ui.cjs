@@ -35,26 +35,76 @@ assert.match(recorder, /selectionIndexAfterStoppedRetake/);
 assert.match(recorder, /setRetakeItemId\(item\.status === 'pending' \? null : item\.id\)/);
 assert.match(recorder, /retakeItemId === currentItem\.id/);
 assert.match(recorder, /const isRetakeDecision = hasRetakeDecision/);
-assert.match(recorder, /hasRetakeVersionChoice/);
+assert.match(recorder, /const hasRetakeChoice = Boolean/);
 assert.ok(
   recorder.indexOf('if (isRetakeDecision)')
     < recorder.indexOf('const continuation = continuationAfterAccept'),
   'retake decisions must return before ordinary auto-start continuation',
 );
-assert.match(recorder, /reviewCount > 0/);
+assert.match(recorder, /deriveTaskWorkflow/);
+assert.match(recorder, /cutsReadiness\.ready/);
 assert.match(recorder, /export-status-summary/);
 assert.match(recorder, /exportDialog\.cutsBlockedReview/);
 assert.match(recorder, /state\.exported_count/);
 assert.match(recorder, /void refreshRecordings\(outputDirRef\.current\)/);
-assert.match(recorder, /recording \|\| captureFault \|\| workspaceFaulted \|\| reviewCount > 0/);
+assert.match(recorder, /recording \|\| captureFault \|\| workspaceFaulted \|\| !cutsReadiness\.ready \|\| !exportWarningsAcknowledged/);
 assert.match(recorder, /disabled=\{recording \|\| !reviewAttempt \|\| Boolean\(busy\)\}/);
 assert.doesNotMatch(recorder, /知道了/);
+assert.match(recorder, /data-testid="retake-decision-summary"/);
+assert.match(recorder, /data-testid=\{hasRetakeDecision \? 'preview-retake' : undefined\}[\s\S]*?t\('recorder\.previewCandidate'\)/);
+assert.match(recorder, /data-retake-action=\{hasRetakeDecision \? 'use' : undefined\}[\s\S]*?t\('recorder\.useRetakeCandidate'\)/);
+assert.match(recorder, /data-testid="discard-retake"[\s\S]*?acceptAttempt\(retainedDeliveryAttempt\.attempt_id\)[\s\S]*?t\('recorder\.keepPreviousVersion'\)/);
+assert.equal((recorder.match(/t\('recorder\.previewCandidate'\)/g) ?? []).length, 1);
+assert.equal((recorder.match(/t\('recorder\.useRetakeCandidate'\)/g) ?? []).length, 1);
+assert.equal((recorder.match(/t\('recorder\.keepPreviousVersion'\)/g) ?? []).length, 1);
+assert.doesNotMatch(recorder, /data-testid="version-workbench"/, '普通录制界面不得恢复版本工作台');
+assert.doesNotMatch(recorder, /className="version-(?:comparison|column|silence-metrics)/, '普通录制界面不得恢复版本比较');
+assert.doesNotMatch(recorder, /className="attempt-history(?:-row)?/, '普通录制界面不得展开 attempt 历史');
+assert.doesNotMatch(recorder, /previewAttempt\(retainedDeliveryAttempt\.attempt_id\)/, '重录决策不得提供原录音试听');
+assert.match(recorder, /isAttemptPreviewSafe/);
+assert.match(recorder, /expected_journal_seq: sourceSnapshot\.journal_seq/);
+assert.match(recorder, /if \(!safeAttemptIds\.has\(attemptId\)\) return/);
+assert.match(recorder, /data-testid="issue-workbench"/);
+assert.match(recorder, /adjacentWorkbenchIssue\(visibleWorkbenchIssues, selectedIssueId, direction\)/);
+assert.match(recorder, /setCurrentIndex\(issue\.itemIndex\)/);
+const issueLocator = recorder.slice(
+  recorder.indexOf('function locateWorkbenchIssue'),
+  recorder.indexOf('function moveWorkbenchIssue'),
+);
+assert.doesNotMatch(issueLocator, /startAttempt/, '问题定位绝不得开始录音');
+assert.match(recorder, /exportScope === 'complete_task'/);
+assert.match(recorder, /acknowledged_warning_codes/);
+assert.match(recorder, /expected_session_id: task\.session_id/);
+assert.match(recorder, /const externalDeliveryFailed = Boolean\(destination\) && !deliveryVerified/);
+assert.match(recorder, /status: externalDeliveryFailed \? 'preserved' : 'ok'/);
+assert.match(recorder, /exportFeedback\.status === 'preserved'/);
+assert.match(recorder, /data-testid="vad-health-banner"/);
+assert.match(recorder, /const vadHealth = meter\.vad_health \?\? 'healthy'/);
+assert.match(recorder, /vadDiagnosticFaultCount: persistedVadFaults/);
+assert.doesNotMatch(recorder, /meter\.vad_health \?\? \(persistedVadFaults > 0 \? 'degraded'/);
+assert.match(recorder, /saveWorkspaceContext/);
+assert.match(recorder, /loadWorkspaceContext/);
+assert.match(recorder, /workflowShortcutTargetAllowed\(\{/);
+assert.match(recorder, /modalOpen: Boolean\(document\.querySelector\('\[role="dialog"\]\[aria-modal="true"\]'\)\)[\s\S]*?&& !showDeviceWarningDialog[\s\S]*?&& !showNoiseCheckDialog/);
+assert.match(recorder, /formControl: Boolean\(target\?\.closest\('input, textarea, select, audio, \[contenteditable="true"\]'\)\)/);
+assert.match(recorder, /professionalItem: Boolean\(target\?\.closest\('\.professional-item'\)\)/);
+assert.doesNotMatch(recorder, /target\?\.closest\('input, textarea, select, button, audio'\)/, 'focused sentence rows must not be rejected by the blanket button guard');
+assert.match(recorder, /if \(options\.activate\) await activateCapture\(undefined, inspected\.session_dir\)/);
 
 assert.match(types, /labelTransition\?: ScriptLabelTransition \| null/);
+assert.match(types, /capture_provenance: CaptureProvenanceSpan\[\]/);
 assert.match(prompter, /state\?\.labelTransition\?\.changed/);
+assert.match(recorder, /<b>\{t\('recorder\.labelChanged'\)\}<\/b>/);
+assert.match(prompter, /<span>\{t\('prompter\.labelChanged'\)\}<\/span>/);
+assert.match(recorder, /key=\{`transition:\$\{currentItem\?\.id/);
+assert.match(recorder, /key=\{`label:\$\{currentItem\?\.id/);
+assert.doesNotMatch(recorder, /labelChangedFromTo/, '主控端标签提醒只说标签已变化');
+assert.doesNotMatch(prompter, /labelChangedFromTo/, '提词端标签提醒只说标签已变化');
 assert.equal((prompter.match(/step=\{1\}/g) ?? []).length, 2);
 assert.equal((prompter.match(/step=\{2\}/g) ?? []).length, 2);
 assert.match(prompter, /className="prompter-label-transition" role="status" aria-live="polite"/);
+assert.match(prompter, /data-item-disposition/);
+assert.match(prompter, /data-delivery-health/);
 
 assert.match(css, /--label-change:\s*#[0-9a-f]{6}/i);
 assert.match(css, /\.professional-item\.label-boundary/);
@@ -71,7 +121,21 @@ assert.match(css, /\.prompt-surface\.label-changed/);
 assert.match(css, /\.prompt-surface\s*\{[^}]*position:\s*relative/);
 assert.match(css, /\.label-transition-chip\s*\{[^}]*position:\s*absolute/);
 assert.match(css, /\.prompter-label-transition/);
+assert.match(css, /\.transport-secondary button span\s*\{[^}]*white-space:\s*nowrap/);
+const controllerLabelTransitionRule = css.match(/\.label-transition-chip\s*\{([^}]*)\}/)?.[1] ?? '';
+const prompterLabelTransitionRule = css.match(/\.prompter-label-transition\s*\{([^}]*)\}/)?.[1] ?? '';
+assert.match(controllerLabelTransitionRule, /animation:\s*label-change-notice-in\s+180ms\s+ease-out/);
+assert.match(prompterLabelTransitionRule, /animation:\s*label-change-notice-in\s+180ms\s+ease-out/);
+assert.doesNotMatch(controllerLabelTransitionRule, /infinite/, '主控端标签提醒动效只执行一次');
+assert.doesNotMatch(prompterLabelTransitionRule, /infinite/, '提词端标签提醒动效只执行一次');
+assert.match(css, /@keyframes label-change-notice-in\s*\{/);
+assert.match(css, /@media \(prefers-reduced-motion: reduce\) \{\s*\.label-transition-chip,[\s\S]*?\.prompter-label-transition,[\s\S]*?\{ animation: none; \}\s*\}/);
 assert.match(css, /\.export-dialog \.export-status-summary/);
+assert.doesNotMatch(css, /\.version-comparison\b/, '普通录制界面不保留版本工作台样式');
+assert.doesNotMatch(css, /\.attempt-history-row\b/, '普通录制界面不保留 attempt 历史样式');
+assert.match(css, /\.issue-filters\s*\{[^}]*grid-template-columns:\s*repeat\(3, 1fr\)/);
+assert.match(css, /\.export-scope-control/);
+assert.match(css, /\.vad-health-banner\.degraded/);
 
 function luminance(hex) {
   const channels = hex.match(/[0-9a-f]{2}/gi).map((value) => Number.parseInt(value, 16) / 255);

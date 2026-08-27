@@ -3,7 +3,7 @@ export {};
 declare module '*.css';
 
 import type { DebugLogDraft, DebugLogEntry, DebugLogSnapshot } from './debug-log';
-import type { CapturePresetDraft, CapturePresetLoadResult, CapturePresetStore, DefaultOutputResult, LicenseStatus, PendingLicenseSeal, PrompterState, RecordingHistoryPage } from './types';
+import type { CapturePresetDraft, CapturePresetLoadResult, CapturePresetStore, DefaultOutputResult, ExportDeliveryProgress, ExportDeliveryRequest, ExportDeliveryResult, ExportDeliveryVerification, ExportArtifact, LicenseStatus, PendingLicenseSeal, PrompterState, RecordingHistoryPage } from './types';
 
 declare global {
   interface Window {
@@ -15,11 +15,20 @@ declare global {
       openScript(): Promise<{ filePath: string; name: string; content: string } | null>;
       chooseOutput(): Promise<string | null>;
       chooseExportDir(defaultPath?: string, title?: string): Promise<string | null>;
-      deliverExportArtifact(sourceFile: string, destinationDir: string): Promise<{
-        directory: string;
-        file_path: string;
-        copied: boolean;
-      }>;
+      deliverExportArtifact(request: ExportDeliveryRequest): Promise<ExportDeliveryResult>;
+      cancelExportDelivery(requestId: string): Promise<boolean>;
+      onExportDeliveryProgress(listener: (progress: ExportDeliveryProgress) => void): () => void;
+      verifyExportDelivery(request: {
+        session_id: string;
+        artifact: ExportArtifact;
+        export_id: string;
+      }): Promise<ExportDeliveryVerification | null>;
+      e2eFeedPcm?(payload: {
+        frames: number;
+        seed?: number;
+        block_frames?: number;
+        pattern?: 'silence' | 'speech';
+      }): Promise<unknown>;
       defaultOutput(): Promise<DefaultOutputResult>;
       getLicenseStatus?(): Promise<LicenseStatus>;
       activateLicense?(ticket: string): Promise<LicenseStatus>;

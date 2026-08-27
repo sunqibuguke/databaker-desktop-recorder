@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const { createHash } = require('node:crypto');
 const { EventEmitter } = require('node:events');
 const fs = require('node:fs/promises');
 const Module = require('node:module');
@@ -54,30 +55,33 @@ class FakeEngineClient extends EventEmitter {
   async request(command, payload, timeout) {
     this.commands.push({ command, payload, timeout });
     if (command === 'get_state_optional') return { active: false };
-    if (command === 'export_session') {
+    if (command === 'export_session_artifact') {
       assert.equal(
         payload.expected_session_id,
         path.basename(payload.session_dir),
         'export must bind the exact task identity seen in the authorized history list',
       );
+      assert.equal(payload.artifact, 'full_track');
       announceExportStarted();
       await exportGate;
       const exportDir = path.join(payload.session_dir, 'export');
-      await fs.mkdir(path.join(exportDir, 'sentences'), { recursive: true });
+      const artifactBytes = Buffer.from('mock wav');
+      const sha256 = createHash('sha256').update(artifactBytes).digest('hex');
+      await fs.mkdir(exportDir, { recursive: true });
       await Promise.all([
-        fs.writeFile(path.join(exportDir, 'full-track.wav'), 'mock wav'),
-        fs.writeFile(path.join(exportDir, 'metadata.json'), '{}\n'),
-        fs.writeFile(path.join(exportDir, 'metadata.csv'), 'id,text\n'),
-        fs.writeFile(path.join(exportDir, 'status.json'), `${JSON.stringify({
+        fs.writeFile(path.join(exportDir, 'full-track.wav'), artifactBytes),
+        fs.writeFile(path.join(exportDir, 'status-full-track.json'), `${JSON.stringify({
           schema_version: 2,
           status: 'complete',
           export_id: 'export-after-timeout',
           session_id: path.basename(payload.session_dir),
+          artifact: 'full_track',
           source: {
-            journal_seq: 1,
             committed_samples: 48000,
-            selected_attempts: [{ id: '1', attempt_id: null }],
+            capture_provenance: [],
           },
+          sha256,
+          size_bytes: artifactBytes.length,
           exported_count: 1,
           skipped_count: 0,
         })}\n`),
@@ -279,6 +283,11 @@ async function main() {
     const list = handlers.get('recordings:list');
     const request = handlers.get('engine:request');
     assert.equal((await list({}, root)).recordings.length, 2);
+    await assert.rejects(
+      request(event, 'export_session', { session_dir: sessionDir }),
+      /不允许的录音引擎命令/,
+      'the legacy export command must not bypass revision-bound artifact export gates',
+    );
 
     // The list established the original identity. Replacing only one durable
     // identity source before export must be rejected in Electron, before the
@@ -288,17 +297,23 @@ async function main() {
       `${JSON.stringify({ schema_version: 1, session_id: 'foreign-session' })}\n`,
     );
     await assert.rejects(
-      request(event, 'export_session', { session_dir: replacedSessionDir }),
+      request(event, 'export_session_artifact', {
+        session_dir: replacedSessionDir,
+        artifact: 'full_track',
+      }),
       /多个持久化来源身份不一致/,
     );
     assert.equal(
-      engine.commands.some(({ command }) => command === 'export_session'),
+      engine.commands.some(({ command }) => command === 'export_session_artifact'),
       false,
       'a replaced task must be rejected before export dispatch',
     );
 
     let exportSettled = false;
-    const exportPromise = request(event, 'export_session', { session_dir: sessionDir })
+    const exportPromise = request(event, 'export_session_artifact', {
+      session_dir: sessionDir,
+      artifact: 'full_track',
+    })
       .finally(() => { exportSettled = true; });
     await exportStarted;
     appEvents.get('window-all-closed')();
@@ -306,7 +321,7 @@ async function main() {
     assert.match(tray.menu[0].label, /正在导出/);
     assert.doesNotMatch(tray.menu[0].label, /后台录音正在进行/,
       'export ownership must never be advertised as capture');
-    const exportCall = engine.commands.find(({ command }) => command === 'export_session');
+    const exportCall = engine.commands.find(({ command }) => command === 'export_session_artifact');
     assert.equal(exportCall.timeout, 1000, 'the test-only long export deadline must reach EngineClient');
 
     // This is a compressed stand-in for crossing the former 120-second UI
@@ -314,7 +329,10 @@ async function main() {
     await new Promise((resolve) => setTimeout(resolve, 40));
     assert.equal(exportSettled, false, 'a long export must remain pending instead of timing out early');
     await assert.rejects(
-      request(event, 'export_session', { session_dir: sessionDir }),
+      request(event, 'export_session_artifact', {
+        session_dir: sessionDir,
+        artifact: 'full_track',
+      }),
       /正在导出/,
     );
     await assert.rejects(
@@ -337,7 +355,7 @@ async function main() {
       /正在导出/,
     );
     assert.equal(
-      engine.commands.filter(({ command }) => command === 'export_session').length,
+      engine.commands.filter(({ command }) => command === 'export_session_artifact').length,
       1,
       'duplicate export must be rejected before reaching the engine',
     );

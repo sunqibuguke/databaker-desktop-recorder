@@ -27,6 +27,21 @@ export type PendingLicenseSeal = {
 
 export type ScriptItem = { id: string; text: string; label: string };
 
+export type QualityIssueCode =
+  | 'input_discontinuity'
+  | 'vad_queue_overflow'
+  | 'vad_classifier_failure'
+  | 'vad_flush_timeout'
+  | 'vad_worker_disconnected';
+
+export type AttemptQualityIssue = {
+  /** String-compatible so a newer engine is handled fail-closed by older UI. */
+  code: QualityIssueCode | string;
+  start_sample?: number;
+  end_sample?: number;
+  detector_generation?: number;
+};
+
 export type Attempt = {
   attempt_id: string;
   start_sample: number;
@@ -42,6 +57,7 @@ export type Attempt = {
   required_tail_silence_samples?: number;
   /** True peak of this take, linear 0–1. Absent on older takes. */
   peak?: number;
+  quality_issues?: AttemptQualityIssue[];
   status: string;
   created_at: string;
 };
@@ -75,6 +91,8 @@ export type CaptureProvenanceSpan = {
 
 export type SessionSnapshot = {
   schema_version: number;
+  /** Monotonic task revision used by stale-command guards. */
+  journal_seq: number;
   session_id: string;
   script_name?: string;
   status: string;
@@ -99,6 +117,7 @@ export type SessionSnapshot = {
   overflow_samples: number;
   input_discontinuity_count?: number;
   input_discontinuity_silence_samples?: number;
+  vad_diagnostics?: VadDiagnostics;
   started_at: string;
   updated_at: string;
   noise_check?: NoiseCheckResult | null;
@@ -207,11 +226,35 @@ export type Meter = {
   silence_threshold_dbfs: number;
   silence_duration_ms: number;
   silence_detector?: SilenceDetector;
+  vad_health?: VadHealth;
+  vad_backlog_samples?: number;
+  vad_backlog_blocks?: number;
+  vad_capacity_samples?: number;
+  vad_capacity_blocks?: number;
+  vad_high_water_samples?: number;
+  vad_overflow_count?: number;
+  vad_dropped_samples?: number;
+  vad_classifier_failure_count?: number;
+  vad_flush_timeout_count?: number;
+  vad_worker_disconnect_count?: number;
   waveform: Array<[number, number]>;
   waveform_end_sample?: number;
 };
 
 export type EngineEvent = { event: string; payload: unknown; protocol_version: number };
+
+export type VadHealth = 'healthy' | 'lagging' | 'degraded' | 'unavailable';
+
+export type VadDiagnostics = {
+  queue_capacity_samples: number;
+  queue_capacity_blocks: number;
+  queue_high_water_samples: number;
+  overflow_count: number;
+  dropped_samples: number;
+  classifier_failure_count: number;
+  flush_timeout_count: number;
+  worker_disconnect_count: number;
+};
 
 export type EngineRecoveryFailedPayload = {
   session_dir: string;
@@ -220,6 +263,21 @@ export type EngineRecoveryFailedPayload = {
 
 export type ExportResult = {
   artifact?: ExportArtifact;
+  export_id?: string;
+  scope?: ExportScope;
+  journal_seq?: number;
+  committed_samples?: number;
+  source?: {
+    journal_seq: number;
+    committed_samples: number;
+    selected_attempts: Record<string, string | null> | Array<{ id: string; attempt_id: string | null }>;
+  } | {
+    /** Full-track exports bind the durable master range, not sentence selections. */
+    committed_samples: number;
+    capture_provenance: CaptureProvenanceSpan[];
+  };
+  manifest_file?: string;
+  sha256?: string;
   export_dir: string;
   master_file?: string;
   master_container?: 'riff' | 'rf64';
@@ -233,6 +291,16 @@ export type ExportResult = {
 };
 
 export type ExportArtifact = 'full_track' | 'cuts_zip' | 'timestamps_json';
+export type ExportScope = 'confirmed_only' | 'complete_task';
+
+export type DeliveryReadinessSummary = {
+  ready: boolean;
+  health: 'clear' | 'warning' | 'blocked';
+  included_items: number;
+  excluded_items: number;
+  blocker_count: number;
+  warning_count: number;
+};
 
 export type InspectedSessionState = {
   snapshot: SessionSnapshot;
@@ -276,6 +344,9 @@ export type PrompterState = {
   silenceProgress: number;
   silenceDurationMs: number;
   qualityWarning?: string;
+  itemDisposition?: import('./p1-workflow').ItemDisposition;
+  recommendedAction?: import('./p1-workflow').RecommendedAction;
+  deliveryHealth?: import('./p1-workflow').DeliveryHealth;
 };
 
 export type RecordingHistoryEntry = {
@@ -298,9 +369,14 @@ export type RecordingHistoryEntry = {
   skipped_items: number;
   review_items: number;
   pending_items: number;
+  blocker_items?: number;
+  warning_items?: number;
+  confirmed_only_readiness?: DeliveryReadinessSummary;
+  complete_task_readiness?: DeliveryReadinessSummary;
   noise_check: NoiseCheckResult | null;
   export_exists: boolean;
   export_artifacts?: Partial<Record<ExportArtifact, ExportArtifactState>>;
+  delivery_verifications?: Partial<Record<ExportArtifact, 'pending' | 'verified' | 'stale' | 'missing' | 'invalid'>>;
   data_health?: 'normal' | 'needs_repair' | 'readonly';
   history_issue?: string;
 };
@@ -313,6 +389,12 @@ export type ExportArtifactState = {
   exported_count?: number;
   skipped_count?: number;
   message?: string;
+  export_id?: string;
+  scope?: ExportScope;
+  sha256?: string;
+  manifest_file?: string;
+  /** History scans only establish that a receipt needs verification. */
+  delivery_verification?: 'pending';
 };
 
 export type RecordingHistoryPage = {
@@ -325,4 +407,41 @@ export type RecordingHistoryPage = {
 export type DefaultOutputResult = {
   outputRoot: string;
   warning?: string;
+};
+
+export type ExportDeliveryRequest = {
+  request_id: string;
+  session_id: string;
+  artifact: ExportArtifact;
+  export_id: string;
+  destination_dir: string;
+};
+
+export type ExportDeliveryProgress = {
+  request_id: string;
+  stage: 'validating' | 'copying' | 'verifying' | 'publishing' | 'writing_receipt';
+  bytes_copied: number;
+  total_bytes: number;
+};
+
+export type ExportDeliveryResult = {
+  request_id: string;
+  session_id: string;
+  artifact: ExportArtifact;
+  export_id: string;
+  directory: string;
+  file_path: string;
+  file_name: string;
+  size_bytes: number;
+  sha256: string;
+  copied: true;
+  receipt_path: string;
+  completed_at: string;
+  verification: 'verified';
+};
+
+export type ExportDeliveryVerification = Omit<ExportDeliveryResult, 'copied' | 'verification'> & {
+  copied?: true;
+  verification: 'verified' | 'stale' | 'missing' | 'invalid';
+  message?: string;
 };

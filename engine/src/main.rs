@@ -10,12 +10,12 @@ mod storage_guard;
 mod vad;
 mod wav;
 
-#[cfg(feature = "system-test")]
-use crate::engine::SystemTestStartSessionPayload;
 use crate::engine::{
-    Engine, ExportArtifact, NoiseCheckPayload, ResumeSessionPayload, SetSilenceSettingsPayload,
-    StartSessionPayload, StopAttemptPayload, is_no_active_session_error,
+    Engine, ExportArtifact, ExportScope, NoiseCheckPayload, ResumeSessionPayload,
+    SetSilenceSettingsPayload, StartSessionPayload, StopAttemptPayload, is_no_active_session_error,
 };
+#[cfg(feature = "system-test")]
+use crate::engine::{SystemTestSignalPattern, SystemTestStartSessionPayload};
 use crate::protocol::{CommandEnvelope, Emitter, PROTOCOL_VERSION};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
@@ -51,6 +51,15 @@ struct OfflineAttemptPayload {
 }
 
 #[derive(Deserialize)]
+struct OfflineSelectAttemptPayload {
+    session_dir: String,
+    expected_session_id: String,
+    item_id: String,
+    attempt_id: String,
+    expected_journal_seq: u64,
+}
+
+#[derive(Deserialize)]
 struct ExportPayload {
     session_dir: String,
     expected_session_id: String,
@@ -61,6 +70,11 @@ struct ExportArtifactPayload {
     session_dir: String,
     expected_session_id: String,
     artifact: ExportArtifact,
+    #[serde(default)]
+    scope: ExportScope,
+    expected_journal_seq: Option<u64>,
+    #[serde(default)]
+    acknowledged_warning_codes: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -77,6 +91,8 @@ struct SystemTestFeedPayload {
     seed: u64,
     #[serde(default = "default_system_test_block_frames")]
     block_frames: usize,
+    #[serde(default)]
+    pattern: SystemTestSignalPattern,
 }
 
 #[cfg(feature = "system-test")]
@@ -226,7 +242,12 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
         #[cfg(feature = "system-test")]
         "test_feed_pcm" => {
             let payload: SystemTestFeedPayload = parse(command.payload)?;
-            engine.system_test_feed(payload.frames, payload.seed, payload.block_frames)
+            engine.system_test_feed(
+                payload.frames,
+                payload.seed,
+                payload.block_frames,
+                payload.pattern,
+            )
         }
         #[cfg(not(windows))]
         "dev_feed_pcm" => {
@@ -239,6 +260,12 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
             let payload: ResumeSessionPayload = serde_json::from_value(command.payload)
                 .context("invalid resume_session payload")?;
             engine.resume_session(payload)
+        }
+        #[cfg(feature = "system-test")]
+        "test_activate_session" => {
+            let payload: ResumeSessionPayload = serde_json::from_value(command.payload)
+                .context("invalid test_activate_session payload")?;
+            engine.test_activate_session(payload)
         }
         "inspect_session" => {
             let payload: OfflineSessionPayload = parse(command.payload)?;
@@ -266,12 +293,13 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
             )
         }
         "select_session_attempt" => {
-            let payload: OfflineAttemptPayload = parse(command.payload)?;
+            let payload: OfflineSelectAttemptPayload = parse(command.payload)?;
             engine.select_session_attempt_expected(
                 &PathBuf::from(payload.session_dir),
                 &payload.expected_session_id,
                 &payload.item_id,
                 &payload.attempt_id,
+                payload.expected_journal_seq,
             )
         }
         "check_noise" => {
@@ -336,10 +364,13 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
         }
         "export_session_artifact" => {
             let payload: ExportArtifactPayload = parse(command.payload)?;
-            engine.export_session_artifact_expected(
+            engine.export_session_artifact_with_options_expected(
                 &PathBuf::from(payload.session_dir),
                 &payload.expected_session_id,
                 payload.artifact,
+                payload.scope,
+                payload.expected_journal_seq,
+                &payload.acknowledged_warning_codes,
             )
         }
         "shutdown" => shutdown_protocol_response(engine.shutdown()),
@@ -362,6 +393,30 @@ mod tests {
     use crate::engine::{AudioFormat, ItemState, SessionSnapshot};
     use crate::wav::RecoverableWav;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(feature = "system-test")]
+    #[test]
+    fn system_test_feed_pattern_defaults_to_speech_and_rejects_unknown_values() {
+        let defaulted: SystemTestFeedPayload = serde_json::from_value(json!({
+            "frames": 256,
+        }))
+        .unwrap();
+        assert_eq!(defaulted.pattern, SystemTestSignalPattern::Speech);
+
+        let silence: SystemTestFeedPayload = serde_json::from_value(json!({
+            "frames": 256,
+            "pattern": "silence",
+        }))
+        .unwrap();
+        assert_eq!(silence.pattern, SystemTestSignalPattern::Silence);
+        assert!(
+            serde_json::from_value::<SystemTestFeedPayload>(json!({
+                "frames": 256,
+                "pattern": "noise",
+            }))
+            .is_err()
+        );
+    }
 
     #[test]
     fn shutdown_protocol_does_not_turn_a_stop_failure_into_success() {
@@ -475,6 +530,7 @@ mod tests {
             silence_duration_ms: 1_000,
             silence_threshold_dbfs: -42.0,
             silence_detector: crate::engine::SilenceDetector::Energy,
+            vad_diagnostics: None,
             items: vec![ItemState {
                 id: "001".to_string(),
                 text: "测试文本".to_string(),

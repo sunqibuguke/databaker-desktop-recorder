@@ -14,6 +14,12 @@ type PersistedNoiseCheck = { passed: boolean } | null | undefined;
 export type IdlePrimaryAction = 'finish' | 'accept' | 'start' | 'retake-only' | 'none';
 export type WorkflowShortcutAction = 'finish' | 'accept' | 'start' | 'retake' | 'none';
 export type ViewShortcutAction = 'preview' | 'enter-capture' | 'none';
+export type WorkflowShortcutTarget = Readonly<{
+  modalOpen: boolean;
+  formControl: boolean;
+  button: boolean;
+  professionalItem: boolean;
+}>;
 export type WorkspacePosture = 'home' | 'setup' | 'view' | 'record';
 export type CaptureExitAction = 'pause' | 'complete' | 'fault';
 export type CaptureExitDialog = 'pause' | 'finish';
@@ -283,6 +289,11 @@ export function viewShortcutAction(code: string, key: string): ViewShortcutActio
   if (code === 'Space' || key.toLowerCase() === 'p') return 'preview';
   if (key.toLowerCase() === 'r') return 'enter-capture';
   return 'none';
+}
+
+export function workflowShortcutTargetAllowed(target: WorkflowShortcutTarget): boolean {
+  if (target.modalOpen || target.formControl) return false;
+  return !target.button || target.professionalItem;
 }
 
 export function resolveRunningItemIndex(

@@ -59,6 +59,9 @@ jobs:
       - name: Run tests including deterministic engine kill recovery
         run: npm test
 
+      - name: Run real Electron P1 golden flows
+        run: npm run test:e2e:electron
+
       - name: Build Windows NSIS installer
         run: npm run package:win
         env:

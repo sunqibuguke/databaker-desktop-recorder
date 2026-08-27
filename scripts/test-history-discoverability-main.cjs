@@ -389,11 +389,18 @@ async function main() {
     assert.deepEqual(openedPaths, [validDir, path.join(validDir, 'export'), partialDir],
       'an inspection-only damaged task must still allow opening its real directory');
     await assert.rejects(
-      handlers.get('engine:request')(event, 'export_session', { session_dir: partialDir }),
+      handlers.get('engine:request')(event, 'export_session_artifact', {
+        session_dir: partialDir,
+        artifact: 'full_track',
+      }),
       /无法确认录制任务身份/,
       'a visible damaged task must not become trusted for export',
     );
-    assert.equal(globalThis.discoverabilityEngine.commands.some(({ command }) => command === 'export_session'), false);
+    assert.equal(
+      globalThis.discoverabilityEngine.commands
+        .some(({ command }) => command === 'export_session_artifact'),
+      false,
+    );
 
     const nextRecordingRoot = path.join(root, 'second-external-drive');
     await fs.mkdir(nextRecordingRoot);

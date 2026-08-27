@@ -1,0 +1,317 @@
+{
+  "version": 1,
+  "committed_samples": 10000,
+  "task_status": "stopped",
+  "overflow_samples": 0,
+  "audio_format": { "sample_rate": 48000 },
+  "capture_provenance": [{ "start_sample": 0, "end_sample": 10000, "device_name": "Fixture Input", "device_id": "fixture-input", "input_sample_format": "f32", "input_channels": 1, "input_channel": 1, "sample_rate": 48000 }],
+  "cases": [
+    {
+      "name": "unrecorded",
+      "item": { "id": "001", "text": "未录制", "label": "A", "status": "pending", "attempts": [], "selected_attempt_id": null },
+      "expected": { "disposition": "unrecorded", "recommendedAction": "record", "deliveryHealth": "blocked" }
+    },
+    {
+      "name": "first take pending confirmation",
+      "item": {
+        "id": "002", "text": "首录待确认", "label": "A", "status": "review", "selected_attempt_id": null,
+        "attempts": [{ "attempt_id": "002-a1", "start_sample": 100, "recording_started_sample": 100, "content_started_sample": 200, "end_sample": 800, "status": "recorded", "created_at": "2026-08-27T00:00:00Z" }]
+      },
+      "expected": { "disposition": "first_take_review", "recommendedAction": "confirm_first", "deliveryHealth": "blocked" }
+    },
+    {
+      "name": "retake pending decision",
+      "item": {
+        "id": "003", "text": "重录待决策", "label": "A", "status": "review", "selected_attempt_id": "003-a1",
+        "attempts": [
+          { "attempt_id": "003-a1", "start_sample": 100, "recording_started_sample": 100, "content_started_sample": 200, "end_sample": 800, "status": "accepted", "created_at": "2026-08-27T00:00:00Z" },
+          { "attempt_id": "003-a2", "start_sample": 900, "recording_started_sample": 900, "content_started_sample": 1000, "end_sample": 1600, "status": "recorded", "created_at": "2026-08-27T00:01:00Z" }
+        ]
+      },
+      "expected": { "disposition": "retake_review", "recommendedAction": "decide_retake", "deliveryHealth": "blocked" }
+    },
+    {
+      "name": "rerecord required without old version",
+      "item": {
+        "id": "004", "text": "需重录", "label": "A", "status": "review", "selected_attempt_id": null,
+        "attempts": [{ "attempt_id": "004-a1", "start_sample": 100, "recording_started_sample": 100, "content_started_sample": 200, "end_sample": 800, "status": "needs_rerecord", "created_at": "2026-08-27T00:00:00Z", "quality_issues": [{ "code": "vad_queue_overflow", "start_sample": 400, "end_sample": 500, "detector_generation": 7 }] }]
+      },
+      "expected": { "disposition": "rerecord_required", "recommendedAction": "rerecord", "deliveryHealth": "blocked" }
+    },
+    {
+      "name": "affected retake retains old version",
+      "item": {
+        "id": "005", "text": "仍用旧版", "label": "A", "status": "accepted", "selected_attempt_id": "005-a1",
+        "attempts": [
+          { "attempt_id": "005-a1", "start_sample": 100, "recording_started_sample": 100, "content_started_sample": 200, "end_sample": 800, "status": "accepted", "created_at": "2026-08-27T00:00:00Z" },
+          { "attempt_id": "005-a2", "start_sample": 900, "recording_started_sample": 900, "content_started_sample": 1000, "end_sample": 1600, "status": "needs_rerecord", "created_at": "2026-08-27T00:01:00Z", "quality_issues": [{ "code": "input_discontinuity", "start_sample": 1200, "end_sample": 1300 }] }
+        ]
+      },
+      "expected": { "disposition": "retained_previous", "recommendedAction": "continue", "deliveryHealth": "warning" }
+    },
+    {
+      "name": "selected clean version",
+      "item": {
+        "id": "006", "text": "已采用", "label": "A", "status": "accepted", "selected_attempt_id": "006-a1",
+        "attempts": [{ "attempt_id": "006-a1", "start_sample": 100, "recording_started_sample": 100, "content_started_sample": 200, "end_sample": 800, "status": "accepted", "created_at": "2026-08-27T00:00:00Z" }]
+      },
+      "expected": { "disposition": "selected", "recommendedAction": "continue", "deliveryHealth": "clear" }
+    },
+    {
+      "name": "skipped item",
+      "item": { "id": "007", "text": "已跳过", "label": "A", "status": "skipped", "attempts": [], "selected_attempt_id": null },
+      "expected": { "disposition": "skipped", "recommendedAction": "none", "deliveryHealth": "warning" }
+    },
+    {
+      "name": "dangling selected attempt",
+      "item": { "id": "008", "text": "悬空版本", "label": "A", "status": "accepted", "attempts": [], "selected_attempt_id": "missing" },
+      "expected": { "disposition": "inconsistent", "recommendedAction": "repair", "deliveryHealth": "blocked", "blockers": ["selected_not_found"] }
+    },
+    {
+      "name": "unknown quality code fails closed",
+      "item": {
+        "id": "009", "text": "未知质量码", "label": "A", "status": "accepted", "selected_attempt_id": "009-a1",
+        "attempts": [{ "attempt_id": "009-a1", "start_sample": 100, "recording_started_sample": 100, "content_started_sample": 200, "end_sample": 800, "status": "accepted", "created_at": "2026-08-27T00:00:00Z", "quality_issues": [{ "code": "future_issue" }] }]
+      },
+      "expected": { "disposition": "inconsistent", "recommendedAction": "repair", "deliveryHealth": "blocked", "blockers": ["unknown_quality_issue"] }
+    },
+    {
+      "name": "accepted item with recorded candidate fails closed",
+      "item": {
+        "id": "010", "text": "确认状态仍有候选", "label": "A", "status": "accepted", "selected_attempt_id": "010-a1",
+        "attempts": [
+          { "attempt_id": "010-a1", "start_sample": 100, "recording_started_sample": 100, "content_started_sample": 200, "end_sample": 800, "status": "accepted", "created_at": "2026-08-27T00:00:00Z" },
+          { "attempt_id": "010-a2", "start_sample": 900, "recording_started_sample": 900, "content_started_sample": 1000, "end_sample": 1600, "status": "recorded", "created_at": "2026-08-27T00:01:00Z" }
+        ]
+      },
+      "expected": { "disposition": "inconsistent", "recommendedAction": "repair", "deliveryHealth": "blocked", "blockers": ["accepted_has_recorded_candidate"] }
+    },
+    {
+      "name": "multiple accepted attempts fail closed",
+      "item": {
+        "id": "011", "text": "多个确认版本", "label": "A", "status": "accepted", "selected_attempt_id": "011-a2",
+        "attempts": [
+          { "attempt_id": "011-a1", "start_sample": 100, "recording_started_sample": 100, "content_started_sample": 200, "end_sample": 800, "status": "accepted", "created_at": "2026-08-27T00:00:00Z" },
+          { "attempt_id": "011-a2", "start_sample": 900, "recording_started_sample": 900, "content_started_sample": 1000, "end_sample": 1600, "status": "accepted", "created_at": "2026-08-27T00:01:00Z" }
+        ]
+      },
+      "expected": { "disposition": "inconsistent", "recommendedAction": "repair", "deliveryHealth": "blocked", "blockers": ["multiple_accepted_attempts"] }
+    },
+    {
+      "name": "skipped item with selected attempt fails closed",
+      "item": {
+        "id": "012", "text": "跳过状态仍有版本", "label": "A", "status": "skipped", "selected_attempt_id": "012-a1",
+        "attempts": [{ "attempt_id": "012-a1", "start_sample": 100, "recording_started_sample": 100, "content_started_sample": 200, "end_sample": 800, "status": "accepted", "created_at": "2026-08-27T00:00:00Z" }]
+      },
+      "expected": { "disposition": "inconsistent", "recommendedAction": "repair", "deliveryHealth": "blocked", "blockers": ["selected_not_accepted"] }
+    },
+    {
+      "name": "malformed non-selected history fails closed",
+      "item": {
+        "id": "013", "text": "历史版本结构损坏", "label": "A", "status": "accepted", "selected_attempt_id": "013-a1",
+        "attempts": [
+          { "attempt_id": "013-a1", "start_sample": 100, "recording_started_sample": 100, "content_started_sample": 200, "end_sample": 800, "status": "accepted", "created_at": "2026-08-27T00:00:00Z" },
+          { "attempt_id": "013-a2", "start_sample": 900, "recording_started_sample": 900, "content_started_sample": 1000, "end_sample": 10001, "status": "rejected_by_operator", "created_at": "2026-08-27T00:01:00Z", "quality_issues": [{ "code": "input_discontinuity", "start_sample": 1200 }] }
+        ]
+      },
+      "expected": { "disposition": "inconsistent", "recommendedAction": "repair", "deliveryHealth": "blocked", "blockers": ["selected_beyond_committed", "quality_issue_range_invalid"] }
+    },
+    {
+      "name": "empty attempt id fails closed",
+      "item": {
+        "id": "014", "text": "录音版本缺少 ID", "label": "A", "status": "review", "selected_attempt_id": null,
+        "attempts": [{ "attempt_id": "   ", "start_sample": 100, "recording_started_sample": 100, "content_started_sample": 200, "end_sample": 800, "status": "recorded", "created_at": "2026-08-27T00:00:00Z" }]
+      },
+      "expected": { "disposition": "inconsistent", "recommendedAction": "repair", "deliveryHealth": "blocked", "blockers": ["attempt_id_invalid"] }
+    },
+    {
+      "name": "duplicate attempt ids fail closed",
+      "item": {
+        "id": "015", "text": "录音版本 ID 重复", "label": "A", "status": "accepted", "selected_attempt_id": "015-a1",
+        "attempts": [
+          { "attempt_id": "015-a1", "start_sample": 100, "recording_started_sample": 100, "content_started_sample": 200, "end_sample": 800, "status": "accepted", "created_at": "2026-08-27T00:00:00Z" },
+          { "attempt_id": "015-a1", "start_sample": 900, "recording_started_sample": 900, "content_started_sample": 1000, "end_sample": 1600, "status": "rejected_by_operator", "created_at": "2026-08-27T00:01:00Z" }
+        ]
+      },
+      "expected": { "disposition": "inconsistent", "recommendedAction": "repair", "deliveryHealth": "blocked", "blockers": ["attempt_id_invalid"] }
+    },
+    {
+      "name": "empty item id fails closed",
+      "item": { "id": "   ", "text": "句子缺少 ID", "label": "A", "status": "pending", "attempts": [], "selected_attempt_id": null },
+      "expected": { "disposition": "inconsistent", "recommendedAction": "repair", "deliveryHealth": "blocked", "blockers": ["item_id_invalid"] }
+    },
+    {
+      "name": "retained previous requires accepted item status",
+      "item": {
+        "id": "016", "text": "旧版保留状态矛盾", "label": "A", "status": "review", "selected_attempt_id": "016-a1",
+        "attempts": [
+          { "attempt_id": "016-a1", "start_sample": 100, "recording_started_sample": 100, "content_started_sample": 200, "end_sample": 800, "status": "accepted", "created_at": "2026-08-27T00:00:00Z" },
+          { "attempt_id": "016-a2", "start_sample": 900, "recording_started_sample": 900, "content_started_sample": 1000, "end_sample": 1600, "status": "needs_rerecord", "created_at": "2026-08-27T00:01:00Z", "quality_issues": [{ "code": "vad_flush_timeout" }] }
+        ]
+      },
+      "expected": { "disposition": "inconsistent", "recommendedAction": "repair", "deliveryHealth": "blocked", "blockers": ["unknown_item_status"] }
+    },
+    {
+      "name": "recording start beyond attempt end fails closed",
+      "item": {
+        "id": "017", "text": "录音起点越过结束", "label": "A", "status": "accepted", "selected_attempt_id": "017-a1",
+        "attempts": [{ "attempt_id": "017-a1", "start_sample": 100, "recording_started_sample": 900, "content_started_sample": 0, "end_sample": 800, "status": "accepted", "created_at": "2026-08-27T00:00:00Z" }]
+      },
+      "expected": { "disposition": "inconsistent", "recommendedAction": "repair", "deliveryHealth": "blocked", "blockers": ["selected_range_invalid"] }
+    },
+    {
+      "name": "attempt start before recording start fails closed",
+      "item": {
+        "id": "018", "text": "切片起点早于开录", "label": "A", "status": "accepted", "selected_attempt_id": "018-a1",
+        "attempts": [{ "attempt_id": "018-a1", "start_sample": 100, "recording_started_sample": 200, "content_started_sample": 300, "end_sample": 800, "status": "accepted", "created_at": "2026-08-27T00:00:00Z" }]
+      },
+      "expected": { "disposition": "inconsistent", "recommendedAction": "repair", "deliveryHealth": "blocked", "blockers": ["selected_range_invalid"] }
+    },
+    {
+      "name": "content start before attempt start fails closed",
+      "item": {
+        "id": "019", "text": "内容起点早于切片", "label": "A", "status": "accepted", "selected_attempt_id": "019-a1",
+        "attempts": [{ "attempt_id": "019-a1", "start_sample": 300, "recording_started_sample": 100, "content_started_sample": 200, "end_sample": 800, "status": "accepted", "created_at": "2026-08-27T00:00:00Z" }]
+      },
+      "expected": { "disposition": "inconsistent", "recommendedAction": "repair", "deliveryHealth": "blocked", "blockers": ["selected_range_invalid"] }
+    },
+    {
+      "name": "trimmed clip may start after recording begins",
+      "item": {
+        "id": "020", "text": "合法的句首裁切", "label": "A", "status": "accepted", "selected_attempt_id": "020-a1",
+        "attempts": [{ "attempt_id": "020-a1", "start_sample": 300, "recording_started_sample": 100, "content_started_sample": 400, "end_sample": 800, "status": "accepted", "created_at": "2026-08-27T00:00:00Z" }]
+      },
+      "expected": { "disposition": "selected", "recommendedAction": "continue", "deliveryHealth": "clear" }
+    },
+    {
+      "name": "head silence markers beyond attempt end fail closed",
+      "item": {
+        "id": "021", "text": "句首静音标记越过结束", "label": "A", "status": "accepted", "selected_attempt_id": "021-a1",
+        "attempts": [{ "attempt_id": "021-a1", "start_sample": 300, "recording_started_sample": 100, "head_silence_armed_sample": 900, "head_silence_passed_sample": 950, "content_started_sample": 400, "end_sample": 800, "status": "accepted", "created_at": "2026-08-27T00:00:00Z" }]
+      },
+      "expected": { "disposition": "inconsistent", "recommendedAction": "repair", "deliveryHealth": "blocked", "blockers": ["selected_range_invalid"] }
+    },
+    {
+      "name": "incomplete required head silence contract fails closed",
+      "item": {
+        "id": "022", "text": "句首静音不足但被标记通过", "label": "A", "status": "accepted", "selected_attempt_id": "022-a1",
+        "attempts": [{ "attempt_id": "022-a1", "start_sample": 100, "recording_started_sample": 100, "head_silence_armed_sample": 100, "head_silence_passed_sample": 200, "required_head_silence_samples": 1000, "content_started_sample": 300, "end_sample": 800, "status": "accepted", "created_at": "2026-08-27T00:00:00Z" }]
+      },
+      "expected": { "disposition": "inconsistent", "recommendedAction": "repair", "deliveryHealth": "blocked", "blockers": ["selected_range_invalid"] }
+    },
+    {
+      "name": "review with selected version but no candidate fails closed",
+      "item": {
+        "id": "023", "text": "review 状态缺少重录候选", "label": "A", "status": "review", "selected_attempt_id": "023-a1",
+        "attempts": [{ "attempt_id": "023-a1", "start_sample": 100, "recording_started_sample": 100, "content_started_sample": 200, "end_sample": 800, "status": "accepted", "created_at": "2026-08-27T00:00:00Z" }]
+      },
+      "expected": { "disposition": "inconsistent", "recommendedAction": "repair", "deliveryHealth": "blocked", "blockers": ["unknown_item_status"] }
+    }
+  ],
+  "task_cases": [
+    {
+      "name": "duplicate item ids fail closed for every affected row",
+      "items": [
+        {
+          "id": "duplicate-item", "text": "重复句子一", "label": "A", "status": "accepted", "selected_attempt_id": "duplicate-item-a1",
+          "attempts": [{ "attempt_id": "duplicate-item-a1", "start_sample": 100, "recording_started_sample": 100, "content_started_sample": 200, "end_sample": 800, "status": "accepted", "created_at": "2026-08-27T00:00:00Z" }]
+        },
+        {
+          "id": "duplicate-item", "text": "重复句子二", "label": "B", "status": "accepted", "selected_attempt_id": "duplicate-item-a2",
+          "attempts": [{ "attempt_id": "duplicate-item-a2", "start_sample": 900, "recording_started_sample": 900, "content_started_sample": 1000, "end_sample": 1600, "status": "accepted", "created_at": "2026-08-27T00:01:00Z" }]
+        }
+      ],
+      "expected": { "affected_indices": [0, 1], "reason": "item_id_invalid", "blocker_count": 2, "confirmed_only_ready": false, "complete_task_ready": false }
+    }
+  ],
+  "provenance_cases": [
+    {
+      "name": "missing legacy provenance fails closed",
+      "item_name": "selected clean version",
+      "mode": "missing",
+      "expected_blocker": "selected_provenance_gap"
+    },
+    {
+      "name": "explicit empty provenance fails closed",
+      "item_name": "selected clean version",
+      "mode": "empty",
+      "expected_blocker": "selected_provenance_gap"
+    }
+  ],
+  "task_provenance_cases": [
+    {
+      "name": "full contiguous provenance permits cuts",
+      "capture_provenance": [{ "start_sample": 0, "end_sample": 4000, "device_name": "Fixture Input", "device_id": "fixture-input", "input_sample_format": "f32", "input_channels": 1, "input_channel": 1, "sample_rate": 48000 }, { "start_sample": 4000, "end_sample": 10000, "device_name": "Fixture Input", "device_id": "fixture-input", "input_sample_format": "f32", "input_channels": 1, "input_channel": 1, "sample_rate": 48000 }],
+      "expected_ready": true
+    },
+    {
+      "name": "missing task provenance blocks cuts",
+      "expected_ready": false
+    },
+    {
+      "name": "empty task provenance blocks nonempty cuts",
+      "capture_provenance": [],
+      "expected_ready": false
+    },
+    {
+      "name": "task provenance must begin at zero",
+      "capture_provenance": [{ "start_sample": 100, "end_sample": 10000, "device_name": "Fixture Input", "device_id": "fixture-input", "input_sample_format": "f32", "input_channels": 1, "input_channel": 1, "sample_rate": 48000 }],
+      "expected_ready": false
+    },
+    {
+      "name": "task provenance gap blocks cuts",
+      "capture_provenance": [{ "start_sample": 0, "end_sample": 4000, "device_name": "Fixture Input", "device_id": "fixture-input", "input_sample_format": "f32", "input_channels": 1, "input_channel": 1, "sample_rate": 48000 }, { "start_sample": 5000, "end_sample": 10000, "device_name": "Fixture Input", "device_id": "fixture-input", "input_sample_format": "f32", "input_channels": 1, "input_channel": 1, "sample_rate": 48000 }],
+      "expected_ready": false
+    },
+    {
+      "name": "task provenance overlap blocks cuts",
+      "capture_provenance": [{ "start_sample": 0, "end_sample": 5000, "device_name": "Fixture Input", "device_id": "fixture-input", "input_sample_format": "f32", "input_channels": 1, "input_channel": 1, "sample_rate": 48000 }, { "start_sample": 4000, "end_sample": 10000, "device_name": "Fixture Input", "device_id": "fixture-input", "input_sample_format": "f32", "input_channels": 1, "input_channel": 1, "sample_rate": 48000 }],
+      "expected_ready": false
+    },
+    {
+      "name": "task provenance must cover committed tail",
+      "capture_provenance": [{ "start_sample": 0, "end_sample": 9000, "device_name": "Fixture Input", "device_id": "fixture-input", "input_sample_format": "f32", "input_channels": 1, "input_channel": 1, "sample_rate": 48000 }],
+      "expected_ready": false
+    },
+    {
+      "name": "task provenance may not exceed committed audio",
+      "capture_provenance": [{ "start_sample": 0, "end_sample": 10001, "device_name": "Fixture Input", "device_id": "fixture-input", "input_sample_format": "f32", "input_channels": 1, "input_channel": 1, "sample_rate": 48000 }],
+      "expected_ready": false
+    },
+    {
+      "name": "task provenance driver metadata must be valid",
+      "capture_provenance": [{ "start_sample": 0, "end_sample": 10000, "device_name": "Fixture Input", "device_id": "fixture-input", "input_sample_format": "f32", "input_channels": 1, "input_channel": 2, "sample_rate": 48000 }],
+      "expected_ready": false
+    }
+  ],
+  "data_preservation_cases": [
+    { "name": "stopped healthy master is clear", "input": { "status": "stopped", "overflow_samples": 0 }, "expected": { "ready": true, "health": "clear" } },
+    { "name": "faulted master remains preservable with warning", "input": { "status": "faulted", "overflow_samples": 0 }, "expected": { "ready": true, "health": "warning", "warnings": ["task_audio_fault"] } },
+    { "name": "overflowed master remains preservable with warning", "input": { "status": "stopped", "overflow_samples": 12 }, "expected": { "ready": true, "health": "warning", "warnings": ["task_audio_fault"] } },
+    { "name": "live task is not ready for preservation export", "input": { "status": "recording", "overflow_samples": 0 }, "expected": { "ready": false, "health": "blocked", "blockers": ["task_not_stopped"] } },
+    { "name": "missing task state fails closed", "input": { "overflow_samples": 0 }, "expected": { "ready": false, "health": "blocked", "blockers": ["task_not_stopped"] } },
+    { "name": "missing overflow evidence fails closed", "input": { "status": "stopped" }, "expected": { "ready": false, "health": "blocked", "blockers": ["task_audio_fault"] } }
+  ],
+  "vad_health_cases": [
+    { "name": "historical diagnostics are warning only", "task_issues": { "vadHealth": "healthy", "vadDiagnosticFaultCount": 3 }, "expected": { "blockers": 0, "warnings": 1, "kinds": ["vad_diagnostics"] } },
+    { "name": "current degraded worker is blocker", "task_issues": { "vadHealth": "degraded", "vadDiagnosticFaultCount": 3 }, "expected": { "blockers": 1, "warnings": 1, "kinds": ["vad_health", "vad_diagnostics"] } },
+    { "name": "current lag is warning", "task_issues": { "vadHealth": "lagging", "vadDiagnosticFaultCount": 0 }, "expected": { "blockers": 0, "warnings": 1, "kinds": ["vad_health"] } }
+  ],
+  "warning_cases": [
+    {
+      "name": "no speech marker does not create head silence warning",
+      "attempt": { "attempt_id": "warning-a1", "start_sample": 100, "recording_started_sample": 100, "content_started_sample": 0, "end_sample": 800, "required_head_silence_samples": 480, "tail_silence_samples": 480, "required_tail_silence_samples": 480, "status": "accepted", "created_at": "2026-08-27T00:00:00Z" },
+      "expected_warning_codes": []
+    },
+    {
+      "name": "legacy forced flag without a required tail does not create export warning",
+      "attempt": { "attempt_id": "warning-a2", "start_sample": 100, "recording_started_sample": 100, "content_started_sample": 200, "end_sample": 800, "required_head_silence_samples": 0, "forced_without_tail_silence": true, "tail_silence_samples": 0, "required_tail_silence_samples": 0, "status": "accepted", "created_at": "2026-08-27T00:00:00Z" },
+      "expected_warning_codes": []
+    }
+  ],
+  "scope_case": {
+    "item_names": ["selected clean version", "affected retake retains old version", "unrecorded", "skipped item"],
+    "confirmed_only": { "ready": true, "included": ["006", "005"], "excluded": ["001", "007"], "requiresAcknowledgement": true },
+    "complete_task": { "ready": false, "included": ["006", "005"], "excluded": ["001", "007"], "requiresAcknowledgement": true }
+  }
+}

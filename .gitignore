@@ -9,6 +9,9 @@ build/bin/
 .DS_Store
 *.log
 recordings/
+test-results/
+playwright-report/
+.playwright-artifacts/
 
 # Historical mobile source is local reference material only. It contains
 # generated dependencies, binaries and environment-specific configuration.

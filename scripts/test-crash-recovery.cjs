@@ -410,7 +410,10 @@ async function main() {
     const interrupted = killedResult.snapshot.items[0].attempts[0];
     assert.equal(interrupted.attempt_id, '001-crashed');
     assert.equal(interrupted.status, 'interrupted');
-    assert.equal(interrupted.start_sample, 100);
+    // Older journals can carry a pre-arm start boundary. Recovery must never
+    // expose a diagnostic attempt before the physical recording start.
+    assert.equal(interrupted.start_sample, 110);
+    assert.equal(interrupted.recording_started_sample, 110);
     assert.equal(interrupted.end_sample, killedFrames);
     assert.ok(killedResult.warnings.some((warning) => warning.includes('最后一行不完整')));
     assert.ok(killedResult.warnings.some((warning) => warning.includes('最终快照')));
