@@ -3,8 +3,8 @@
   "profile": "databaker-windows-v1",
   "qualification_id": "REPLACE-ME-WIN-AUDIO-001",
   "release": {
-    "app_version": "0.1.0",
-    "installer_path": "./DataBaker-Recorder-0.1.0-Windows-x64.exe",
+    "app_version": "0.2.0",
+    "installer_path": "./DataBaker-Recorder-0.2.0-Windows-x64.exe",
     "installer_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
     "engine_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
     "acceptance_tool_sha256": "0000000000000000000000000000000000000000000000000000000000000000"

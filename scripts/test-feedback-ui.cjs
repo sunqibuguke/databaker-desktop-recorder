@@ -12,8 +12,11 @@ const css = fs.readFileSync(path.join(root, 'src', 'styles.css'), 'utf8');
 
 assert.match(recorder, /parseScript\(file\.content, file\.name\)/);
 assert.match(recorder, /scriptPreview\.items\.slice\(0, 10\)/);
-assert.match(recorder, /data-testid="confirm-script-preview"/);
-assert.match(recorder, /scriptPreviewConfirmed && scriptItems\.length > 0/);
+assert.match(recorder, /data-testid="open-script-preview"/);
+assert.match(recorder, /data-testid="close-script-preview"/);
+assert.match(recorder, /setScriptItems\(parsed\.errors\.length \? \[\] : parsed\.items\)/);
+assert.match(recorder, /const scriptReady = scriptItems\.length > 0 && !scriptErrors\.length/);
+assert.doesNotMatch(recorder, /confirm-script-preview|scriptPreviewConfirmed|confirmScriptPreview/);
 assert.match(recorder, /isLabelBoundary\(items, index\)/);
 assert.match(recorder, /itemRequiresRerecord\(item\)/);
 assert.match(recorder, /findNextRerecordIndex\(items, currentIndex\)/);

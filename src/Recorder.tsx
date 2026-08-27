@@ -697,7 +697,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const [scriptItems, setScriptItems] = useState<ScriptItem[]>([]);
   const [scriptErrors, setScriptErrors] = useState<string[]>([]);
   const [scriptPreview, setScriptPreview] = useState<ParseResult | null>(null);
-  const [scriptPreviewConfirmed, setScriptPreviewConfirmed] = useState(false);
+  const [scriptPreviewOpen, setScriptPreviewOpen] = useState(false);
   const [snapshot, setSnapshot] = useState<SessionSnapshot | null>(null);
   const [captureActive, setCaptureActive] = useState(false);
   const [devWebCaptureEnabled, setDevWebCaptureEnabled] = useState(false);
@@ -2362,13 +2362,13 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   function stageScriptPreview(fileName: string, parsed: ParseResult) {
     setScriptFile(fileName);
     setSessionName(fileName.replace(/\.[^.]+$/, '') || t('setup.newSessionName'));
-    setScriptItems([]);
+    setScriptItems(parsed.errors.length ? [] : parsed.items);
     setScriptPreview(parsed);
-    setScriptPreviewConfirmed(false);
+    setScriptPreviewOpen(false);
     setScriptErrors(parsed.errors);
     logUserAction(
       parsed.errors.length ? 'ui.import_script.invalid' : 'ui.import_script',
-      parsed.errors.length ? `脚本 ${fileName} 需要修正` : `已读取脚本 ${fileName}，等待预览确认`,
+      parsed.errors.length ? `脚本 ${fileName} 需要修正` : `已导入脚本 ${fileName}`,
       {
         name: fileName,
         items: parsed.items.length,
@@ -2378,20 +2378,9 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       },
       parsed.errors.length ? 'warn' : 'info',
     );
-    setNotice(parsed.errors.length ? t('notice.scriptNeedsFix') : t('setup.previewConfirmHint'));
-  }
-
-  function confirmScriptPreview() {
-    if (!scriptPreview || scriptPreview.errors.length || !scriptPreview.items.length) return;
-    setScriptItems(scriptPreview.items);
-    setScriptPreviewConfirmed(true);
-    setNotice(t('notice.importedItems', { count: scriptPreview.items.length }));
-    logUserAction('ui.import_script.confirmed', '已确认脚本导入预览', {
-      name: scriptFile,
-      items: scriptPreview.items.length,
-      mode: scriptPreview.mode,
-      summary: scriptPreview.summary,
-    });
+    setNotice(parsed.errors.length
+      ? t('notice.scriptNeedsFix')
+      : t('notice.importedItems', { count: parsed.items.length }));
   }
 
   async function chooseScript() {
@@ -2514,7 +2503,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     if (options?.captureShareMode) setCaptureShareMode(nextShareMode);
     if (options?.inputSampleFormat) setInputSampleFormat(nextSampleFormat);
     const settingsAlreadyChosen = Boolean(options?.captureShareMode || options?.inputSampleFormat);
-    if (!scriptPreviewConfirmed || !scriptItems.length || scriptErrors.length || !selectedDevice || !outputDir || (!settingsAlreadyChosen && !captureConfigurationValid)) {
+    if (!scriptItems.length || scriptErrors.length || !selectedDevice || !outputDir || (!settingsAlreadyChosen && !captureConfigurationValid)) {
       if (!settingsAlreadyChosen && captureConfigurationIssue) setError(captureConfigurationIssue);
       return false;
     }
@@ -3683,7 +3672,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setScriptItems([]);
     setScriptErrors([]);
     setScriptPreview(null);
-    setScriptPreviewConfirmed(false);
+    setScriptPreviewOpen(false);
     setSessionName(t('setup.newSessionName'));
     setSilenceDetector('vad');
     setSilenceDetectorDraft('vad');
@@ -3759,6 +3748,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       }
       if (openActionsSessionDir && event.key === 'Escape') {
         setOpenActionsSessionDir('');
+        return;
+      }
+      if (scriptPreviewOpen) {
+        if (event.key === 'Escape') setScriptPreviewOpen(false);
         return;
       }
       if (previewOpen) {
@@ -4220,7 +4213,8 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   }
 
   if (phase === 'setup') {
-    const readyToStart = engineStatus === 'ready' && scriptPreviewConfirmed && scriptItems.length > 0 && !scriptErrors.length && Boolean(outputDir) && captureConfigurationValid && !busy && !presetBusy;
+    const scriptReady = scriptItems.length > 0 && !scriptErrors.length;
+    const readyToStart = engineStatus === 'ready' && scriptReady && Boolean(outputDir) && captureConfigurationValid && !busy && !presetBusy;
     return <div className="studio-shell">
       <StudioChrome phase={phase} title={t('setup.title')} onBack={returnToRecordings} onOpenSettings={() => setSettingsOpen(true)} />
       <div className="studio-workspace setup-workspace" data-testid="setup-workspace">
@@ -4229,7 +4223,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           <div className="panel-tabs"><button className="active">{t('setup.tabPrepare')}</button><button>{t('setup.tabPresets')}</button></div>
           <div className="panel-section-title">{t('setup.title')}</div>
           <ol className="setup-steps">
-            <li className={scriptPreviewConfirmed ? 'complete' : 'active'}><span>{scriptPreviewConfirmed ? <Icon name="check" size={13} /> : '1'}</span><div><strong>{t('setup.stepImportTitle')}</strong><small>{scriptPreviewConfirmed ? t('setup.previewConfirmed') : scriptFile || t('setup.stepImportHint')}</small></div></li>
+            <li className={scriptReady ? 'complete' : 'active'}><span>{scriptReady ? <Icon name="check" size={13} /> : '1'}</span><div><strong>{t('setup.stepImportTitle')}</strong><small>{scriptReady ? t('setup.previewImported') : scriptFile || t('setup.stepImportHint')}</small></div></li>
             <li className={deviceName ? 'complete' : ''}><span>{deviceName ? <Icon name="check" size={13} /> : '2'}</span><div><strong>{t('setup.stepAudioTitle')}</strong><small>{deviceName || t('setup.stepAudioHint')}</small></div></li>
             <li className={outputDir ? 'complete' : ''}><span>{outputDir ? <Icon name="check" size={13} /> : '3'}</span><div><strong>{t('setup.stepSaveTitle')}</strong><small>{t('setup.stepSaveHint')}</small></div></li>
           </ol>
@@ -4242,36 +4236,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
               <div className="property-heading"><span>01</span><div><h2>{t('setup.scriptHeading')}</h2><p>{t('setup.scriptHelp')}</p></div></div>
               <label className={`script-picker ${busy ? 'disabled' : ''}`}><input data-testid="script-file" className="file-input" type="file" accept=".csv,.tsv,.txt,text/csv,text/tab-separated-values,text/plain" disabled={Boolean(busy)} onChange={(event) => void chooseScriptFile(event.target.files?.[0])} /><span className="picker-icon"><Icon name="file" size={19} /></span><span className="picker-copy"><strong>{scriptFile || t('setup.pickScript')}</strong><small>{scriptFile && scriptPreview ? t('setup.scriptLoaded', { count: scriptPreview.summary.totalItems }) : t('setup.scriptColumns')}</small></span><span className="button subtle">{t('common.browse')}</span></label>
               {scriptErrors.length > 0 && <div className="validation-errors">{scriptErrors.slice(0, 5).map((message) => <p key={message}>{message}</p>)}</div>}
-              {scriptPreview && <section className={`script-import-preview${scriptPreviewConfirmed ? ' confirmed' : ''}`} data-testid="script-import-preview" aria-label={t('setup.previewTitle')}>
-                <header>
-                  <div><strong>{t('setup.previewTitle')}</strong><small>{t(scriptPreview.mode === 'structured' ? 'setup.previewStructuredHint' : 'setup.previewPlainTextHint')}</small></div>
-                  <span className={`script-mode ${scriptPreview.mode}`}>{t(scriptPreview.mode === 'structured' ? 'setup.previewStructured' : 'setup.previewPlainText')}</span>
-                </header>
-                <dl className="script-preview-stats">
-                  <div><dt>{t('setup.previewTotal')}</dt><dd>{scriptPreview.summary.totalItems}</dd></div>
-                  <div><dt>{t('setup.previewEmptyLabels')}</dt><dd>{scriptPreview.summary.emptyLabelCount}</dd></div>
-                  <div><dt>{t('setup.previewUniqueLabels')}</dt><dd>{scriptPreview.summary.uniqueLabelCount}</dd></div>
-                  <div><dt>{t('setup.previewLabelChanges')}</dt><dd>{scriptPreview.summary.labelChangeCount}</dd></div>
-                </dl>
-                {scriptPreview.warnings.length > 0 && <div className="script-preview-warnings" role="status">{scriptPreview.warnings.map((warning) => <p key={warning}>{warning}</p>)}</div>}
-                <div className="script-preview-table-wrap">
-                  <table>
-                    <thead><tr><th scope="col">{t('setup.previewId')}</th><th scope="col">{t('setup.previewText')}</th><th scope="col">{t('setup.previewLabel')}</th></tr></thead>
-                    <tbody>{scriptPreview.items.slice(0, 10).map((item, index) => {
-                      const boundary = isLabelBoundary(scriptPreview.items, index);
-                      return <tr key={`${item.id}:${index}`} className={boundary ? 'label-boundary' : ''}>
-                        <td title={item.id}>{item.id}</td>
-                        <td title={item.text}>{item.text}</td>
-                        <td title={item.label || t('prompter.none')}><span>{item.label || t('prompter.none')}</span>{boundary ? <em>{t('recorder.labelChanged')}</em> : null}</td>
-                      </tr>;
-                    })}</tbody>
-                  </table>
-                </div>
-                <footer>
-                  <span>{scriptPreview.summary.totalItems > 10 ? t('setup.previewFirstRows', { shown: 10, total: scriptPreview.summary.totalItems }) : t('setup.previewAllRows', { total: scriptPreview.summary.totalItems })}</span>
-                  <button type="button" className="button primary" data-testid="confirm-script-preview" disabled={scriptPreviewConfirmed || scriptPreview.errors.length > 0 || scriptPreview.items.length === 0} onClick={confirmScriptPreview}>{scriptPreviewConfirmed ? t('setup.previewConfirmed') : t('setup.previewConfirm')}</button>
-                </footer>
-              </section>}
+              {scriptPreview && <div className={`script-preview-entry${scriptErrors.length ? ' invalid' : ''}`} data-testid="script-preview-entry">
+                <div><strong>{scriptErrors.length ? t('setup.previewNeedsFix') : t('setup.previewImported')}</strong><small>{t(scriptPreview.mode === 'structured' ? 'setup.previewStructuredHint' : 'setup.previewPlainTextHint')}</small></div>
+                <button type="button" className="button subtle" data-testid="open-script-preview" onClick={() => setScriptPreviewOpen(true)}><Icon name="file" size={14} />{t('setup.previewOpen')}</button>
+              </div>}
             </section>
             <section className="property-group">
               <div className="property-heading"><span>02</span><div><h2>{t('setup.audioHeading')}</h2><p>{t('setup.audioHelp')}</p></div></div>
@@ -4324,6 +4292,40 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         </aside>
       </div>
       <StudioStatus engineStatus={engineStatus} message={error || dataSafetyAlert || presetWarning || busy || notice} isError={Boolean(error || dataSafetyAlert)} />
+      {scriptPreviewOpen && scriptPreview && <div className="dialog-backdrop script-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setScriptPreviewOpen(false); }}>
+        <section className="studio-dialog script-preview-dialog" role="dialog" aria-modal="true" aria-labelledby="script-preview-title" data-testid="script-import-preview">
+          <header>
+            <span className="dialog-icon"><Icon name="file" size={19} /></span>
+            <div><h2 id="script-preview-title">{t('setup.previewTitle')}</h2><small>{scriptFile}</small></div>
+            <span className={`script-mode ${scriptPreview.mode}`}>{t(scriptPreview.mode === 'structured' ? 'setup.previewStructured' : 'setup.previewPlainText')}</span>
+          </header>
+          <div className="script-preview-body">
+            <p>{t(scriptPreview.mode === 'structured' ? 'setup.previewStructuredHint' : 'setup.previewPlainTextHint')}</p>
+            <dl className="script-preview-stats">
+              <div><dt>{t('setup.previewTotal')}</dt><dd>{scriptPreview.summary.totalItems}</dd></div>
+              <div><dt>{t('setup.previewEmptyLabels')}</dt><dd>{scriptPreview.summary.emptyLabelCount}</dd></div>
+              <div><dt>{t('setup.previewUniqueLabels')}</dt><dd>{scriptPreview.summary.uniqueLabelCount}</dd></div>
+              <div><dt>{t('setup.previewLabelChanges')}</dt><dd>{scriptPreview.summary.labelChangeCount}</dd></div>
+            </dl>
+            {scriptPreview.warnings.length > 0 && <div className="script-preview-warnings" role="status">{scriptPreview.warnings.map((warning) => <p key={warning}>{warning}</p>)}</div>}
+            <div className="script-preview-table-wrap">
+              <table>
+                <thead><tr><th scope="col">{t('setup.previewId')}</th><th scope="col">{t('setup.previewText')}</th><th scope="col">{t('setup.previewLabel')}</th></tr></thead>
+                <tbody>{scriptPreview.items.slice(0, 10).map((item, index) => {
+                  const boundary = isLabelBoundary(scriptPreview.items, index);
+                  return <tr key={`${item.id}:${index}`} className={boundary ? 'label-boundary' : ''}>
+                    <td title={item.id}>{item.id}</td>
+                    <td title={item.text}>{item.text}</td>
+                    <td title={item.label || t('prompter.none')}><span>{item.label || t('prompter.none')}</span>{boundary ? <em>{t('recorder.labelChanged')}</em> : null}</td>
+                  </tr>;
+                })}</tbody>
+              </table>
+            </div>
+            <small className="script-preview-count">{scriptPreview.summary.totalItems > 10 ? t('setup.previewFirstRows', { shown: 10, total: scriptPreview.summary.totalItems }) : t('setup.previewAllRows', { total: scriptPreview.summary.totalItems })}</small>
+          </div>
+          <footer><button type="button" className="button primary" data-testid="close-script-preview" autoFocus onClick={() => setScriptPreviewOpen(false)}>{t('common.close')}</button></footer>
+        </section>
+      </div>}
       {settingsDialog}
       {exportFeedbackDialog}
       {userAlertDialog}

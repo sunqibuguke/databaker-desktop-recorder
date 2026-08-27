@@ -314,7 +314,7 @@ def draw_cover(canv, doc) -> None:
     canv.line(22 * mm, 28 * mm, PAGE_W - 22 * mm, 28 * mm)
     canv.setFillColor(HexColor("#9AA0A0"))
     canv.setFont("PF", 8.5)
-    canv.drawString(22 * mm, 20 * mm, "产品版本 0.1.0")
+    canv.drawString(22 * mm, 20 * mm, "产品版本 0.2.0")
     canv.drawRightString(PAGE_W - 22 * mm, 20 * mm, "文档版本 2026.08")
     canv.restoreState()
 
@@ -330,7 +330,7 @@ def draw_body(canv, doc) -> None:
     canv.setFillColor(HexColor("#D5DBDA"))
     canv.setFont("PF", 8)
     canv.drawString(LEFT, PAGE_H - 7.2 * mm, "标贝音频采集  ·  使用手册")
-    canv.drawRightString(PAGE_W - RIGHT, PAGE_H - 7.2 * mm, "DataBaker Recorder 0.1")
+    canv.drawRightString(PAGE_W - RIGHT, PAGE_H - 7.2 * mm, "DataBaker Recorder 0.2")
 
     canv.setStrokeColor(LINE)
     canv.setLineWidth(0.4)
@@ -441,7 +441,7 @@ def build_story() -> list:
         ],
     ))
     s.append(heading(2, "脚本"))
-    s.append(P("推荐 UTF-8，三列：序号 / 句子正文 / 标签（备注）。表头可用中文或 id / text / label。无表头时按第 1–3 列读取。也可用两列 id,text，或纯 TXT（按行导入，自动生成序号）。ID 不能为空或重复，正文不能为空。导入后任务使用固化副本，改原文件不影响已创建的任务。"))
+    s.append(P("推荐 UTF-8。CSV / TSV 固定三列：序号 / 句子正文 / 标签（备注）；表头可用中文或 id / text / label，无表头时按第 1–3 列读取。缺少第三列会阻止创建，但单行空标签允许。TXT 按每行一条正文导入，自动生成序号并使用空标签。解析成功后已直接导入，需要核对时点“查看预览”，不需要再确认导入。ID 不能为空或重复，正文不能为空。导入后任务使用固化副本，改原文件不影响已创建的任务。"))
     s.extend(figure(FIG / "script-format.png", "脚本格式", max_h=95 * mm))
     s.append(heading(2, "音频输入"))
     s.append(bullets([
@@ -671,7 +671,7 @@ def build_story() -> list:
     ))
 
     s.append(Spacer(1, 12))
-    s.append(P("标贝音频采集 0.1  ·  2026.08", "center_muted"))
+    s.append(P("标贝音频采集 0.2  ·  2026.08", "center_muted"))
     return s
 
 
@@ -687,7 +687,7 @@ def main() -> None:
         pagesize=A4,
         title="标贝音频采集 使用手册",
         author="DataBaker",
-        subject="标贝音频采集 0.1 操作手册",
+        subject="标贝音频采集 0.2 操作手册",
         creator="DataBaker Handbook Builder",
     )
     cover_frame = Frame(0, 0, PAGE_W, PAGE_H, id="cover", leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0)

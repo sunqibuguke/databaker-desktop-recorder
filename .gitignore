@@ -12,6 +12,8 @@ recordings/
 test-results/
 playwright-report/
 .playwright-artifacts/
+/tmp/
+**/__pycache__/
 
 # Historical mobile source is local reference material only. It contains
 # generated dependencies, binaries and environment-specific configuration.
