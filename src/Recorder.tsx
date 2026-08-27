@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import { HomeHeader, Icon, StudioChrome, StudioStatus, type EngineStatus, type Phase } from './studio-chrome';
 import {
   effectiveCaptureFaultKind,
@@ -1013,12 +1013,88 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     : Math.max(-96, Math.min(0, 20 * Math.log10(meter.rms)));
   const liveRmsOnThresholdScale = Math.min(100, Math.max(0, (liveRmsDbfs + 72) / 60 * 100));
   const effectiveSilenceDurationMs = snapshot?.silence_duration_ms ?? silenceDurationMs;
-  const itemSilenceViews = items.map((item, index) => (
-    recording && index === currentIndex
+  const silenceActiveItemIndex = recording ? currentIndex : -1;
+  const itemSilenceViews = useMemo(() => items.map((item, index) => (
+    index === silenceActiveItemIndex
       ? { headShort: false, tailShort: false, title: '' }
       : itemSilenceMarks(item, sampleRateForDisplay, effectiveSilenceDurationMs, silenceDetector)
-  ));
+  )), [effectiveSilenceDurationMs, items, sampleRateForDisplay, silenceActiveItemIndex, silenceDetector]);
   const flaggedSilenceCount = itemSilenceViews.filter((marks) => marks.headShort || marks.tailShort).length;
+  const captureFaultKind = effectiveCaptureFaultKind(phase === 'running' && captureActive, engineStatus, meter);
+  const captureFault = captureFaultKind !== null;
+  const deferredItemBrowserIndex = useDeferredValue(currentIndex);
+  const itemBrowserRows = useMemo(() => items.map((item, index) => {
+    const marks = itemSilenceViews[index] ?? { headShort: false, tailShort: false, title: '' };
+    const flagged = marks.headShort || marks.tailShort;
+    const statusClass = itemStatusMetaClass(item.status);
+    const labelBoundary = isLabelBoundary(items, index);
+    const requiresRerecord = itemRequiresRerecord(item);
+    const retainedWarning = itemHasRetainedPreviousWarning(item);
+    const normalizedLabel = item.label.trim();
+    const labelValue = normalizedLabel || t('prompter.none');
+    const accessibleParts = [
+      item.id,
+      item.text,
+      t('recorder.itemLabelAria', { label: labelValue }),
+      statusLabel(item.status),
+      labelBoundary ? t('recorder.labelChanged') : '',
+      requiresRerecord ? t('recorder.requiresRerecord') : '',
+      retainedWarning ? t('recorder.retainedPreviousShort') : '',
+    ].filter(Boolean).join('。');
+    return <button
+      key={item.id}
+      ref={(node) => {
+        if (node) itemRowRefs.current.set(item.id, node);
+        else itemRowRefs.current.delete(item.id);
+      }}
+      className={`professional-item${index === deferredItemBrowserIndex ? ' active' : ''}${item.status === 'skipped' ? ' skipped' : ''}${flagged ? ' has-silence-issue' : ''}${labelBoundary ? ' label-boundary' : ''}${requiresRerecord ? ' requires-rerecord' : ''}${retainedWarning ? ' retained-warning' : ''}`}
+      disabled={recording || Boolean(captureFault)}
+      tabIndex={index === deferredItemBrowserIndex ? 0 : -1}
+      aria-current={index === deferredItemBrowserIndex ? 'step' : undefined}
+      aria-label={accessibleParts}
+      title={[marks.title, item.label].filter(Boolean).join(' · ') || undefined}
+      onClick={(event) => {
+        const previous = event.currentTarget.parentElement?.querySelector<HTMLButtonElement>('.professional-item.active');
+        if (previous && previous !== event.currentTarget) {
+          previous.classList.remove('active');
+          previous.removeAttribute('aria-current');
+          previous.tabIndex = -1;
+        }
+        event.currentTarget.classList.add('active');
+        event.currentTarget.setAttribute('aria-current', 'step');
+        event.currentTarget.tabIndex = 0;
+        event.currentTarget.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        setCurrentIndex(index);
+        setReviewAttemptId(null);
+      }}
+      onKeyDown={(event) => {
+        const nextIndex = event.key === 'ArrowDown'
+          ? Math.min(items.length - 1, index + 1)
+          : event.key === 'ArrowUp'
+            ? Math.max(0, index - 1)
+            : event.key === 'Home'
+              ? 0
+              : event.key === 'End'
+                ? items.length - 1
+                : -1;
+        if (nextIndex < 0 || nextIndex === index) return;
+        event.preventDefault();
+        setCurrentIndex(nextIndex);
+        setReviewAttemptId(null);
+        window.requestAnimationFrame(() => itemRowRefs.current.get(items[nextIndex]?.id ?? '')?.focus());
+      }}
+    >
+      <span className={`item-state ${item.status}`}>{item.status === 'accepted' ? <Icon name="check" size={12} /> : item.status === 'skipped' ? '—' : String(index + 1).padStart(2, '0')}</span>
+      <span className="item-copy"><strong>{item.id}</strong><small>{item.text}</small></span>
+      {normalizedLabel || labelBoundary ? <span className="item-label-line"><b>{labelBoundary ? t('recorder.labelChanged') : t('recorder.labelShort')}</b><em className="item-label-value" title={normalizedLabel || undefined}>{labelValue}</em></span> : null}
+      <span className="item-meta">
+        <em className={statusClass}>{statusLabel(item.status)}</em>
+        {requiresRerecord ? <i className="item-rerecord-mark">{t('recorder.requiresRerecord')}</i> : null}
+        {retainedWarning ? <i className="item-retained-mark">{t('recorder.retainedPreviousShort')}</i> : null}
+        <ItemSilenceMarkPills marks={marks} />
+      </span>
+    </button>;
+  }), [captureFault, deferredItemBrowserIndex, itemSilenceViews, items, locale, recording]);
   const requiredSilenceSamples = sampleRateForDisplay * effectiveSilenceDurationMs / 1_000;
   const headSilenceRequiredSamples = Math.max(1, meter.required_head_silence_samples ?? requiredSilenceSamples);
   const headSilenceProgressSamples = Math.min(
@@ -1158,8 +1234,6 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const silencePair = shouldUseRecordedSilencePair(recording, reviewAttempt)
     ? reviewBillPair
     : livePair;
-  const captureFaultKind = effectiveCaptureFaultKind(phase === 'running' && captureActive, engineStatus, meter);
-  const captureFault = captureFaultKind !== null;
   const exitAction = captureExitAction(items, captureFault);
   const footerActions = inspectorFooterModel(captureActive, Boolean(captureFault));
   const captureFaultCopy = captureFaultKind
@@ -2839,23 +2913,6 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     if (next.issue) locateWorkbenchIssue(next.issue, next.wrapped);
   }
 
-  function moveItemListFocus(event: ReactKeyboardEvent<HTMLButtonElement>, index: number) {
-    const nextIndex = event.key === 'ArrowDown'
-      ? Math.min(items.length - 1, index + 1)
-      : event.key === 'ArrowUp'
-        ? Math.max(0, index - 1)
-        : event.key === 'Home'
-          ? 0
-          : event.key === 'End'
-            ? items.length - 1
-            : -1;
-    if (nextIndex < 0 || nextIndex === index) return;
-    event.preventDefault();
-    setCurrentIndex(nextIndex);
-    setReviewAttemptId(null);
-    window.requestAnimationFrame(() => itemRowRefs.current.get(items[nextIndex]?.id ?? '')?.focus());
-  }
-
   async function acceptAttempt(targetAttemptId?: string) {
     // This is deliberately repeated behind the disabled button / shortcut
     // gates: a fault event may arrive after a click was queued but before the
@@ -4358,50 +4415,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           </div>
           <div className="mini-progress"><i style={{ width: `${items.length ? completed / items.length * 100 : 0}%` }} /></div>
         </div>
-        <div className="professional-item-list" aria-label={t('recorder.scriptListAria')}>{items.map((item, index) => {
-          const marks = itemSilenceViews[index] ?? { headShort: false, tailShort: false, title: '' };
-          const flagged = marks.headShort || marks.tailShort;
-          const statusClass = itemStatusMetaClass(item.status);
-          const labelBoundary = isLabelBoundary(items, index);
-          const requiresRerecord = itemRequiresRerecord(item);
-          const retainedWarning = itemHasRetainedPreviousWarning(item);
-          const normalizedLabel = item.label.trim();
-          const labelValue = normalizedLabel || t('prompter.none');
-          const accessibleParts = [
-            item.id,
-            item.text,
-            t('recorder.itemLabelAria', { label: labelValue }),
-            statusLabel(item.status),
-            labelBoundary ? t('recorder.labelChanged') : '',
-            requiresRerecord ? t('recorder.requiresRerecord') : '',
-            retainedWarning ? t('recorder.retainedPreviousShort') : '',
-          ].filter(Boolean).join('。');
-          return <button
-            key={item.id}
-            ref={(node) => {
-              if (node) itemRowRefs.current.set(item.id, node);
-              else itemRowRefs.current.delete(item.id);
-            }}
-            className={`professional-item${index === currentIndex ? ' active' : ''}${item.status === 'skipped' ? ' skipped' : ''}${flagged ? ' has-silence-issue' : ''}${labelBoundary ? ' label-boundary' : ''}${requiresRerecord ? ' requires-rerecord' : ''}${retainedWarning ? ' retained-warning' : ''}`}
-            disabled={recording || captureFault}
-            tabIndex={index === currentIndex ? 0 : -1}
-            aria-current={index === currentIndex ? 'step' : undefined}
-            aria-label={accessibleParts}
-            title={[marks.title, item.label].filter(Boolean).join(' · ') || undefined}
-            onClick={() => { setCurrentIndex(index); setReviewAttemptId(null); }}
-            onKeyDown={(event) => moveItemListFocus(event, index)}
-          >
-            <span className={`item-state ${item.status}`}>{item.status === 'accepted' ? <Icon name="check" size={12} /> : item.status === 'skipped' ? '—' : String(index + 1).padStart(2, '0')}</span>
-            <span className="item-copy"><strong>{item.id}</strong><small>{item.text}</small></span>
-            {normalizedLabel || labelBoundary ? <span className="item-label-line"><b>{labelBoundary ? t('recorder.labelChanged') : t('recorder.labelShort')}</b><em className="item-label-value" title={normalizedLabel || undefined}>{labelValue}</em></span> : null}
-            <span className="item-meta">
-              <em className={statusClass}>{statusLabel(item.status)}</em>
-              {requiresRerecord ? <i className="item-rerecord-mark">{t('recorder.requiresRerecord')}</i> : null}
-              {retainedWarning ? <i className="item-retained-mark">{t('recorder.retainedPreviousShort')}</i> : null}
-              <ItemSilenceMarkPills marks={marks} />
-            </span>
-          </button>;
-        })}</div>
+        <div className="professional-item-list" aria-label={t('recorder.scriptListAria')}>{itemBrowserRows}</div>
       </aside>
       <main id="main" className="editor-document">
         <div className="document-tabs"><span className="active"><Icon name="microphone" size={13} /> {workflowComplete ? t('recorder.taskComplete') : currentItem?.id ?? 'Item'} <i>×</i></span></div>
