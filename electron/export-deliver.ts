@@ -759,6 +759,11 @@ export class ReliableExportDeliveryManager {
           collision,
         );
         await this.#options.testHooks?.beforePublish?.({ request, file_path: candidate });
+        // Revalidate after the final pre-publication boundary. On Windows a
+        // directory containing an open partial file cannot always be renamed,
+        // so replacement tests and real media changes are checked after the
+        // copy handles have closed and immediately before publication.
+        await assertExportDeliveryDestinationUnchanged(destination);
         let usedCopyFallback = this.#options.testHooks?.forceCopyPublishFallback === true;
         if (!usedCopyFallback) {
           try {

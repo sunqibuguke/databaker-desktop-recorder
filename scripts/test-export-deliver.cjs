@@ -287,12 +287,13 @@ async function main() {
     const targetReplaced = await createFixture('target-replaced');
     const displacedDestination = `${targetReplaced.destinationDir}-old`;
     let targetChanged = false;
-    const targetManager = targetReplaced.makeManager((entry) => {
-      if (!targetChanged && entry.stage === 'copying') {
+    const targetManager = targetReplaced.makeManager(undefined, {
+      beforePublish: () => {
+        if (targetChanged) return;
         targetChanged = true;
         renameSync(targetReplaced.destinationDir, displacedDestination);
         mkdirSync(targetReplaced.destinationDir);
-      }
+      },
     });
     await assert.rejects(
       targetManager.deliver(targetReplaced.request),
