@@ -155,6 +155,19 @@ async function feedActiveTake(page: Page, transport: ReturnType<Page['getByTestI
   await expect(transport).toContainText(/完成本句|结束本句/);
 }
 
+async function feedTakeWithSilenceWarning(
+  page: Page,
+  transport: ReturnType<Page['getByTestId']>,
+): Promise<void> {
+  await expect(transport).toContainText(/即将开始|完成本句|结束本句/);
+  // Deliberately start with speech and leave only a short tail. These golden
+  // flows exercise warning acknowledgement, so they must not depend on
+  // platform-specific callback pacing accidentally producing a warning.
+  await feedPaced(page, 48_000, 'speech');
+  await feedPaced(page, 12_000, 'silence');
+  await expect(transport).toContainText(/完成本句|结束本句/);
+}
+
 async function disableMandatoryHeadTailGate(page: Page): Promise<void> {
   await page.locator('.monitor-tabs button').filter({ hasText: /检测/ }).click();
   const toggle = page.getByTestId('rule-enforce-head-tail');
@@ -201,12 +214,18 @@ async function selectRowAndMeasure(page: Page, index: number): Promise<void> {
     if (!target) return { elapsed: Number.POSITIVE_INFINITY, active: false, visible: false };
     const started = performance.now();
     target.click();
-    await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
-    const bounds = target.getBoundingClientRect();
+    let active = false;
+    let visible = false;
+    do {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      const bounds = target.getBoundingClientRect();
+      active = target.classList.contains('active');
+      visible = bounds.bottom > 0 && bounds.top < window.innerHeight;
+    } while ((!active || !visible) && performance.now() - started < 1_000);
     return {
       elapsed: performance.now() - started,
-      active: target.classList.contains('active'),
-      visible: bounds.bottom > 0 && bounds.top < window.innerHeight,
+      active,
+      visible,
     };
   }, index);
   expect(result.active, `row ${index + 1} should be active`).toBe(true);
@@ -454,7 +473,7 @@ test('real Electron derives confirmed-only and complete-task export gates from t
 
     const transport = page.getByTestId('main-transport');
     await transport.click();
-    await feedActiveTake(page, transport);
+    await feedTakeWithSilenceWarning(page, transport);
     await transport.click();
     await expect(transport).toContainText(/确认|采用/);
     await transport.click();
@@ -513,7 +532,7 @@ test('real Electron filters and locates current-task issues without starting a r
 
     const transport = page.getByTestId('main-transport');
     await transport.click();
-    await feedActiveTake(page, transport);
+    await feedTakeWithSilenceWarning(page, transport);
     await transport.click();
     await expect(transport).toContainText(/确认|采用/);
     await transport.click();
@@ -662,7 +681,7 @@ test('real Electron exports cuts, verifies the external copy, writes a receipt, 
 
     const transport = page.getByTestId('main-transport');
     await transport.click();
-    await feedActiveTake(page, transport);
+    await feedTakeWithSilenceWarning(page, transport);
     await transport.click();
     await expect(transport).toContainText(/确认|采用/);
     await transport.click();
