@@ -282,9 +282,13 @@ test('real Electron uses default VAD for a complete first-take confirmation flow
     const selectedDetector = page.getByTestId('detector-vad');
     await expect(selectedDetector).toHaveAttribute('aria-checked', 'true');
     await expect(selectedDetector).toBeDisabled();
+    const currentRow = page.locator('.professional-item.current-item');
+    await expect(currentRow).toHaveCount(1);
+    await expect(currentRow.locator('.item-current-flag')).toHaveText('当前句子');
 
     const transport = page.getByTestId('main-transport');
     await transport.click();
+    await expect(currentRow).toHaveClass(/\brecording-item\b/);
     await feedActiveTake(page, transport);
     await transport.click();
     await expect(transport).toContainText(/确认|采用/);

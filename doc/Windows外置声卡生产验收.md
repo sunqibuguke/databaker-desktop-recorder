@@ -168,6 +168,16 @@ $device = "<inventory 返回的完整设备 ID>"
 
 对预计超过 4 GiB 的 2–8 小时任务，`soak --export` 应作为独立的 RF64 兼容性门禁执行：验收报告中的 `full_track.container` 必须为 `rf64`、`exact_header=true`，并由实际交付所用的播放器/切分器/质检工具成功打开。不要只凭本工具解析成功就推定整条下游链路兼容。
 
+### 6.1 可恢复短暂抖动与缺帧
+
+现场长稳出现非终止型声卡链路 warning 时，必须分别核对以下两类结果，不能只凭波形外观判定录音合格：
+
+- 驱动上报 `DATA_DISCONTINUITY`，但 packet position 连续、`missing_frames=0`：`input_discontinuity_count` 可以增加，`input_discontinuity_silence_samples` 不增加；活动 attempt 仍可正常确认，界面按既有自动续录和标签规则进入下一句，采集保持 active。
+- 确认存在 `missing_frames>0` 的有界前向缺口：引擎插入等值静音保持母音频时间轴，`input_discontinuity_silence_samples` 增加；受影响 attempt 必须标记 `needs_rerecord`，不得确认、试听切片或进入交付。界面先切到下一物理句并按自动续录规则继续，受损句保留在问题队列稍后补录；末句则停在末句提示重录。
+- 两类情况都不得中断持续母音频或整批采集。超过恢复上限、位置倒退/溢出、设备断开、输入停滞、队列/写盘故障仍按 fail-closed 处理，不适用本节的继续采集规则。
+
+验收证据至少包括 `events.jsonl`、最终 snapshot、discontinuity count/silence samples、受影响 attempt 状态、切句后的当前索引与录音状态，以及常规切片/交付拒绝结果。
+
 ## 7. 录制中拔出 USB 声卡
 
 ### 7.1 拔出后 fail-closed
