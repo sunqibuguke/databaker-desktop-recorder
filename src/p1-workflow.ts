@@ -286,7 +286,10 @@ export function attemptRangeCoveredByProvenance(
   if (!spans?.length) return false;
   if (spans.some((span) => !isSample(span.start_sample)
     || !isSample(span.end_sample)
-    || span.end_sample <= span.start_sample)) return false;
+    // A freshly activated capture has a legal zero-length tail span until
+    // its first durable frame arrives. It contributes no coverage, but must
+    // not invalidate already-confirmed ranges from earlier activations.
+    || span.end_sample < span.start_sample)) return false;
   let cursor = attempt.start_sample;
   const ordered = [...spans].sort((left, right) => left.start_sample - right.start_sample);
   for (const span of ordered) {

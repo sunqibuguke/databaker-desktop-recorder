@@ -381,6 +381,46 @@ async function main() {
     { start_sample: 0, end_sample: 500 },
     { start_sample: 500, end_sample: 1000 },
   ]), true, 'contiguous provenance spans cover the attempt');
+  const resumedProvenance = [
+    ...fullProvenance,
+    {
+      ...fullProvenance.at(-1),
+      start_sample: fixture.committed_samples,
+      end_sample: fixture.committed_samples,
+    },
+  ];
+  assert.equal(
+    workflow.attemptRangeCoveredByProvenance(previewAttempt, resumedProvenance),
+    true,
+    'a newly activated zero-length tail span does not invalidate an earlier attempt',
+  );
+  const resumedTask = workflow.deriveTaskWorkflow({
+    status: 'recording',
+    overflow_samples: 0,
+    committed_samples: fixture.committed_samples,
+    capture_provenance: resumedProvenance,
+    audio_format: fixture.audio_format,
+    items: [byName.get('selected clean version')],
+  });
+  assert.equal(resumedTask.items[0].disposition, 'selected', 'resume keeps the selected item valid');
+  assert.equal(resumedTask.blockerCount, 0, 'resume does not create an item blocker');
+  assert.equal(
+    workflow.buildIssueWorkbench(resumedTask).length,
+    0,
+    'resume does not create a false state-conflict issue',
+  );
+  const resumedHistory = deriveHistorySummary({
+    status: 'recording',
+    overflow_samples: 0,
+    committed_samples: fixture.committed_samples,
+    capture_provenance: resumedProvenance,
+    items: [byName.get('selected clean version')],
+  });
+  assert.equal(resumedHistory.blocker_items, 0, 'history summary agrees during resume');
+  assert.equal(workflow.attemptRangeCoveredByProvenance(previewAttempt, [
+    { start_sample: 0, end_sample: 1000 },
+    { start_sample: 1000, end_sample: 999 },
+  ]), false, 'a reversed provenance span remains unsafe');
   assert.equal(workflow.attemptRangeCoveredByProvenance(previewAttempt, [
     { start_sample: 0, end_sample: 450 },
     { start_sample: 500, end_sample: 1000 },

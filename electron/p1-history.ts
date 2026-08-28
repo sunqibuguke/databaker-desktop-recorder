@@ -254,7 +254,9 @@ function rangeCoveredByProvenance(
   for (const raw of provenance) {
     if (!safeSample(raw.start_sample)
       || !safeSample(raw.end_sample)
-      || raw.end_sample <= raw.start_sample) return false;
+      // Resume appends an empty tail span before the new activation writes
+      // audio. Ignore that non-covering marker without invalidating history.
+      || raw.end_sample < raw.start_sample) return false;
     spans.push({ start: raw.start_sample, end: raw.end_sample });
   }
   spans.sort((left, right) => left.start - right.start);
