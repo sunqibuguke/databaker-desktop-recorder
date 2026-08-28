@@ -171,6 +171,34 @@ export function nextPhysicalItemIndex(currentIndex: number, itemCount: number): 
   return Math.min(currentIndex + 1, itemCount - 1);
 }
 
+export function retakeSequenceActionReady(
+  active: boolean,
+  item: WorkflowItem | null | undefined,
+  hasPendingDecision: boolean,
+): boolean {
+  return Boolean(
+    active
+    && !hasPendingDecision
+    && item
+    && (item.status === 'accepted' || item.status === 'skipped'),
+  );
+}
+
+export function shouldContinueRetakeSequence(
+  active: boolean,
+  sourceIndex: number,
+  targetIndex: number,
+  target: WorkflowItem | null | undefined,
+): boolean {
+  return Boolean(
+    active
+    && targetIndex >= 0
+    && targetIndex !== sourceIndex
+    && target
+    && (target.status === 'accepted' || target.status === 'skipped'),
+  );
+}
+
 export function areAllItemsHandled(items: readonly WorkflowItem[]): boolean {
   return items.length > 0 && items.every((item) => (
     item.status === 'accepted' || item.status === 'skipped'

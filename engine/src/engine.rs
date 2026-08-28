@@ -685,6 +685,7 @@ struct ActiveAttempt {
     start_sample: u64,
     recording_started_sample: u64,
     input_discontinuity_count_at_start: u64,
+    input_discontinuity_silence_samples_at_start: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3460,6 +3461,10 @@ impl Engine {
                 .capture_recovery
                 .discontinuities
                 .load(Ordering::Acquire),
+            input_discontinuity_silence_samples_at_start: session
+                .capture_recovery
+                .inserted_silence_frames
+                .load(Ordering::Acquire),
         });
         session.persist(
             "attempt_started",
@@ -3673,11 +3678,19 @@ impl Engine {
             }
             bail!("attempt contains no audio samples");
         }
-        let recovered_discontinuity = session
+        let observed_discontinuity = session
             .capture_recovery
             .discontinuities
             .load(Ordering::Acquire)
             > active.input_discontinuity_count_at_start;
+        // Some WASAPI drivers repeatedly set DATA_DISCONTINUITY while packet
+        // positions remain continuous. Keep that signal as session telemetry,
+        // but only invalidate the take when recovery inserted missing frames.
+        let recovered_discontinuity = session
+            .capture_recovery
+            .inserted_silence_frames
+            .load(Ordering::Acquire)
+            > active.input_discontinuity_silence_samples_at_start;
         let quality_issues = if recovered_discontinuity {
             vec![AttemptQualityIssue {
                 code: "input_discontinuity".to_string(),
@@ -3760,6 +3773,7 @@ impl Engine {
             "attempt": attempt,
             "forced": forced_without_tail_silence,
             "auto_selected": false,
+            "observed_discontinuity": observed_discontinuity,
             "recovered_discontinuity": recovered_discontinuity,
         }))
     }
@@ -10741,6 +10755,7 @@ mod tests {
                 start_sample: 20,
                 recording_started_sample: 20,
                 input_discontinuity_count_at_start: 0,
+                input_discontinuity_silence_samples_at_start: 0,
             });
             if has_old_version {
                 session.snapshot.items[0].status = "accepted".to_string();
@@ -10800,6 +10815,7 @@ mod tests {
             start_sample: 20,
             recording_started_sample: 20,
             input_discontinuity_count_at_start: 0,
+            input_discontinuity_silence_samples_at_start: 0,
         });
         let (vad_control_tx, vad_control_rx) = bounded::<VadControlMessage>(1);
         session.vad_tx = Some(vad_control_tx);
@@ -12062,6 +12078,7 @@ mod tests {
             start_sample: 0,
             recording_started_sample: 20,
             input_discontinuity_count_at_start: 0,
+            input_discontinuity_silence_samples_at_start: 0,
         });
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
@@ -12120,6 +12137,7 @@ mod tests {
             start_sample: 0,
             recording_started_sample: 20,
             input_discontinuity_count_at_start: 0,
+            input_discontinuity_silence_samples_at_start: 0,
         });
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
@@ -12149,6 +12167,7 @@ mod tests {
             start_sample: 0,
             recording_started_sample: 0,
             input_discontinuity_count_at_start: 0,
+            input_discontinuity_silence_samples_at_start: 0,
         });
         let event_path = root.join("metadata/events.jsonl");
         std::fs::remove_file(&event_path).unwrap();
@@ -12374,6 +12393,7 @@ mod tests {
             start_sample: 10,
             recording_started_sample: 10,
             input_discontinuity_count_at_start: 0,
+            input_discontinuity_silence_samples_at_start: 0,
         });
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
@@ -12451,6 +12471,7 @@ mod tests {
             start_sample: 0,
             recording_started_sample: 20,
             input_discontinuity_count_at_start: 0,
+            input_discontinuity_silence_samples_at_start: 0,
         });
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
@@ -12541,6 +12562,7 @@ mod tests {
             start_sample: 20,
             recording_started_sample: 20,
             input_discontinuity_count_at_start: 0,
+            input_discontinuity_silence_samples_at_start: 0,
         });
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
@@ -12588,6 +12610,7 @@ mod tests {
             start_sample: 20,
             recording_started_sample: 20,
             input_discontinuity_count_at_start: 0,
+            input_discontinuity_silence_samples_at_start: 0,
         });
         let (writer_tx, writer_rx) = bounded::<WriterMessage>(1);
         session.writer_tx = writer_tx;
@@ -12603,6 +12626,82 @@ mod tests {
         assert_eq!(stopped["attempt"]["start_sample"], 40);
         assert_eq!(stopped["attempt"]["recording_started_sample"], 20);
         assert_eq!(stopped["attempt"]["head_silence_passed_sample"], 40);
+        engine
+            .session
+            .as_mut()
+            .unwrap()
+            .writer_join
+            .take()
+            .unwrap()
+            .join()
+            .unwrap();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn driver_only_discontinuity_without_missing_frames_remains_deliverable() {
+        let root = test_root("driver-only-discontinuity-remains-deliverable");
+        let mut session = prepare_metadata_test_session(&root);
+        session.snapshot.audio_format.sample_rate = 100;
+        session.snapshot.silence_duration_ms = 200;
+        session
+            .capture_recovery
+            .discontinuities
+            .store(1, Ordering::Release);
+        session.head_silence = HeadSilenceMonitor::new(20);
+        session.snapshot.captured_samples = 100;
+        session.snapshot.committed_samples = 100;
+        cover_committed_test_audio(&mut session.snapshot);
+        session.captured.store(100, Ordering::Release);
+        session.committed.store(100, Ordering::Release);
+        session.analyzed_samples.store(100, Ordering::Release);
+        session.last_signal_sample.store(80, Ordering::Release);
+        session
+            .attempt_signal_start_sample
+            .store(50, Ordering::Release);
+        session
+            .head_silence
+            .armed_sample
+            .store(20, Ordering::Release);
+        session
+            .head_silence
+            .passed_sample
+            .store(40, Ordering::Release);
+        session
+            .head_silence
+            .phase
+            .store(HEAD_SILENCE_SPEECH_STARTED, Ordering::Release);
+        session.active_attempt = Some(ActiveAttempt {
+            item_id: "001".to_string(),
+            attempt_id: "001-a1".to_string(),
+            start_sample: 20,
+            recording_started_sample: 20,
+            input_discontinuity_count_at_start: 0,
+            input_discontinuity_silence_samples_at_start: 0,
+        });
+        let (writer_tx, writer_rx) = bounded::<WriterMessage>(1);
+        session.writer_tx = writer_tx;
+        session.writer_join = Some(thread::spawn(move || {
+            if let Ok(WriterMessage::Checkpoint(reply)) = writer_rx.recv() {
+                let _ = reply.send(Ok(100));
+            }
+        }));
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+
+        let stopped = engine.stop_attempt(false, true, false).unwrap();
+
+        assert_eq!(stopped["observed_discontinuity"], true);
+        assert_eq!(stopped["recovered_discontinuity"], false);
+        assert_eq!(stopped["attempt"]["status"], "recorded");
+        assert_eq!(stopped["attempt"]["quality_issues"], Value::Null);
+        assert!(engine.accept_attempt("001", "001-a1").is_ok());
+        assert_eq!(
+            engine.session.as_ref().unwrap().snapshot.items[0].status,
+            "accepted"
+        );
+
         engine
             .session
             .as_mut()
@@ -12644,6 +12743,10 @@ mod tests {
             .capture_recovery
             .discontinuities
             .store(1, Ordering::Release);
+        session
+            .capture_recovery
+            .inserted_silence_frames
+            .store(1, Ordering::Release);
         session.head_silence = HeadSilenceMonitor::new(20);
         session.snapshot.captured_samples = 100;
         session.snapshot.committed_samples = 100;
@@ -12673,6 +12776,7 @@ mod tests {
             start_sample: 20,
             recording_started_sample: 20,
             input_discontinuity_count_at_start: 0,
+            input_discontinuity_silence_samples_at_start: 0,
         });
         let (writer_tx, writer_rx) = bounded::<WriterMessage>(1);
         session.writer_tx = writer_tx;
@@ -12730,6 +12834,10 @@ mod tests {
             .capture_recovery
             .discontinuities
             .store(1, Ordering::Release);
+        session
+            .capture_recovery
+            .inserted_silence_frames
+            .store(1, Ordering::Release);
         session.head_silence = HeadSilenceMonitor::new(20);
         session.captured.store(100, Ordering::Release);
         session.committed.store(100, Ordering::Release);
@@ -12756,6 +12864,7 @@ mod tests {
             start_sample: 20,
             recording_started_sample: 20,
             input_discontinuity_count_at_start: 0,
+            input_discontinuity_silence_samples_at_start: 0,
         });
         let (writer_tx, writer_rx) = bounded::<WriterMessage>(1);
         session.writer_tx = writer_tx;
@@ -12839,6 +12948,7 @@ mod tests {
             start_sample: 20,
             recording_started_sample: 20,
             input_discontinuity_count_at_start: 0,
+            input_discontinuity_silence_samples_at_start: 0,
         });
 
         let (writer_tx, writer_rx) = bounded::<WriterMessage>(1);
@@ -15174,6 +15284,7 @@ mod tests {
                 start_sample: 0,
                 recording_started_sample: 1,
                 input_discontinuity_count_at_start: 0,
+                input_discontinuity_silence_samples_at_start: 0,
             }),
             metadata_fault: None,
             stop_requested: false,
@@ -17036,6 +17147,7 @@ mod tests {
             start_sample: 0,
             recording_started_sample: 0,
             input_discontinuity_count_at_start: 0,
+            input_discontinuity_silence_samples_at_start: 0,
         });
         session.latch_metadata_fault(&failure);
 
@@ -17631,6 +17743,7 @@ mod tests {
             start_sample: 10,
             recording_started_sample: 20,
             input_discontinuity_count_at_start: 0,
+            input_discontinuity_silence_samples_at_start: 0,
         });
         session
             .persist(

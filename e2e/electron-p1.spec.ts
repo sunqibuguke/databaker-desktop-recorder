@@ -352,7 +352,7 @@ test('real Electron preserves first-take rhythm across a label boundary', async 
   }
 });
 
-test('real Electron keeps the selected take until a retake decision and never auto-records after it', async () => {
+test('real Electron keeps the selected take and continues handled retakes with Space without auto-recording', async () => {
   let harness: Harness | null = null;
   try {
     harness = await launchHarness();
@@ -414,8 +414,21 @@ test('real Electron keeps the selected take until a retake decision and never au
     ))?.status).toBe('rejected_by_operator');
 
     await expect(page.locator('.professional-item.active')).toContainText('002');
-    await expect(transport).not.toContainText(/完成本句|结束本句/);
+    await expect(transport).toContainText('重录本句');
+    await expect(transport).toHaveAttribute('data-retake-sequence', 'ready');
     await expect(transport).not.toHaveClass(/\b(stop|waiting)\b/);
+    await expect(page.getByTestId('finish-retake-sequence')).toContainText('完成采集');
+
+    await transport.click();
+    await expect(transport).toHaveClass(/\b(?:waiting|stop|accept)\b/);
+    await feedActiveTake(page, transport);
+    await transport.click();
+    await expectCompactRetakeDecision(page);
+    await page.getByTestId('discard-retake').click();
+
+    await expect(page.locator('.professional-item.active')).toContainText('002');
+    await expect(transport).toContainText(/全部完成|完成采集/);
+    await expect(transport).not.toHaveAttribute('data-retake-sequence', 'ready');
   } finally {
     await closeHarness(harness);
   }

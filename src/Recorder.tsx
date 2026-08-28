@@ -34,11 +34,13 @@ import {
   noiseCheckShortcutAction,
   NOISE_CHECK_STEPS,
   resolveRunningItemIndex,
+  retakeSequenceActionReady,
   selectionIndexAfterStoppedRetake,
   sessionNoiseGate,
   shouldAutoRunSessionNoiseCheck,
   shouldShowSessionNoiseCheckDialog,
   shouldAutoStartAfterAccept,
+  shouldContinueRetakeSequence,
   viewShortcutAction,
   workflowShortcutAction,
   workflowShortcutTargetAllowed,
@@ -724,6 +726,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const [attemptRecordingStartedSample, setAttemptRecordingStartedSample] = useState(0);
   const [reviewAttemptId, setReviewAttemptId] = useState<string | null>(null);
   const [retakeItemId, setRetakeItemId] = useState<string | null>(null);
+  const [retakeSequenceActive, setRetakeSequenceActive] = useState(false);
   const [reviewPeak, setReviewPeak] = useState(0);
   const [discontinuityToast, setDiscontinuityToast] = useState('');
   const [automationRules, setAutomationRules] = useState<AutomationRules>(loadWorkstationAutomationRules);
@@ -1063,6 +1066,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         event.currentTarget.setAttribute('aria-current', 'step');
         event.currentTarget.tabIndex = 0;
         event.currentTarget.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        setRetakeSequenceActive(false);
         setCurrentIndex(index);
         setReviewAttemptId(null);
       }}
@@ -1078,6 +1082,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
                 : -1;
         if (nextIndex < 0 || nextIndex === index) return;
         event.preventDefault();
+        setRetakeSequenceActive(false);
         setCurrentIndex(nextIndex);
         setReviewAttemptId(null);
         window.requestAnimationFrame(() => itemRowRefs.current.get(items[nextIndex]?.id ?? '')?.focus());
@@ -1177,6 +1182,11 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       || itemHasPendingRetakeDecision(currentItem)
       || hasRetakeChoice
     ),
+  );
+  const retakeSequenceReady = retakeSequenceActionReady(
+    retakeSequenceActive,
+    currentItem,
+    hasRetakeDecision,
   );
   const hasRetainedPreviousWarning = Boolean(
     currentItem && itemHasRetainedPreviousWarning(currentItem),
@@ -2296,6 +2306,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       (current.active_attempt && restoredItem.status !== 'pending')
       || itemHasPendingRetakeDecision(restoredItem)
     ) ? restoredItem.id : null);
+    setRetakeSequenceActive(false);
     setContinuationLabelTransition(null);
     if (localContext) {
       setIssueFilter(localContext.issueFilter);
@@ -2422,6 +2433,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setRetakeItemId(inspectionItem && itemHasPendingRetakeDecision(inspectionItem)
       ? inspectionItem.id
       : null);
+    setRetakeSequenceActive(false);
     setReviewAttemptId(preferredReviewAttemptId(inspectionItem));
     setMeter({ ...emptyMeter, captured_samples: nextSnapshot.captured_samples, committed_samples: nextSnapshot.committed_samples, overflow_samples: nextSnapshot.overflow_samples });
     clearDeviceWarning();
@@ -2725,10 +2737,14 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
 
   async function startAttempt(
     item = currentItem,
-    options: { acknowledgeLabelTransition?: boolean } = {},
+    options: {
+      acknowledgeLabelTransition?: boolean;
+      beginRetakeSequence?: boolean;
+      allowAfterSealedTake?: boolean;
+    } = {},
   ) {
-    if (!item || recording || phase !== 'running' || captureFault || !captureActive) return;
-    if (deviceWarningKind || currentNoiseGate !== 'ready') return;
+    if (!item || (recording && !options.allowAfterSealedTake) || phase !== 'running' || captureFault || !captureActive) return false;
+    if (deviceWarningKind || currentNoiseGate !== 'ready') return false;
     clearAudioPreview();
     const result = await run(t('notice.starting'), () => window.recorder.request<{
       attempt_id: string;
@@ -2744,7 +2760,13 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       item_id: item.id,
       enforce_silence: automationRules.enforceHeadTailSilence,
     }));
-    if (!result) return;
+    if (!result) return false;
+    if (
+      options.beginRetakeSequence
+      && (item.status === 'accepted' || item.status === 'skipped')
+    ) {
+      setRetakeSequenceActive(true);
+    }
     setRetakeItemId(item.status === 'pending' ? null : item.id);
     if (
       options.acknowledgeLabelTransition !== false
@@ -2772,6 +2794,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setReviewAttemptId(null);
     void refreshRecordings(outputDirRef.current);
     setNotice(t('notice.startedWait', { id: item.id, seconds: (effectiveSilenceDurationMs / 1_000).toFixed(1) }));
+    return true;
   }
 
   async function stopAttempt(forceOverride?: boolean): Promise<boolean> {
@@ -2835,14 +2858,51 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       const latestItem = latest?.items.find((item) => item.id === currentItem.id);
       if (latest && retakeItemId === currentItem.id && latestItem && itemHasRetainedPreviousWarning(latestItem)) {
         const nextIndex = nextPhysicalItemIndex(currentIndex, latest.items.length);
+        const nextItem = latest.items[nextIndex];
         setRetakeItemId(null);
-        moveToAutomaticTarget(currentItem, latest.items[nextIndex], nextIndex);
+        moveToAutomaticTarget(currentItem, nextItem, nextIndex);
+        setRetakeSequenceActive(shouldContinueRetakeSequence(
+          retakeSequenceActive,
+          currentIndex,
+          nextIndex,
+          nextItem,
+        ));
         setNotice(nextIndex === currentIndex
           ? t('notice.retakeKeptPreviousLast')
           : t('notice.retakeKeptPreviousNext'));
         return true;
       }
-      setNotice(t('notice.jitterRetake'));
+      if (!latest) {
+        setNotice(t('notice.jitterRetake'));
+        return true;
+      }
+      const nextIndex = nextPhysicalItemIndex(currentIndex, latest.items.length);
+      if (nextIndex === currentIndex) {
+        setNotice(t('notice.jitterLastItem'));
+        return true;
+      }
+      const nextItem = latest.items[nextIndex];
+      const nextLabelTransition = moveToAutomaticTarget(currentItem, nextItem, nextIndex)
+        ?? labelTransition(currentItem.label, nextItem.label);
+      setRetakeItemId(null);
+      setRetakeSequenceActive(false);
+      const autoStartsNext = nextItem.status === 'pending' && shouldAutoStartAfterAccept(
+        { kind: 'start', nextIndex },
+        {
+          autoStartNext: automationRules.autoStartNext,
+          pauseOnLabelChange: automationRules.pauseOnLabelChange,
+          labelChanged: nextLabelTransition.changed,
+        },
+      );
+      const started = autoStartsNext
+        ? await startAttempt(nextItem, {
+          acknowledgeLabelTransition: false,
+          allowAfterSealedTake: true,
+        })
+        : false;
+      setNotice(started
+        ? t('notice.jitterMovedAndStarted', { id: nextItem.id })
+        : t('notice.jitterMovedNext', { id: nextItem.id }));
       return true;
     }
     setReviewPeak(Math.max(takePeakRef.current, result.attempt.peak ?? 0));
@@ -2895,6 +2955,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   function locateNextRerecord() {
     const nextIndex = findNextRerecordIndex(items, currentIndex);
     if (nextIndex < 0) return;
+    setRetakeSequenceActive(false);
     setCurrentIndex(nextIndex);
     setReviewAttemptId(null);
     window.requestAnimationFrame(() => {
@@ -2914,6 +2975,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setSelectedIssueId(issue.id);
     setMonitorPanelTab('issues');
     if (issue.itemIndex !== null && items[issue.itemIndex]) {
+      setRetakeSequenceActive(false);
       setCurrentIndex(issue.itemIndex);
       setReviewAttemptId(preferredReviewAttemptId(items[issue.itemIndex]));
     }
@@ -2951,7 +3013,14 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     if (!latest) return;
     if (isRetakeDecision) {
       const nextIndex = nextPhysicalItemIndex(currentIndex, latest.items.length);
-      if (nextIndex >= 0) moveToAutomaticTarget(currentItem, latest.items[nextIndex], nextIndex);
+      const nextItem = latest.items[nextIndex];
+      if (nextIndex >= 0) moveToAutomaticTarget(currentItem, nextItem, nextIndex);
+      setRetakeSequenceActive(shouldContinueRetakeSequence(
+        retakeSequenceActive,
+        currentIndex,
+        nextIndex,
+        nextItem,
+      ));
       const keptPrevious = attemptId === retainedAttemptId;
       setNotice(nextIndex === currentIndex
         ? t(keptPrevious ? 'notice.retakeKeptPreviousLast' : 'notice.retakeUsedCandidateLast')
@@ -2997,6 +3066,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     if (captureFault || !currentItem || !['pending', 'review'].includes(currentItem.status) || recording) return;
     const skipped = await run(t('notice.savingSkip'), () => window.recorder.request('skip_item', { item_id: currentItem.id }));
     if (!skipped) return;
+    setRetakeSequenceActive(false);
     const latest = await refreshState();
     setReviewAttemptId(null);
     setRetakeItemId(null);
@@ -3489,6 +3559,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setRecording(false);
     setCurrentIndex(0);
     setReviewAttemptId(null);
+    setRetakeSequenceActive(false);
     setMeter(emptyMeter);
     clearSessionNoiseCheck();
     clearActivationFailure();
@@ -3664,6 +3735,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         setPauseConfirmOpen(false);
         unbindTaskLog(mode);
       }
+      setRetakeSequenceActive(false);
       logUserAction('ui.safe_stop', stayAfterStop
         ? mode === 'finish' ? '已安全结束并进入查看模式' : '已安全暂停并留在当前任务'
         : mode === 'pause' ? '已安全暂停并返回任务列表' : '已安全结束并返回任务列表', {
@@ -3725,6 +3797,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setAttemptStartSample(0);
     setAttemptRecordingStartedSample(0);
     setReviewAttemptId(null);
+    setRetakeSequenceActive(false);
     setMeter(emptyMeter);
     setFinishConfirmOpen(false);
     setPauseConfirmOpen(false);
@@ -3766,6 +3839,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setAttemptStartSample(0);
     setAttemptRecordingStartedSample(0);
     setReviewAttemptId(null);
+    setRetakeSequenceActive(false);
     setMeter(emptyMeter);
     setFinishConfirmOpen(false);
     setPauseConfirmOpen(false);
@@ -3897,21 +3971,27 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           void stopAttempt();
         }
         else {
-          const action = workflowShortcutAction(event.code, event.key, primaryAction, Boolean(currentItem));
-          if (action === 'finish') requestFinishCapture();
-          else if (action === 'accept') void acceptAttempt();
-          else if (action === 'start') void startAttempt();
+          if (retakeSequenceReady) {
+            void startAttempt();
+          } else {
+            const action = workflowShortcutAction(event.code, event.key, primaryAction, Boolean(currentItem));
+            if (action === 'finish') requestFinishCapture();
+            else if (action === 'accept') void acceptAttempt();
+            else if (action === 'start') void startAttempt();
+          }
         }
       } else if (!recording && workflowShortcutAction(event.code, event.key, primaryAction, Boolean(currentItem)) === 'retake') {
-        void startAttempt();
+        void startAttempt(currentItem, { beginRetakeSequence: true });
       } else if (event.key.toLowerCase() === 'p' && !recording) {
         void previewAttempt();
       } else if (event.key.toLowerCase() === 's' && !recording && captureActive && !hasRetakeDecision) {
         void skipItem();
       } else if (event.key === 'ArrowLeft' && !recording) {
+        setRetakeSequenceActive(false);
         setCurrentIndex((index) => Math.max(0, index - 1));
         setReviewAttemptId(null);
       } else if (event.key === 'ArrowRight' && !recording) {
+        setRetakeSequenceActive(false);
         setCurrentIndex((index) => Math.min(items.length - 1, index + 1));
         setReviewAttemptId(null);
       }
@@ -4431,7 +4511,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       </aside>
       <main id="main" className="editor-document">
         <div className="document-tabs"><span className="active"><Icon name="microphone" size={13} /> {workflowComplete ? t('recorder.taskComplete') : currentItem?.id ?? 'Item'} <i>×</i></span></div>
-        <div className="editor-toolbar"><div className="editor-nav"><button title={t('recorder.prevItem')} disabled={recording || currentIndex === 0} onClick={() => setCurrentIndex((index) => Math.max(0, index - 1))}><Icon name="chevron-left" /></button><span>{currentIndex + 1} / {items.length}</span><button title={t('recorder.nextItem')} disabled={recording || currentIndex >= items.length - 1} onClick={() => setCurrentIndex((index) => Math.min(items.length - 1, index + 1))}><Icon name="chevron-right" /></button></div><div className="editor-time"><strong className={recording ? 'recording' : ''}>{recording ? attemptDuration : sessionDuration}</strong></div><div className="editor-toolbar-actions"><button className="prompter-launch" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? t('recorder.locatePrompter') : t('recorder.openPrompter')}</button></div><div className={`save-health ${workspaceFaulted || captureFault ? 'fault' : meter.storage_status === 'warning' ? 'warning' : ''}`}><i />{workspaceFaulted ? t('recorder.healthReadonly') : !captureActive ? t('recorder.healthView') : captureFault ? t('recorder.healthFaultStop', { title: captureFaultCopy.title }) : meter.storage_status === 'warning' ? t('recorder.healthWarning', { minutes: Math.max(0, Math.floor(meter.storage_safe_remaining_seconds / 60)) }) : t('recorder.healthLive')}</div></div>
+        <div className="editor-toolbar"><div className="editor-nav"><button title={t('recorder.prevItem')} disabled={recording || currentIndex === 0} onClick={() => { setRetakeSequenceActive(false); setCurrentIndex((index) => Math.max(0, index - 1)); }}><Icon name="chevron-left" /></button><span>{currentIndex + 1} / {items.length}</span><button title={t('recorder.nextItem')} disabled={recording || currentIndex >= items.length - 1} onClick={() => { setRetakeSequenceActive(false); setCurrentIndex((index) => Math.min(items.length - 1, index + 1)); }}><Icon name="chevron-right" /></button></div><div className="editor-time"><strong className={recording ? 'recording' : ''}>{recording ? attemptDuration : sessionDuration}</strong></div><div className="editor-toolbar-actions"><button className="prompter-launch" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? t('recorder.locatePrompter') : t('recorder.openPrompter')}</button></div><div className={`save-health ${workspaceFaulted || captureFault ? 'fault' : meter.storage_status === 'warning' ? 'warning' : ''}`}><i />{workspaceFaulted ? t('recorder.healthReadonly') : !captureActive ? t('recorder.healthView') : captureFault ? t('recorder.healthFaultStop', { title: captureFaultCopy.title }) : meter.storage_status === 'warning' ? t('recorder.healthWarning', { minutes: Math.max(0, Math.floor(meter.storage_safe_remaining_seconds / 60)) }) : t('recorder.healthLive')}</div></div>
         <div className="editor-canvas">
           {(activationFailure || captureFault || discontinuityToast || qualityWarning || vadHealth !== 'healthy') && <div className="workspace-toasts" aria-live="polite">
             {activationFailure && !captureActive && <div className="session-noise-banner failed" role="alert" data-testid="activation-failure-banner"><Icon name="stop" size={16} /><div><strong>{activationErrorCopy(activationFailure.kind).title}</strong><span>{activationErrorCopy(activationFailure.kind).body}</span></div><button className="button" onClick={() => setActivationFailureOpen(true)} disabled={Boolean(busy)}>{t('activationError.openEditor')}</button></div>}
@@ -4475,7 +4555,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             <div className="transport-controls">
               <div className="transport-secondary">
               <button data-testid={hasRetakeDecision ? 'preview-retake' : undefined} title={t('recorder.previewKey')} onClick={() => void previewAttempt()} disabled={recording || !reviewAttempt || Boolean(busy)}><Icon name="play" /><span>{hasRetakeDecision ? t('recorder.previewCandidate') : t('recorder.preview')}</span><kbd>P</kbd></button>
-              {captureActive && <button title={t('recorder.retakeKey')} onClick={() => void startAttempt()} disabled={workspaceFaulted || captureFault || entryBlocksAttempt || recording || !currentItem || Boolean(busy)}><Icon name="retake" /><span>{t('recorder.retake')}</span><kbd>R</kbd></button>}
+              {captureActive && <button title={t('recorder.retakeKey')} onClick={() => void startAttempt(currentItem, { beginRetakeSequence: true })} disabled={workspaceFaulted || captureFault || entryBlocksAttempt || recording || !currentItem || Boolean(busy)}><Icon name="retake" /><span>{t('recorder.retake')}</span><kbd>R</kbd></button>}
               </div>
               <div className="transport-primary">
               {!captureActive
@@ -4484,12 +4564,14 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
                   : <button data-testid="main-transport" className="main-transport start" onClick={() => void previewAttempt()} disabled={Boolean(busy) || !reviewAttempt}><span><Icon name="play" /></span><strong>{t('recorder.previewThis')}</strong><kbd>SPACE</kbd></button>
                 : captureFault
                 ? <button data-testid="main-transport" className="main-transport stop" onClick={finishSession} disabled={Boolean(busy)}><span><Icon name="stop" /></span><strong>{t('recorder.finishKeepMaster')}</strong><kbd>SPACE</kbd></button>
-                : entryBlocksAttempt && primaryAction === 'start'
+                : entryBlocksAttempt && (primaryAction === 'start' || retakeSequenceReady)
                   ? <button data-testid="main-transport" className="main-transport waiting" onClick={() => { if (deviceWarningOpen) { acknowledgeDeviceWarning(); return; } if (snapshot) void runSessionNoiseCheck(sessionDir, snapshot); }} disabled={noiseCheckRunning || Boolean(busy)}><span><Icon name="meter" /></span><strong>{deviceWarningOpen ? t('deviceWarning.pendingCue') : noiseCheckRunning ? t('recorder.noiseChecking') : t('recorder.finishNoiseFirst')}</strong></button>
                 : recording
                   ? <button data-testid="main-transport" className={`main-transport ${isPendingTake || waitingForTailSilence ? 'waiting' : cue === 'ready' ? 'accept' : 'stop'}`} onClick={() => void stopAttempt()} disabled={Boolean(busy) || waitingForTailSilence}><span><Icon name="stop" /></span><strong>{isPendingTake ? t('recorder.pendingCancel') : waitingForTailSilence ? t('recorder.waitTailSilence') : t('recorder.finishSentence')}</strong>{isPendingTake ? <div className="transport-keys"><kbd>ESC</kbd><kbd>SPACE</kbd></div> : waitingForTailSilence ? null : <kbd>SPACE</kbd>}</button>
                 : primaryAction === 'accept'
                   ? <button data-testid="main-transport" data-retake-action={hasRetakeDecision ? 'use' : undefined} className="main-transport accept" onClick={() => void acceptAttempt()} disabled={Boolean(busy) || !defaultAcceptAttemptSafe}><span><Icon name="check" /></span><strong>{hasRetakeDecision ? t('recorder.useRetakeCandidate') : acceptButtonLabel}</strong><kbd>SPACE</kbd></button>
+                  : retakeSequenceReady
+                    ? <button data-testid="main-transport" data-retake-sequence="ready" className="main-transport start" onClick={() => void startAttempt()} disabled={Boolean(busy)}><span><Icon name="retake" /></span><strong>{t('recorder.continueRetake')}</strong><kbd>SPACE</kbd></button>
                   : primaryAction === 'finish'
                     ? <button data-testid="main-transport" className="main-transport complete" onClick={requestFinishCapture} disabled={Boolean(busy)}><span><Icon name="check" /></span><strong>{t('recorder.finishAll')}</strong><kbd>SPACE</kbd></button>
                     : primaryAction === 'start'
@@ -4498,6 +4580,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             </div>
               <div className="transport-secondary right">
                 {captureActive && hasRetakeDecision && retainedDeliveryAttempt ? <button className="discard-retake-button" data-testid="discard-retake" onClick={() => void acceptAttempt(retainedDeliveryAttempt.attempt_id)} disabled={Boolean(busy) || !safeAttemptIds.has(retainedDeliveryAttempt.attempt_id)}><Icon name="close" /><span>{t('recorder.keepPreviousVersion')}</span></button> : null}
+                {captureActive && retakeSequenceReady && allHandled ? <button data-testid="finish-retake-sequence" onClick={requestFinishCapture} disabled={Boolean(busy)}><Icon name="check" /><span>{t('recorder.finishCapture')}</span></button> : null}
                 {captureActive && <button title={t('recorder.skipKey')} onClick={() => void skipItem()} disabled={captureFault || recording || Boolean(busy) || hasRetakeDecision || !currentItem || !['pending', 'review'].includes(currentItem.status)}><Icon name="skip" /><span>{t('recorder.skip')}</span><kbd>S</kbd></button>}
               </div>
             </div>

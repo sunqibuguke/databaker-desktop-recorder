@@ -30,12 +30,14 @@ async function main() {
     normalizeScriptLabel,
     nextPhysicalItemIndex,
     resolveRunningItemIndex,
+    retakeSequenceActionReady,
     selectionIndexAfterStoppedRetake,
     sessionNoiseGate,
     shouldAutoRunSessionNoiseCheck,
     shouldShowSessionNoiseCheckDialog,
     captureEntryOverlay,
     shouldAutoStartAfterAccept,
+    shouldContinueRetakeSequence,
     viewShortcutAction,
     workflowShortcutAction,
     workflowShortcutTargetAllowed,
@@ -479,6 +481,36 @@ async function main() {
     workflowShortcutAction('KeyR', 'r', 'retake-only', true),
     'retake',
     'R remains an explicit retake action',
+  );
+  assert.equal(
+    retakeSequenceActionReady(true, item('accepted'), false),
+    true,
+    'an accepted physical next sentence offers Space as the next retake action',
+  );
+  assert.equal(
+    retakeSequenceActionReady(true, item('accepted'), true),
+    false,
+    'an unresolved retake decision must stay on its use-or-discard action',
+  );
+  assert.equal(
+    retakeSequenceActionReady(true, item('pending'), false),
+    false,
+    'ordinary pending work must keep its first-take action',
+  );
+  assert.equal(
+    shouldContinueRetakeSequence(true, 0, 1, item('accepted')),
+    true,
+    'a retake chain continues only onto a distinct handled physical next sentence',
+  );
+  assert.equal(
+    shouldContinueRetakeSequence(true, 1, 1, item('accepted')),
+    false,
+    'the last sentence ends the retake chain instead of wrapping',
+  );
+  assert.equal(
+    shouldContinueRetakeSequence(true, 0, 1, item('pending')),
+    false,
+    'a pending physical next sentence returns to the ordinary first-take workflow',
   );
 
   assert.equal(workspacePosture('running', false), 'view');

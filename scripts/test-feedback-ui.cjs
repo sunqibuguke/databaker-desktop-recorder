@@ -36,11 +36,20 @@ assert.match(recorder, /startAttempt\(nextItem, \{ acknowledgeLabelTransition: f
 assert.match(recorder, /acceptTarget\?\.status === 'review' \|\| acceptPausesForLabelChange/);
 assert.match(recorder, /acceptAttempt\(retainedDeliveryAttempt\.attempt_id\)/);
 assert.match(recorder, /nextPhysicalItemIndex\(currentIndex, latest\.items\.length\)/);
-assert.match(recorder, /moveToAutomaticTarget\(currentItem, latest\.items\[nextIndex\], nextIndex\)/);
+assert.match(recorder, /const nextItem = latest\.items\[nextIndex\];[\s\S]*?moveToAutomaticTarget\(currentItem, nextItem, nextIndex\)/);
 assert.match(recorder, /selectionIndexAfterStoppedRetake/);
 assert.match(recorder, /setRetakeItemId\(item\.status === 'pending' \? null : item\.id\)/);
 assert.match(recorder, /retakeItemId === currentItem\.id/);
 assert.match(recorder, /const isRetakeDecision = hasRetakeDecision/);
+assert.match(recorder, /nextPhysicalItemIndex\(currentIndex, latest\.items\.length\)[\s\S]*?jitterMovedAndStarted/);
+assert.match(recorder, /nextItem\.status === 'pending'[\s\S]*?shouldAutoStartAfterAccept/);
+assert.match(recorder, /allowAfterSealedTake: true/);
+assert.match(recorder, /jitterLastItem/);
+assert.match(recorder, /const \[retakeSequenceActive, setRetakeSequenceActive\] = useState\(false\)/);
+assert.match(recorder, /retakeSequenceActionReady\([\s\S]*?retakeSequenceActive,[\s\S]*?currentItem,[\s\S]*?hasRetakeDecision/);
+assert.match(recorder, /data-retake-sequence="ready"[\s\S]*?t\('recorder\.continueRetake'\)[\s\S]*?<kbd>SPACE<\/kbd>/);
+assert.match(recorder, /data-testid="finish-retake-sequence"[\s\S]*?t\('recorder\.finishCapture'\)/);
+assert.match(recorder, /startAttempt\(currentItem, \{ beginRetakeSequence: true \}\)/);
 assert.match(recorder, /const hasRetakeChoice = Boolean/);
 assert.ok(
   recorder.indexOf('if (isRetakeDecision)')
