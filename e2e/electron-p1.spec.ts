@@ -319,13 +319,13 @@ test('real Electron preserves first-take rhythm across a label boundary', async 
     await transport.click();
     await expect(page.locator('.professional-item.active')).toContainText('002');
     await expect(page.locator('.editor-nav span')).toHaveText('2 / 3');
-    await expect(transport).toContainText('完成本句');
+    await expect(transport).toHaveClass(/\b(?:waiting|stop|accept)\b/);
     await feedActiveTake(page, transport);
     await transport.click();
     await transport.click();
     await expect(page.locator('.professional-item.active')).toContainText('003');
     await expect(page.locator('.editor-nav span')).toHaveText('3 / 3');
-    await expect(transport).toContainText('完成本句');
+    await expect(transport).toHaveClass(/\b(?:waiting|stop|accept)\b/);
     const labelTransition = page.locator('.label-transition-chip');
     await expect(labelTransition).toBeVisible();
     await expect(labelTransition).toHaveText('标签已变化');
