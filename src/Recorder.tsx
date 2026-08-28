@@ -1029,8 +1029,6 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const itemBrowserRows = useMemo(() => items.map((item, index) => {
     const marks = itemSilenceViews[index] ?? { headShort: false, tailShort: false, title: '' };
     const flagged = marks.headShort || marks.tailShort;
-    const isCurrent = index === currentIndex;
-    const isRecordingCurrent = isCurrent && recording;
     const statusClass = itemStatusMetaClass(item.status);
     const labelBoundary = isLabelBoundary(items, index);
     const requiresRerecord = itemRequiresRerecord(item);
@@ -1042,7 +1040,6 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       item.text,
       t('recorder.itemLabelAria', { label: labelValue }),
       statusLabel(item.status),
-      isCurrent ? t('recorder.currentSentence') : '',
       labelBoundary ? t('recorder.labelChanged') : '',
       requiresRerecord ? t('recorder.requiresRerecord') : '',
       retainedWarning ? t('recorder.retainedPreviousShort') : '',
@@ -1053,7 +1050,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         if (node) itemRowRefs.current.set(item.id, node);
         else itemRowRefs.current.delete(item.id);
       }}
-      className={`professional-item${isCurrent ? ' current-item' : ''}${isRecordingCurrent ? ' recording-item' : ''}${item.status === 'skipped' ? ' skipped' : ''}${flagged ? ' has-silence-issue' : ''}${labelBoundary ? ' label-boundary' : ''}${requiresRerecord ? ' requires-rerecord' : ''}${retainedWarning ? ' retained-warning' : ''}`}
+      className={`professional-item${item.status === 'skipped' ? ' skipped' : ''}${flagged ? ' has-silence-issue' : ''}${labelBoundary ? ' label-boundary' : ''}${requiresRerecord ? ' requires-rerecord' : ''}${retainedWarning ? ' retained-warning' : ''}`}
       disabled={recording || Boolean(captureFault)}
       tabIndex={-1}
       aria-label={accessibleParts}
@@ -1095,13 +1092,13 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       <span className="item-copy"><strong>{item.id}</strong><small>{item.text}</small></span>
       {normalizedLabel || labelBoundary ? <span className="item-label-line"><b>{labelBoundary ? t('recorder.labelChanged') : t('recorder.labelShort')}</b><em className="item-label-value" title={normalizedLabel || undefined}>{labelValue}</em></span> : null}
       <span className="item-meta">
-        <em className={statusClass}>{isCurrent ? <span className={`item-current-flag${isRecordingCurrent ? ' recording' : ''}`}><i aria-hidden="true" />{t('recorder.currentSentence')}</span> : null}{statusLabel(item.status)}</em>
+        <em className={statusClass}><span className="item-current-flag"><i aria-hidden="true" />{t('recorder.currentSentence')}</span>{statusLabel(item.status)}</em>
         {requiresRerecord ? <i className="item-rerecord-mark">{t('recorder.requiresRerecord')}</i> : null}
         {retainedWarning ? <i className="item-retained-mark">{t('recorder.retainedPreviousShort')}</i> : null}
         <ItemSilenceMarkPills marks={marks} />
       </span>
     </button>;
-  }), [captureFault, currentIndex, itemSilenceViews, items, locale, recording]);
+  }), [captureFault, itemSilenceViews, items, locale, recording]);
   const requiredSilenceSamples = sampleRateForDisplay * effectiveSilenceDurationMs / 1_000;
   const headSilenceRequiredSamples = Math.max(1, meter.required_head_silence_samples ?? requiredSilenceSamples);
   const headSilenceProgressSamples = Math.min(
@@ -4510,7 +4507,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           </div>
           <div className="mini-progress"><i style={{ width: `${items.length ? completed / items.length * 100 : 0}%` }} /></div>
         </div>
-        <div className="professional-item-list" aria-label={t('recorder.scriptListAria')}>{itemBrowserRows}</div>
+        <div className={`professional-item-list${recording ? ' recording' : ''}`} aria-label={t('recorder.scriptListAria')}>{itemBrowserRows}</div>
       </aside>
       <main id="main" className="editor-document">
         <div className="document-tabs"><span className="active"><Icon name="microphone" size={13} /> {workflowComplete ? t('recorder.taskComplete') : currentItem?.id ?? 'Item'} <i>×</i></span></div>
