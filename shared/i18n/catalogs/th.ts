@@ -299,6 +299,7 @@ const th: MessageTree = {
     systemDefault: ' (ค่าเริ่มต้นของระบบ)',
     refreshDevices: 'รีเฟรชอุปกรณ์',
     shareMode: 'โหมดการเก็บเสียง',
+    bufferFrames: '{frames} เฟรม',
     exclusiveRecommended: 'เอกสิทธิ์ (แนะนำ)',
     sharedRecommended: 'แชร์ (แนะนำ)',
     sharedMode: 'แชร์',

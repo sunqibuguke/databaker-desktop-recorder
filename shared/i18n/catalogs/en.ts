@@ -299,6 +299,7 @@ const en: MessageTree = {
     systemDefault: ' (system default)',
     refreshDevices: 'Refresh devices',
     shareMode: 'Capture mode',
+    bufferFrames: '{frames} frames',
     exclusiveRecommended: 'Exclusive (recommended)',
     sharedRecommended: 'Shared (recommended)',
     sharedMode: 'Shared',

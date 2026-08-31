@@ -299,6 +299,7 @@ const ko: MessageTree = {
     systemDefault: ' (시스템 기본)',
     refreshDevices: '장치 새로고침',
     shareMode: '수집 모드',
+    bufferFrames: '{frames} 프레임',
     exclusiveRecommended: '독점(권장)',
     sharedRecommended: '공유(권장)',
     sharedMode: '공유',

@@ -299,6 +299,7 @@ const pt: MessageTree = {
     systemDefault: ' (predefinição do sistema)',
     refreshDevices: 'Atualizar dispositivos',
     shareMode: 'Modo de captura',
+    bufferFrames: '{frames} amostras',
     exclusiveRecommended: 'Exclusivo (recomendado)',
     sharedRecommended: 'Partilhado (recomendado)',
     sharedMode: 'Partilhado',

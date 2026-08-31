@@ -299,6 +299,7 @@ const ja: MessageTree = {
     systemDefault: '（システムの既定）',
     refreshDevices: 'デバイスを更新',
     shareMode: '収録モード',
+    bufferFrames: '{frames} フレーム',
     exclusiveRecommended: '排他（推奨）',
     sharedRecommended: '共有（推奨）',
     sharedMode: '共有',

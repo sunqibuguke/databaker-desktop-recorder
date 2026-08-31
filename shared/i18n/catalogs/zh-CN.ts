@@ -298,6 +298,7 @@ const zhCN = {
     systemDefault: '（系统默认）',
     refreshDevices: '刷新设备',
     shareMode: '采集模式',
+    bufferFrames: '{frames} 帧',
     exclusiveRecommended: '独占（推荐）',
     sharedRecommended: '系统混音（推荐）',
     sharedMode: '系统混音',
