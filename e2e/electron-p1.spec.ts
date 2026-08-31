@@ -1162,6 +1162,7 @@ test('real Electron exports cuts, verifies the external copy, writes a receipt, 
     await confirmInputAudition(page);
     await disableMandatoryHeadTailGate(page);
     await setAutomationRule(page, 'rule-head-tail', false);
+    await setAutomationRule(page, 'rule-discard-empty', true);
 
     const transport = page.getByTestId('main-transport');
     await transport.click();
@@ -1200,9 +1201,14 @@ test('real Electron exports cuts, verifies the external copy, writes a receipt, 
 
     const resultDialog = page.getByTestId('export-result-dialog');
     await expect(resultDialog).toBeVisible();
-    await expect(resultDialog.locator('#export-result-title')).toContainText(/导出完成/, {
+    const resultTitle = resultDialog.locator('#export-result-title');
+    await expect(resultTitle).toContainText(/导出完成|导出失败/, {
       timeout: 30_000,
     });
+    if ((await resultTitle.textContent())?.includes('导出失败')) {
+      const reason = await resultDialog.locator('.dialog-warning.danger').textContent();
+      throw new Error(`cuts export failed: ${reason || '未返回错误原因'}`);
+    }
     await expect(resultDialog.locator('.dialog-icon')).toHaveClass(/\bsuccess\b/);
     await expect(resultDialog).not.toContainText(/外部交付未完成/);
 
@@ -1237,6 +1243,8 @@ test('real Electron exports cuts, verifies the external copy, writes a receipt, 
       scope: string;
       included: unknown[];
       excluded: unknown[];
+      warnings: Array<{ code: string }>;
+      acknowledged_warning_codes: string[];
     };
     expect(manifest).toMatchObject({
       export_id: status.export_id,
@@ -1245,6 +1253,9 @@ test('real Electron exports cuts, verifies the external copy, writes a receipt, 
     });
     expect(manifest.included).toHaveLength(1);
     expect(manifest.excluded).toHaveLength(0);
+    expect([...manifest.acknowledged_warning_codes].sort()).toEqual(
+      [...new Set(manifest.warnings.map(({ code }) => code))].sort(),
+    );
 
     const deliveredFiles = (await fs.readdir(delivery)).filter((name) => !name.endsWith('.partial'));
     expect(deliveredFiles).toHaveLength(1);

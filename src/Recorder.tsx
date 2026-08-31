@@ -3625,8 +3625,12 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         failExport(t('p1.revisionUnavailable'));
         return;
       }
+      const workflow = deriveTaskWorkflow(sourceSnapshot);
+      const rawReadiness = workflow[cutsScope === 'complete_task'
+        ? 'completeTask'
+        : 'confirmedOnly'];
       const readiness = applyHeadTailWarningPreference(
-        deriveTaskWorkflow(sourceSnapshot),
+        workflow,
         automationRules.headTailSilence,
       )[cutsScope === 'complete_task'
         ? 'completeTask'
@@ -3640,13 +3644,20 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         failExport(t('p1.exportAcknowledgeFirst'));
         return;
       }
+      const acknowledgedWarningCodes = new Set(
+        acknowledgedExportWarnings.filter((code) => rawReadiness.warningCodes.includes(code)),
+      );
+      if (!automationRules.headTailSilence) {
+        for (const code of rawReadiness.warningCodes) {
+          if (code === 'head_silence_short' || code === 'tail_silence_short') {
+            acknowledgedWarningCodes.add(code);
+          }
+        }
+      }
       Object.assign(exportRequest, {
         scope: cutsScope,
         expected_journal_seq: sourceSnapshot.journal_seq,
-        acknowledged_warning_codes: [
-          ...acknowledgedExportWarnings.filter((code) => readiness.warningCodes.includes(code)),
-          ...(automationRules.headTailSilence ? [] : ['head_silence_short', 'tail_silence_short']),
-        ],
+        acknowledged_warning_codes: [...acknowledgedWarningCodes],
       });
     }
     const exported = await run(t('notice.exportingFiles'), () => window.recorder.request<ExportResult>('export_session_artifact', {
