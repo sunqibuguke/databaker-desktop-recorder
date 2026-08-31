@@ -1276,7 +1276,10 @@ function testReplugIntegration(scenario, expectedStatus, expectedOverall, failed
           ...process.env,
           NODE_ENV: 'test',
           DATABAKER_ACCEPTANCE_TEST_FAULT_DRAIN_MS: '250',
-          DATABAKER_ACCEPTANCE_TEST_REPLUG_TIMEOUT_MS: '900',
+          // Reappearance requires two 250 ms polls. A 900 ms wall-clock
+          // budget can expire before the second response on a busy Windows
+          // hosted runner, making the fixture fail before session B starts.
+          DATABAKER_ACCEPTANCE_TEST_REPLUG_TIMEOUT_MS: '3000',
           DATABAKER_ACCEPTANCE_MOCK_REPLUG: scenario,
           DATABAKER_ACCEPTANCE_MOCK_UNPLUG_AFTER_MS: scenario === 'early-fault' ? '1250' : '2250',
         },
