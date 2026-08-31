@@ -1,6 +1,12 @@
 import type { DebugLogDraft, DebugLogEntry, DebugLogSnapshot } from './debug-log';
 import { formatDebugLogText } from './debug-log';
-import type { Attempt, AudioDevice, CapturePresetDraft, CapturePresetStore, ExportDeliveryProgress, ExportDeliveryRequest, HeadSilencePhase, LicenseStatus, Meter, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SessionSnapshot } from './types';
+import {
+  createCurrentInputAuditionDecision,
+  inputAuditionCaptureFingerprint,
+  inputAuditionConfiguration,
+  logicalInputAuditionConfigurationKey,
+} from './input-audition';
+import type { Attempt, AudioDevice, CapturePresetDraft, CapturePresetStore, ExportDeliveryProgress, ExportDeliveryRequest, HeadSilencePhase, InputAuditionCacheConfiguration, InputAuditionCommandResult, InputAuditionDecision, InputAuditionFinishResult, LicenseStatus, Meter, NoiseCheckResult, PrompterState, RecordingHistoryEntry, ScriptItem, SessionSnapshot } from './types';
 
 type MockActiveAttempt = {
   item_id: string;
@@ -72,6 +78,7 @@ export function installDevRecorderMock() {
   let meterTimer: number | undefined;
   let mockPrompterOpen = false;
   let capturePresetStore: CapturePresetStore = { schemaVersion: 1, lastSelectedPresetId: null, presets: [] };
+  const inputAuditionDecisions = new Map<string, InputAuditionDecision>();
   const meterListeners = new Set<(message: unknown) => void>();
   const prompterListeners = new Set<(state: PrompterState) => void>();
   const prompterStatusListeners = new Set<(status: { open: boolean; ready: boolean }) => void>();
@@ -343,6 +350,12 @@ export function installDevRecorderMock() {
       snapshot.captured_samples = capturedSamples;
       snapshot.committed_samples = committedSamples;
       snapshot.updated_at = new Date().toISOString();
+      if (snapshot.input_audition?.status === 'recording') {
+        snapshot.input_audition.captured_samples = Math.min(
+          snapshot.input_audition.required_samples,
+          Math.max(0, capturedSamples - snapshot.input_audition.start_sample),
+        );
+      }
       if (committedSamples > 0) {
         const span = {
           start_sample: 0,
@@ -499,7 +512,7 @@ export function installDevRecorderMock() {
         device_id: requestedDevice.id,
         input_sample_format: String(data.input_sample_format || requestedDevice.configurations?.[0]?.sample_format || 'f32').toLowerCase(),
         capture_share_mode: data.capture_share_mode === 'shared' ? 'shared' : 'exclusive',
-        audio_format: { sample_rate: Number(data.sample_rate), bit_depth: Number(data.bit_depth ?? 24), encoding: Number(data.bit_depth ?? 24) === 32 ? 'float' : 'pcm', channels: 1, input_channels: 2, input_channel: Number(data.input_channel ?? 1) },
+        audio_format: { sample_rate: Number(data.sample_rate), bit_depth: Number(data.bit_depth ?? 16), encoding: Number(data.bit_depth ?? 16) === 32 ? 'float' : 'pcm', channels: 1, input_channels: 2, input_channel: Number(data.input_channel ?? 1) },
         master_audio: 'audio/master.wav', storage_layout_version: 1, segment_frames: Number(data.sample_rate) * 300, captured_samples: 0, committed_samples: 0, overflow_samples: 0,
         capture_provenance: [],
         input_discontinuity_count: 0,
@@ -703,6 +716,135 @@ export function installDevRecorderMock() {
       } as T;
     }
     if (!snapshot) throw new Error('Mock 录制尚未启动');
+    if (command === 'begin_input_audition') {
+      if (!captureActive) throw new Error('当前没有活动录制任务');
+      if (activeAttempt) throw new Error('请先结束当前句子录制');
+      if (snapshot.input_audition?.status === 'recording') throw new Error('输入试听正在录制');
+      const now = new Date().toISOString();
+      const captureFingerprint = `preview-${logicalInputAuditionConfigurationKey(inputAuditionConfiguration(snapshot)).length}`;
+      snapshot.input_audition = {
+        status: 'recording',
+        check_id: crypto.randomUUID(),
+        started_at: now,
+        start_sample: capturedSamples,
+        required_samples: mockSampleRate * 10,
+        captured_samples: 0,
+        capture_fingerprint: captureFingerprint,
+      };
+      snapshot.updated_at = now;
+      emitEvent('input_audition_started', structuredClone(snapshot.input_audition));
+      return {
+        input_audition: structuredClone(snapshot.input_audition),
+        snapshot: snapshotCopy(),
+      } as T;
+    }
+    if (command === 'finish_input_audition') {
+      const audition = snapshot.input_audition;
+      if (!audition || audition.status !== 'recording') throw new Error('当前没有正在录制的输入试听');
+      if (data.check_id !== audition.check_id) throw new Error('输入试听操作已过期');
+      emitMeter();
+      const captured = Math.max(0, capturedSamples - audition.start_sample);
+      if (captured < audition.required_samples) throw new Error('输入试听尚未录满 10 秒');
+      const endSample = audition.start_sample + audition.required_samples;
+      const warningCodes: string[] = [];
+      const metrics = {
+        duration_samples: audition.required_samples,
+        duration_seconds: audition.required_samples / mockSampleRate,
+        peak_dbfs: -9.1,
+        rms_dbfs: -24.8,
+        waveform_bin_count: 160,
+        input_discontinuity_count: 0,
+        input_discontinuity_silence_samples: 0,
+        overflow_samples: 0,
+        warning_codes: warningCodes,
+      };
+      snapshot.input_audition = {
+        ...audition,
+        status: 'ready',
+        captured_samples: audition.required_samples,
+        end_sample: endSample,
+        completed_at: new Date().toISOString(),
+        metrics,
+        warning_codes: warningCodes,
+        file_path: `${currentSessionDir}/preview/input-audition.wav`,
+      };
+      snapshot.updated_at = snapshot.input_audition.completed_at!;
+      const bins = Array.from({ length: 160 }, (_, index): [number, number] => {
+        const envelope = .08 + Math.abs(Math.sin(index * .19)) * .24;
+        return [-envelope, envelope];
+      });
+      const result: InputAuditionFinishResult = {
+        input_audition: structuredClone(snapshot.input_audition),
+        check_id: snapshot.input_audition.check_id!,
+        start_sample: audition.start_sample,
+        end_sample: endSample,
+        file_path: snapshot.input_audition.file_path!,
+        bins,
+        rms_dbfs: metrics.rms_dbfs,
+        peak_dbfs: metrics.peak_dbfs,
+        warning_codes: warningCodes,
+        capture_fingerprint: snapshot.input_audition.capture_fingerprint!,
+        metrics,
+        snapshot: snapshotCopy(),
+      };
+      emitEvent('input_audition_finished', structuredClone(result));
+      return result as T;
+    }
+    if (command === 'confirm_input_audition') {
+      const audition = snapshot.input_audition;
+      if (!audition || audition.status !== 'ready') throw new Error('当前没有可确认的输入试听');
+      if (data.check_id !== audition.check_id) throw new Error('输入试听操作已过期');
+      snapshot.input_audition = {
+        ...audition,
+        status: 'confirmed',
+        confirmed_at: new Date().toISOString(),
+      };
+      snapshot.updated_at = snapshot.input_audition.confirmed_at!;
+      emitEvent('input_audition_confirmed', structuredClone(snapshot.input_audition));
+      return {
+        input_audition: structuredClone(snapshot.input_audition),
+        snapshot: snapshotCopy(),
+      } as T;
+    }
+    if (command === 'skip_input_audition') {
+      if (snapshot.input_audition?.status === 'recording') throw new Error('请先取消正在录制的输入试听');
+      const existing = snapshot.input_audition;
+      if ((existing?.status === 'ready' || existing?.status === 'warning')
+        && data.check_id !== existing.check_id) {
+        throw new Error('输入试听操作已过期');
+      }
+      const now = new Date().toISOString();
+      snapshot.input_audition = {
+        status: 'skipped',
+        check_id: existing?.check_id ?? crypto.randomUUID(),
+        started_at: existing?.started_at ?? now,
+        completed_at: now,
+        skipped_at: now,
+        start_sample: existing?.start_sample ?? capturedSamples,
+        end_sample: existing?.end_sample ?? capturedSamples,
+        required_samples: existing?.required_samples ?? mockSampleRate * 10,
+        captured_samples: existing?.captured_samples ?? 0,
+        capture_fingerprint: existing?.capture_fingerprint
+          ?? `preview-${logicalInputAuditionConfigurationKey(inputAuditionConfiguration(snapshot)).length}`,
+      };
+      snapshot.updated_at = now;
+      emitEvent('input_audition_skipped', structuredClone(snapshot.input_audition));
+      return {
+        input_audition: structuredClone(snapshot.input_audition),
+        snapshot: snapshotCopy(),
+      } as T;
+    }
+    if (command === 'cancel_input_audition') {
+      const cancelled = snapshot.input_audition;
+      if (!cancelled || data.check_id !== cancelled.check_id) throw new Error('输入试听操作已过期');
+      snapshot.input_audition = null;
+      snapshot.updated_at = new Date().toISOString();
+      emitEvent('input_audition_cancelled', cancelled ? structuredClone(cancelled) : null);
+      return {
+        input_audition: null,
+        snapshot: snapshotCopy(),
+      } as T;
+    }
     if (command === 'check_noise') {
       const thresholdDbfs = Number(data.threshold_dbfs ?? -42);
       const samples: number[] = [];
@@ -1010,6 +1152,53 @@ export function installDevRecorderMock() {
       platform: 'darwin',
       devWebCapture: async () => false,
       request,
+      getInputAuditionDecision: async (configuration: InputAuditionCacheConfiguration) => (
+        inputAuditionDecisions.get(logicalInputAuditionConfigurationKey(configuration)) ?? null
+      ),
+      clearInputAuditionDecision: async (configuration: InputAuditionCacheConfiguration) => {
+        inputAuditionDecisions.delete(logicalInputAuditionConfigurationKey(configuration));
+      },
+      beginInputAudition: () => request<InputAuditionCommandResult>('begin_input_audition'),
+      finishInputAudition: (checkId: string) => request<InputAuditionFinishResult>(
+        'finish_input_audition',
+        { check_id: checkId },
+      ),
+      confirmInputAudition: async (checkId: string) => {
+        const result = await request<InputAuditionCommandResult>(
+          'confirm_input_audition',
+          { check_id: checkId },
+        );
+        const decision = createCurrentInputAuditionDecision(
+          'confirmed',
+          inputAuditionCaptureFingerprint(result.input_audition),
+          result.input_audition?.check_id ?? checkId,
+        );
+        inputAuditionDecisions.set(
+          logicalInputAuditionConfigurationKey(inputAuditionConfiguration(result.snapshot)),
+          decision,
+        );
+        return result;
+      },
+      skipInputAudition: async (checkId?: string) => {
+        const result = await request<InputAuditionCommandResult>(
+          'skip_input_audition',
+          checkId ? { check_id: checkId } : {},
+        );
+        const decision = createCurrentInputAuditionDecision(
+          'skipped',
+          inputAuditionCaptureFingerprint(result.input_audition),
+          result.input_audition?.check_id ?? checkId ?? '',
+        );
+        inputAuditionDecisions.set(
+          logicalInputAuditionConfigurationKey(inputAuditionConfiguration(result.snapshot)),
+          decision,
+        );
+        return result;
+      },
+      cancelInputAudition: (checkId: string) => request<InputAuditionCommandResult>(
+        'cancel_input_audition',
+        { check_id: checkId },
+      ),
       openScript: async () => null,
       chooseOutput: async () => '/tmp/DataBaker Recordings',
       chooseExportDir: async () => '/tmp/DataBaker Preview Export',

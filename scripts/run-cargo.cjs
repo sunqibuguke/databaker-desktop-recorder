@@ -14,6 +14,8 @@ const candidates = [
 
 const cargo = candidates.find((candidate) => fs.existsSync(candidate)) ?? executable;
 const environment = { ...process.env };
+const packageJson = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+environment.DATABAKER_APP_VERSION ??= String(packageJson.version || 'unknown');
 const localCacheCargo = path.join(home, '.cache', 'databaker-rust', 'cargo', 'bin', executable);
 if (cargo === localCacheCargo) {
   environment.CARGO_HOME ??= path.join(home, '.cache', 'databaker-rust', 'cargo');

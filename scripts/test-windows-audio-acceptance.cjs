@@ -120,6 +120,8 @@ function testArgs() {
   assert.equal(short.export, true);
   const shared = parseArgs(['--mode', 'short', '--share-mode', 'shared']);
   assert.equal(shared.shareMode, 'shared');
+  assert.equal(shared.bitDepth, 16);
+  assert.equal(shared.minimumInputFormatBits, 16);
   assert.throws(() => parseArgs(['--mode', 'short', '--share-mode', 'asio']), /share-mode/);
 
   const qualification = parseArgs([

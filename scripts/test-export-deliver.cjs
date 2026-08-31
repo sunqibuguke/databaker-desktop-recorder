@@ -85,6 +85,11 @@ async function main() {
     assert.match(preloadSource, new RegExp(channel));
   }
   assert.match(preloadSource, /export:delivery-progress/);
+  assert.match(
+    mainSource,
+    /verification\?\.verification === 'verified'[\s\S]*?rememberUserExportDirectory\(verification\.directory\)/,
+    'a successful receipt recheck must re-authorize the exact external directory for View delivery after restart',
+  );
 
   assert.equal(isExportDeliveryRequest({
     request_id: 'request-1',

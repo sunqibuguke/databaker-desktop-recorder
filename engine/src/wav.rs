@@ -910,6 +910,75 @@ pub fn waveform_wav_mono(
     Ok(fold.finish())
 }
 
+/// Computes whole-range levels from the encoded WAV samples themselves.
+/// Live meters are deliberately not used here: they are smoothed snapshots
+/// and cannot describe an exact persisted audition range.
+pub(crate) fn level_metrics_wav_mono(
+    source: &Path,
+    bit_depth: u16,
+    start_frame: u64,
+    end_frame: u64,
+) -> Result<(f32, f32)> {
+    if end_frame <= start_frame {
+        bail!("invalid level range: end must be after start");
+    }
+    let encoding = WavEncoding::for_bit_depth(bit_depth)?;
+    let frame_bytes = u64::from(bytes_per_sample(bit_depth)?);
+    let mut input =
+        File::open(source).with_context(|| format!("open source WAV {}", source.display()))?;
+    let input_len = input.metadata()?.len();
+    let start_byte = encoding
+        .header_len()
+        .checked_add(
+            start_frame
+                .checked_mul(frame_bytes)
+                .context("WAV level offset overflow")?,
+        )
+        .context("WAV level offset overflow")?;
+    let end_byte = encoding
+        .header_len()
+        .checked_add(
+            end_frame
+                .checked_mul(frame_bytes)
+                .context("WAV level range overflow")?,
+        )
+        .context("WAV level range overflow")?;
+    if end_byte > input_len {
+        bail!(
+            "level range exceeds committed audio: requested byte {}, file length {}",
+            end_byte,
+            input_len
+        );
+    }
+    input.seek(SeekFrom::Start(start_byte))?;
+    let mut remaining = end_byte - start_byte;
+    let mut bytes = vec![0u8; 48 * 1024];
+    let mut peak = 0.0f32;
+    let mut square_sum = 0.0f64;
+    let mut sample_count = 0u64;
+    while remaining > 0 {
+        let count = usize::try_from(remaining.min(bytes.len() as u64))?;
+        input.read_exact(&mut bytes[..count])?;
+        for sample in decode_encoded_mono_samples(&bytes[..count], bit_depth)? {
+            if !sample.is_finite() {
+                bail!("WAV level range contains a non-finite sample");
+            }
+            let normalized = sample.clamp(-1.0, 1.0);
+            peak = peak.max(normalized.abs());
+            square_sum += f64::from(normalized) * f64::from(normalized);
+            sample_count = sample_count
+                .checked_add(1)
+                .context("WAV level sample counter overflow")?;
+        }
+        remaining -= count as u64;
+    }
+    if sample_count != end_frame - start_frame {
+        bail!("WAV level range decoded an unexpected number of samples");
+    }
+    let rms = (square_sum / sample_count as f64).sqrt() as f32;
+    Ok((peak, rms))
+}
+
 pub fn slice_wav_mono(
     source: &Path,
     destination: &Path,

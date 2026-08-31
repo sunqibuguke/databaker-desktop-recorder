@@ -1,5 +1,7 @@
 # Windows 外置声卡生产验收
 
+> 本文是后续正式工位资格工具的技术说明，不是当前受控试运行版的上线门槛。受控试运行不绑定 USB 物理插口，也不会因换插口显示配置不一致；现场要求见同目录《受控试运行说明》。
+
 本文档是第一版音频采集上线门禁，不是功能演示。每一种客户常用声卡、驱动版本和 Windows 机型都要留下独立报告。没有通过真实 Windows + USB 声卡的短录、长稳、拔设备和磁盘保护前，不应标记为“生产可发布”。
 
 ## 1. 验收工具做什么
@@ -128,7 +130,7 @@ $device = "<inventory 返回的完整设备 ID>"
 强制通过标准：
 
 - 请求设备 ID、开流模式、采样率、输入通道和交付位深与会话快照一致。
-- 引擎记录非空 `input_sample_format` 与 `capture_share_mode`，且通过 `minimum_input_format_bits` 有效数字精度门槛（整数按位宽，`f32=24`、`f64=53`；默认 24/32-bit 交付不接受 `i16/u16`）。
+- 引擎记录非空 `input_sample_format` 与 `capture_share_mode`，且通过 `minimum_input_format_bits` 有效数字精度门槛（整数按位宽，`f32=24`、`f64=53`；显式选择 24/32-bit 交付时不接受 `i16/u16`）。
 - `captured` / `committed` 单调，最大提交延迟 ≤ 15 秒，无 overflow/fault marker。
 - 所有分段 WAV 为请求采样率、请求位深、Mono；物理帧数等于最终 `committed_samples`。
 - 安全停止后 WAV 头与物理 EOF 一致，整轨导出可解析；文件较大时能正确识别 RF64 的 `ds64` 计数和哨兵字段。
@@ -172,7 +174,7 @@ $device = "<inventory 返回的完整设备 ID>"
 
 现场长稳出现非终止型声卡链路 warning 时，必须分别核对以下两类结果，不能只凭波形外观判定录音合格：
 
-- 驱动上报 `DATA_DISCONTINUITY`，但 packet position 连续、`missing_frames=0`：`input_discontinuity_count` 可以增加，`input_discontinuity_silence_samples` 不增加；活动 attempt 仍可正常确认，界面按既有自动续录和标签规则进入下一句，采集保持 active。
+- 驱动上报 `DATA_DISCONTINUITY`，即使 packet position 连续且 `missing_frames=0`：`input_discontinuity_count` 增加、`input_discontinuity_silence_samples` 不增加；活动 attempt 仍必须标记 `needs_rerecord`，不得确认或交付，采集任务本身保持 active。
 - 确认存在 `missing_frames>0` 的有界前向缺口：引擎插入等值静音保持母音频时间轴，`input_discontinuity_silence_samples` 增加；受影响 attempt 必须标记 `needs_rerecord`，不得确认、试听切片或进入交付。界面先切到下一物理句并按自动续录规则继续，受损句保留在问题队列稍后补录；末句则停在末句提示重录。
 - 两类情况都不得中断持续母音频或整批采集。超过恢复上限、位置倒退/溢出、设备断开、输入停滞、队列/写盘故障仍按 fail-closed 处理，不适用本节的继续采集规则。
 

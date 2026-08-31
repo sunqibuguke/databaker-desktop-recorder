@@ -29,9 +29,27 @@ assert.match(recorder, /event\.key === 'ArrowDown'/);
 assert.match(recorder, /className="item-label-value" title=\{normalizedLabel \|\| undefined\}/);
 assert.match(recorder, /testId="recorder-label-font-size"/);
 assert.match(recorder, /labelTransition\(currentItem\.label, nextItem\.label\)/);
-assert.match(recorder, /testId="rule-pause-on-label-change" checked=\{automationRules\.pauseOnLabelChange\}/);
-assert.match(recorder, /applyAutomationRule\('pauseOnLabelChange', enabled\)/);
+assert.match(recorder, /testId=\{testId\('pause-on-label-change'\)\} checked=\{props\.rules\.pauseOnLabelChange\} disabled=\{!props\.rules\.autoStartNext\}/);
+assert.match(recorder, /props\.onChange\('pauseOnLabelChange', enabled\)/);
 assert.match(recorder, /pauseOnLabelChange: automationRules\.pauseOnLabelChange/);
+assert.match(recorder, /monitorPanelTab === 'settings'[\s\S]*?data-testid="task-recording-settings"/);
+assert.match(recorder, /testIdPrefix="rule"/);
+assert.match(recorder, /saveSessionAutomationRules\(sessionDir, next\)/);
+assert.match(recorder, /saveWorkstationAutomationRules\(next\)/);
+assert.doesNotMatch(recorder, /saveAutomationRules/);
+assert.match(recorder, /const bitDepth = DEFAULT_DELIVERY_BIT_DEPTH/);
+assert.match(recorder, /const nextBitDepth = DEFAULT_DELIVERY_BIT_DEPTH/);
+assert.match(recorder, /bit_depth: nextBitDepth,[\s\S]*?input_sample_format: nextSampleFormat/,
+  'new task delivery depth and native driver input format must be sent independently');
+assert.doesNotMatch(recorder, /deliveryBitDepthForCaptureFormat\(nextSampleFormat\)/,
+  'the selected ASIO/WASAPI input representation must not change PCM16 delivery');
+const detectionPanel = recorder.slice(
+  recorder.indexOf("monitorPanelTab === 'detection'"),
+  recorder.indexOf("monitorPanelTab === 'settings'"),
+);
+assert.doesNotMatch(detectionPanel, /RecordingRuleGroups|rule-auto-start-next|rule-pause-on-label-change/);
+assert.match(css, /\.rule-switch/);
+assert.match(css, /\.dependent-rule/);
 assert.match(recorder, /startAttempt\(nextItem, \{ acknowledgeLabelTransition: false \}\)/);
 assert.match(recorder, /acceptTarget\?\.status === 'review' \|\| acceptPausesForLabelChange/);
 assert.match(recorder, /acceptAttempt\(retainedDeliveryAttempt\.attempt_id\)/);
@@ -66,22 +84,30 @@ assert.match(recorder, /recording \|\| captureFault \|\| workspaceFaulted \|\| !
 assert.match(recorder, /disabled=\{recording \|\| !reviewAttempt \|\| Boolean\(busy\)\}/);
 assert.doesNotMatch(recorder, /知道了/);
 assert.match(recorder, /data-testid="retake-decision-summary"/);
-assert.match(recorder, /data-testid=\{hasRetakeDecision \? 'preview-retake' : undefined\}[\s\S]*?t\('recorder\.previewCandidate'\)/);
+assert.match(recorder, /data-testid="preview-current-delivery"[\s\S]*?previewAttempt\(retainedDeliveryAttempt\.attempt_id\)/);
+assert.match(recorder, /data-testid="preview-retake"[\s\S]*?previewAttempt\(retakeCandidateAttempt\.attempt_id\)/);
+assert.match(recorder, /data-testid="retake-current-duration"[\s\S]*?SilencePairReadout pair=\{retainedDeliveryPair\} hint testId="retake-current-silence"/);
+assert.match(recorder, /data-testid="retake-candidate-duration"[\s\S]*?SilencePairReadout pair=\{retakeCandidatePair\} hint testId="retake-candidate-silence"/);
 assert.match(recorder, /data-retake-action=\{hasRetakeDecision \? 'use' : undefined\}[\s\S]*?t\('recorder\.useRetakeCandidate'\)/);
 assert.match(recorder, /data-testid="discard-retake"[\s\S]*?acceptAttempt\(retainedDeliveryAttempt\.attempt_id\)[\s\S]*?t\('recorder\.keepPreviousVersion'\)/);
-assert.equal((recorder.match(/t\('recorder\.previewCandidate'\)/g) ?? []).length, 1);
-assert.equal((recorder.match(/t\('recorder\.useRetakeCandidate'\)/g) ?? []).length, 1);
-assert.equal((recorder.match(/t\('recorder\.keepPreviousVersion'\)/g) ?? []).length, 1);
 assert.doesNotMatch(recorder, /data-testid="version-workbench"/, '普通录制界面不得恢复版本工作台');
 assert.doesNotMatch(recorder, /className="version-(?:comparison|column|silence-metrics)/, '普通录制界面不得恢复版本比较');
 assert.doesNotMatch(recorder, /className="attempt-history(?:-row)?/, '普通录制界面不得展开 attempt 历史');
-assert.doesNotMatch(recorder, /previewAttempt\(retainedDeliveryAttempt\.attempt_id\)/, '重录决策不得提供原录音试听');
+assert.match(recorder, /previewAttempt\(retainedDeliveryAttempt\.attempt_id\)/, '重录 A\/B 决策必须可以试听原录音');
 assert.match(recorder, /isAttemptPreviewSafe/);
 assert.match(recorder, /expected_journal_seq: sourceSnapshot\.journal_seq/);
 assert.match(recorder, /if \(!safeAttemptIds\.has\(attemptId\)\) return/);
 assert.match(recorder, /data-testid="issue-workbench"/);
 assert.match(recorder, /adjacentWorkbenchIssue\(visibleWorkbenchIssues, selectedIssueId, direction\)/);
 assert.match(recorder, /setCurrentIndex\(issue\.itemIndex\)/);
+assert.match(recorder, /nextWorkbenchIssueAfterResolution\(/);
+assert.match(recorder, /data-testid="issue-resolution"/);
+assert.match(recorder, /acceptAttempt\(undefined, \{ autoStartNext: false \}\)/);
+assert.doesNotMatch(
+  recorder,
+  /issueJustAppeared|hadMonitorIssuesRef/,
+  '正常待确认或质量提示不得自动打开问题队列并抢占连续采录的当前句',
+);
 const issueLocator = recorder.slice(
   recorder.indexOf('function locateWorkbenchIssue'),
   recorder.indexOf('function moveWorkbenchIssue'),
@@ -100,11 +126,45 @@ assert.doesNotMatch(recorder, /meter\.vad_health \?\? \(persistedVadFaults > 0 \
 assert.match(recorder, /saveWorkspaceContext/);
 assert.match(recorder, /loadWorkspaceContext/);
 assert.match(recorder, /workflowShortcutTargetAllowed\(\{/);
-assert.match(recorder, /modalOpen: Boolean\(document\.querySelector\('\[role="dialog"\]\[aria-modal="true"\]'\)\)[\s\S]*?&& !showDeviceWarningDialog[\s\S]*?&& !showNoiseCheckDialog/);
+assert.match(recorder, /modalOpen: inputAuditionOpen[\s\S]*?Boolean\(document\.querySelector\('\[role="dialog"\]\[aria-modal="true"\]'\)\)[\s\S]*?&& !showDeviceWarningDialog[\s\S]*?&& !showNoiseCheckDialog/);
 assert.match(recorder, /formControl: Boolean\(target\?\.closest\('input, textarea, select, audio, \[contenteditable="true"\]'\)\)/);
 assert.match(recorder, /professionalItem: Boolean\(target\?\.closest\('\.professional-item'\)\)/);
 assert.doesNotMatch(recorder, /target\?\.closest\('input, textarea, select, button, audio'\)/, 'focused sentence rows must not be rejected by the blanket button guard');
 assert.match(recorder, /if \(options\.activate\) await activateCapture\(undefined, inspected\.session_dir\)/);
+assert.match(recorder, /function showTaskIssues[\s\S]*?openHistoricalRecording\(recording, \{ panel: 'issues' \}\)/);
+assert.match(recorder, /function showTaskExportReview[\s\S]*?openHistoricalRecording\(recording, \{ panel: 'export' \}\)/);
+assert.match(recorder, /listEntry\.reason === 'warning' \? showTaskExportReview\(recording\) : listEntry\.reason === 'blocked' \? showTaskIssues\(recording\)/);
+assert.match(recorder, /data-testid="seal-recording" className="row-primary"/);
+assert.match(recorder, /data-testid="deliver-recording" className="row-primary"/);
+assert.match(recorder, /data-testid="view-delivery" className="row-primary"/);
+assert.match(recorder, /function openVerifiedRecordingDelivery[\s\S]*?verified_delivery_directories\?\.cuts_zip[\s\S]*?openPath\(target\)/);
+const verifiedDeliveryOpener = recorder.slice(
+  recorder.indexOf('async function openVerifiedRecordingDelivery'),
+  recorder.indexOf('async function openRecordingDirectory'),
+);
+assert.doesNotMatch(verifiedDeliveryOpener, /joinPath|session_dir, 'export'/,
+  '查看交付不得退回任务内部 export 目录');
+assert.match(recorder, /verifyHistoryCutsDeliveries\(result\.recordings, sequence\)/);
+const backgroundDeliveryVerification = recorder.slice(
+  recorder.indexOf('async function verifyHistoryCutsDeliveries'),
+  recorder.indexOf('async function verifyRecordingDeliveries'),
+);
+assert.match(backgroundDeliveryVerification, /artifact: 'cuts_zip'/);
+assert.doesNotMatch(backgroundDeliveryVerification, /full_track|timestamps_json/,
+  '首页后台复验只应检查 cuts ZIP，避免启动时哈希巨大整轨');
+assert.doesNotMatch(recorder, /listEntry\.kind === 'view-record'/);
+assert.match(recorder, /const activeDialogKey = logPanelOpen/);
+assert.match(recorder, /dialogFocusableElements\(activeDialog\)/);
+assert.match(recorder, /event\.key === 'Tab'/);
+assert.match(recorder, /if \(event\.isComposing\) return/);
+assert.match(recorder, /data-dialog-initial className="button"[\s\S]*?setDeleteConfirmRecording\(null\)/);
+assert.match(recorder, /data-testid="setup-essential-audio"/);
+assert.match(recorder, /data-testid="setup-technical-settings"/);
+assert.match(recorder, /setupReadinessIssues\(\{/);
+assert.match(recorder, /data-testid="setup-readiness"/);
+assert.match(css, /\.setup-rhythm/);
+assert.match(css, /\.issue-resolution/);
+assert.match(css, /\.retake-ab-review/);
 
 assert.match(types, /labelTransition\?: ScriptLabelTransition \| null/);
 assert.match(types, /capture_provenance: CaptureProvenanceSpan\[\]/);

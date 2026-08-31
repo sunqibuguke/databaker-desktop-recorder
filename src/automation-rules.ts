@@ -26,6 +26,17 @@ const WORKSTATION_RULES_KEY = 'databaker:automation-rules:workstation';
 
 export type TaskDetectionPolicyKey = 'envCheck' | 'discardEmpty';
 
+const AUTOMATION_RULE_KEYS: Array<keyof AutomationRules> = [
+  'autoStartNext',
+  'pauseOnLabelChange',
+  'headTailSilence',
+  'enforceHeadTailSilence',
+  'discardEmpty',
+  'envCheck',
+  'almostSilent',
+  'peakHigh',
+];
+
 function asBoolean(value: unknown, fallback: boolean): boolean {
   return typeof value === 'boolean' ? value : fallback;
 }
@@ -111,10 +122,8 @@ export function saveSessionAutomationRules(sessionDir: string, rules: Automation
   }
 }
 
-export function saveAutomationRules(sessionDir: string, rules: AutomationRules): void {
-  const normalized = normalizeAutomationRules(rules);
-  saveWorkstationAutomationRules(normalized);
-  saveSessionAutomationRules(sessionDir, normalized);
+export function automationRulesEqual(left: AutomationRules, right: AutomationRules): boolean {
+  return AUTOMATION_RULE_KEYS.every((key) => left[key] === right[key]);
 }
 
 /** Turn off env check for this task only. New-task drafts keep the workstation default. */

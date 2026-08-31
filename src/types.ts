@@ -95,6 +95,10 @@ export type CaptureProvenanceSpan = {
 
 export type SessionSnapshot = {
   schema_version: number;
+  /** Application build that created or most recently wrote this task. */
+  app_version?: string;
+  /** Audio-engine build that created or most recently wrote this task. */
+  engine_version?: string;
   /** Monotonic task revision used by stale-command guards. */
   journal_seq: number;
   session_id: string;
@@ -128,6 +132,7 @@ export type SessionSnapshot = {
   started_at: string;
   updated_at: string;
   noise_check?: NoiseCheckResult | null;
+  input_audition?: InputAuditionState | null;
   noise_threshold_dbfs?: number;
   silence_duration_ms: number;
   silence_threshold_dbfs: number;
@@ -153,6 +158,86 @@ export type NoiseCheckProgress = {
   rms_dbfs: number;
   peak_dbfs: number;
   threshold_dbfs: number;
+};
+
+export type InputAuditionStatus = 'recording' | 'ready' | 'confirmed' | 'skipped' | 'warning';
+
+export type InputAuditionMetrics = {
+  duration_samples: number;
+  duration_seconds: number;
+  peak_dbfs: number;
+  rms_dbfs?: number;
+  waveform_bin_count: number;
+  input_discontinuity_count: number;
+  input_discontinuity_silence_samples: number;
+  overflow_samples: number;
+  warning_codes: string[];
+};
+
+export type InputAuditionState = {
+  status: InputAuditionStatus;
+  check_id?: string;
+  started_at: string;
+  completed_at?: string;
+  confirmed_at?: string;
+  skipped_at?: string;
+  decision_source?: 'current_audition' | 'launch_cache';
+  source_check_id?: string;
+  source_decided_at?: string;
+  source_capture_fingerprint?: string;
+  start_sample: number;
+  end_sample?: number;
+  required_samples: number;
+  captured_samples?: number;
+  /** Engine-owned SHA-256 over the concrete capture path. */
+  capture_fingerprint?: string;
+  /** Compatibility with an early protocol draft; prefer capture_fingerprint. */
+  fingerprint?: string;
+  metrics?: InputAuditionMetrics;
+  warning_codes?: string[];
+  file_path?: string;
+};
+
+export type InputAuditionCommandResult = {
+  input_audition: InputAuditionState | null;
+  snapshot: SessionSnapshot;
+};
+
+export type InputAuditionFinishResult = InputAuditionCommandResult & {
+  input_audition: InputAuditionState;
+  check_id: string;
+  start_sample: number;
+  end_sample: number;
+  file_path: string;
+  bins: Array<[number, number]>;
+  rms_dbfs: number;
+  peak_dbfs: number;
+  warning_codes: string[];
+  capture_fingerprint: string;
+  metrics?: InputAuditionMetrics;
+};
+
+export type InputAuditionCacheConfiguration = {
+  backend: string;
+  deviceName: string;
+  /** Diagnostic only; deliberately excluded from the logical cache key. */
+  deviceId?: string;
+  driverName?: string;
+  sampleRate: number;
+  outputBitDepth: number;
+  inputSampleFormat: string;
+  inputChannels: number;
+  inputChannel: number;
+  shareMode: string;
+  requestedBufferFrames?: number | null;
+  actualBufferFrames?: number | null;
+};
+
+export type InputAuditionDecision = {
+  status: 'confirmed' | 'skipped';
+  decidedAt: string;
+  captureFingerprint: string | null;
+  sourceCheckId: string;
 };
 
 export type DeviceStreamConfiguration = {
@@ -386,12 +471,20 @@ export type RecordingHistoryEntry = {
   pending_items: number;
   blocker_items?: number;
   warning_items?: number;
+  warning_items_without_head_tail?: number;
+  warning_codes?: string[];
   confirmed_only_readiness?: DeliveryReadinessSummary;
   complete_task_readiness?: DeliveryReadinessSummary;
   noise_check: NoiseCheckResult | null;
   export_exists: boolean;
   export_artifacts?: Partial<Record<ExportArtifact, ExportArtifactState>>;
   delivery_verifications?: Partial<Record<ExportArtifact, 'pending' | 'verified' | 'stale' | 'missing' | 'invalid'>>;
+  /**
+   * Renderer-only locations returned by a successful receipt verification.
+   * A task must never treat its internal `export/` directory as an externally
+   * delivered destination.
+   */
+  verified_delivery_directories?: Partial<Record<ExportArtifact, string>>;
   data_health?: 'normal' | 'needs_repair' | 'readonly';
   history_issue?: string;
 };

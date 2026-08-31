@@ -98,7 +98,13 @@ async function importScript(
   await expect(page.getByTestId('open-script-preview')).toBeVisible();
   await expect(page.getByTestId('script-import-preview')).toHaveCount(0);
   const detectorOption = page.getByTestId(`detector-${detector}`);
-  if (detector === 'energy') await detectorOption.click();
+  if (await detectorOption.getAttribute('aria-checked') !== 'true') {
+    const advanced = page.getByTestId('setup-detection-advanced');
+    if (!await advanced.evaluate((node) => (node as HTMLDetailsElement).open)) {
+      await advanced.locator('summary').click();
+    }
+    await detectorOption.click();
+  }
   await expect(detectorOption).toHaveAttribute('aria-checked', 'true');
   await expect(page.getByTestId('start-session')).toBeEnabled();
 }
@@ -145,6 +151,45 @@ async function feedPaced(
   }
 }
 
+async function skipInputAuditionIfPrompted(page: Page): Promise<void> {
+  const dialog = page.getByTestId('input-audition-dialog');
+  const prompted = await dialog.waitFor({ state: 'visible', timeout: 5_000 })
+    .then(() => true)
+    .catch(() => false);
+  if (!prompted) return;
+
+  await page.getByTestId('input-audition-skip').click();
+  const confirmation = page.getByTestId('input-audition-skip-confirm');
+  await expect(confirmation).toBeVisible();
+  await confirmation.click();
+  await expect(dialog).toBeHidden();
+}
+
+async function confirmInputAudition(page: Page): Promise<void> {
+  const dialog = page.getByTestId('input-audition-dialog');
+  await expect(dialog).toBeVisible();
+  await page.getByTestId('input-audition-start').click();
+  await expect(page.getByTestId('input-audition-progress')).toBeVisible();
+  await feedPaced(page, 480_000, 'speech');
+  const audio = page.getByTestId('input-audition-audio');
+  await expect(audio).toBeVisible({ timeout: 15_000 });
+  await audio.evaluate((node) => node.dispatchEvent(new Event('ended')));
+  await page.getByTestId('input-audition-confirm').click();
+  await expect(dialog).toBeHidden();
+}
+
+async function enterCreatedRecording(page: Page): Promise<void> {
+  await page.getByTestId('start-session').click();
+  await page.getByTestId('recording-workspace').waitFor();
+  await skipInputAuditionIfPrompted(page);
+}
+
+async function enterHistoricalRecording(page: Page): Promise<void> {
+  await page.getByTestId('record-recording').first().click();
+  await page.getByTestId('recording-workspace').waitFor();
+  await skipInputAuditionIfPrompted(page);
+}
+
 async function feedActiveTake(page: Page, transport: ReturnType<Page['getByTestId']>): Promise<void> {
   await expect(transport).toContainText(/即将开始|完成本句|结束本句/);
   // Keep a half-second margin around the one-second gate so block boundaries
@@ -169,14 +214,14 @@ async function feedTakeWithSilenceWarning(
 }
 
 async function disableMandatoryHeadTailGate(page: Page): Promise<void> {
-  await page.locator('.monitor-tabs button').filter({ hasText: /检测/ }).click();
+  await page.locator('.monitor-tabs button').filter({ hasText: /设置/ }).click();
   const toggle = page.getByTestId('rule-enforce-head-tail');
   if (await toggle.isChecked()) await toggle.uncheck();
   await expect(toggle).not.toBeChecked();
 }
 
 async function setAutomationRule(page: Page, testId: string, enabled: boolean): Promise<void> {
-  await page.locator('.monitor-tabs button').filter({ hasText: /检测/ }).click();
+  await page.locator('.monitor-tabs button').filter({ hasText: /设置/ }).click();
   const toggle = page.getByTestId(testId);
   await expect(toggle).toBeEnabled();
   if (await toggle.isChecked() !== enabled) {
@@ -196,11 +241,18 @@ async function expectCompactRetakeDecision(page: Page): Promise<void> {
   await expect(summary).toBeVisible();
   await expect(summary).not.toContainText('两次录音');
   await expect(previewRetake).toHaveCount(1);
-  await expect(previewRetake.locator('span')).toHaveText('试听本次重录');
+  await expect(previewRetake.locator(':scope > .retake-version')).toHaveText('本次重录');
+  await expect(previewRetake.locator('strong')).toContainText('试听本次重录');
+  await expect(page.getByTestId('retake-current-duration')).toHaveText(/^\d{2}:\d{2}:\d{2}$/);
+  await expect(page.getByTestId('retake-candidate-duration')).toHaveText(/^\d{2}:\d{2}:\d{2}$/);
+  await expect(page.getByTestId('retake-current-silence')).toContainText(/首/);
+  await expect(page.getByTestId('retake-current-silence')).toContainText(/尾/);
+  await expect(page.getByTestId('retake-candidate-silence')).toContainText(/首/);
+  await expect(page.getByTestId('retake-candidate-silence')).toContainText(/尾/);
   await expect(useRetake).toHaveCount(1);
   await expect(useRetake.locator('strong')).toHaveText('使用本次重录');
   await expect(discardRetake).toHaveCount(1);
-  await expect(discardRetake.locator('span')).toHaveText('放弃本次重录');
+  await expect(discardRetake.locator('span')).toHaveText('保留原录音');
 
   await expect(page.getByRole('button', { name: /试听原录音/ })).toHaveCount(0);
   await expect(page.getByTestId('version-workbench')).toHaveCount(0);
@@ -244,6 +296,14 @@ type E2eEngineState = {
   snapshot: {
     session_id: string;
     journal_seq: number;
+    input_audition?: {
+      status: string;
+      check_id?: string;
+      decision_source?: string;
+    } | null;
+    audio_format: {
+      sample_rate: number;
+    };
     items: Array<{
       id: string;
       status: string;
@@ -266,6 +326,242 @@ async function sha256File(filePath: string): Promise<string> {
   return createHash('sha256').update(await fs.readFile(filePath)).digest('hex');
 }
 
+function expectNoSentenceAttempt(state: E2eEngineState): void {
+  expect(state.active_attempt).toBeNull();
+  for (const item of state.snapshot.items) {
+    expect(item.status).toBe('pending');
+    expect(item.selected_attempt_id).toBeNull();
+    expect(item.attempts).toHaveLength(0);
+  }
+}
+
+test('real Electron confirms a ten-second input audition without creating a sentence attempt', async () => {
+  let harness: Harness | null = null;
+  try {
+    harness = await launchHarness();
+    const { page } = harness;
+    await importScript(page, [
+      '序号,正文,标签',
+      '001,这句只用于验证输入试听不污染句子,输入试听',
+    ].join('\n'), 'p1-input-audition-confirm.csv');
+
+    await page.getByTestId('start-session').click();
+    await page.getByTestId('recording-workspace').waitFor();
+    const dialog = page.getByTestId('input-audition-dialog');
+    await expect(dialog).toBeVisible();
+    expectNoSentenceAttempt(await readEngineState(page));
+
+    await page.getByTestId('input-audition-start').click();
+    await expect(page.getByTestId('input-audition-progress')).toBeVisible();
+    await feedPaced(page, 480_000, 'speech');
+    const audio = page.getByTestId('input-audition-audio');
+    await expect(audio).toBeVisible({ timeout: 15_000 });
+    expectNoSentenceAttempt(await readEngineState(page));
+
+    // CI does not have to expose an audible output endpoint. Dispatching the
+    // media completion event exercises the dialog's explicit "listened to the
+    // end" gate while the captured WAV itself still comes from the real
+    // system-test engine and synthetic PCM bridge.
+    await audio.evaluate((node) => node.dispatchEvent(new Event('ended')));
+    await page.getByTestId('input-audition-confirm').click();
+    await expect(dialog).toBeHidden();
+
+    const confirmed = await readEngineState(page);
+    expect(confirmed.snapshot.input_audition?.status).toBe('confirmed');
+    expectNoSentenceAttempt(confirmed);
+  } finally {
+    await closeHarness(harness);
+  }
+});
+
+test('real Electron retries and explicitly skips input audition without shortcut or attempt bleed', async () => {
+  let harness: Harness | null = null;
+  try {
+    harness = await launchHarness();
+    const { page } = harness;
+    await importScript(page, [
+      '序号,正文,标签',
+      '001,这句用于验证重试和明确跳过,输入试听',
+    ].join('\n'), 'p1-input-audition-retry-skip.csv');
+
+    await page.getByTestId('start-session').click();
+    await page.getByTestId('recording-workspace').waitFor();
+    const dialog = page.getByTestId('input-audition-dialog');
+    await expect(dialog).toBeVisible();
+    await page.getByTestId('input-audition-start').click();
+    await feedPaced(page, 480_000, 'speech');
+    await expect(page.getByTestId('input-audition-audio')).toBeVisible({ timeout: 15_000 });
+    const firstCheckId = (await readEngineState(page)).snapshot.input_audition?.check_id;
+    expect(firstCheckId).toBeTruthy();
+
+    await page.getByTestId('input-audition-retry').click();
+    await expect(page.getByTestId('input-audition-progress')).toBeVisible();
+    const retryState = await readEngineState(page);
+    expect(retryState.snapshot.input_audition?.status).toBe('recording');
+    expect(retryState.snapshot.input_audition?.check_id).not.toBe(firstCheckId);
+    expectNoSentenceAttempt(retryState);
+
+    const transportBefore = (await page.getByTestId('main-transport').textContent()) ?? '';
+    // Focus the modal surface itself: Space on a focused button is expected
+    // browser activation and is not shortcut bleed from the workspace.
+    await dialog.focus();
+    await page.keyboard.press('r');
+    await page.keyboard.press('Space');
+    await expect(page.getByTestId('main-transport')).toHaveText(transportBefore);
+    expectNoSentenceAttempt(await readEngineState(page));
+
+    // A recording-phase audition must be cancelled before it can be skipped;
+    // reopen the still-blocked gate and then exercise the explicit decision.
+    await dialog.getByRole('button', { name: '取消试听' }).click();
+    await expect(dialog).toBeHidden();
+    await page.getByTestId('main-transport').click();
+    await expect(dialog).toBeVisible();
+    await page.getByTestId('input-audition-skip').click();
+    await page.getByTestId('input-audition-skip-cancel').click();
+    await expect(dialog).toBeVisible();
+    const returnedToAudition = await readEngineState(page);
+    expect(returnedToAudition.snapshot.input_audition ?? null).toBeNull();
+    expectNoSentenceAttempt(returnedToAudition);
+
+    await page.getByTestId('input-audition-skip').click();
+    await page.getByTestId('input-audition-skip-confirm').click();
+    await expect(dialog).toBeHidden();
+    const skipped = await readEngineState(page);
+    expect(skipped.snapshot.input_audition?.status).toBe('skipped');
+    expectNoSentenceAttempt(skipped);
+  } finally {
+    await closeHarness(harness);
+  }
+});
+
+test('real Electron scopes audition reuse to one launch and one capture configuration', async () => {
+  let harness: Harness | null = null;
+  try {
+    harness = await launchHarness();
+    let { page } = harness;
+    const dialog = () => page.getByTestId('input-audition-dialog');
+    const explicitlySkip = async () => {
+      await page.getByTestId('input-audition-skip').click();
+      await expect(page.getByTestId('input-audition-skip-confirm')).toBeVisible();
+      await page.getByTestId('input-audition-skip-confirm').click();
+      await expect(dialog()).toBeHidden();
+    };
+    const pauseToHome = async () => {
+      await page.getByTestId('finish-session').click();
+      await expect(page.getByTestId('pause-confirm')).toBeVisible();
+      await page.getByTestId('pause-confirm').click();
+      await page.getByTestId('recordings-workspace').waitFor();
+    };
+
+    await importScript(page, [
+      '序号,正文,标签',
+      '001,验证手动重新试听取消后仍然阻断,试听缓存',
+    ].join('\n'), 'p1-audition-cache-first.csv');
+    await page.getByTestId('start-session').click();
+    await page.getByTestId('recording-workspace').waitFor();
+    await expect(dialog()).toBeVisible();
+    await explicitlySkip();
+
+    await page.locator('.monitor-tabs button').filter({ hasText: /任务/ }).click();
+    await page.getByTestId('recheck-input-audition').click();
+    await expect(dialog()).toBeVisible();
+    await dialog().focus();
+    await page.keyboard.press('Escape');
+    await expect(dialog()).toBeHidden();
+    expectNoSentenceAttempt(await readEngineState(page));
+
+    const transport = page.getByTestId('main-transport');
+    await expect(transport).toContainText('输入试听');
+    await transport.click();
+    await expect(dialog()).toBeVisible();
+    expectNoSentenceAttempt(await readEngineState(page));
+    await explicitlySkip();
+    await pauseToHome();
+
+    await importScript(page, [
+      '序号,正文,标签',
+      '001,同次启动与同一采集配置应复用决定,试听缓存',
+    ].join('\n'), 'p1-audition-cache-second.csv');
+    await page.getByTestId('start-session').click();
+    await page.getByTestId('recording-workspace').waitFor();
+    // The cache lookup may briefly own the modal while IPC is pending, but it
+    // must settle without asking the operator for another decision.
+    await expect.poll(async () => {
+      try {
+        return (await readEngineState(page)).snapshot.input_audition?.decision_source ?? 'none';
+      } catch {
+        return 'starting';
+      }
+    }, { timeout: 10_000 }).toBe('launch_cache');
+    await expect(dialog()).toBeHidden();
+    const reused = await readEngineState(page);
+    expect(reused.snapshot.input_audition).toMatchObject({
+      status: 'skipped',
+      decision_source: 'launch_cache',
+    });
+    expectNoSentenceAttempt(reused);
+    const reusedSessionId = reused.snapshot.session_id;
+    await pauseToHome();
+
+    await harness.app.close();
+    harness = await launchHarness(harness.root);
+    page = harness.page;
+    const resumedRow = page.locator('.home-recording-row').filter({ hasText: reusedSessionId });
+    await resumedRow.getByTestId('record-recording').click();
+    await page.getByTestId('recording-workspace').waitFor();
+    await expect(dialog()).toBeVisible({ timeout: 10_000 });
+    expectNoSentenceAttempt(await readEngineState(page));
+    await explicitlySkip();
+
+    // The synthetic CI input exposes one fixed hardware format. Exercise the
+    // main-process authority boundary directly: a renderer lookup for a
+    // different capture configuration must never receive this task's cached
+    // decision, which makes the normal workspace flow show the audition gate.
+    const changedConfigurationDecision = await page.evaluate(async () => {
+      const recorder = (window as unknown as {
+        recorder: {
+          request<T>(command: string, payload?: unknown): Promise<T>;
+          getInputAuditionDecision(configuration: unknown): Promise<unknown>;
+        };
+      }).recorder;
+      const state = await recorder.request<{
+        snapshot: {
+          capture_backend?: string;
+          device_name: string;
+          device_id?: string;
+          input_sample_format?: string;
+          capture_share_mode?: string;
+          requested_capture_buffer_frames?: number;
+          capture_buffer_frames?: number;
+          audio_format: {
+            sample_rate: number;
+            bit_depth: number;
+            input_channels: number;
+            input_channel?: number;
+          };
+        };
+      }>('get_state');
+      const snapshot = state.snapshot;
+      return await recorder.getInputAuditionDecision({
+        backend: snapshot.capture_backend ?? 'unknown',
+        deviceName: snapshot.device_name,
+        deviceId: snapshot.device_id,
+        sampleRate: snapshot.audio_format.sample_rate * 2,
+        outputBitDepth: snapshot.audio_format.bit_depth,
+        inputSampleFormat: snapshot.input_sample_format ?? `i${snapshot.audio_format.bit_depth}`,
+        inputChannels: snapshot.audio_format.input_channels,
+        inputChannel: snapshot.audio_format.input_channel ?? 1,
+        shareMode: snapshot.capture_share_mode ?? 'exclusive',
+        requestedBufferFrames: snapshot.requested_capture_buffer_frames ?? null,
+        actualBufferFrames: snapshot.capture_buffer_frames ?? null,
+      });
+    });
+    expect(changedConfigurationDecision).toBeNull();
+  } finally {
+    await closeHarness(harness);
+  }
+});
+
 test('real Electron uses default VAD for a complete first-take confirmation flow', async () => {
   let harness: Harness | null = null;
   try {
@@ -275,9 +571,9 @@ test('real Electron uses default VAD for a complete first-take confirmation flow
       '序号,正文,标签',
       '001,请保持正常语速和音量,VAD 黄金流程',
     ].join('\n'), 'p1-default-vad.csv', 'vad');
-    await page.getByTestId('start-session').click();
-    await page.getByTestId('recording-workspace').waitFor();
+    await enterCreatedRecording(page);
     await disableMandatoryHeadTailGate(page);
+    await page.locator('.monitor-tabs button').filter({ hasText: /检测/ }).click();
 
     const selectedDetector = page.getByTestId('detector-vad');
     await expect(selectedDetector).toHaveAttribute('aria-checked', 'true');
@@ -311,8 +607,7 @@ test('real Electron preserves first-take rhythm across a label boundary', async 
       '002,请继续保持正常语速,正常语速',
       '003,请使用较慢语速,较慢语速',
     ].join('\n'));
-    await page.getByTestId('start-session').click();
-    await page.getByTestId('recording-workspace').waitFor();
+    await enterCreatedRecording(page);
     await disableMandatoryHeadTailGate(page);
 
     const transport = page.getByTestId('main-transport');
@@ -366,8 +661,7 @@ test('real Electron keeps the selected take and continues handled retakes with S
       '001,这是此前已确认录音,同一标签',
       '002,这是物理下一句,同一标签',
     ].join('\n'));
-    await page.getByTestId('start-session').click();
-    await page.getByTestId('recording-workspace').waitFor();
+    await enterCreatedRecording(page);
     await disableMandatoryHeadTailGate(page);
 
     const transport = page.getByTestId('main-transport');
@@ -448,8 +742,7 @@ test('real Electron restores local item context and an undecided take without gh
       '001,第一句已确认,同一标签',
       '002,第二句等待确认,同一标签',
     ].join('\n'));
-    await page.getByTestId('start-session').click();
-    await page.getByTestId('recording-workspace').waitFor();
+    await enterCreatedRecording(page);
     await disableMandatoryHeadTailGate(page);
 
     let transport = page.getByTestId('main-transport');
@@ -465,13 +758,84 @@ test('real Electron restores local item context and an undecided take without gh
 
     await harness.app.close();
     harness = await launchHarness(root);
-    await harness.page.getByTestId('record-recording').first().click();
+    await harness.page.getByTestId('handle-recording-issues').first().click();
     await harness.page.getByTestId('recording-workspace').waitFor();
     transport = harness.page.getByTestId('main-transport');
 
+    await expect(harness.page.locator('.monitor-tabs button.active')).toContainText('问题');
+    await expect(harness.page.getByTestId('issue-workbench')).toBeVisible();
+    await expect(harness.page.getByTestId('issue-workbench').locator('.issue-list > button.active')).toHaveCount(1);
     await expect(harness.page.locator('.professional-item.active')).toContainText('002');
-    await expect(transport).toContainText(/确认|采用/);
+    await expect(transport).toContainText('试听本句');
     await expect(transport).not.toContainText(/完成本句|结束本句/);
+  } finally {
+    await closeHarness(harness);
+  }
+});
+
+test('real Electron separates current-task recording settings from new-task defaults', async () => {
+  let harness: Harness | null = null;
+  try {
+    harness = await launchHarness();
+    const { page, root } = harness;
+    await importScript(page, [
+      '序号,正文,标签',
+      '001,第一句使用同一标签,标签甲',
+      '002,第二句切换新的标签,标签乙',
+    ].join('\n'), 'recording-settings-scope.csv');
+    await enterCreatedRecording(page);
+    await page.locator('.monitor-tabs button').filter({ hasText: /^设置$/ }).click();
+
+    const taskAutoNext = page.getByTestId('rule-auto-start-next');
+    const taskLabelPause = page.getByTestId('rule-pause-on-label-change');
+    await expect(taskAutoNext).toBeChecked();
+    await taskLabelPause.check();
+    await expect(page.locator('.continuous-rule-summary')).toContainText('同标签连续录制，标签变化时暂停');
+    await taskAutoNext.uncheck();
+    await expect(taskLabelPause).toBeChecked();
+    await expect(taskLabelPause).toBeDisabled();
+    await expect(page.locator('.continuous-rule-summary')).toContainText('每句确认后停在下一句');
+    if (process.env.DATABAKER_UPDATE_MANUAL_CAPTURES === '1') {
+      const taskEnvCheck = page.getByTestId('rule-env-check');
+      const noiseDialog = page.getByRole('dialog', { name: /环境噪声检测/ });
+      if (await noiseDialog.isVisible().catch(() => false) && !await taskEnvCheck.isChecked()) {
+        await taskEnvCheck.check({ force: true });
+      }
+      if (await taskEnvCheck.isChecked()) await taskEnvCheck.uncheck({ force: true });
+      await expect(noiseDialog).toHaveCount(0);
+      const cdp = await page.context().newCDPSession(page);
+      await cdp.send('Emulation.setDeviceMetricsOverride', {
+        width: 1280,
+        height: 720,
+        deviceScaleFactor: 1,
+        mobile: false,
+      });
+      await expect(page.locator('.monitor-tabs button.active')).toContainText('设置');
+      await page.waitForTimeout(150);
+      await page.screenshot({ path: path.join(workspace, 'doc', '手册', 'captures', '13-recording-settings.jpg'), type: 'jpeg', quality: 90 });
+    }
+
+    await page.getByTestId('edit-new-task-defaults').click();
+    const defaults = page.getByTestId('settings-recording-defaults');
+    await defaults.locator('summary').click();
+    await expect(page.getByTestId('settings-rule-auto-start-next')).toBeChecked();
+    await expect(page.getByTestId('settings-rule-pause-on-label-change')).not.toBeChecked();
+    await page.getByRole('button', { name: '完成' }).click();
+    if (process.env.DATABAKER_UPDATE_MANUAL_CAPTURES === '1') {
+      await page.locator('.monitor-tabs button').filter({ hasText: /检测/ }).click();
+      await expect(page.locator('.monitor-tabs button.active')).toContainText('检测');
+      await page.waitForTimeout(150);
+      await page.screenshot({ path: path.join(workspace, 'doc', '手册', 'captures', '09-detection.jpg'), type: 'jpeg', quality: 90 });
+      await page.locator('.monitor-tabs button').filter({ hasText: /^设置$/ }).click();
+    }
+
+    await harness.app.close();
+    harness = await launchHarness(root);
+    await enterHistoricalRecording(harness.page);
+    await expect(harness.page.getByTestId('task-recording-settings')).toBeVisible();
+    await expect(harness.page.getByTestId('rule-auto-start-next')).not.toBeChecked();
+    await expect(harness.page.getByTestId('rule-pause-on-label-change')).toBeChecked();
+    await expect(harness.page.getByTestId('rule-pause-on-label-change')).toBeDisabled();
   } finally {
     await closeHarness(harness);
   }
@@ -487,8 +851,7 @@ test('real Electron derives confirmed-only and complete-task export gates from t
       '001,这一句将被确认,导出范围',
       '002,这一句保持未录,导出范围',
     ].join('\n'), 'p1-export-scopes.csv');
-    await page.getByTestId('start-session').click();
-    await page.getByTestId('recording-workspace').waitFor();
+    await enterCreatedRecording(page);
     await disableMandatoryHeadTailGate(page);
     await setAutomationRule(page, 'rule-auto-start-next', false);
 
@@ -547,8 +910,7 @@ test('real Electron filters and locates current-task issues without starting a r
       '001,已确认但保留首尾静音警告,问题工作台',
       '002,本句停在待确认状态,问题工作台',
     ].join('\n'), 'p1-issue-workbench.csv');
-    await page.getByTestId('start-session').click();
-    await page.getByTestId('recording-workspace').waitFor();
+    await enterCreatedRecording(page);
     await disableMandatoryHeadTailGate(page);
 
     const transport = page.getByTestId('main-transport');
@@ -604,6 +966,86 @@ test('real Electron filters and locates current-task issues without starting a r
   }
 });
 
+test('real Electron closes the issue queue and exposes one explicit path to delivery', async () => {
+  let harness: Harness | null = null;
+  try {
+    harness = await launchHarness();
+    const { page } = harness;
+    await importScript(page, [
+      '序号,正文,标签',
+      '001,这句在问题队列中确认后前往交付,闭环',
+    ].join('\n'), 'p1-issue-to-delivery.csv');
+    await enterCreatedRecording(page);
+    await disableMandatoryHeadTailGate(page);
+    await setAutomationRule(page, 'rule-head-tail', false);
+
+    const transport = page.getByTestId('main-transport');
+    await transport.click();
+    await feedTakeWithSilenceWarning(page, transport);
+    await transport.click();
+    await expect(transport).toContainText(/确认|采用/);
+    expect((await readEngineState(page)).active_attempt).toBeNull();
+
+    await page.locator('.monitor-tabs button').filter({ hasText: /问题/ }).click();
+    const workbench = page.getByTestId('issue-workbench');
+    await expect(workbench.locator('.issue-list > button')).toHaveCount(1);
+    await workbench.locator('.issue-list > button').click();
+    await workbench.locator('.issue-resolution-actions .primary').click();
+
+    const goToDelivery = page.getByTestId('go-to-delivery');
+    await expect(goToDelivery).toBeVisible();
+    await expect(workbench.locator('.issue-list > button')).toHaveCount(0);
+    expect((await readEngineState(page)).active_attempt).toBeNull();
+    await goToDelivery.click();
+    await expect(page.locator('.monitor-tabs button.active')).toContainText('导出');
+  } finally {
+    await closeHarness(harness);
+  }
+});
+
+test('real Electron home warning action opens export review instead of restoring an old panel', async () => {
+  let harness: Harness | null = null;
+  try {
+    harness = await launchHarness();
+    const { page } = harness;
+    await importScript(page, [
+      '序号,正文,标签',
+      '001,这句保留首尾静音告警用于交付复核,首页直达',
+    ].join('\n'), 'p1-home-warning-export.csv');
+    await enterCreatedRecording(page);
+    await disableMandatoryHeadTailGate(page);
+    await setAutomationRule(page, 'rule-head-tail', true);
+
+    const transport = page.getByTestId('main-transport');
+    await transport.click();
+    await feedTakeWithSilenceWarning(page, transport);
+    await transport.click();
+    await expect(transport).toContainText(/确认|采用/);
+    await transport.click();
+    await expect(transport).toContainText(/全部完成|完成采集/);
+    const sessionId = (await readEngineState(page)).snapshot.session_id;
+
+    // Save an unrelated panel in local workspace context first. The home
+    // primary action must override it with export review.
+    await page.locator('.monitor-tabs button').filter({ hasText: /^设置$/ }).click();
+    await transport.click();
+    await expect(page.getByTestId('finish-confirm')).toBeVisible();
+    await page.getByTestId('finish-confirm').click();
+    await expect(page.getByTestId('enter-capture')).toBeVisible();
+    await page.getByTestId('finish-session').click();
+    await page.getByTestId('recordings-workspace').waitFor();
+
+    const warningRow = page.locator('.home-recording-row').filter({ hasText: sessionId });
+    const reviewAndDeliver = warningRow.getByTestId('view-recording');
+    await expect(reviewAndDeliver).toHaveText('复核并交付');
+    await reviewAndDeliver.click();
+    await page.getByTestId('recording-workspace').waitFor();
+    await expect(page.locator('.monitor-tabs button.active')).toContainText('导出');
+  } finally {
+    await closeHarness(harness);
+  }
+});
+
 test('real Electron rejects a stale offline attempt switch without changing the selected version', async () => {
   let harness: Harness | null = null;
   try {
@@ -613,8 +1055,7 @@ test('real Electron rejects a stale offline attempt switch without changing the 
       '序号,正文,标签',
       '001,用自然修订变化制造过期版本切换,版本安全',
     ].join('\n'), 'p1-stale-attempt.csv');
-    await page.getByTestId('start-session').click();
-    await page.getByTestId('recording-workspace').waitFor();
+    await enterCreatedRecording(page);
     await disableMandatoryHeadTailGate(page);
 
     const transport = page.getByTestId('main-transport');
@@ -698,11 +1139,13 @@ test('real Electron exports cuts, verifies the external copy, writes a receipt, 
     ].join('\n'), 'p1-reliable-delivery.csv');
     await page.getByTestId('start-session').click();
     await page.getByTestId('recording-workspace').waitFor();
+    await confirmInputAudition(page);
     await disableMandatoryHeadTailGate(page);
+    await setAutomationRule(page, 'rule-head-tail', false);
 
     const transport = page.getByTestId('main-transport');
     await transport.click();
-    await feedTakeWithSilenceWarning(page, transport);
+    await feedActiveTake(page, transport);
     await transport.click();
     await expect(transport).toContainText(/确认|采用/);
     await transport.click();
@@ -715,15 +1158,11 @@ test('real Electron exports cuts, verifies the external copy, writes a receipt, 
     const scopeButtons = page.locator('.export-scope-control > button');
     await scopeButtons.nth(1).click();
     const readiness = page.locator('.export-readiness');
-    await expect(readiness).toHaveClass(/\bwarning\b/);
+    await expect(readiness).toHaveClass(/\bclear\b/);
     await expect(readiness).toContainText(/包含\s*1/);
     await expect(readiness).toContainText(/排除\s*0/);
     await expect(readiness).toContainText(/阻断\s*0/);
-    const warningChecks = page.locator('.export-warning-acks input[type="checkbox"]');
-    await expect(warningChecks.first()).toBeVisible();
-    for (let index = 0; index < await warningChecks.count(); index += 1) {
-      await warningChecks.nth(index).check();
-    }
+    await expect(page.locator('.export-warning-acks')).toHaveCount(0);
 
     await page.getByTestId('choose-export-dir').click();
     await expect(page.locator('.export-destination code')).toHaveText(delivery);
@@ -811,52 +1250,24 @@ test('real Electron exports cuts, verifies the external copy, writes a receipt, 
     await harness.app.close();
     harness = await launchHarness(root);
 
-    const history = await harness.page.evaluate(async (output) => {
-      const recorder = (window as unknown as {
-        recorder: { listRecordings(root: string, options?: unknown): Promise<{
-          recordings: Array<{
-            session_id: string;
-            export_artifacts?: { cuts_zip?: { export_id?: string; delivery_verification?: string } };
-          }>;
-        }> };
-      }).recorder;
-      return await recorder.listRecordings(output, { offset: 0, limit: 100 });
-    }, harness.output);
-    const restartedTask = history.recordings.find((recording) => recording.session_id === sessionId);
-    expect(restartedTask?.export_artifacts?.cuts_zip).toMatchObject({
-      export_id: status.export_id,
-      delivery_verification: 'pending',
-    });
-
-    const verification = await harness.page.evaluate(async (request) => {
-      const recorder = (window as unknown as {
-        recorder: { verifyExportDelivery(payload: unknown): Promise<{ verification: string } | null> };
-      }).recorder;
-      return await recorder.verifyExportDelivery(request);
-    }, {
-      session_id: sessionId,
-      artifact: 'cuts_zip',
-      export_id: status.export_id,
-    });
-    expect(verification?.verification).toBe('verified');
-
-    await harness.page.getByTestId('view-recording').first().click();
-    await harness.page.getByTestId('recording-workspace').waitFor();
-    await harness.page.locator('.monitor-tabs button').filter({ hasText: /导出/ }).click();
-    const restartedWarningChecks = harness.page.locator(
-      '.export-warning-acks input[type="checkbox"]',
-    );
-    for (let index = 0; index < await restartedWarningChecks.count(); index += 1) {
-      await restartedWarningChecks.nth(index).check();
-    }
-    await expect(harness.page.getByRole('button', { name: /分段 ZIP/ }))
-      .toContainText(/外部交付已复验/, { timeout: 15_000 });
+    // History loading must reverify the current cuts receipt in the background
+    // and retain the returned external directory. No explicit export-dialog
+    // visit or verification API call is required after restart.
+    const deliveredRow = harness.page.locator('.home-recording-row').filter({ hasText: sessionId });
+    await expect(deliveredRow.locator('.row-primary')).toHaveCount(1);
+    const viewDelivery = deliveredRow.getByTestId('view-delivery');
+    await expect(viewDelivery).toBeVisible({ timeout: 15_000 });
+    await expect(viewDelivery).toHaveText('查看交付');
+    await expect(viewDelivery).toHaveAttribute('title', delivery);
+    await viewDelivery.click();
+    await expect(harness.page.locator('.home-notice')).toContainText(/已.*打开/, { timeout: 10_000 });
+    await expect(harness.page.getByRole('dialog', { name: '导出当前任务' })).toHaveCount(0);
   } finally {
     await closeHarness(harness);
   }
 });
 
-test('real Electron keeps 320 long-label items bounded at target resolutions and blocks shortcut bleed', async () => {
+test('real Electron keeps 320 long-label items reachable at target resolutions and Windows 125% scaling', async () => {
   let harness: Harness | null = null;
   try {
     harness = await launchHarness();
@@ -867,9 +1278,9 @@ test('real Electron keeps 320 long-label items bounded at target resolutions and
       rows.push(`${id},这是第 ${index} 条专业音频采录文本,高噪声环境下的长标签条件说明与现场执行备注 ${index}`);
     }
     await importScript(page, rows.join('\n'), 'p1-320-long-labels.csv');
-    await page.getByTestId('start-session').click();
-    await page.getByTestId('recording-workspace').waitFor();
+    await enterCreatedRecording(page);
     await disableMandatoryHeadTailGate(page);
+    await page.locator('.monitor-tabs button').filter({ hasText: /检测/ }).click();
 
     const transport = page.getByTestId('main-transport');
     const durationInput = page.getByTestId('task-silence-duration');
@@ -884,10 +1295,16 @@ test('real Electron keeps 320 long-label items bounded at target resolutions and
     await expect(transport).not.toHaveClass(/\bstop\b/);
 
     const targetSizes = [
-      { width: 1080, height: 700 },
-      { width: 1280, height: 720 },
-      { width: 1366, height: 768 },
-      { width: 1920, height: 1080 },
+      {
+        label: 'Windows 1366x768 at 125%',
+        width: 1093,
+        height: 614,
+        deviceScaleFactor: 1.25,
+      },
+      { label: '1080x700 at 100%', width: 1080, height: 700, deviceScaleFactor: 1 },
+      { label: '1280x720 at 100%', width: 1280, height: 720, deviceScaleFactor: 1 },
+      { label: '1366x768 at 100%', width: 1366, height: 768, deviceScaleFactor: 1 },
+      { label: '1920x1080 at 100%', width: 1920, height: 1080, deviceScaleFactor: 1 },
     ];
     // Native BrowserWindow bounds are clamped by the host work area (for
     // example, a 1080px macOS display exposes less than 1080px below the menu
@@ -900,13 +1317,18 @@ test('real Electron keeps 320 long-label items bounded at target resolutions and
         height: size.height,
         screenWidth: size.width,
         screenHeight: size.height,
-        deviceScaleFactor: 1,
+        deviceScaleFactor: size.deviceScaleFactor,
         mobile: false,
       });
       await expect.poll(() => page.evaluate(() => ({
         width: window.innerWidth,
         height: window.innerHeight,
-      }))).toEqual(size);
+        deviceScaleFactor: window.devicePixelRatio,
+      }))).toEqual({
+        width: size.width,
+        height: size.height,
+        deviceScaleFactor: size.deviceScaleFactor,
+      });
 
       const layout = await page.evaluate(() => {
         const root = document.documentElement;
@@ -925,18 +1347,37 @@ test('real Electron keeps 320 long-label items bounded at target resolutions and
           inspector: rect(inspector),
         };
       });
-      expect(layout.rootOverflow, `${size.width}x${size.height} document overflow`).toBe(false);
-      expect(layout.bodyOverflow, `${size.width}x${size.height} body overflow`).toBe(false);
-      expect(layout.shellOverflow, `${size.width}x${size.height} shell overflow`).toBe(false);
-      expect(layout.workspaceOverflow, `${size.width}x${size.height} workspace overflow`).toBe(false);
+      expect(layout.rootOverflow, `${size.label} document overflow`).toBe(false);
+      expect(layout.bodyOverflow, `${size.label} body overflow`).toBe(false);
+      expect(layout.shellOverflow, `${size.label} shell overflow`).toBe(false);
+      expect(layout.workspaceOverflow, `${size.label} workspace overflow`).toBe(false);
       for (const [name, rect] of [
         ['shell', layout.shell],
         ['workspace', layout.workspace],
         ['inspector', layout.inspector],
       ] as const) {
-        expect(rect, `${name} should exist at ${size.width}x${size.height}`).not.toBeNull();
-        expect(rect!.left, `${name} left edge at ${size.width}x${size.height}`).toBeGreaterThanOrEqual(-1);
-        expect(rect!.right, `${name} right edge at ${size.width}x${size.height}`).toBeLessThanOrEqual(size.width + 1);
+        expect(rect, `${name} should exist at ${size.label}`).not.toBeNull();
+        expect(rect!.left, `${name} left edge at ${size.label}`).toBeGreaterThanOrEqual(-1);
+        expect(rect!.right, `${name} right edge at ${size.label}`).toBeLessThanOrEqual(size.width + 1);
+      }
+
+      // These are the operator's essential controls. Merely avoiding a
+      // horizontal scrollbar is insufficient if Windows scaling pushes the
+      // transport, task navigation, settings, or safe-exit action off-screen.
+      for (const [name, control] of [
+        ['transport', page.getByTestId('main-transport')],
+        ['active sentence', page.locator('.professional-item.active')],
+        ['monitor tabs', page.locator('.monitor-tabs')],
+        ['safe exit', page.getByTestId('finish-session')],
+      ] as const) {
+        const bounds = await control.boundingBox();
+        expect(bounds, `${size.label} renders ${name}`).not.toBeNull();
+        expect(bounds!.x, `${size.label} ${name} left edge`).toBeGreaterThanOrEqual(-1);
+        expect(bounds!.y, `${size.label} ${name} top edge`).toBeGreaterThanOrEqual(-1);
+        expect(bounds!.x + bounds!.width, `${size.label} ${name} right edge`)
+          .toBeLessThanOrEqual(size.width + 1);
+        expect(bounds!.y + bounds!.height, `${size.label} ${name} bottom edge`)
+          .toBeLessThanOrEqual(size.height + 1);
       }
     }
 
@@ -960,8 +1401,7 @@ test('real Electron keeps 1000-item navigation visible and bounded', async () =>
       rows.push(`${id},这是第 ${index} 条专业音频采录文本,${label}`);
     }
     await importScript(page, rows.join('\n'), 'p1-1000.csv');
-    await page.getByTestId('start-session').click();
-    await page.getByTestId('recording-workspace').waitFor();
+    await enterCreatedRecording(page);
 
     for (const index of [0, 159, 499, 999]) await selectRowAndMeasure(page, index);
   } finally {

@@ -80,6 +80,9 @@ export function captureFormatsSupportBitDepth(
 export const CAPTURE_SAMPLE_FORMATS = ['i16', 'i24', 'i32', 'f32'] as const;
 export type CaptureSampleFormat = (typeof CAPTURE_SAMPLE_FORMATS)[number];
 
+/** New recording tasks always deliver mono PCM16, regardless of driver input. */
+export const DEFAULT_DELIVERY_BIT_DEPTH = 16 as const;
+
 const PREFERRED_CAPTURE_SAMPLE_FORMATS: readonly CaptureSampleFormat[] = ['i24', 'f32', 'i32', 'i16'];
 
 const REJECTED_INPUT_DEVICE = /阵列|array|senary|bluetooth|hands-?free|headset|communications|立体声混音|stereo mix|what u hear|wave out/i;
@@ -138,17 +141,6 @@ export function captureSampleFormatFromBitDepth(bitDepth: number): CaptureSample
   if (bitDepth === 16) return 'i16';
   if (bitDepth === 32) return 'f32';
   return 'i24';
-}
-
-export function deliveryBitDepthForCaptureFormat(format: string): 16 | 24 | 32 {
-  switch (normalizeCaptureSampleFormat(format)) {
-    case 'i16':
-      return 16;
-    case 'i24':
-      return 24;
-    default:
-      return 32;
-  }
 }
 
 export function preferredCaptureSampleFormat(formats: readonly string[]): CaptureSampleFormat | null {

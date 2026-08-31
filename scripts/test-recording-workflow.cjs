@@ -49,6 +49,7 @@ async function main() {
     shouldHandleLiveMeter,
   } = await import(pathToFileURL(inputQualityModulePath).href);
   const {
+    DEFAULT_DELIVERY_BIT_DEPTH,
     classifyInputDevice,
     inputDeviceNeedsWarning,
     preferredInputDevice,
@@ -59,7 +60,6 @@ async function main() {
     captureSampleFormatsForConfiguration,
     captureShareModeLabel,
     configurationsForShareMode,
-    deliveryBitDepthForCaptureFormat,
     inputSampleFormatRepresentationBits,
     minimumInputRepresentationBits,
     normalizeCaptureSampleFormat,
@@ -273,8 +273,8 @@ async function main() {
   assert.equal(normalizeCaptureSampleFormat('pcm24'), null);
   assert.equal(captureSampleFormatFromBitDepth(16), 'i16');
   assert.equal(captureSampleFormatFromBitDepth(32), 'f32');
-  assert.equal(deliveryBitDepthForCaptureFormat('i24'), 24);
-  assert.equal(deliveryBitDepthForCaptureFormat('i32'), 32);
+  assert.equal(DEFAULT_DELIVERY_BIT_DEPTH, 16,
+    'new tasks keep PCM16 delivery independently from the selected driver input format');
   assert.equal(preferredCaptureSampleFormat(['f32', 'i16']), 'f32');
   assert.equal(preferredCaptureSampleFormat(['i16', 'i24']), 'i24');
   assert.equal(classifyInputDevice({ name: 'Analogue 1 + 2 (2- Focusrite USB Audio)' }), 'production');

@@ -16,16 +16,26 @@ type HistoryRecoveryFields = Pick<
 
 type TaskListFields = HistoryRecoveryFields & Pick<
   RecordingHistoryEntry,
-  'history_issue' | 'data_health'
+  | 'history_issue'
+  | 'data_health'
+  | 'blocker_items'
+  | 'warning_items'
+  | 'complete_task_readiness'
+  | 'export_artifacts'
+  | 'delivery_verifications'
+  | 'verified_delivery_directories'
 >;
-
-export type TaskListRecordDisabledReason = 'fault' | 'issue' | 'readonly';
 
 export type TaskListEntry =
   | { kind: 'return' }
   | { kind: 'continue-stop' }
-  | { kind: 'view-record'; viewPrimary: boolean; recordEnabled: boolean }
-  | { kind: 'view-only'; recordDisabledReason: TaskListRecordDisabledReason };
+  | { kind: 'repair' }
+  | { kind: 'record' }
+  | { kind: 'issues' }
+  | { kind: 'export' }
+  | { kind: 'deliver' }
+  | { kind: 'delivered' }
+  | { kind: 'inspect'; reason: 'issue' | 'readonly' | 'blocked' | 'warning' };
 
 export type HistoryRecoveryPlan = {
   canResume: boolean;
@@ -97,30 +107,51 @@ export function planHistoryRecovery(recording: HistoryRecoveryFields): HistoryRe
 }
 
 /**
- * Home-row actions declare an intent at the door: view (inspect, card off)
- * or record (activate capture). Recovery/seal stay in overflow. A row that
- * still needs offline repair must not jump straight into exclusive capture.
+ * Every home row has one primary next step. Secondary inspection remains
+ * available by clicking the task name, but the action column never asks the
+ * operator to choose between two equally prominent doors.
  */
 export function planTaskListEntry(recording: TaskListFields): TaskListEntry {
   if (recording.is_active) {
     return recording.status === 'stopping' ? { kind: 'continue-stop' } : { kind: 'return' };
   }
   if (recording.history_issue) {
-    return { kind: 'view-only', recordDisabledReason: 'issue' };
+    return { kind: 'inspect', reason: 'issue' };
   }
   if (recording.data_health === 'readonly') {
-    return { kind: 'view-only', recordDisabledReason: 'readonly' };
+    return { kind: 'inspect', reason: 'readonly' };
+  }
+  if (recording.data_health === 'needs_repair') {
+    return { kind: 'repair' };
   }
   const recovery = planHistoryRecovery(recording);
   if (recovery.canSeal) {
-    return { kind: 'view-only', recordDisabledReason: 'fault' };
+    return { kind: 'repair' };
   }
-  const unfinished = recording.pending_items + recording.review_items > 0;
-  return {
-    kind: 'view-record',
-    viewPrimary: !unfinished,
-    recordEnabled: true,
-  };
+  if (recording.review_items > 0) return { kind: 'issues' };
+  if (recording.pending_items > 0) return { kind: 'record' };
+  if ((recording.blocker_items ?? 0) > 0
+    || recording.complete_task_readiness?.health === 'blocked') {
+    return { kind: 'inspect', reason: 'blocked' };
+  }
+  if ((recording.warning_items ?? 0) > 0
+    || recording.complete_task_readiness?.health === 'warning') {
+    return { kind: 'inspect', reason: 'warning' };
+  }
+  if (!recording.complete_task_readiness) {
+    return { kind: 'inspect', reason: 'blocked' };
+  }
+  const cuts = recording.export_artifacts?.cuts_zip;
+  if (recording.complete_task_readiness?.ready && (!cuts || cuts.state === 'never' || cuts.state === 'stale' || cuts.state === 'failed')) {
+    return { kind: 'export' };
+  }
+  if (recording.complete_task_readiness.ready && cuts?.state === 'current') {
+    return recording.delivery_verifications?.cuts_zip === 'verified'
+      && Boolean(recording.verified_delivery_directories?.cuts_zip)
+      ? { kind: 'delivered' }
+      : { kind: 'deliver' };
+  }
+  return { kind: 'inspect', reason: 'blocked' };
 }
 
 export function engineRecoveryFailure(message: EngineEvent): EngineRecoveryFailedPayload | null {

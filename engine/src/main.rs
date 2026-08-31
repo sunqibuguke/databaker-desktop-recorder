@@ -11,8 +11,9 @@ mod vad;
 mod wav;
 
 use crate::engine::{
-    Engine, ExportArtifact, ExportScope, NoiseCheckPayload, ResumeSessionPayload,
-    SetSilenceSettingsPayload, StartSessionPayload, StopAttemptPayload, is_no_active_session_error,
+    AdoptCachedInputAuditionPayload, Engine, ExportArtifact, ExportScope, InputAuditionPayload,
+    NoiseCheckPayload, ResumeSessionPayload, SetSilenceSettingsPayload, SkipInputAuditionPayload,
+    StartSessionPayload, StopAttemptPayload, is_no_active_session_error,
 };
 #[cfg(feature = "system-test")]
 use crate::engine::{SystemTestSignalPattern, SystemTestStartSessionPayload};
@@ -306,6 +307,37 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
             let payload: NoiseCheckPayload = parse(command.payload)?;
             engine.check_noise(payload)
         }
+        "begin_input_audition" => engine.begin_input_audition(),
+        "finish_input_audition" => {
+            let payload: InputAuditionPayload = parse(command.payload)?;
+            engine.finish_input_audition(&payload.check_id)
+        }
+        "confirm_input_audition" => {
+            let payload: InputAuditionPayload = parse(command.payload)?;
+            engine.confirm_input_audition(&payload.check_id)
+        }
+        "skip_input_audition" => {
+            let payload = if command.payload.is_null() {
+                SkipInputAuditionPayload::default()
+            } else {
+                parse(command.payload)?
+            };
+            engine.skip_input_audition(payload.check_id.as_deref())
+        }
+        "cancel_input_audition" => {
+            let payload: InputAuditionPayload = parse(command.payload)?;
+            engine.cancel_input_audition(&payload.check_id)
+        }
+        // Renderer code cannot invoke this through Electron's generic command
+        // allow-list; main uses it to retire a runtime arm before a recheck.
+        "invalidate_input_audition_decision" => engine.invalidate_input_audition_decision(),
+        // This command is intentionally absent from Electron's renderer
+        // allow-list. Only the trusted main process may adopt its own
+        // launch-scoped cache into the current engine generation.
+        "adopt_cached_input_audition" => {
+            let payload: AdoptCachedInputAuditionPayload = parse(command.payload)?;
+            engine.adopt_cached_input_audition(payload)
+        }
         "set_silence_settings" => {
             let payload: SetSilenceSettingsPayload = parse(command.payload)?;
             engine.set_silence_settings(payload)
@@ -498,6 +530,8 @@ mod tests {
         writer.finalize().unwrap();
         let snapshot = SessionSnapshot {
             schema_version: 1,
+            app_version: crate::engine::build_app_version(),
+            engine_version: crate::engine::build_engine_version(),
             journal_seq: 1,
             session_id: "protocol-seal".to_string(),
             script_name: "test.csv".to_string(),
@@ -529,6 +563,7 @@ mod tests {
             started_at: "2026-08-10T11:00:00Z".to_string(),
             updated_at: "2026-08-10T12:00:00Z".to_string(),
             noise_check: None,
+            input_audition: None,
             noise_threshold_dbfs: Some(-42.0),
             silence_duration_ms: 1_000,
             silence_threshold_dbfs: -42.0,

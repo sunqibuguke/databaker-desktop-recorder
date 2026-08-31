@@ -3,7 +3,7 @@ export {};
 declare module '*.css';
 
 import type { DebugLogDraft, DebugLogEntry, DebugLogSnapshot } from './debug-log';
-import type { CapturePresetDraft, CapturePresetLoadResult, CapturePresetStore, DefaultOutputResult, ExportDeliveryProgress, ExportDeliveryRequest, ExportDeliveryResult, ExportDeliveryVerification, ExportArtifact, LicenseStatus, PendingLicenseSeal, PrompterState, RecordingHistoryPage } from './types';
+import type { CapturePresetDraft, CapturePresetLoadResult, CapturePresetStore, DefaultOutputResult, ExportDeliveryProgress, ExportDeliveryRequest, ExportDeliveryResult, ExportDeliveryVerification, ExportArtifact, InputAuditionCacheConfiguration, InputAuditionCommandResult, InputAuditionDecision, InputAuditionFinishResult, LicenseStatus, PendingLicenseSeal, PrompterState, RecordingHistoryPage } from './types';
 
 declare global {
   interface Window {
@@ -12,6 +12,13 @@ declare global {
       platform?: string;
       devWebCapture?(): Promise<boolean>;
       request<T = unknown>(command: string, payload?: unknown): Promise<T>;
+      getInputAuditionDecision(configuration: InputAuditionCacheConfiguration): Promise<InputAuditionDecision | null>;
+      clearInputAuditionDecision(configuration: InputAuditionCacheConfiguration): Promise<void>;
+      beginInputAudition(): Promise<InputAuditionCommandResult>;
+      finishInputAudition(checkId: string): Promise<InputAuditionFinishResult>;
+      confirmInputAudition(checkId: string): Promise<InputAuditionCommandResult>;
+      skipInputAudition(checkId?: string): Promise<InputAuditionCommandResult>;
+      cancelInputAudition(checkId: string): Promise<InputAuditionCommandResult>;
       openScript(): Promise<{ filePath: string; name: string; content: string } | null>;
       chooseOutput(): Promise<string | null>;
       chooseExportDir(defaultPath?: string, title?: string): Promise<string | null>;

@@ -4,11 +4,12 @@ const { pathToFileURL } = require('node:url');
 
 async function main() {
   const {
+    automationRulesEqual,
     DEFAULT_AUTOMATION_RULES,
     loadAutomationRules,
     loadWorkstationAutomationRules,
     normalizeAutomationRules,
-    saveAutomationRules,
+    saveSessionAutomationRules,
     saveWorkstationAutomationRules,
     showsPostTakeQualityBill,
     skipSessionEnvCheck,
@@ -50,7 +51,7 @@ async function main() {
   assert.equal(loadAutomationRules('session-a').headTailSilence, false);
   assert.equal(loadAutomationRules('session-a').discardEmpty, true);
 
-  saveAutomationRules('session-a', {
+  saveSessionAutomationRules('session-a', {
     ...DEFAULT_AUTOMATION_RULES,
     pauseOnLabelChange: true,
     envCheck: false,
@@ -61,6 +62,8 @@ async function main() {
   assert.equal(loaded.almostSilent, true);
   assert.equal(loaded.pauseOnLabelChange, true);
   assert.equal(loaded.headTailSilence, true);
+  assert.equal(automationRulesEqual(loaded, { ...loaded }), true);
+  assert.equal(automationRulesEqual(loaded, { ...loaded, peakHigh: !loaded.peakHigh }), false);
   assert.deepEqual(
     normalizeAutomationRules({ discardEmpty: 'nope', peakHigh: true }),
     { ...DEFAULT_AUTOMATION_RULES, peakHigh: true },
@@ -88,17 +91,12 @@ async function main() {
 
   assert.deepEqual(
     loadWorkstationAutomationRules(),
-    {
-      ...DEFAULT_AUTOMATION_RULES,
-      pauseOnLabelChange: true,
-      envCheck: false,
-      almostSilent: true,
-    },
-    'saving a task also remembers the last-used workstation defaults',
+    DEFAULT_AUTOMATION_RULES,
+    'saving current-task rules must not silently rewrite defaults for future tasks',
   );
   assert.equal(
     loadAutomationRules('').envCheck,
-    false,
+    true,
     'a new-task draft reads workstation defaults, not the product default',
   );
   assert.equal(
@@ -118,7 +116,7 @@ async function main() {
     'workstation defaults must not rewrite an already saved task',
   );
 
-  saveAutomationRules('', {
+  saveWorkstationAutomationRules({
     ...DEFAULT_AUTOMATION_RULES,
     envCheck: false,
     discardEmpty: false,

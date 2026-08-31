@@ -132,6 +132,10 @@ class FakeEngineClient extends EventEmitter {
 
   async forceStop() { throw new Error('forceStop must not be used'); }
 
+  requestInputAudition(command, payload = {}) {
+    return this.request(command, payload, 20_000);
+  }
+
   optionalState() {
     if (!this.active) return { active: false };
     return {
@@ -157,6 +161,30 @@ class FakeEngineClient extends EventEmitter {
       this.active = true;
       await persistSessionTree(this.sessionDir, this.snapshot);
       return { session_dir: this.sessionDir, snapshot: clone(this.snapshot) };
+    }
+
+    if (command === 'skip_input_audition') {
+      const decidedAt = '2026-08-12T00:00:02Z';
+      const captureFingerprint = 'trusted-current-audition-fingerprint';
+      this.incrementJournal();
+      this.snapshot.input_audition = {
+        status: 'skipped',
+        check_id: 'trusted-current-audition-skip',
+        capture_fingerprint: captureFingerprint,
+        start_sample: this.snapshot.committed_samples,
+        end_sample: this.snapshot.committed_samples,
+        required_samples: 480_000,
+        captured_samples: 0,
+        started_at: decidedAt,
+        completed_at: decidedAt,
+        skipped_at: decidedAt,
+        warning_codes: [],
+      };
+      return {
+        capture_fingerprint: captureFingerprint,
+        input_audition: clone(this.snapshot.input_audition),
+        snapshot: clone(this.snapshot),
+      };
     }
 
     if (command === 'start_attempt') {
@@ -330,6 +358,7 @@ async function main() {
       session_dir: sessionDir,
       items: [item('1'), item('2')],
     });
+    await handlers.get('input-audition:skip_input_audition')(event, {});
 
     engine.nextAttemptOutcome = 'timeout-start-success';
     const started = await handlers.get('engine:request')(event, 'start_attempt', { item_id: '1' });

@@ -13,6 +13,16 @@ const GRACEFUL_STOP_TIMEOUT_MS = 90_000;
 const SHUTDOWN_REQUEST_TIMEOUT_MS = 80_000;
 const FORCED_EXIT_WAIT_MS = 10_000;
 
+export type InputAuditionCommand =
+  | 'begin_input_audition'
+  | 'finish_input_audition'
+  | 'confirm_input_audition'
+  | 'skip_input_audition'
+  | 'cancel_input_audition';
+
+const INPUT_AUDITION_FINISH_TIMEOUT_MS = 60_000;
+const INPUT_AUDITION_COMMAND_TIMEOUT_MS = 20_000;
+
 type EngineClientOptions = Readonly<{
   args?: readonly string[];
   gracefulStopTimeoutMs?: number;
@@ -175,6 +185,19 @@ export class EngineClient extends EventEmitter {
         request.reject(new Error(`无法向录音引擎发送 ${command}：${error.message}`));
       });
     });
+  }
+
+  requestInputAudition(
+    command: InputAuditionCommand,
+    payload: unknown = {},
+  ): Promise<unknown> {
+    return this.request(
+      command,
+      payload,
+      command === 'finish_input_audition'
+        ? INPUT_AUDITION_FINISH_TIMEOUT_MS
+        : INPUT_AUDITION_COMMAND_TIMEOUT_MS,
+    );
   }
 
   stop(): Promise<void> {

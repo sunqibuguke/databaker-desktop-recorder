@@ -12,6 +12,8 @@ export type HistoryDeliveryReadiness = Readonly<{
 export type HistoryWorkflowSummary = Readonly<{
   blocker_items: number;
   warning_items: number;
+  warning_items_without_head_tail: number;
+  warning_codes: readonly string[];
   confirmed_only_readiness: HistoryDeliveryReadiness;
   complete_task_readiness: HistoryDeliveryReadiness;
 }>;
@@ -512,6 +514,8 @@ export function deriveHistoryWorkflowSummary(snapshotValue: unknown): HistoryWor
     return {
       blocker_items: Array.isArray(snapshot?.items) ? snapshot.items.length : 1,
       warning_items: 0,
+      warning_items_without_head_tail: 0,
+      warning_codes: [],
       confirmed_only_readiness: blocked,
       complete_task_readiness: blocked,
     };
@@ -562,6 +566,13 @@ export function deriveHistoryWorkflowSummary(snapshotValue: unknown): HistoryWor
     audioFormat?.sample_rate,
   )) taskBlockers.push('task_provenance_incomplete');
   const taskWarningCount = hasHistoricalVadDiagnosticWarning(snapshot) ? 1 : 0;
+  const warningCodes = unique([
+    ...items.flatMap((item) => item.warnings),
+    ...(taskWarningCount ? ['vad_diagnostics'] : []),
+  ]);
+  const isHeadTailWarning = (reason: Reason) => (
+    reason === 'head_silence_short' || reason === 'tail_silence_short'
+  );
   return {
     blocker_items: items.filter((item) => item.blockers.length > 0
       || ['unrecorded', 'first_take_review', 'retake_review', 'rerecord_required', 'inconsistent']
@@ -569,6 +580,11 @@ export function deriveHistoryWorkflowSummary(snapshotValue: unknown): HistoryWor
     warning_items: items.filter((item) => item.blockers.length === 0
       && (item.warnings.length > 0 || item.disposition === 'skipped')).length
       + taskWarningCount,
+    warning_items_without_head_tail: items.filter((item) => item.blockers.length === 0
+      && (item.warnings.some((warning) => !isHeadTailWarning(warning))
+        || item.disposition === 'skipped')).length
+      + taskWarningCount,
+    warning_codes: warningCodes,
     confirmed_only_readiness: readiness(items, 'confirmed_only', taskBlockers),
     complete_task_readiness: readiness(items, 'complete_task', taskBlockers),
   };

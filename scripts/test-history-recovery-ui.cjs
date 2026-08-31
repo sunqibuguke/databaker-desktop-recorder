@@ -74,33 +74,95 @@ async function main() {
   );
   assert.deepEqual(
     planTaskListEntry({ ...base, status: 'stopped', pending_items: 2 }),
-    { kind: 'view-record', viewPrimary: false, recordEnabled: true },
-    'an unfinished stopped task offers record as the primary row action',
+    { kind: 'record' },
+    'an unfinished stopped task has one direct record action',
+  );
+  assert.deepEqual(
+    planTaskListEntry({ ...base, status: 'stopped', pending_items: 2, review_items: 1 }),
+    { kind: 'issues' },
+    'a task with an unresolved take routes to issue handling before reopening hardware',
   );
   assert.deepEqual(
     planTaskListEntry({ ...base, status: 'stopped' }),
-    { kind: 'view-record', viewPrimary: true, recordEnabled: true },
-    'a completed stopped task offers view as the primary row action',
+    { kind: 'inspect', reason: 'blocked' },
+    'a legacy task without delivery readiness must be checked instead of looking complete',
   );
   assert.deepEqual(
     planTaskListEntry({ ...base, status: 'recording', pending_items: 2 }),
-    { kind: 'view-only', recordDisabledReason: 'fault' },
-    'an interrupted unfinished task must be sealed before record can arm capture',
+    { kind: 'repair' },
+    'an interrupted unfinished task exposes repair directly instead of hiding it in overflow',
   );
   assert.deepEqual(
     planTaskListEntry({ ...base, status: 'faulted', pending_items: 2 }),
-    { kind: 'view-only', recordDisabledReason: 'fault' },
-    'faulted audio stays viewable but cannot jump into capture',
+    { kind: 'repair' },
+    'faulted audio exposes the one safe repair action',
   );
   assert.deepEqual(
     planTaskListEntry({ ...base, status: 'stopped', history_issue: 'snapshot unreadable' }),
-    { kind: 'view-only', recordDisabledReason: 'issue' },
-    'a history issue blocks record even when the row looks complete',
+    { kind: 'inspect', reason: 'issue' },
+    'a history issue routes directly to inspection',
   );
   assert.deepEqual(
     planTaskListEntry({ ...base, status: 'stopped', data_health: 'readonly' }),
-    { kind: 'view-only', recordDisabledReason: 'readonly' },
-    'readonly health keeps view available and disables record',
+    { kind: 'inspect', reason: 'readonly' },
+    'readonly health routes directly to inspection',
+  );
+  assert.deepEqual(
+    planTaskListEntry({ ...base, status: 'stopped', data_health: 'needs_repair' }),
+    { kind: 'repair' },
+    'an explicit repairable data-health state exposes repair directly',
+  );
+  assert.deepEqual(
+    planTaskListEntry({ ...base, status: 'stopped', blocker_items: 1 }),
+    { kind: 'inspect', reason: 'blocked' },
+    'a completed-looking task with delivery blockers cannot claim export readiness',
+  );
+  assert.deepEqual(
+    planTaskListEntry({ ...base, status: 'stopped', warning_items: 1 }),
+    { kind: 'inspect', reason: 'warning' },
+    'a task with warnings routes to review before delivery',
+  );
+  assert.deepEqual(
+    planTaskListEntry({
+      ...base,
+      status: 'stopped',
+      complete_task_readiness: { ready: true, health: 'clear', included_items: 2, excluded_items: 0, blocker_count: 0, warning_count: 0 },
+    }),
+    { kind: 'export' },
+    'a clean completed task with no current cuts exposes export directly',
+  );
+  assert.deepEqual(
+    planTaskListEntry({
+      ...base,
+      status: 'stopped',
+      complete_task_readiness: { ready: true, health: 'clear', included_items: 2, excluded_items: 0, blocker_count: 0, warning_count: 0 },
+      export_artifacts: { cuts_zip: { artifact: 'cuts_zip', state: 'current', warnings: [] } },
+    }),
+    { kind: 'deliver' },
+    'a current internal artifact is still pending delivery until its receipt is verified',
+  );
+  assert.deepEqual(
+    planTaskListEntry({
+      ...base,
+      status: 'stopped',
+      complete_task_readiness: { ready: true, health: 'clear', included_items: 2, excluded_items: 0, blocker_count: 0, warning_count: 0 },
+      export_artifacts: { cuts_zip: { artifact: 'cuts_zip', state: 'current', warnings: [] } },
+      delivery_verifications: { cuts_zip: 'verified' },
+      verified_delivery_directories: { cuts_zip: '/external/delivery' },
+    }),
+    { kind: 'delivered' },
+    'only a current artifact with a verified delivery receipt and its external directory is shown as delivered',
+  );
+  assert.deepEqual(
+    planTaskListEntry({
+      ...base,
+      status: 'stopped',
+      complete_task_readiness: { ready: true, health: 'clear', included_items: 2, excluded_items: 0, blocker_count: 0, warning_count: 0 },
+      export_artifacts: { cuts_zip: { artifact: 'cuts_zip', state: 'current', warnings: [] } },
+      delivery_verifications: { cuts_zip: 'verified' },
+    }),
+    { kind: 'deliver' },
+    'a verified status without the verified external directory must not open the internal export as delivery',
   );
 
   const healthy = { faulted: false, overflow_samples: 0, storage_status: 'healthy' };

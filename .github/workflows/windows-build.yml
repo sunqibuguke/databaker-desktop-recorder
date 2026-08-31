@@ -48,7 +48,7 @@ jobs:
         run: npm ci
 
       - name: Check Rust formatting
-        run: node scripts/run-cargo.cjs fmt --manifest-path engine/Cargo.toml -- --check
+        run: node scripts/run-cargo.cjs fmt --manifest-path engine/Cargo.toml --package recorder-engine -- --check
 
       - name: Run strict Rust lints
         run: node scripts/run-cargo.cjs clippy --manifest-path engine/Cargo.toml --all-targets --all-features -- -D warnings
@@ -81,8 +81,9 @@ jobs:
           $qualificationSchema = Join-Path $resources "acceptance/windows-audio-qualification-plan.schema.json"
           $qualificationExample = Join-Path $resources "acceptance/Windows外置声卡资格计划.example.json"
           $acceptanceDoc = Join-Path $resources "acceptance/Windows外置声卡生产验收.md"
+          $pilotReleaseNotes = Join-Path $resources "acceptance/受控试运行说明.md"
           $engine = Join-Path $resources "bin/recorder-engine.exe"
-          foreach ($required in @($acceptance, $launcher, $cmdLauncher, $qualification, $qualificationLauncher, $qualificationPowerShell, $qualificationSchema, $qualificationExample, $acceptanceDoc, $engine)) {
+          foreach ($required in @($acceptance, $launcher, $cmdLauncher, $qualification, $qualificationLauncher, $qualificationPowerShell, $qualificationSchema, $qualificationExample, $acceptanceDoc, $pilotReleaseNotes, $engine)) {
             if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
               throw "Packaged acceptance resource is missing: $required"
             }
@@ -154,8 +155,9 @@ jobs:
           $installedLauncher = Join-Path $installRoot "resources/acceptance/run-windows-audio-acceptance.cmd"
           $installedQualification = Join-Path $installRoot "resources/acceptance/run-windows-audio-qualification.cmd"
           $installedQualificationExample = Join-Path $installRoot "resources/acceptance/Windows外置声卡资格计划.example.json"
+          $installedPilotReleaseNotes = Join-Path $installRoot "resources/acceptance/受控试运行说明.md"
           $installedEngine = Join-Path $installRoot "resources/bin/recorder-engine.exe"
-          foreach ($required in @($installedLauncher, $installedQualification, $installedQualificationExample, $installedEngine)) {
+          foreach ($required in @($installedLauncher, $installedQualification, $installedQualificationExample, $installedPilotReleaseNotes, $installedEngine)) {
             if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
               throw "Installed production payload is missing: $required"
             }

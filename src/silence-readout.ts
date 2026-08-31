@@ -1,5 +1,5 @@
 import { t } from '../shared/i18n/index.ts';
-import { loadAutomationRules, saveAutomationRules } from './automation-rules.ts';
+import { loadAutomationRules, saveSessionAutomationRules } from './automation-rules.ts';
 import type { Attempt, HeadSilencePhase, ItemState, SilenceDetector } from './types';
 
 export type SilencePadStatus = 'unknown' | 'short' | 'met';
@@ -453,5 +453,5 @@ export function loadPostTakeSilenceReview(sessionDir: string): boolean {
 
 export function savePostTakeSilenceReview(sessionDir: string, enabled: boolean): void {
   const current = loadAutomationRules(sessionDir);
-  saveAutomationRules(sessionDir, { ...current, headTailSilence: enabled });
+  saveSessionAutomationRules(sessionDir, { ...current, headTailSilence: enabled });
 }

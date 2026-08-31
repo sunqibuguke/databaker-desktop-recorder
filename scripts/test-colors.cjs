@@ -91,19 +91,20 @@ function main() {
   assert.match(css, /\.silence-review-toggle input\s*\{[^}]*cursor:\s*pointer/, 'the hidden checkbox must keep the pointer');
   assert.match(
     css,
-    /\.silence-review-toggle:hover:not\(:has\(input:disabled\)\):not\(:has\(input:checked\)\) \.rule-check/,
-    'empty-box hover must not apply to a checked rule',
+    /\.silence-review-toggle:hover:not\(:has\(input:disabled\)\):not\(:has\(input:checked\)\) \.rule-switch/,
+    'unchecked switch hover must not apply to a checked rule',
   );
   assert.match(
     css,
-    /\.silence-review-toggle:hover:has\(input:checked\):not\(:has\(input:disabled\)\) \.rule-check[^}]*background:\s*var\(--accent-fill-hover\)/,
-    'checked hover must stay filled',
+    /\.silence-review-toggle:hover:has\(input:checked\):not\(:has\(input:disabled\)\) \.rule-switch[^}]*background:\s*var\(--accent-fill-hover\)/,
+    'checked switch hover must stay filled',
   );
   assert.doesNotMatch(
     css,
-    /\.silence-review-toggle:hover:not\(:has\(input:disabled\)\) \.rule-check/,
-    'checked hover must not reuse the empty-box fill',
+    /\.silence-review-toggle:hover:not\(:has\(input:disabled\)\) \.rule-switch/,
+    'checked hover must not reuse the unchecked switch fill',
   );
+  assert.match(css, /\.silence-review-toggle:has\(input:disabled\)\s*\{[^}]*opacity:\s*\.38/, 'disabled switches must be visibly muted');
   assert.match(css, /button:not\(:disabled\),\s*select:not\(:disabled\)/, 'clickable controls must share a pointer');
   assert.match(css, /input:not\(:disabled\):is\([^{]*\[type="text"\]/, 'text fields must keep a text cursor');
   assert.match(

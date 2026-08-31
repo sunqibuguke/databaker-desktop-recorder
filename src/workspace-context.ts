@@ -1,6 +1,6 @@
 import type { IssueFilter } from './p1-workflow';
 
-export type WorkspacePanel = 'monitor' | 'detection' | 'task' | 'export' | 'issues';
+export type WorkspacePanel = 'monitor' | 'detection' | 'settings' | 'task' | 'export' | 'issues';
 
 export type WorkspaceContext = {
   sessionId: string;
@@ -29,7 +29,7 @@ function safeParse(storage: StorageLike): ContextStore {
         && Number.isFinite(entry.updatedAt)
         && entry.updatedAt >= 0
         && ['all', 'blocker', 'warning'].includes(entry.issueFilter)
-        && ['monitor', 'detection', 'task', 'export', 'issues'].includes(entry.panel)
+        && ['monitor', 'detection', 'settings', 'task', 'export', 'issues'].includes(entry.panel)
       ))
       .sort((left, right) => right.updatedAt - left.updatedAt);
     const sessionIds = new Set<string>();

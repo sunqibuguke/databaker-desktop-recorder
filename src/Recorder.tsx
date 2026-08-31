@@ -4,11 +4,10 @@ import {
   effectiveCaptureFaultKind,
   engineRecoveryFailure,
   isReconciliableInactiveStopError,
-  planHistoryRecovery,
   planTaskListEntry,
   splitRecoveryWarnings,
 } from './history-recovery';
-import type { TaskListEntry, TaskListRecordDisabledReason } from './history-recovery';
+import type { TaskListEntry } from './history-recovery';
 import type { EffectiveCaptureFaultKind } from './history-recovery';
 import { parseScript, type ParseResult } from './script-parser';
 import {
@@ -48,6 +47,11 @@ import {
 import { waveformTakeIsActive } from './waveform-buffer';
 import { WebGLWaveform } from './WebGLWaveform';
 import { PreviewPlayer } from './PreviewPlayer';
+import { InputAuditionDialog } from './InputAuditionDialog';
+import {
+  inputAuditionConfiguration,
+  logicalInputAuditionConfigurationKey,
+} from './input-audition';
 import { inputQualityWarning, shouldHandleLiveMeter } from './input-quality';
 import {
   canFinishSpokenTake,
@@ -67,9 +71,10 @@ import {
   type SilencePairView,
 } from './silence-readout';
 import {
+  automationRulesEqual,
   loadAutomationRules,
   loadWorkstationAutomationRules,
-  saveAutomationRules,
+  saveSessionAutomationRules,
   saveWorkstationAutomationRules,
   showsPostTakeQualityBill,
   skipSessionEnvCheck,
@@ -77,6 +82,7 @@ import {
   type TaskDetectionPolicyKey,
 } from './automation-rules.ts';
 import {
+  DEFAULT_DELIVERY_BIT_DEPTH,
   captureSampleFormatFromBitDepth,
   captureSampleFormatLabel,
   captureSampleFormatsForConfiguration,
@@ -86,7 +92,6 @@ import {
   preferredInputDevice,
   productionSampleRates,
   configurationsForShareMode,
-  deliveryBitDepthForCaptureFormat,
   deviceExclusiveAvailable,
   normalizeCaptureSampleFormat,
   normalizeCaptureShareMode,
@@ -97,7 +102,7 @@ import { createLatestFrameCommitter } from './latest-frame';
 import type { LatestFrameCommitter } from './latest-frame';
 import type { SessionNoiseCheckOperation } from './recording-workflow';
 import { licenseSummary } from './ActivateLicense';
-import { normalizeSilenceDetector, type Attempt, type AudioDevice, type CapturePreset, type CapturePresetDraft, type CapturePresetStore, type CaptureShareMode, type EngineEvent, type ExportArtifact, type ExportDeliveryProgress, type ExportResult, type ExportScope, type HeadSilencePhase, type InspectedSessionState, type ItemState, type LicenseStatus, type Meter, type NoiseCheckProgress, type NoiseCheckResult, type PrompterState, type RecordingHistoryEntry, type ScriptItem, type ScriptLabelTransition, type SealInterruptedSessionResult, type SessionSnapshot, type SilenceDetector } from './types';
+import { normalizeSilenceDetector, type Attempt, type AudioDevice, type CapturePreset, type CapturePresetDraft, type CapturePresetStore, type CaptureShareMode, type EngineEvent, type ExportArtifact, type ExportDeliveryProgress, type ExportDeliveryVerification, type ExportResult, type ExportScope, type HeadSilencePhase, type InputAuditionDecision, type InspectedSessionState, type ItemState, type LicenseStatus, type Meter, type NoiseCheckProgress, type NoiseCheckResult, type PrompterState, type RecordingHistoryEntry, type ScriptItem, type ScriptLabelTransition, type SealInterruptedSessionResult, type SessionSnapshot, type SilenceDetector } from './types';
 import { reportRendererError } from './sentry';
 import { logUserAction } from './debug-log';
 import { translateExportDeliverError } from './export-deliver-i18n';
@@ -125,10 +130,13 @@ import { readerCueKey, readerFacingCue, resolveMonitorCue } from './prompter-cue
 import { usePrompterAppearance } from './usePrompterAppearance';
 import {
   adjacentWorkbenchIssue,
+  applyHeadTailWarningPreference,
   buildIssueWorkbench,
   deriveTaskWorkflow,
   filterWorkbenchIssues,
   isAttemptPreviewSafe,
+  nextWorkbenchIssueAfterResolution,
+  setupReadinessIssues,
   type IssueFilter,
   type WorkbenchIssue,
   type WorkflowReasonCode,
@@ -163,7 +171,7 @@ type StoppedSessionState = {
 type CaptureExitMode = 'pause' | 'finish' | 'fault';
 type CaptureStopDestination = 'home' | 'inspect';
 type PauseDestination = 'stay' | 'leave';
-type MonitorPanelTab = 'monitor' | 'detection' | 'task' | 'export' | 'issues';
+type MonitorPanelTab = 'monitor' | 'detection' | 'settings' | 'task' | 'export' | 'issues';
 type OptionalRunningSessionState = ({ active: true } & RunningSessionState) | { active: false };
 type ExportFeedback = {
   sessionId: string;
@@ -178,6 +186,20 @@ type ExportFeedback = {
   warning?: string;
   error?: string;
 };
+
+const DIALOG_FOCUSABLE_SELECTOR = [
+  'button:not([disabled])',
+  'a[href]',
+  'input:not([disabled])',
+  'select:not([disabled])',
+  'textarea:not([disabled])',
+  '[tabindex]:not([tabindex="-1"])',
+].join(',');
+
+function dialogFocusableElements(dialog: Element): HTMLElement[] {
+  return Array.from(dialog.querySelectorAll<HTMLElement>(DIALOG_FOCUSABLE_SELECTOR))
+    .filter((element) => !element.hidden && element.getAttribute('aria-hidden') !== 'true');
+}
 type UserAlert = {
   kind: 'error' | 'warning';
   title: string;
@@ -443,7 +465,7 @@ function DeviceWarningDialog(props: {
             <Icon name="chevron-left" size={14} />
             {t('deviceWarning.leave')}
           </button>
-          <button data-testid="device-warning-continue" className="button primary" onClick={props.onContinue} disabled={props.busy}>
+          <button data-testid="device-warning-continue" data-dialog-default className="button primary" onClick={props.onContinue} disabled={props.busy}>
             {t('deviceWarning.continue')}
           </button>
         </footer>
@@ -462,6 +484,7 @@ function AutomationRuleRow(props: {
 }) {
   return (
     <label className="silence-review-toggle automation-rule">
+      <span><strong>{props.title}</strong><small>{props.hint}</small></span>
       <input
         type="checkbox"
         data-testid={props.testId}
@@ -469,14 +492,52 @@ function AutomationRuleRow(props: {
         disabled={props.disabled}
         onChange={(event) => props.onChange(event.target.checked)}
       />
-      <i className="rule-check" aria-hidden="true"><Icon name="check" size={12} /></i>
-      <span><strong>{props.title}</strong><small>{props.hint}</small></span>
+      <i className="rule-switch" aria-hidden="true"><b /></i>
     </label>
   );
 }
 
-function SilencePairReadout({ pair, hint }: { pair: SilencePairView; hint?: boolean }) {
-  return <span className="silence-pair">
+function RecordingRuleGroups(props: {
+  rules: AutomationRules;
+  testIdPrefix: string;
+  discardEmptyHint: string;
+  onChange: <Key extends keyof AutomationRules>(key: Key, enabled: AutomationRules[Key]) => void;
+}) {
+  const summary = !props.rules.autoStartNext
+    ? t('recorder.continuousSummaryManual')
+    : props.rules.pauseOnLabelChange
+      ? t('recorder.continuousSummaryLabelPause')
+      : t('recorder.continuousSummaryAll');
+  const testId = (name: string) => `${props.testIdPrefix}-${name}`;
+  return (
+    <div className="recording-rule-groups">
+      <section className="recording-rule-group continuous-rule-group">
+        <header><strong>{t('recorder.continuousRecording')}</strong><small>{t('recorder.continuousRecordingHint')}</small></header>
+        <AutomationRuleRow testId={testId('auto-start-next')} checked={props.rules.autoStartNext} title={t('recorder.ruleAutoStartNext')} hint={t('recorder.ruleAutoStartNextHint')} onChange={(enabled) => props.onChange('autoStartNext', enabled)} />
+        <div className="dependent-rule">
+          <AutomationRuleRow testId={testId('pause-on-label-change')} checked={props.rules.pauseOnLabelChange} disabled={!props.rules.autoStartNext} title={t('recorder.rulePauseOnLabelChange')} hint={props.rules.autoStartNext ? t('recorder.rulePauseOnLabelChangeHint') : t('recorder.rulePauseOnLabelChangeDisabledHint')} onChange={(enabled) => props.onChange('pauseOnLabelChange', enabled)} />
+        </div>
+        <p className="continuous-rule-summary"><i />{summary}</p>
+      </section>
+      <section className="recording-rule-group">
+        <header><strong>{t('recorder.recordingProtection')}</strong><small>{t('recorder.recordingProtectionHint')}</small></header>
+        <AutomationRuleRow testId={testId('enforce-head-tail')} checked={props.rules.enforceHeadTailSilence} title={t('recorder.ruleEnforceHeadTail')} hint={t('recorder.ruleEnforceHeadTailHint')} onChange={(enabled) => props.onChange('enforceHeadTailSilence', enabled)} />
+        <AutomationRuleRow testId={testId('discard-empty')} checked={props.rules.discardEmpty} title={t('recorder.ruleDiscardEmpty')} hint={props.discardEmptyHint} onChange={(enabled) => props.onChange('discardEmpty', enabled)} />
+        <AutomationRuleRow testId={testId('env-check')} checked={props.rules.envCheck} title={t('recorder.ruleEnvCheck')} hint={t('recorder.ruleEnvCheckHint')} onChange={(enabled) => props.onChange('envCheck', enabled)} />
+      </section>
+      <section className="recording-rule-group">
+        <header><strong>{t('recorder.recordingFeedback')}</strong><small>{t('recorder.recordingFeedbackHint')}</small></header>
+        <AutomationRuleRow testId={testId('head-tail')} checked={props.rules.headTailSilence} title={t('recorder.ruleHeadTail')} hint={t('recorder.ruleHeadTailHint')} onChange={(enabled) => props.onChange('headTailSilence', enabled)} />
+        <AutomationRuleRow testId={testId('almost-silent')} checked={props.rules.almostSilent} title={t('recorder.ruleAlmostSilent')} hint={t('recorder.ruleAlmostSilentHint')} onChange={(enabled) => props.onChange('almostSilent', enabled)} />
+        <AutomationRuleRow testId={testId('peak-high')} checked={props.rules.peakHigh} title={t('recorder.rulePeakHigh')} hint={t('recorder.rulePeakHighHint')} onChange={(enabled) => props.onChange('peakHigh', enabled)} />
+      </section>
+      <p className="recording-safety-note"><Icon name="check" size={12} />{t('recorder.dataProtectionAlwaysOn')}</p>
+    </div>
+  );
+}
+
+function SilencePairReadout({ pair, hint, testId }: { pair: SilencePairView; hint?: boolean; testId?: string }) {
+  return <span className="silence-pair" data-testid={testId}>
     <span className={silenceReadoutClass(pair.headStatus)}>{pair.headText}</span>
     <span className={silenceReadoutClass(pair.tailStatus)}>{pair.tailText}</span>
     {pair.extra ? <span className="silence-readout note">{pair.extra}</span> : null}
@@ -540,30 +601,46 @@ function preferredReviewAttemptId(item: ItemState | undefined): string | null {
   return item.selected_attempt_id ?? latestUsableAttempt(item)?.attempt_id ?? null;
 }
 
-function recordingState(recording: RecordingHistoryEntry): { kind: RecordingStateKind; label: string } {
-  if (recording.history_issue) return { kind: 'attention', label: t('home.stateNeedsCheck') };
-  if (recording.status === 'faulted' || recording.overflow_samples > 0) return { kind: 'attention', label: t('home.stateNeedsCheck') };
+function recordingState(
+  recording: RecordingHistoryEntry,
+  entry: TaskListEntry = planTaskListEntry(historyEntryWithTaskWarningPreference(recording)),
+): { kind: RecordingStateKind; label: string } {
   if (recording.is_active && recording.status === 'stopping') {
     return { kind: 'attention', label: t('home.stateSafeStopping') };
   }
   if (recording.is_active) return { kind: 'unfinished', label: t('home.stateCurrent') };
-  if (recording.status === 'recording' || recording.status === 'stopping') {
-    return { kind: 'attention', label: t('home.stateInterrupted') };
-  }
-  if (recording.pending_items + recording.review_items > 0) return { kind: 'unfinished', label: t('home.stateUnfinished') };
+  if (entry.kind === 'repair') return { kind: 'attention', label: t('home.stateInterrupted') };
+  if (entry.kind === 'record' || entry.kind === 'issues') return { kind: 'unfinished', label: t('home.stateUnfinished') };
+  if (entry.kind === 'export') return { kind: 'completed', label: t('p1.exportReady') };
+  if (entry.kind === 'deliver') return { kind: 'unfinished', label: t('p1.deliveryVerification.pending') };
+  if (entry.kind === 'delivered') return { kind: 'completed', label: t('p1.deliveryVerification.verified') };
+  if (entry.kind === 'inspect') return { kind: 'attention', label: t('home.stateNeedsCheck') };
   return { kind: 'completed', label: t('home.stateCompleted') };
 }
 
-function listViewIsPrimary(entry: TaskListEntry): boolean {
-  return entry.kind === 'view-only' || (entry.kind === 'view-record' && entry.viewPrimary);
-}
-
-function listRecordEnabled(entry: TaskListEntry): boolean {
-  return entry.kind === 'view-record' && entry.recordEnabled;
-}
-
-function listRecordDisabledReason(entry: TaskListEntry): TaskListRecordDisabledReason | undefined {
-  return entry.kind === 'view-only' ? entry.recordDisabledReason : undefined;
+function historyEntryWithTaskWarningPreference(
+  recording: RecordingHistoryEntry,
+): RecordingHistoryEntry {
+  if (loadAutomationRules(recording.session_dir).headTailSilence) return recording;
+  const warningCodes = (recording.warning_codes ?? []).filter((code) => (
+    code !== 'head_silence_short' && code !== 'tail_silence_short'
+  ));
+  if (warningCodes.length === (recording.warning_codes ?? []).length) return recording;
+  const readiness = recording.complete_task_readiness;
+  return {
+    ...recording,
+    warning_codes: warningCodes,
+    warning_items: recording.warning_items_without_head_tail ?? recording.warning_items,
+    complete_task_readiness: readiness ? {
+      ...readiness,
+      warning_count: warningCodes.length,
+      health: readiness.blocker_count > 0
+        ? 'blocked'
+        : warningCodes.length > 0
+          ? 'warning'
+          : 'clear',
+    } : readiness,
+  };
 }
 
 function recordingMatchesFilter(recording: RecordingHistoryEntry, filter: HistoryFilter): boolean {
@@ -584,7 +661,46 @@ function preserveDeliveryVerification(
     }
     return result;
   }, {} as NonNullable<RecordingHistoryEntry['delivery_verifications']>);
-  return Object.keys(verified).length ? { ...next, delivery_verifications: verified } : next;
+  if (!Object.keys(verified).length) return next;
+  const verifiedDeliveryDirectories = (Object.keys(verified) as ExportArtifact[]).reduce((result, artifact) => {
+    const directory = previous.verified_delivery_directories?.[artifact];
+    if (verified[artifact] === 'verified' && directory) result[artifact] = directory;
+    return result;
+  }, {} as NonNullable<RecordingHistoryEntry['verified_delivery_directories']>);
+  return {
+    ...next,
+    delivery_verifications: verified,
+    ...(Object.keys(verifiedDeliveryDirectories).length
+      ? { verified_delivery_directories: verifiedDeliveryDirectories }
+      : {}),
+  };
+}
+
+function applyDeliveryVerification(
+  recording: RecordingHistoryEntry,
+  artifact: ExportArtifact,
+  exportId: string,
+  verification: ExportDeliveryVerification['verification'],
+  directory?: string,
+): RecordingHistoryEntry {
+  if (recording.export_artifacts?.[artifact]?.export_id !== exportId) return recording;
+  const deliveryVerifications = {
+    ...(recording.delivery_verifications ?? {}),
+    [artifact]: verification,
+  };
+  const verifiedDeliveryDirectories = {
+    ...(recording.verified_delivery_directories ?? {}),
+  };
+  if (verification === 'verified' && directory?.trim()) {
+    verifiedDeliveryDirectories[artifact] = directory;
+  } else {
+    delete verifiedDeliveryDirectories[artifact];
+  }
+  return {
+    ...recording,
+    delivery_verifications: deliveryVerifications,
+    verified_delivery_directories: verifiedDeliveryDirectories,
+  };
 }
 
 function pad2(value: number): string {
@@ -691,7 +807,9 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const [sampleRate, setSampleRate] = useState(48_000);
   const [inputSampleFormat, setInputSampleFormat] = useState('i16');
   const [inputChannel, setInputChannel] = useState(1);
-  const bitDepth = deliveryBitDepthForCaptureFormat(inputSampleFormat);
+  // Delivery stays the product-standard PCM16 contract. The driver's actual
+  // input representation is selected and persisted independently below.
+  const bitDepth = DEFAULT_DELIVERY_BIT_DEPTH;
   const [captureShareMode, setCaptureShareMode] = useState<CaptureShareMode>('exclusive');
   const [sessionName, setSessionName] = useState(() => t('setup.defaultSessionName'));
   const [outputDir, setOutputDir] = useState('');
@@ -702,6 +820,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const [scriptPreviewOpen, setScriptPreviewOpen] = useState(false);
   const [snapshot, setSnapshot] = useState<SessionSnapshot | null>(null);
   const [captureActive, setCaptureActive] = useState(false);
+  const [inputAuditionDecision, setInputAuditionDecision] = useState<InputAuditionDecision | null>(null);
+  const [inputAuditionOpen, setInputAuditionOpen] = useState(false);
+  const [inputAuditionForce, setInputAuditionForce] = useState(false);
+  const [inputAuditionDismissed, setInputAuditionDismissed] = useState(false);
   const [devWebCaptureEnabled, setDevWebCaptureEnabled] = useState(false);
   const [devWebCaptureNotice, setDevWebCaptureNotice] = useState('');
   const [workspaceFaulted, setWorkspaceFaulted] = useState(false);
@@ -730,6 +852,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const [reviewPeak, setReviewPeak] = useState(0);
   const [discontinuityToast, setDiscontinuityToast] = useState('');
   const [automationRules, setAutomationRules] = useState<AutomationRules>(loadWorkstationAutomationRules);
+  const [taskInitialAutomationRules, setTaskInitialAutomationRules] = useState<AutomationRules>(loadWorkstationAutomationRules);
   const [workstationRules, setWorkstationRules] = useState<AutomationRules>(loadWorkstationAutomationRules);
   const takePeakRef = useRef(0);
   const [meter, setMeter] = useState<Meter>(emptyMeter);
@@ -805,8 +928,11 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const noiseCheckRequestSequenceRef = useRef(0);
   const noiseCheckOperationRef = useRef<SessionNoiseCheckOperation | null>(null);
   const silenceSettingsSaveSequenceRef = useRef(0);
-  const hadMonitorIssuesRef = useRef(false);
+  const workbenchIssueQueueRef = useRef<WorkbenchIssue[]>([]);
+  const dialogFocusOriginRef = useRef<HTMLElement | null>(null);
   const discontinuityToastStateRef = useRef(initialDiscontinuityToastState());
+  const inputAuditionDiscontinuityBaselineRef = useRef({ sessionDir: '', count: 0 });
+  const inputAuditionConfigurationKeyRef = useRef('');
   const lastOperationErrorRef = useRef('');
   const discontinuityToastTimerRef = useRef<number | null>(null);
   const activeSessionDirRef = useRef('');
@@ -827,8 +953,11 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     attempts: [],
     selected_attempt_id: null,
   }));
+  const activeInputAuditionConfigurationKey = snapshot
+    ? logicalInputAuditionConfigurationKey(inputAuditionConfiguration(snapshot))
+    : '';
   const currentItem = items[currentIndex] ?? null;
-  const workflowSummary = useMemo(() => deriveTaskWorkflow({
+  const workflowSummary = useMemo(() => applyHeadTailWarningPreference(deriveTaskWorkflow({
     items,
     committed_samples: snapshot?.committed_samples ?? 0,
     capture_provenance: snapshot?.capture_provenance,
@@ -836,13 +965,13 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     overflow_samples: snapshot?.overflow_samples,
     silence_detector: snapshot?.silence_detector,
     audio_format: snapshot?.audio_format,
-  }), [items, snapshot?.audio_format, snapshot?.capture_provenance, snapshot?.committed_samples, snapshot?.overflow_samples, snapshot?.silence_detector, snapshot?.status]);
+  }), automationRules.headTailSilence), [automationRules.headTailSilence, items, snapshot?.audio_format, snapshot?.capture_provenance, snapshot?.committed_samples, snapshot?.overflow_samples, snapshot?.silence_detector, snapshot?.status]);
   // An active but idle capture can be exported through the existing
   // pause-then-export flow. Preview cuts against the exact current item/audio
   // state with only the status projected to the post-pause value; the command
   // still stops the engine and recomputes readiness from its authoritative
   // stopped snapshot before writing anything.
-  const exportWorkflowSummary = useMemo(() => deriveTaskWorkflow({
+  const exportWorkflowSummary = useMemo(() => applyHeadTailWarningPreference(deriveTaskWorkflow({
     items,
     committed_samples: snapshot?.committed_samples ?? 0,
     capture_provenance: snapshot?.capture_provenance,
@@ -850,7 +979,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     overflow_samples: snapshot?.overflow_samples,
     silence_detector: snapshot?.silence_detector,
     audio_format: snapshot?.audio_format,
-  }), [captureActive, items, snapshot?.audio_format, snapshot?.capture_provenance, snapshot?.committed_samples, snapshot?.overflow_samples, snapshot?.silence_detector, snapshot?.status]);
+  }), automationRules.headTailSilence), [automationRules.headTailSilence, captureActive, items, snapshot?.audio_format, snapshot?.capture_provenance, snapshot?.committed_samples, snapshot?.overflow_samples, snapshot?.silence_detector, snapshot?.status]);
   const currentWorkflow = workflowSummary.items[currentIndex] ?? null;
   const cutsReadiness = exportScope === 'complete_task'
     ? exportWorkflowSummary.completeTask
@@ -977,7 +1106,6 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     selectedCapturePreset.deviceId !== deviceId
     || selectedCapturePreset.deviceName !== deviceName
     || selectedCapturePreset.sampleRate !== sampleRate
-    || selectedCapturePreset.bitDepth !== bitDepth
     || (selectedCapturePreset.inputSampleFormat ?? captureSampleFormatFromBitDepth(selectedCapturePreset.bitDepth)) !== inputSampleFormat
     || selectedCapturePreset.inputChannel !== inputChannel
     || normalizeCaptureShareMode(selectedCapturePreset.captureShareMode) !== captureShareMode
@@ -1226,6 +1354,28 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     showPeakHigh: automationRules.peakHigh,
     detector: silenceDetector,
   });
+  const retainedDeliveryPair = reviewSilencePair({
+    attempt: retainedDeliveryAttempt,
+    sampleRate: sampleRateForDisplay,
+    requiredMs: effectiveSilenceDurationMs,
+    peak: retainedDeliveryAttempt?.peak,
+    showHeadTailHints: automationRules.headTailSilence,
+    showAlmostSilent: automationRules.almostSilent,
+    showPeakHigh: automationRules.peakHigh,
+    detector: silenceDetector,
+  });
+  const retakeCandidatePair = reviewSilencePair({
+    attempt: retakeCandidateAttempt,
+    sampleRate: sampleRateForDisplay,
+    requiredMs: effectiveSilenceDurationMs,
+    peak: retakeCandidateAttempt?.attempt_id === reviewAttempt?.attempt_id
+      ? reviewBillPeak
+      : retakeCandidateAttempt?.peak,
+    showHeadTailHints: automationRules.headTailSilence,
+    showAlmostSilent: automationRules.almostSilent,
+    showPeakHigh: automationRules.peakHigh,
+    detector: silenceDetector,
+  });
   const livePair = liveSilencePair({
     recording,
     pending: isPendingTake,
@@ -1290,26 +1440,89 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     () => filterWorkbenchIssues(workbenchIssues, issueFilter),
     [issueFilter, workbenchIssues],
   );
-  const hasBlockingMonitorIssues = Boolean(
-    qualityWarning || workbenchIssues.some((issue) => issue.severity === 'blocker'),
-  );
+  const selectedWorkbenchIssue = visibleWorkbenchIssues.find((issue) => issue.id === selectedIssueId) ?? null;
+  // Live input-quality hints stay visible, but they are not workflow blockers.
+  // Auto-opening the issue queue for one of these hints can select an older
+  // sentence warning and pull currentIndex away from the engine's active item.
   const hasMonitorIssues = Boolean(qualityWarning || workbenchIssues.length > 0);
   const currentNoiseGate = sessionNoiseGate(snapshot?.noise_check, noiseCheckRunning, automationRules.envCheck);
   const noiseCheckBlocksAttempt = phase === 'running' && captureActive && !recording && currentNoiseGate !== 'ready';
+  const inputAuditionBlocksAttempt = phase === 'running'
+    && captureActive
+    && !inputAuditionDecision;
+  const inputAuditionStatusLabel = (captureActive
+    ? inputAuditionDecision?.status
+    : snapshot?.input_audition?.status) === 'confirmed'
+    ? t('inputAudition.statusConfirmed')
+    : (captureActive ? inputAuditionDecision?.status : snapshot?.input_audition?.status) === 'skipped'
+      ? t('inputAudition.statusSkipped')
+      : t('inputAudition.statusPending');
   const deviceWarningOpen = Boolean(deviceWarningKind) && captureActive && !captureFault;
   const entryOverlay = captureEntryOverlay({
     deviceWarningOpen,
     noiseCheckBlocksAttempt,
     hasCaptureFault: Boolean(captureFault),
-    otherOverlayOpen: pauseConfirmOpen || finishConfirmOpen,
+    otherOverlayOpen: pauseConfirmOpen || finishConfirmOpen || inputAuditionOpen,
   });
   const showDeviceWarningDialog = entryOverlay === 'device-warning';
   const showNoiseCheckDialog = shouldShowSessionNoiseCheckDialog(
     noiseCheckBlocksAttempt,
     Boolean(captureFault),
-    pauseConfirmOpen || finishConfirmOpen || showDeviceWarningDialog,
+    pauseConfirmOpen || finishConfirmOpen || showDeviceWarningDialog || inputAuditionOpen,
   );
-  const entryBlocksAttempt = noiseCheckBlocksAttempt || deviceWarningOpen;
+  const activeDialogKey = logPanelOpen
+    ? 'log'
+    : activationFailureOpen && activationFailure
+      ? 'activation-failure'
+      : userAlert
+        ? 'user-alert'
+        : exportFeedback
+          ? `export-feedback:${exportFeedback.status}`
+          : settingsOpen
+            ? 'settings'
+            : deleteConfirmRecording
+              ? 'delete'
+              : resetConfirmRecording
+                ? 'reset'
+                : sealConfirmRecording
+                  ? 'seal'
+                  : exportRecording
+                    ? 'export'
+                    : inputAuditionOpen
+                      ? 'input-audition'
+                    : finishConfirmOpen
+                      ? 'finish'
+                      : previewOpen
+                        ? 'preview'
+                        : pauseConfirmOpen
+                          ? 'pause'
+                          : showNoiseCheckDialog
+                            ? `noise-check:${noiseCheckRunning ? 'running' : currentNoiseGate}`
+                            : showDeviceWarningDialog
+                              ? 'device-warning'
+                              : scriptPreviewOpen
+                                ? 'script-preview'
+                                : '';
+
+  useEffect(() => {
+    const previousIssues = workbenchIssueQueueRef.current;
+    workbenchIssueQueueRef.current = visibleWorkbenchIssues;
+    if (monitorPanelTab !== 'issues' || recording) return;
+    const nextIssue = nextWorkbenchIssueAfterResolution(
+      previousIssues,
+      selectedIssueId,
+      visibleWorkbenchIssues,
+    );
+    if (!nextIssue) {
+      if (selectedIssueId) setSelectedIssueId(null);
+      return;
+    }
+    if (nextIssue.id !== selectedIssueId) locateWorkbenchIssue(nextIssue);
+  }, [monitorPanelTab, recording, selectedIssueId, visibleWorkbenchIssues]);
+  const entryBlocksAttempt = noiseCheckBlocksAttempt
+    || deviceWarningOpen
+    || inputAuditionBlocksAttempt
+    || inputAuditionOpen;
   const noiseLimitDbfs = snapshot?.noise_threshold_dbfs
     ?? snapshot?.noise_check?.threshold_dbfs
     ?? noiseThresholdDbfs;
@@ -1327,7 +1540,11 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         : '';
   const entryBlockMessage = deviceWarningOpen
     ? t('deviceWarning.pendingCue')
-    : noiseCheckMessage;
+    : noiseCheckBlocksAttempt
+      ? noiseCheckMessage
+      : inputAuditionBlocksAttempt || inputAuditionOpen
+        ? t('inputAudition.pendingCue')
+        : '';
   const normalCue = phase !== 'running' || !currentItem
     ? 'idle'
     : entryBlocksAttempt
@@ -1432,21 +1649,20 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     void window.recorder.unbindDebugLog?.(reason).catch(() => undefined);
   }
 
-  function applyAutomationRule<Key extends keyof AutomationRules>(key: Key, enabled: AutomationRules[Key]) {
-    const next = { ...automationRules, [key]: enabled };
+  function applyAutomationRules(next: AutomationRules) {
+    const previous = automationRules;
     setAutomationRules(next);
-    saveAutomationRules(sessionDir, next);
-    setWorkstationRules(next);
-    if (key === 'enforceHeadTailSilence' && captureActive && !workspaceFaulted && !captureFault) {
+    if (sessionDir) saveSessionAutomationRules(sessionDir, next);
+    if (previous.enforceHeadTailSilence !== next.enforceHeadTailSilence && captureActive && !workspaceFaulted && !captureFault) {
       void window.recorder.request('set_silence_settings', {
         threshold_dbfs: snapshot?.silence_threshold_dbfs ?? noiseThresholdDbfs,
         silence_duration_ms: snapshot?.silence_duration_ms ?? silenceDurationMs,
         silence_detector: snapshot?.silence_detector ?? silenceDetector,
-        enforce_silence: enabled,
+        enforce_silence: next.enforceHeadTailSilence,
       }).catch(() => undefined);
     }
-    if (key !== 'envCheck') return;
-    if (!enabled) {
+    if (previous.envCheck === next.envCheck) return;
+    if (!next.envCheck) {
       noiseCheckOperationRef.current = null;
       setNoiseCheckRunning(false);
       setNoiseCheckError('');
@@ -1457,6 +1673,14 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     }
   }
 
+  function applyAutomationRule<Key extends keyof AutomationRules>(key: Key, enabled: AutomationRules[Key]) {
+    applyAutomationRules({ ...automationRules, [key]: enabled });
+  }
+
+  function restoreTaskAutomationRules() {
+    applyAutomationRules({ ...taskInitialAutomationRules });
+  }
+
   function skipCurrentSessionEnvCheck() {
     setAutomationRules(skipSessionEnvCheck(sessionDir, automationRules));
     noiseCheckOperationRef.current = null;
@@ -1464,14 +1688,14 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setNoiseCheckError('');
   }
 
-  function applyWorkstationDetectionPolicy(key: TaskDetectionPolicyKey, enabled: boolean) {
-    if (!sessionDir) {
-      applyAutomationRule(key, enabled);
-      return;
-    }
+  function applyWorkstationAutomationRule<Key extends keyof AutomationRules>(key: Key, enabled: AutomationRules[Key]) {
     const next = { ...workstationRules, [key]: enabled };
     saveWorkstationAutomationRules(next);
     setWorkstationRules(next);
+    if (!sessionDir) {
+      setAutomationRules(next);
+      setTaskInitialAutomationRules(next);
+    }
   }
 
   function clearDeviceWarning() {
@@ -1488,6 +1712,62 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setNoiseCheckLive(null);
     setNoiseCheckSamples([]);
     setNoiseCheckError('');
+  }
+
+  function resetInputAuditionGate(required: boolean) {
+    setInputAuditionDecision(null);
+    setInputAuditionOpen(false);
+    setInputAuditionForce(false);
+    setInputAuditionDismissed(false);
+    if (!required) {
+      inputAuditionDiscontinuityBaselineRef.current = { sessionDir: '', count: 0 };
+      inputAuditionConfigurationKeyRef.current = '';
+    }
+  }
+
+  function openInputAudition(force = false) {
+    if (!snapshot || !captureActive || recording || captureFault || workspaceFaulted) return;
+    if (force) {
+      // Retire both renderer and trusted-main decisions before the dialog can
+      // be cancelled. Esc from a manual recheck must leave the gate closed.
+      setInputAuditionDecision(null);
+      void window.recorder.clearInputAuditionDecision(inputAuditionConfiguration(snapshot))
+        .catch((caught) => setError(errorMessage(caught)));
+    }
+    setInputAuditionForce(force);
+    setInputAuditionDismissed(false);
+    setInputAuditionOpen(true);
+  }
+
+  function resolveInputAudition(
+    decision: InputAuditionDecision,
+    source: 'current' | 'startup-cache',
+  ) {
+    setInputAuditionDecision(decision);
+    setInputAuditionOpen(false);
+    setInputAuditionForce(false);
+    setInputAuditionDismissed(false);
+    if (source === 'current') {
+      setNotice(decision.status === 'confirmed'
+        ? t('inputAudition.confirmedNotice')
+        : t('inputAudition.skippedNotice'));
+      void refreshRecordings(outputDirRef.current);
+    }
+    logUserAction('ui.input_audition.resolved', decision.status === 'confirmed'
+      ? '输入试听已确认'
+      : '输入试听已明确跳过', {
+      status: decision.status,
+      source,
+      session_id: snapshot?.session_id,
+      capture_fingerprint: decision.captureFingerprint,
+    });
+  }
+
+  function cancelInputAuditionGate() {
+    setInputAuditionOpen(false);
+    setInputAuditionForce(false);
+    setInputAuditionDismissed(true);
+    setNotice(t('inputAudition.cancelledNotice'));
   }
 
   async function runSessionNoiseCheck(targetSessionDir: string, currentSnapshot: SessionSnapshot) {
@@ -1771,6 +2051,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       )));
       setHistoryNextOffset(result.next_offset);
       setError((current) => current.startsWith(t('notice.historyPrefix')) ? '' : current);
+      void verifyHistoryCutsDeliveries(result.recordings, sequence);
     } catch (caught) {
       if (sequence !== historyLoadSequenceRef.current) return;
       setRecordings([]);
@@ -1797,6 +2078,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       });
       setHistoryNextOffset(result.next_offset);
       setError((current) => current.startsWith(t('notice.moreHistoryPrefix')) ? '' : current);
+      void verifyHistoryCutsDeliveries(result.recordings, sequence);
     } catch (caught) {
       if (sequence === historyLoadSequenceRef.current) {
         setError(`${t('notice.moreHistoryPrefix')}${errorMessage(caught)}`);
@@ -1954,6 +2236,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         setPhase('home');
         setSnapshot(null);
         setSessionDir('');
+        resetInputAuditionGate(false);
         setCurrentIndex(0);
         setRecording(false);
         setAttemptStartSample(0);
@@ -2127,7 +2410,9 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   }, [prompterState]);
 
   useEffect(() => {
-    setAutomationRules(loadAutomationRules(sessionDir));
+    const loaded = loadAutomationRules(sessionDir);
+    setAutomationRules(loaded);
+    setTaskInitialAutomationRules(loaded);
     takePeakRef.current = 0;
     setReviewPeak(0);
     discontinuityToastStateRef.current = initialDiscontinuityToastState();
@@ -2162,6 +2447,104 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     }, DISCONTINUITY_TOAST_MS);
   }, [discontinuityCount, discontinuitySilenceSamples, discontinuityWarning, sampleRateForDisplay]);
 
+  useEffect(() => {
+    if (!captureActive || !sessionDir) return;
+    const baseline = inputAuditionDiscontinuityBaselineRef.current;
+    if (baseline.sessionDir !== sessionDir) {
+      inputAuditionDiscontinuityBaselineRef.current = {
+        sessionDir,
+        count: discontinuityCount,
+      };
+      return;
+    }
+    if (discontinuityCount > baseline.count) {
+      setInputAuditionDecision(null);
+      setInputAuditionOpen(false);
+      setInputAuditionDismissed(false);
+      // Any newly observed input discontinuity invalidates a ready playback as
+      // well as a cached decision. Reopen in forced mode so the dialog first
+      // cancels the stale non-final check id instead of allowing confirmation.
+      setInputAuditionForce(true);
+      logUserAction('ui.input_audition.invalidated', '输入不连续已使本次启动的试听结果失效', {
+        session_id: snapshot?.session_id,
+        previous_count: baseline.count,
+        current_count: discontinuityCount,
+      }, 'warn');
+    }
+    inputAuditionDiscontinuityBaselineRef.current = {
+      sessionDir,
+      count: Math.max(baseline.count, discontinuityCount),
+    };
+  }, [captureActive, discontinuityCount, sessionDir, snapshot?.session_id]);
+
+  useEffect(() => {
+    if (!captureActive || !activeInputAuditionConfigurationKey) return;
+    const previous = inputAuditionConfigurationKeyRef.current;
+    if (previous && previous !== activeInputAuditionConfigurationKey) {
+      setInputAuditionDecision(null);
+      setInputAuditionOpen(false);
+      setInputAuditionDismissed(false);
+      setInputAuditionForce(true);
+      logUserAction('ui.input_audition.invalidated', '采集配置变化已使输入试听结果失效', {
+        session_id: snapshot?.session_id,
+      }, 'warn');
+    }
+    inputAuditionConfigurationKeyRef.current = activeInputAuditionConfigurationKey;
+  }, [activeInputAuditionConfigurationKey, captureActive, snapshot?.session_id]);
+
+  useEffect(() => {
+    if (!captureFault) return;
+    setInputAuditionDecision(null);
+    setInputAuditionOpen(false);
+    setInputAuditionDismissed(false);
+    setInputAuditionForce(false);
+  }, [captureFault]);
+
+  useEffect(() => {
+    const canOpen = phase === 'running'
+      && captureActive
+      && !recording
+      && !captureFault
+      && !workspaceFaulted
+      && !deviceWarningOpen
+      && currentNoiseGate === 'ready'
+      && !pauseConfirmOpen
+      && !finishConfirmOpen
+      && !settingsOpen
+      && !logPanelOpen
+      && !previewOpen
+      && !exportRecording
+      && !exportFeedback
+      && !userAlert
+      && !activationFailureOpen;
+    if (inputAuditionBlocksAttempt
+      && !inputAuditionDismissed
+      && !inputAuditionOpen
+      && canOpen) {
+      setInputAuditionOpen(true);
+    }
+  }, [
+    activationFailureOpen,
+    captureActive,
+    captureFault,
+    currentNoiseGate,
+    deviceWarningOpen,
+    exportFeedback,
+    exportRecording,
+    finishConfirmOpen,
+    inputAuditionBlocksAttempt,
+    inputAuditionDismissed,
+    inputAuditionOpen,
+    logPanelOpen,
+    pauseConfirmOpen,
+    phase,
+    previewOpen,
+    recording,
+    settingsOpen,
+    userAlert,
+    workspaceFaulted,
+  ]);
+
   useEffect(() => () => {
     if (discontinuityToastTimerRef.current !== null) {
       window.clearTimeout(discontinuityToastTimerRef.current);
@@ -2181,13 +2564,6 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setPauseConfirmOpen(false);
     setFinishConfirmOpen(true);
   }, [captureFault, pauseConfirmOpen]);
-
-  useEffect(() => {
-    const issueJustAppeared = hasBlockingMonitorIssues && !hadMonitorIssuesRef.current;
-    hadMonitorIssuesRef.current = hasBlockingMonitorIssues;
-    if (issueJustAppeared && phase === 'running') setMonitorPanelTab('issues');
-    else if (!hasMonitorIssues) setMonitorPanelTab((current) => current === 'issues' ? 'monitor' : current);
-  }, [hasBlockingMonitorIssues, hasMonitorIssues, phase]);
 
   useEffect(() => {
     if (selectedCapturePreset) return;
@@ -2275,6 +2651,14 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     // engine/session generation. It must not overwrite this authoritative
     // recovery snapshot on the next animation frame.
     meterFrameCommitterRef.current?.invalidate();
+    resetInputAuditionGate(true);
+    inputAuditionDiscontinuityBaselineRef.current = {
+      sessionDir: nextSessionDir,
+      count: nextSnapshot.input_discontinuity_count ?? 0,
+    };
+    inputAuditionConfigurationKeyRef.current = logicalInputAuditionConfigurationKey(
+      inputAuditionConfiguration(nextSnapshot),
+    );
     setSnapshot(nextSnapshot);
     setCaptureActive(true);
     setWorkspaceFaulted(nextSnapshot.status === 'faulted' || nextSnapshot.overflow_samples > 0);
@@ -2374,6 +2758,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     const nextSnapshot = current.snapshot;
     clearAudioPreview();
     meterFrameCommitterRef.current?.invalidate();
+    resetInputAuditionGate(false);
     setSnapshot(nextSnapshot);
     setSessionDir(current.session_dir);
     bindTaskLog(current.session_dir, nextSnapshot.session_id);
@@ -2600,7 +2985,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   }): Promise<boolean> {
     const nextShareMode = options?.captureShareMode ?? captureShareMode;
     const nextSampleFormat = options?.inputSampleFormat ?? inputSampleFormat;
-    const nextBitDepth = deliveryBitDepthForCaptureFormat(nextSampleFormat);
+    const nextBitDepth = DEFAULT_DELIVERY_BIT_DEPTH;
     if (options?.captureShareMode) setCaptureShareMode(nextShareMode);
     if (options?.inputSampleFormat) setInputSampleFormat(nextSampleFormat);
     const settingsAlreadyChosen = Boolean(options?.captureShareMode || options?.inputSampleFormat);
@@ -2646,8 +3031,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       env_check: automationRules.envCheck,
       discard_empty: automationRules.discardEmpty,
     });
-    saveAutomationRules(destination, automationRules);
-    setWorkstationRules(automationRules);
+    saveSessionAutomationRules(destination, automationRules);
     enterInspectionWorkspace(result);
     setNotice(options?.activateAfterCreate ? t('activationError.recreatedNotice') : t('notice.taskCreated'));
     if (options?.activateAfterCreate) {
@@ -2750,7 +3134,12 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     } = {},
   ) {
     if (!item || (recording && !options.allowAfterSealedTake) || phase !== 'running' || captureFault || !captureActive) return false;
-    if (deviceWarningKind || currentNoiseGate !== 'ready') return false;
+    if (deviceWarningKind || currentNoiseGate !== 'ready' || !inputAuditionDecision || inputAuditionOpen) {
+      if (!deviceWarningKind && currentNoiseGate === 'ready' && !inputAuditionOpen) {
+        openInputAudition(false);
+      }
+      return false;
+    }
     clearAudioPreview();
     const result = await run(t('notice.starting'), () => window.recorder.request<{
       attempt_id: string;
@@ -2993,7 +3382,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     if (next.issue) locateWorkbenchIssue(next.issue, next.wrapped);
   }
 
-  async function acceptAttempt(targetAttemptId?: string) {
+  async function acceptAttempt(
+    targetAttemptId?: string,
+    options: { autoStartNext?: boolean } = {},
+  ) {
     // This is deliberately repeated behind the disabled button / shortcut
     // gates: a fault event may arrive after a click was queued but before the
     // handler executes.
@@ -3041,7 +3433,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         nextItem,
         continuation.nextIndex,
       ) ?? labelTransition(currentItem.label, nextItem.label);
-      const autoStartsNext = shouldAutoStartAfterAccept(continuation, {
+      const autoStartsNext = options.autoStartNext !== false && shouldAutoStartAfterAccept(continuation, {
         autoStartNext: automationRules.autoStartNext,
         pauseOnLabelChange: automationRules.pauseOnLabelChange,
         labelChanged: nextLabelTransition.changed,
@@ -3069,7 +3461,12 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   async function skipItem() {
     // Keep a second mutation gate in the handler for stale DOM and queued
     // keyboard events. The engine performs the authoritative final guard.
-    if (captureFault || !currentItem || !['pending', 'review'].includes(currentItem.status) || recording) return;
+    if (captureFault
+      || !currentItem
+      || !['pending', 'review'].includes(currentItem.status)
+      || recording
+      || inputAuditionOpen
+      || !inputAuditionDecision) return;
     const skipped = await run(t('notice.savingSkip'), () => window.recorder.request('skip_item', { item_id: currentItem.id }));
     if (!skipped) return;
     setRetakeSequenceActive(false);
@@ -3155,7 +3552,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
 
   async function openHistoricalRecording(
     recording: RecordingHistoryEntry,
-    options: { activate?: boolean } = {},
+    options: { activate?: boolean; panel?: 'issues' | 'export' } = {},
   ) {
     if (recording.is_active) {
       await returnToActiveRecording(recording);
@@ -3166,6 +3563,11 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     }));
     if (!inspected) return;
     enterInspectionWorkspace(inspected);
+    if (options.panel === 'issues') {
+      setIssueFilter('all');
+      setSelectedIssueId(null);
+    }
+    if (options.panel) setMonitorPanelTab(options.panel);
     if (options.activate) await activateCapture(undefined, inspected.session_dir);
   }
 
@@ -3223,7 +3625,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         failExport(t('p1.revisionUnavailable'));
         return;
       }
-      const readiness = deriveTaskWorkflow(sourceSnapshot)[cutsScope === 'complete_task'
+      const readiness = applyHeadTailWarningPreference(
+        deriveTaskWorkflow(sourceSnapshot),
+        automationRules.headTailSilence,
+      )[cutsScope === 'complete_task'
         ? 'completeTask'
         : 'confirmedOnly'];
       if (!readiness.ready) {
@@ -3238,7 +3643,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       Object.assign(exportRequest, {
         scope: cutsScope,
         expected_journal_seq: sourceSnapshot.journal_seq,
-        acknowledged_warning_codes: acknowledgedExportWarnings.filter((code) => readiness.warningCodes.includes(code)),
+        acknowledged_warning_codes: [
+          ...acknowledgedExportWarnings.filter((code) => readiness.warningCodes.includes(code)),
+          ...(automationRules.headTailSilence ? [] : ['head_silence_short', 'tail_silence_short']),
+        ],
       });
     }
     const exported = await run(t('notice.exportingFiles'), () => window.recorder.request<ExportResult>('export_session_artifact', {
@@ -3312,15 +3720,9 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       warning: dialogWarning || undefined,
     });
     await refreshRecordings();
-    if (deliveryVerified) {
+    if (deliveryVerified && exported.export_id && deliveredDir) {
       setRecordings((current) => current.map((recording) => recording.session_id === task.session_id
-        ? {
-          ...recording,
-          delivery_verifications: {
-            ...(recording.delivery_verifications ?? {}),
-            [artifact]: 'verified',
-          },
-        }
+        ? applyDeliveryVerification(recording, artifact, exported.export_id!, 'verified', deliveredDir)
         : recording));
     }
   }
@@ -3380,6 +3782,49 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     void verifyRecordingDeliveries(next);
   }
 
+  async function verifyHistoryCutsDeliveries(
+    loadedRecordings: readonly RecordingHistoryEntry[],
+    historySequence: number,
+  ) {
+    // Home only derives its delivered state from the complete-task cuts ZIP.
+    // Verify these receipts sequentially so startup never hashes large full
+    // tracks or creates an I/O storm across a long task history.
+    for (const recording of loadedRecordings) {
+      if (historySequence !== historyLoadSequenceRef.current) return;
+      const cuts = recording.export_artifacts?.cuts_zip;
+      if (cuts?.state !== 'current' || !cuts.export_id) continue;
+      let result: ExportDeliveryVerification | null = null;
+      let failed = false;
+      try {
+        result = await window.recorder.verifyExportDelivery({
+          session_id: recording.session_id,
+          artifact: 'cuts_zip',
+          export_id: cuts.export_id,
+        });
+      } catch {
+        failed = true;
+      }
+      if (historySequence !== historyLoadSequenceRef.current) return;
+      const status = failed ? 'invalid' : result?.verification ?? 'missing';
+      const resultMatches = !result || (
+        result.session_id === recording.session_id
+        && result.artifact === 'cuts_zip'
+        && result.export_id === cuts.export_id
+      );
+      setRecordings((current) => current.map((candidate) => (
+        candidate.session_dir === recording.session_dir
+          ? applyDeliveryVerification(
+            candidate,
+            'cuts_zip',
+            cuts.export_id!,
+            resultMatches ? status : 'invalid',
+            resultMatches ? result?.directory : undefined,
+          )
+          : candidate
+      )));
+    }
+  }
+
   async function verifyRecordingDeliveries(recording: RecordingHistoryEntry) {
     const checks = (['full_track', 'timestamps_json', 'cuts_zip'] as const).flatMap((artifact) => {
       const exportId = recording.export_artifacts?.[artifact]?.export_id;
@@ -3388,16 +3833,32 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         session_id: recording.session_id,
         artifact,
         export_id: exportId,
-      }).then((result) => ({ artifact, status: result?.verification ?? 'missing' as const }))
-        .catch(() => ({ artifact, status: 'invalid' as const }))];
+      }).then((result) => ({ artifact, exportId, result, failed: false }))
+        .catch(() => ({ artifact, exportId, result: null, failed: true }))];
     });
     if (!checks.length) return;
     const verified = await Promise.all(checks);
     const apply = (candidate: RecordingHistoryEntry) => {
       if (candidate.session_dir !== recording.session_dir) return candidate;
-      const delivery_verifications = { ...(candidate.delivery_verifications ?? {}) };
-      for (const result of verified) delivery_verifications[result.artifact] = result.status;
-      return { ...candidate, delivery_verifications };
+      return verified.reduce((next, verification) => {
+        const resultMatches = !verification.result || (
+          verification.result.session_id === recording.session_id
+          && verification.result.artifact === verification.artifact
+          && verification.result.export_id === verification.exportId
+        );
+        const status = verification.failed
+          ? 'invalid'
+          : resultMatches
+            ? verification.result?.verification ?? 'missing'
+            : 'invalid';
+        return applyDeliveryVerification(
+          next,
+          verification.artifact,
+          verification.exportId,
+          status,
+          resultMatches ? verification.result?.directory : undefined,
+        );
+      }, candidate);
     };
     setRecordings((current) => current.map(apply));
     setExportRecording((current) => current ? apply(current) : current);
@@ -3406,6 +3867,16 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   function showTaskDetails(recording: RecordingHistoryEntry) {
     setOpenActionsSessionDir('');
     void openHistoricalRecording(recording);
+  }
+
+  function showTaskIssues(recording: RecordingHistoryEntry) {
+    setOpenActionsSessionDir('');
+    void openHistoricalRecording(recording, { panel: 'issues' });
+  }
+
+  function showTaskExportReview(recording: RecordingHistoryEntry) {
+    setOpenActionsSessionDir('');
+    void openHistoricalRecording(recording, { panel: 'export' });
   }
 
   async function sealHistoricalRecording(recording: RecordingHistoryEntry) {
@@ -3493,6 +3964,21 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     if (opened) setNotice(t('notice.openedExport', { id: recording.session_id }));
   }
 
+  async function openVerifiedRecordingDelivery(recording: RecordingHistoryEntry) {
+    const target = recording.verified_delivery_directories?.cuts_zip;
+    if (!target) {
+      // Never substitute the task's internal export directory for a verified
+      // external handoff. A stale row returns to explicit verification.
+      showExport(recording);
+      return;
+    }
+    const opened = await run(t('notice.openingExport'), async () => {
+      await window.recorder.openPath(target);
+      return true;
+    });
+    if (opened) setNotice(t('notice.openedExport', { id: recording.session_id }));
+  }
+
   async function openRecordingDirectory(recording: RecordingHistoryEntry) {
     const opened = await run(t('notice.openingDir'), async () => {
       await window.recorder.openPath(recording.session_dir);
@@ -3555,6 +4041,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
 
   function leaveInspectionWorkspace() {
     clearAudioPreview();
+    resetInputAuditionGate(false);
     setPhase('home');
     setSnapshot(null);
     setSessionDir('');
@@ -3629,6 +4116,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   function stayInPausedWorkspace(stopped: StoppedSessionState, keepItemId?: string) {
     const nextSnapshot = stopped.snapshot;
     clearAudioPreview();
+    resetInputAuditionGate(false);
     meterFrameCommitterRef.current?.invalidate();
     setResumeError(null);
     setSealConfirmRecording(null);
@@ -3730,6 +4218,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         clearSessionNoiseCheck();
         setSnapshot(null);
         setSessionDir('');
+        resetInputAuditionGate(false);
         setCaptureActive(false);
         setWorkspaceFaulted(false);
         setRecording(false);
@@ -3787,6 +4276,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
 
   function resetForNewSession() {
     clearAudioPreview();
+    resetInputAuditionGate(false);
     meterFrameCommitterRef.current?.invalidate();
     setResumeError(null);
     setSealConfirmRecording(null);
@@ -3830,6 +4320,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
 
   function returnToRecordings() {
     clearAudioPreview();
+    resetInputAuditionGate(false);
     meterFrameCommitterRef.current?.invalidate();
     setResumeError(null);
     setSealConfirmRecording(null);
@@ -3855,14 +4346,82 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     void refreshRecordings();
   }
 
+  useLayoutEffect(() => {
+    if (!activeDialogKey) {
+      const origin = dialogFocusOriginRef.current;
+      dialogFocusOriginRef.current = null;
+      if (origin?.isConnected) window.requestAnimationFrame(() => origin.focus());
+      return undefined;
+    }
+    if (!dialogFocusOriginRef.current) {
+      const active = document.activeElement;
+      if (active instanceof HTMLElement && !active.closest('[role="dialog"][aria-modal="true"]')) {
+        dialogFocusOriginRef.current = active;
+      }
+    }
+    const frame = window.requestAnimationFrame(() => {
+      const dialogs = document.querySelectorAll<HTMLElement>('[role="dialog"][aria-modal="true"]');
+      const dialog = dialogs[dialogs.length - 1];
+      if (!dialog) return;
+      if (dialog.getAttribute('aria-busy') === 'true') {
+        dialog.tabIndex = -1;
+        dialog.focus();
+        return;
+      }
+      const initial = dialog.querySelector<HTMLElement>('[data-dialog-initial]:not([disabled])')
+        ?? dialog.querySelector<HTMLElement>('[data-dialog-default]:not([disabled])')
+        ?? dialog.querySelector<HTMLElement>('.button.primary:not([disabled])')
+        ?? dialogFocusableElements(dialog)[0];
+      if (initial && !dialog.contains(document.activeElement)) initial.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [activeDialogKey]);
+
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
+      const target = event.target as HTMLElement | null;
+      const dialogs = document.querySelectorAll<HTMLElement>('[role="dialog"][aria-modal="true"]');
+      const activeDialog = dialogs[dialogs.length - 1];
+      if (activeDialog && event.key === 'Tab') {
+        const focusable = dialogFocusableElements(activeDialog);
+        if (!focusable.length) {
+          event.preventDefault();
+          return;
+        }
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (!activeDialog.contains(document.activeElement)
+          || document.activeElement === activeDialog
+          || event.shiftKey && document.activeElement === first
+          || !event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          (event.shiftKey ? last : first).focus();
+          return;
+        }
+      }
+      if (event.isComposing) return;
       if (logPanelOpen) {
         if (event.key === 'Escape') setLogPanelOpen(false);
         return;
       }
+      if (userAlert) {
+        if (event.key === 'Escape') setUserAlert(null);
+        return;
+      }
+      if (activationFailureOpen) {
+        if (event.key === 'Escape' && !busy) setActivationFailureOpen(false);
+        return;
+      }
+      if (exportFeedback) {
+        if (event.key === 'Escape' && exportFeedback.status !== 'working') setExportFeedback(null);
+        return;
+      }
       if (settingsOpen) {
         if (event.key === 'Escape') setSettingsOpen(false);
+        return;
+      }
+      if (exportRecording) {
+        if (event.key === 'Escape' && !busy) setExportRecording(null);
         return;
       }
       if (resetConfirmRecording) {
@@ -3905,6 +4464,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       }
       if (previewOpen) {
         if (event.code === 'Space') event.preventDefault();
+        if (event.key === 'Escape') closePreviewPlayer();
         return;
       }
       if (phase !== 'running' || busy) return;
@@ -3913,14 +4473,14 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         void stopAttempt();
         return;
       }
-      const target = event.target as HTMLElement | null;
       if (!workflowShortcutTargetAllowed({
         // Device/noise overlays own their explicit Space/Escape contracts
         // below. Every other modal blocks workspace shortcuts, including when
         // focus was left on a sentence row behind the backdrop.
-        modalOpen: Boolean(document.querySelector('[role="dialog"][aria-modal="true"]'))
+        modalOpen: inputAuditionOpen
+          || (Boolean(document.querySelector('[role="dialog"][aria-modal="true"]'))
           && !showDeviceWarningDialog
-          && !showNoiseCheckDialog,
+          && !showNoiseCheckDialog),
         formControl: Boolean(target?.closest('input, textarea, select, audio, [contenteditable="true"]')),
         button: Boolean(target?.closest('button')),
         professionalItem: Boolean(target?.closest('.professional-item')),
@@ -4092,7 +4652,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           <code title={license.machineCode}>{licenseSummary(license)} · {license.machineCode || t('license.machineUnavailable')}</code>
         </section>}
         <section className="settings-advanced">
-          <details data-testid="settings-detection-advanced" onToggle={(event) => {
+          <details data-testid="settings-recording-defaults" onToggle={(event) => {
             if (!event.currentTarget.open) return;
             const node = event.currentTarget;
             requestAnimationFrame(() => {
@@ -4101,23 +4661,21 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           }}>
             <summary>
               <div>
-                <strong>{t('settings.detectionAdvanced')}</strong>
-                <small>{t('settings.detectionHint')}</small>
+                <strong>{t('settings.recordingDefaults')}</strong>
+                <small>{t('settings.recordingDefaultsHint')}</small>
               </div>
-              <em>{detectionPolicySummary(workstationRules)}</em>
+              <em>{workstationRules.autoStartNext ? t('settings.continuousDefault') : t('settings.manualDefault')}</em>
             </summary>
-            <div className="automation-rules">
-              <DetectionPolicyFields
-                rules={workstationRules}
-                envTestId="settings-rule-env-check"
-                emptyTestId="settings-rule-discard-empty"
-                onChange={applyWorkstationDetectionPolicy}
-              />
-            </div>
+            <RecordingRuleGroups
+              rules={workstationRules}
+              testIdPrefix="settings-rule"
+              discardEmptyHint={t('recorder.ruleDiscardEmptyHint')}
+              onChange={applyWorkstationAutomationRule}
+            />
           </details>
         </section>
       </div>
-      <footer><button className="button primary" onClick={() => setSettingsOpen(false)}>{t('common.done')}</button></footer>
+      <footer><button data-dialog-default className="button primary" onClick={() => setSettingsOpen(false)}>{t('common.done')}</button></footer>
     </section>
   </div>;
 
@@ -4174,7 +4732,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       <footer>
         {exportFeedback.status === 'working' && exportFeedback.requestId && <button className="button" onClick={() => void cancelExportDelivery()}>{t('common.cancel')}</button>}
         {(exportFeedback.status === 'ok' || exportFeedback.status === 'preserved') && <button data-testid="export-result-open-folder" className="button" onClick={() => void openExportFeedbackFolder()} disabled={Boolean(busy)}>{t('exportDialog.openFolder')}</button>}
-        <button data-testid="export-result-close" className="button primary" onClick={() => setExportFeedback(null)} disabled={exportFeedback.status === 'working'}>
+        <button data-testid="export-result-close" data-dialog-default className="button primary" onClick={() => setExportFeedback(null)} disabled={exportFeedback.status === 'working'}>
           {exportFeedback.status === 'working' ? t('common.loading') : t('common.done')}
         </button>
       </footer>
@@ -4193,7 +4751,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       </header>
       <p>{userAlert.body}</p>
       <footer>
-        <button data-testid="user-alert-close" className="button primary" onClick={() => setUserAlert(null)}>{t('common.close')}</button>
+        <button data-testid="user-alert-close" data-dialog-default className="button primary" onClick={() => setUserAlert(null)}>{t('common.close')}</button>
       </footer>
     </section>
   </div>;
@@ -4227,14 +4785,14 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             setRecoverySampleFormat(preferredCaptureSampleFormat(formats) ?? recoverySampleFormat);
           }
         }}><option value="exclusive">{t('setup.exclusiveRecommended')}</option><option value="shared">{t('setup.sharedNotProduction')}</option></select></label>}
-        <label className="field"><span>{t('setup.bitDepth')}</span><select data-testid="activation-recovery-format" value={recoverySampleFormat} onChange={(event) => setRecoverySampleFormat(event.target.value)}>{!recoveryFormatOptions.some((format) => format === recoverySampleFormat) && <option value={recoverySampleFormat}>{captureSampleFormatLabel(recoverySampleFormat)}</option>}{(recoveryFormatOptions.length ? recoveryFormatOptions : [recoverySampleFormat]).map((format) => <option value={format} key={format}>{captureSampleFormatLabel(format)}</option>)}</select></label>
+        <label className="field"><span>{t('recorder.driverInputFormat')}</span><select data-testid="activation-recovery-format" value={recoverySampleFormat} onChange={(event) => setRecoverySampleFormat(event.target.value)}>{!recoveryFormatOptions.some((format) => format === recoverySampleFormat) && <option value={recoverySampleFormat}>{captureSampleFormatLabel(recoverySampleFormat)}</option>}{(recoveryFormatOptions.length ? recoveryFormatOptions : [recoverySampleFormat]).map((format) => <option value={format} key={format}>{captureSampleFormatLabel(format)}</option>)}</select></label>
       </div>
       <details className="activation-failure-detail">
         <summary>{t('activationError.detail')}</summary>
         <p>{activationFailure.message}</p>
       </details>
       <footer>
-        <button className="button" onClick={() => setActivationFailureOpen(false)} disabled={Boolean(busy)}>{t('common.close')}</button>
+        <button data-dialog-initial className="button" onClick={() => setActivationFailureOpen(false)} disabled={Boolean(busy)}>{t('common.close')}</button>
         <button data-testid="activation-back-to-setup" className="button" onClick={returnToSetupFromInspection} disabled={Boolean(busy)}>{t('activationError.backToSetup')}</button>
         <button data-testid="activation-recreate" className="button primary" onClick={() => void recreateFromActivationFailure()} disabled={Boolean(busy)}>{t('activationError.recreateAndEnter')}</button>
       </footer>
@@ -4269,7 +4827,8 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           {historyLoading && <div className="home-loading" aria-busy="true" aria-live="polite"><strong className="home-loading-label">{t('home.readingTasks')}</strong><i className="home-skeleton-row" /><i className="home-skeleton-row" /><i className="home-skeleton-row" /></div>}
           {!historyLoading && !filteredRecordings.length && <div className="home-empty"><span className="home-empty-icon"><Icon name="microphone" size={24} /></span><strong>{recordings.length ? t('home.emptyFilteredTitle') : t('home.emptyTitle')}</strong><p>{recordings.length ? t('home.emptyFilteredBody') : t('home.emptyBody')}</p>{!recordings.length && <button className="home-primary" onClick={beginNewRecording} disabled={Boolean(busy)}><Icon name="plus" size={15} />{t('home.newRecording')}</button>}</div>}
           {!historyLoading && filteredRecordings.map((recording) => {
-            const state = recordingState(recording);
+            const listEntry = planTaskListEntry(historyEntryWithTaskWarningPreference(recording));
+            const state = recordingState(recording, listEntry);
             const handled = recording.accepted_items + recording.skipped_items;
             const progress = recording.total_items ? handled / recording.total_items * 100 : 0;
             const updated = formatListDateTime(recording.updated_at);
@@ -4278,16 +4837,6 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             const isResetting = resettingSessionDir === recording.session_dir;
             const actionsOpen = openActionsSessionDir === recording.session_dir;
             const rowResumeError = resumeError?.sessionDir === recording.session_dir ? resumeError.message : '';
-            const recoveryPlan = planHistoryRecovery(recording);
-            const listEntry = planTaskListEntry(recording);
-            const recordDisabledReason = listRecordDisabledReason(listEntry);
-            const recordDisabledCopy = recordDisabledReason === 'fault'
-              ? t('home.recordDisabledFault')
-              : recordDisabledReason === 'issue'
-                ? t('home.recordDisabledIssue')
-                : recordDisabledReason === 'readonly'
-                  ? t('home.recordDisabledReadonly')
-                  : undefined;
             return <article key={recording.session_dir} className={`home-recording-row ${rowResumeError ? 'has-error' : ''} ${actionsOpen ? 'menu-open' : ''}`}>
               <button className="home-recording-name" onClick={() => showTaskDetails(recording)} aria-label={t('home.openTaskAria', { id: recording.session_id })}><i className={`recording-dot ${state.kind}`} /><div><strong>{recording.session_id}</strong><small title={recording.history_issue}>{recording.history_issue || <>{recording.script_name || t('home.unknownSource')} · {recording.sample_rate ? `${recording.sample_rate.toLocaleString(locale)} Hz / ${recording.bit_depth}-bit` : t('home.unknownFormat')}</>}</small></div></button>
               <div className="home-recording-progress"><span><b>{handled}</b><small> / {recording.total_items}</small></span><i><em style={{ width: `${progress}%` }} /></i></div>
@@ -4298,16 +4847,24 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
                   ? <button className="row-primary" onClick={() => void continuePendingStop(recording)} disabled={Boolean(busy)}>{t('home.continueSafeStop')}</button>
                   : listEntry.kind === 'return'
                     ? <button className="row-primary" onClick={() => void returnToActiveRecording(recording)} disabled={Boolean(busy)}>{t('home.returnToRecording')}</button>
-                    : <>
-                      <button data-testid="view-recording" className={listViewIsPrimary(listEntry) ? 'row-primary' : 'row-secondary'} onClick={() => showTaskDetails(recording)} disabled={Boolean(busy)} aria-label={t('home.viewTaskAria', { id: recording.session_id })}>{t('home.viewTask')}</button>
-                      <button data-testid="record-recording" className={listRecordEnabled(listEntry) && !listViewIsPrimary(listEntry) ? 'row-primary' : 'row-secondary'} onClick={() => void openHistoricalRecording(recording, { activate: true })} disabled={Boolean(busy) || Boolean(sealingSessionDir) || !listRecordEnabled(listEntry)} title={recordDisabledCopy} aria-label={t('home.recordTaskAria', { id: recording.session_id })}>{t('home.recordTask')}</button>
-                    </>}
+                    : listEntry.kind === 'repair'
+                      ? <button data-testid="seal-recording" className="row-primary" onClick={() => setSealConfirmRecording(recording)} disabled={Boolean(busy) || Boolean(sealingSessionDir)}>{isSealing ? t('common.checking') : t('home.inspectAndRepair')}</button>
+                      : listEntry.kind === 'record'
+                        ? <button data-testid="record-recording" className="row-primary" onClick={() => void openHistoricalRecording(recording, { activate: true })} disabled={Boolean(busy) || Boolean(sealingSessionDir)} aria-label={t('home.recordTaskAria', { id: recording.session_id })}>{t('home.continueRecording')}</button>
+                        : listEntry.kind === 'issues'
+                          ? <button data-testid="handle-recording-issues" className="row-primary" onClick={() => showTaskIssues(recording)} disabled={Boolean(busy)} aria-label={t('home.handleIssuesAria', { id: recording.session_id })}>{t('home.handleIssues')}</button>
+                        : listEntry.kind === 'export'
+                          ? <button data-testid="export-recording" className="row-primary" onClick={() => showExport(recording)} disabled={Boolean(busy)}>{t('home.exportDelivery')}</button>
+                          : listEntry.kind === 'deliver'
+                            ? <button data-testid="deliver-recording" className="row-primary" onClick={() => showExport(recording)} disabled={Boolean(busy)}>{t('home.completeDelivery')}</button>
+                            : listEntry.kind === 'delivered'
+                              ? <button data-testid="view-delivery" className="row-primary" title={recording.verified_delivery_directories?.cuts_zip} onClick={() => void openVerifiedRecordingDelivery(recording)} disabled={Boolean(busy)}>{t('home.viewDelivery')}</button>
+                          : <button data-testid="view-recording" className="row-primary" onClick={() => listEntry.reason === 'warning' ? showTaskExportReview(recording) : listEntry.reason === 'blocked' ? showTaskIssues(recording) : showTaskDetails(recording)} disabled={Boolean(busy)} aria-label={t('home.viewTaskAria', { id: recording.session_id })}>{listEntry.reason === 'warning' ? t('home.reviewAndDeliver') : listEntry.reason === 'blocked' ? t('home.handleIssues') : t('home.viewProblem')}</button>}
                 <div className="home-actions-menu-wrap">
                   <button data-testid="recording-actions-menu" className="row-more" title={t('common.moreActions')} aria-label={t('home.moreAria', { id: recording.session_id })} aria-haspopup="menu" aria-expanded={actionsOpen} onClick={() => setOpenActionsSessionDir(actionsOpen ? '' : recording.session_dir)} disabled={Boolean(busy) || Boolean(deletingSessionDir) || Boolean(resettingSessionDir)}><Icon name="more" size={16} /></button>
                   {actionsOpen && <div className="home-actions-menu" role="menu" aria-label={t('home.actionsAria', { id: recording.session_id })}>
                     <button data-testid="open-recording-folder" role="menuitem" aria-label={t('home.openFolderAria', { id: recording.session_id })} onClick={() => { setOpenActionsSessionDir(''); void openRecordingDirectory(recording); }} disabled={Boolean(busy)}><Icon name="folder" size={14} /><span>{t('home.openFolder')}</span></button>
                     {!recording.is_active && recording.export_exists && <button role="menuitem" onClick={() => { setOpenActionsSessionDir(''); void openRecordingExport(recording); }}><Icon name="export" size={14} /><span>{t('home.openExportDir')}</span></button>}
-                    {!recording.is_active && (recoveryPlan.secondary === 'seal' || recoveryPlan.primary === 'seal') && <button data-testid="seal-recording" role="menuitem" onClick={() => { setOpenActionsSessionDir(''); setSealConfirmRecording(recording); }} disabled={Boolean(busy) || Boolean(sealingSessionDir)}><Icon name="history" size={14} /><span>{isSealing ? t('common.checking') : t('home.inspectAndRepair')}</span></button>}
                     {!recording.is_active && <><i className="home-actions-divider" /><button data-testid="reset-recording" className="danger" role="menuitem" aria-busy={isResetting} onClick={() => { setOpenActionsSessionDir(''); setResetConfirmRecording(recording); }} disabled={Boolean(busy) || Boolean(sealingSessionDir) || Boolean(deletingSessionDir) || Boolean(resettingSessionDir)}><Icon name="refresh" size={14} /><span>{t('home.resetTask')}</span></button><button data-testid="delete-recording" className="danger" role="menuitem" aria-busy={isDeleting} onClick={() => { setOpenActionsSessionDir(''); setDeleteConfirmRecording(recording); }} disabled={Boolean(busy) || Boolean(sealingSessionDir) || Boolean(deletingSessionDir) || Boolean(resettingSessionDir)}><Icon name="trash" size={14} /><span>{t('home.deleteTask')}</span></button></>}
                   </div>}
                 </div>
@@ -4332,7 +4889,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             <button onClick={() => { const task = exportRecording; setExportRecording(null); void exportRecordingArtifact(task, 'cuts_zip'); }} disabled={Boolean(busy) || recordingState(exportRecording).kind === 'attention' || exportRecording.review_items > 0}><span><Icon name="export" size={16} /></span><div><strong>{t('exportDialog.cuts')}</strong><small>{recordingState(exportRecording).kind === 'attention' ? t('exportDialog.cutsBlocked') : exportRecording.review_items > 0 ? t('exportDialog.cutsBlockedReview') : `cuts.zip · ${artifactStatusCopy(exportRecording, 'cuts_zip')}`}</small></div></button>
           </div>
           <div className="dialog-warning">{t('exportDialog.taskLine', { id: exportRecording.session_id })}<br />{t('exportDialog.warning')}</div>
-          <footer><button className="button" onClick={() => setExportRecording(null)} disabled={Boolean(busy)}>{t('common.close')}</button></footer>
+          <footer><button data-dialog-initial className="button" onClick={() => setExportRecording(null)} disabled={Boolean(busy)}>{t('common.close')}</button></footer>
         </section>
       </div>}
       {sealConfirmRecording && <div className="dialog-backdrop" role="presentation">
@@ -4340,7 +4897,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           <header><span className="dialog-icon"><Icon name="history" size={19} /></span><div><h2 id="seal-confirm-title">{t('sealDialog.title')}</h2></div></header>
           <p>{t('sealDialog.body')}</p>
           <div className="dialog-warning">{t('sealDialog.taskLine', { id: sealConfirmRecording.session_id })}<br />{sealConfirmRecording.status === 'faulted' || sealConfirmRecording.overflow_samples > 0 ? t('sealDialog.keepFault') : t('sealDialog.canContinue')}</div>
-          <footer><button className="button" onClick={() => setSealConfirmRecording(null)} disabled={Boolean(busy)}>{t('common.cancel')}</button><button data-testid="confirm-seal-recording" className="button primary" onClick={() => { const recording = sealConfirmRecording; setSealConfirmRecording(null); void sealHistoricalRecording(recording); }} disabled={Boolean(busy)}>{t('sealDialog.confirm')}</button></footer>
+          <footer><button className="button" onClick={() => setSealConfirmRecording(null)} disabled={Boolean(busy)}>{t('common.cancel')}</button><button data-testid="confirm-seal-recording" data-dialog-default className="button primary" onClick={() => { const recording = sealConfirmRecording; setSealConfirmRecording(null); void sealHistoricalRecording(recording); }} disabled={Boolean(busy)}>{t('sealDialog.confirm')}</button></footer>
         </section>
       </div>}
       {resetConfirmRecording && <div className="dialog-backdrop" role="presentation">
@@ -4348,7 +4905,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           <header><span className="dialog-icon danger"><Icon name="refresh" size={19} /></span><div><h2 id="reset-confirm-title">{t('resetDialog.title')}</h2></div></header>
           <p>{t('resetDialog.body')}</p>
           <div className="dialog-warning danger">{t('resetDialog.taskLine', { id: resetConfirmRecording.session_id })}<br />{t('resetDialog.warning')}</div>
-          <footer><button className="button" onClick={() => setResetConfirmRecording(null)} disabled={Boolean(resettingSessionDir)}>{t('common.cancel')}</button><button data-testid="confirm-reset-recording" className="button danger" onClick={() => { const recording = resetConfirmRecording; setResetConfirmRecording(null); void resetHistoricalRecording(recording); }} disabled={Boolean(resettingSessionDir)}>{t('resetDialog.confirm')}</button></footer>
+          <footer><button data-dialog-initial className="button" onClick={() => setResetConfirmRecording(null)} disabled={Boolean(resettingSessionDir)}>{t('common.cancel')}</button><button data-testid="confirm-reset-recording" className="button danger" onClick={() => { const recording = resetConfirmRecording; setResetConfirmRecording(null); void resetHistoricalRecording(recording); }} disabled={Boolean(resettingSessionDir)}>{t('resetDialog.confirm')}</button></footer>
         </section>
       </div>}
       {deleteConfirmRecording && <div className="dialog-backdrop" role="presentation">
@@ -4356,7 +4913,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           <header><span className="dialog-icon danger"><Icon name="trash" size={19} /></span><div><h2 id="delete-confirm-title">{t('deleteDialog.title')}</h2></div></header>
           <p>{t('deleteDialog.body')}</p>
           <div className="dialog-warning danger">{t('deleteDialog.taskLine', { id: deleteConfirmRecording.session_id })}<br />{t('deleteDialog.warning')}</div>
-          <footer><button className="button" onClick={() => setDeleteConfirmRecording(null)} disabled={Boolean(deletingSessionDir)}>{t('common.cancel')}</button><button data-testid="confirm-delete-recording" className="button danger" onClick={() => { const recording = deleteConfirmRecording; setDeleteConfirmRecording(null); void deleteHistoricalRecording(recording); }} disabled={Boolean(deletingSessionDir)}>{t('deleteDialog.confirm')}</button></footer>
+          <footer><button data-dialog-initial className="button" onClick={() => setDeleteConfirmRecording(null)} disabled={Boolean(deletingSessionDir)}>{t('common.cancel')}</button><button data-testid="confirm-delete-recording" className="button danger" onClick={() => { const recording = deleteConfirmRecording; setDeleteConfirmRecording(null); void deleteHistoricalRecording(recording); }} disabled={Boolean(deletingSessionDir)}>{t('deleteDialog.confirm')}</button></footer>
         </section>
       </div>}
       {settingsDialog}
@@ -4369,7 +4926,19 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
 
   if (phase === 'setup') {
     const scriptReady = scriptItems.length > 0 && !scriptErrors.length;
-    const readyToStart = engineStatus === 'ready' && scriptReady && Boolean(outputDir) && captureConfigurationValid && !busy && !presetBusy;
+    const readinessIssues = setupReadinessIssues({
+      engineReady: engineStatus === 'ready',
+      scriptReady,
+      captureReady: captureConfigurationValid,
+      outputReady: Boolean(outputDir),
+    });
+    const readinessCopy = readinessIssues.map((issue) => {
+      if (issue === 'engine') return engineStatus === 'connecting' ? t('settings.engineConnecting') : t('settings.engineOffline');
+      if (issue === 'script') return scriptErrors[0] || t('setup.stepImportHint');
+      if (issue === 'capture') return captureConfigurationIssue || t('setup.stepAudioHint');
+      return t('home.locationUnset');
+    });
+    const readyToStart = readinessIssues.length === 0 && !busy && !presetBusy;
     return <div className="studio-shell">
       <StudioChrome phase={phase} title={t('setup.title')} onBack={returnToRecordings} onOpenSettings={() => setSettingsOpen(true)} />
       <div className="studio-workspace setup-workspace" data-testid="setup-workspace">
@@ -4409,7 +4978,11 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
                   <div><button className="button" onClick={() => void saveCapturePreset('new')} disabled={!presetName.trim() || Boolean(busy) || presetBusy}>{selectedCapturePreset ? t('setup.saveAsNew') : t('setup.saveAsPreset')}</button>{selectedCapturePreset && <><button className="button primary" onClick={() => void saveCapturePreset('update')} disabled={!presetName.trim() || Boolean(busy) || presetBusy}>{t('setup.updatePreset')}</button><button className="button danger-button" onClick={() => void deleteCapturePreset()} disabled={Boolean(busy) || presetBusy}>{t('common.delete')}</button></>}</div>
                 </div>}
               </div>
-              <div className="form-grid audio-form"><label className="field span-2"><span>{t('setup.deviceLabel')}</span><div className="field-row"><select value={deviceId} onChange={(event) => { const device = devices.find((candidate) => candidate.id === event.target.value); setDeviceId(event.target.value); setDeviceName(device?.name ?? ''); }} disabled={Boolean(busy)}>{!devices.length && <option value="">{t('setup.noDevices')}</option>}{deviceId && !selectedDevice && <option value={deviceId}>{t('setup.deviceUnavailable', { name: deviceName || deviceId })}</option>}{devices.map((device) => <option value={device.id} key={device.id}>{device.name}{device.backend ? ` — ${device.backend.toUpperCase()}` : ''}{device.is_default ? t('setup.systemDefault') : ''}{classifyInputDevice(device) === 'rejected' ? t('setup.deviceRejectedSuffix') : classifyInputDevice(device) === 'discouraged' ? t('setup.deviceDiscouragedSuffix') : ''}</option>)}</select><button className="square-button" title={t('setup.refreshDevices')} onClick={() => void loadDevices()}><Icon name="refresh" /></button></div></label>{exclusiveCaptureAvailable ? <label className="field"><span>{t('setup.shareMode')}</span><input data-testid="capture-share-mode" value={selectedDevice?.backend === 'asio' ? selectedDevice.recommended_buffer_frames ? `ASIO · ${t('setup.bufferFrames', { frames: selectedDevice.recommended_buffer_frames })}` : 'ASIO' : captureShareMode === 'exclusive' ? t('setup.exclusiveRecommended') : t('setup.sharedNotProduction')} readOnly /></label> : <label className="field"><span>{t('setup.shareMode')}</span><input value={t('setup.shareModeDev')} readOnly /></label>}<label className={`field ${selectedDevice && !rateOptions.includes(sampleRate) ? 'invalid' : ''}`}><span>{t('setup.sampleRate')}</span><select value={sampleRate} onChange={(event) => setSampleRate(Number(event.target.value))}>{!rateOptions.includes(sampleRate) && <option value={sampleRate}>{t('setup.rateIncompatible', { rate: sampleRate.toLocaleString(locale) })}</option>}{rateOptions.map((rate) => <option value={rate} key={rate}>{rate.toLocaleString(locale)} Hz</option>)}</select></label><label className={`field ${selectedDevice && !formatOptions.some((format) => format === inputSampleFormat) ? 'invalid' : ''}`}><span>{t('setup.bitDepth')}</span><select data-testid="capture-sample-format" value={inputSampleFormat} onChange={(event) => setInputSampleFormat(event.target.value)}>{!formatOptions.some((format) => format === inputSampleFormat) && <option value={inputSampleFormat}>{t('setup.formatIncompatible', { format: captureSampleFormatLabel(inputSampleFormat) })}</option>}{formatOptions.map((format) => <option value={format} key={format}>{captureSampleFormatLabel(format)}</option>)}</select></label><label className={`field ${selectedDevice && inputChannel > activeInputChannels ? 'invalid' : ''}`}><span>{t('setup.inputChannel')}</span><select value={inputChannel} onChange={(event) => setInputChannel(Number(event.target.value))}>{inputChannel > activeInputChannels && <option value={inputChannel}>{t('setup.inputIncompatible', { n: inputChannel })}</option>}{Array.from({ length: activeInputChannels }, (_, index) => <option value={index + 1} key={index + 1}>{t('setup.inputN', { n: index + 1 })}</option>)}</select></label><label className="field"><span>{t('setup.silenceThreshold')}</span><input type="number" min="-72" max="-12" step="1" value={noiseThresholdDbfs} onChange={(event) => setNoiseThresholdDbfs(Math.min(-12, Math.max(-72, Number(event.target.value) || -42)))} /></label><label className="field"><span>{t('setup.silenceDuration')}</span><input type="number" min="0.2" max="5" step="0.1" value={silenceDurationMs / 1_000} onChange={(event) => setSilenceDurationMs(Math.round(Math.min(5, Math.max(.2, Number(event.target.value) || 1)) * 1_000))} /></label><div className="setup-detector" data-testid="setup-detector"><header><span><strong>{t('recorder.detectorTitle')}</strong><small>{t('setup.detectorHelp')}</small></span></header><DetectorSelectCards value={silenceDetector} disabled={Boolean(busy)} onChange={(value) => { setSilenceDetector(value); setSilenceDetectorDraft(value); }} /></div></div>
+              <div className="form-grid audio-form setup-essential-audio" data-testid="setup-essential-audio">
+                <label className="field span-2"><span>{t('setup.deviceLabel')}</span><div className="field-row"><select value={deviceId} onChange={(event) => { const device = devices.find((candidate) => candidate.id === event.target.value); setDeviceId(event.target.value); setDeviceName(device?.name ?? ''); }} disabled={Boolean(busy)}>{!devices.length && <option value="">{t('setup.noDevices')}</option>}{deviceId && !selectedDevice && <option value={deviceId}>{t('setup.deviceUnavailable', { name: deviceName || deviceId })}</option>}{devices.map((device) => <option value={device.id} key={device.id}>{device.name}{device.backend ? ` — ${device.backend.toUpperCase()}` : ''}{device.is_default ? t('setup.systemDefault') : ''}{classifyInputDevice(device) === 'rejected' ? t('setup.deviceRejectedSuffix') : classifyInputDevice(device) === 'discouraged' ? t('setup.deviceDiscouragedSuffix') : ''}</option>)}</select><button className="square-button" title={t('setup.refreshDevices')} onClick={() => void loadDevices()}><Icon name="refresh" /></button></div></label>
+                <label className={`field ${selectedDevice && inputChannel > activeInputChannels ? 'invalid' : ''}`}><span>{t('setup.inputChannel')}</span><select value={inputChannel} onChange={(event) => setInputChannel(Number(event.target.value))}>{inputChannel > activeInputChannels && <option value={inputChannel}>{t('setup.inputIncompatible', { n: inputChannel })}</option>}{Array.from({ length: activeInputChannels }, (_, index) => <option value={index + 1} key={index + 1}>{t('setup.inputN', { n: index + 1 })}</option>)}</select></label>
+                <div className="setup-rhythm"><span>{t('recorder.continuousRecording')}</span><div role="group" aria-label={t('recorder.continuousRecording')}><button type="button" className={automationRules.autoStartNext ? 'active' : ''} aria-pressed={automationRules.autoStartNext} onClick={() => applyAutomationRule('autoStartNext', true)}>{t('settings.continuousDefault')}</button><button type="button" className={!automationRules.autoStartNext ? 'active' : ''} aria-pressed={!automationRules.autoStartNext} onClick={() => applyAutomationRule('autoStartNext', false)}>{t('settings.manualDefault')}</button></div><small>{automationRules.autoStartNext ? automationRules.pauseOnLabelChange ? t('recorder.continuousSummaryLabelPause') : t('recorder.continuousSummaryAll') : t('recorder.continuousSummaryManual')}</small></div>
+              </div>
               <details className="setup-advanced" data-testid="setup-detection-advanced">
                 <summary>
                   <div>
@@ -4418,6 +4991,14 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
                   </div>
                   <em>{detectionPolicySummary(automationRules)}</em>
                 </summary>
+                <div className="form-grid audio-form setup-advanced-grid" data-testid="setup-technical-settings">
+                  {exclusiveCaptureAvailable ? <label className="field"><span>{t('setup.shareMode')}</span><input data-testid="capture-share-mode" value={selectedDevice?.backend === 'asio' ? selectedDevice.recommended_buffer_frames ? `ASIO · ${t('setup.bufferFrames', { frames: selectedDevice.recommended_buffer_frames })}` : 'ASIO' : captureShareMode === 'exclusive' ? t('setup.exclusiveRecommended') : t('setup.sharedNotProduction')} readOnly /></label> : <label className="field"><span>{t('setup.shareMode')}</span><input value={t('setup.shareModeDev')} readOnly /></label>}
+                  <label className={`field ${selectedDevice && !rateOptions.includes(sampleRate) ? 'invalid' : ''}`}><span>{t('setup.sampleRate')}</span><select value={sampleRate} onChange={(event) => setSampleRate(Number(event.target.value))}>{!rateOptions.includes(sampleRate) && <option value={sampleRate}>{t('setup.rateIncompatible', { rate: sampleRate.toLocaleString(locale) })}</option>}{rateOptions.map((rate) => <option value={rate} key={rate}>{rate.toLocaleString(locale)} Hz</option>)}</select></label>
+                  <label className={`field ${selectedDevice && !formatOptions.some((format) => format === inputSampleFormat) ? 'invalid' : ''}`}><span>{t('recorder.driverInputFormat')}</span><select data-testid="capture-sample-format" value={inputSampleFormat} onChange={(event) => setInputSampleFormat(event.target.value)}>{!formatOptions.some((format) => format === inputSampleFormat) && <option value={inputSampleFormat}>{t('setup.formatIncompatible', { format: captureSampleFormatLabel(inputSampleFormat) })}</option>}{formatOptions.map((format) => <option value={format} key={format}>{captureSampleFormatLabel(format)}</option>)}</select></label>
+                  <label className="field"><span>{t('setup.silenceThreshold')}</span><input type="number" min="-72" max="-12" step="1" value={noiseThresholdDbfs} onChange={(event) => setNoiseThresholdDbfs(Math.min(-12, Math.max(-72, Number(event.target.value) || -42)))} /></label>
+                  <label className="field"><span>{t('setup.silenceDuration')}</span><input type="number" min="0.2" max="5" step="0.1" value={silenceDurationMs / 1_000} onChange={(event) => setSilenceDurationMs(Math.round(Math.min(5, Math.max(.2, Number(event.target.value) || 1)) * 1_000))} /></label>
+                  <div className="setup-detector" data-testid="setup-detector"><header><span><strong>{t('recorder.detectorTitle')}</strong><small>{t('setup.detectorHelp')}</small></span></header><DetectorSelectCards value={silenceDetector} disabled={Boolean(busy)} onChange={(value) => { setSilenceDetector(value); setSilenceDetectorDraft(value); }} /></div>
+                </div>
                 <div className="automation-rules">
                   <DetectionPolicyFields
                     rules={automationRules}
@@ -4436,12 +5017,17 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
               <div className="property-heading"><span>03</span><div><h2>{t('setup.storageHeading')}</h2><p>{t('setup.storageHelp')}</p></div></div>
               <div className="form-grid storage-form"><label className="field"><span>{t('setup.sessionName')}</span><input value={sessionName} onChange={(event) => setSessionName(event.target.value)} /></label><label className="field span-2"><span>{t('setup.localLocation')}</span><div className="field-row"><input value={outputDir} readOnly /><button className="button" onClick={() => void chooseOutput()}><Icon name="folder" size={14} />{t('common.selectEllipsis')}</button></div></label></div>
             </section>
-            <div className="document-actions"><p><Icon name="check" size={14} />{t('setup.createHint')}</p><button data-testid="start-session" className="button primary" onClick={() => void startSession({ activateAfterCreate: true })} disabled={!readyToStart}><Icon name="record" size={14} />{t('setup.createTask')}</button></div>
+            <div className={`document-actions setup-readiness ${readinessIssues.length ? 'blocked' : 'ready'}`} data-testid="setup-readiness" aria-live="polite">
+              {readinessIssues.length
+                ? <div><strong>{t('setup.createTask')}</strong><ul>{readinessCopy.map((copy, index) => <li key={`${readinessIssues[index]}:${copy}`}><Icon name="stop" size={12} />{copy}</li>)}</ul></div>
+                : <p><Icon name="check" size={14} />{t('setup.createHint')}</p>}
+              <button data-testid="start-session" className="button primary" onClick={() => void startSession({ activateAfterCreate: true })} disabled={!readyToStart}><Icon name="record" size={14} />{t('setup.createTask')}</button>
+            </div>
           </div>
         </main>
         <aside className="panel inspector setup-inspector">
           <div className="panel-tabs"><button className="active">{t('setup.inspector')}</button></div>
-          <div className="inspector-section"><h3>{t('setup.summary')}</h3><dl className="property-list"><div><dt>{t('setup.scriptItems')}</dt><dd>{scriptPreview?.summary.totalItems || t('common.dash')}</dd></div><div><dt>{t('setup.shareMode')}</dt><dd>{selectedDevice?.backend?.toUpperCase() || captureShareModeLabel(captureShareMode)}{selectedDevice?.recommended_buffer_frames ? ` · ${t('setup.bufferFrames', { frames: selectedDevice.recommended_buffer_frames })}` : ''}</dd></div><div><dt>{t('setup.sampleRate')}</dt><dd>{sampleRate.toLocaleString(locale)} Hz</dd></div><div><dt>{t('setup.bitDepth')}</dt><dd>{captureSampleFormatLabel(inputSampleFormat)}</dd></div><div><dt>{t('setup.inputChannel')}</dt><dd>{inputChannel}</dd></div><div><dt>{t('setup.channels')}</dt><dd>{t('setup.mono')}</dd></div><div><dt>{t('setup.noiseCeiling')}</dt><dd>{noiseThresholdDbfs} dBFS</dd></div><div><dt>{t('setup.headTailSilence')}</dt><dd>{(silenceDurationMs / 1_000).toFixed(1)} s</dd></div><div><dt>{t('recorder.detectorTitle')}</dt><dd>{silenceDetector === 'vad' ? t('recorder.detectorVad') : t('recorder.detectorEnergy')}</dd></div><div><dt>{t('recorder.ruleEnvCheck')}</dt><dd>{automationRules.envCheck ? t('setup.policyOn') : t('setup.policyOff')}</dd></div><div><dt>{t('recorder.ruleDiscardEmpty')}</dt><dd>{automationRules.discardEmpty ? t('setup.policyOn') : t('setup.policyOff')}</dd></div></dl></div>
+          <div className="inspector-section"><h3>{t('setup.summary')}</h3><dl className="property-list"><div><dt>{t('setup.scriptItems')}</dt><dd>{scriptPreview?.summary.totalItems || t('common.dash')}</dd></div><div><dt>{t('setup.shareMode')}</dt><dd>{selectedDevice?.backend?.toUpperCase() || captureShareModeLabel(captureShareMode)}{selectedDevice?.recommended_buffer_frames ? ` · ${t('setup.bufferFrames', { frames: selectedDevice.recommended_buffer_frames })}` : ''}</dd></div><div><dt>{t('setup.sampleRate')}</dt><dd>{sampleRate.toLocaleString(locale)} Hz</dd></div><div><dt>{t('recorder.exportFormat')}</dt><dd>{sampleRate / 1_000}k / {bitDepth}-bit PCM</dd></div><div><dt>{t('recorder.driverInputFormat')}</dt><dd>{captureSampleFormatLabel(inputSampleFormat)}</dd></div><div><dt>{t('setup.inputChannel')}</dt><dd>{inputChannel}</dd></div><div><dt>{t('setup.channels')}</dt><dd>{t('setup.mono')}</dd></div><div><dt>{t('setup.noiseCeiling')}</dt><dd>{noiseThresholdDbfs} dBFS</dd></div><div><dt>{t('setup.headTailSilence')}</dt><dd>{(silenceDurationMs / 1_000).toFixed(1)} s</dd></div><div><dt>{t('recorder.detectorTitle')}</dt><dd>{silenceDetector === 'vad' ? t('recorder.detectorVad') : t('recorder.detectorEnergy')}</dd></div><div><dt>{t('recorder.ruleEnvCheck')}</dt><dd>{automationRules.envCheck ? t('setup.policyOn') : t('setup.policyOff')}</dd></div><div><dt>{t('recorder.ruleDiscardEmpty')}</dt><dd>{automationRules.discardEmpty ? t('setup.policyOn') : t('setup.policyOff')}</dd></div></dl></div>
           <div className="inspector-section"><h3>{t('setup.inputDevice')}</h3><div className="device-summary"><span><Icon name="microphone" /></span><div><strong>{deviceName || t('setup.noDeviceSelected')}</strong><small>{selectedDevice?.is_default ? t('setup.defaultInput') : t('setup.externalInput')}</small></div></div></div>
           <div className="inspector-section"><h3>{t('setup.dataPolicy')}</h3><ul className="feature-list"><li><Icon name="check" />{t('setup.policyMaster')}</li><li><Icon name="check" />{t('setup.policyInteger')}</li><li><Icon name="check" />{t('setup.policyRetake')}</li><li><Icon name="check" />{t('setup.policySnapshot')}</li></ul></div>
         </aside>
@@ -4478,7 +5064,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             </div>
             <small className="script-preview-count">{scriptPreview.summary.totalItems > 10 ? t('setup.previewFirstRows', { shown: 10, total: scriptPreview.summary.totalItems }) : t('setup.previewAllRows', { total: scriptPreview.summary.totalItems })}</small>
           </div>
-          <footer><button type="button" className="button primary" data-testid="close-script-preview" autoFocus onClick={() => setScriptPreviewOpen(false)}>{t('common.close')}</button></footer>
+          <footer><button type="button" className="button primary" data-testid="close-script-preview" data-dialog-default onClick={() => setScriptPreviewOpen(false)}>{t('common.close')}</button></footer>
         </section>
       </div>}
       {settingsDialog}
@@ -4543,24 +5129,46 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
               {captureFault
                 ? <span className="label-chip">{t('recorder.stopReadingChip')}</span>
                 : entryBlocksAttempt
-                  ? <span className="label-chip">{deviceWarningOpen ? t('deviceWarning.dialogKicker') : t('recorder.envChip')}</span>
+                  ? <span className="label-chip">{deviceWarningOpen
+                    ? t('deviceWarning.dialogKicker')
+                    : inputAuditionBlocksAttempt || inputAuditionOpen
+                      ? t('inputAudition.title')
+                      : t('recorder.envChip')}</span>
                   : (workflowComplete || currentItem?.label || showCurrentLabelTransition) && <span key={`label:${currentItem?.id ?? 'none'}:${currentItem?.label ?? ''}`} className={`label-chip${showCurrentLabelTransition ? ' changed' : ''}`}>{workflowComplete ? t('recorder.allDoneChip') : currentItem?.label || t('recorder.noLabelThisItem')}</span>}
-              <p>{captureFault ? captureFaultCopy.title : entryBlocksAttempt ? (deviceWarningOpen ? t('deviceWarning.pendingCue') : t('recorder.keepQuiet')) : workflowComplete ? t('recorder.scriptFinished') : currentItem?.text ?? t('recorder.noText')}</p>
-              <small>{captureFault ? captureFaultCopy.detail : entryBlocksAttempt ? (deviceWarningOpen ? t('deviceWarning.warning') : noiseCheckMessage) : workflowComplete ? t('recorder.exportLater') : <>{currentItem?.id}</>}</small>
+              <p>{captureFault ? captureFaultCopy.title : entryBlocksAttempt ? entryBlockMessage : workflowComplete ? t('recorder.scriptFinished') : currentItem?.text ?? t('recorder.noText')}</p>
+              <small>{captureFault ? captureFaultCopy.detail : entryBlocksAttempt ? (inputAuditionBlocksAttempt || inputAuditionOpen ? t('inputAudition.introBody') : deviceWarningOpen ? t('deviceWarning.warning') : noiseCheckMessage) : workflowComplete ? t('recorder.exportLater') : <>{currentItem?.id}</>}</small>
             </div>
           </section>
           <section className="signal-monitor"><header><div><strong>{t('recorder.waveform')}</strong>{captureActive || shouldUseRecordedSilencePair(recording, reviewAttempt) ? <SilencePairReadout pair={silencePair} /> : null}</div><div>{captureActive ? <><span>RMS <b>{db(meter.rms)}</b></span><span>PEAK <b className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</b></span></> : <span>{reviewAttempt ? formatDuration(reviewAttempt.end_sample - reviewAttempt.start_sample, sampleRateForDisplay) : t('recorder.noTakeWaveform')}</span>}</div></header><div className="signal-scope"><WebGLWaveform key={showReviewWaveform ? `${sessionDir}:${reviewAttempt?.attempt_id}` : `${sessionDir}:${waveformGeneration}`} mode={showReviewWaveform ? 'review' : 'live'} bins={showReviewWaveform ? reviewWaveformBins : (meter.waveform ?? [])} capturedSamples={meter.captured_samples} waveformEndSample={meter.waveform_end_sample} recording={waveformTakeIsActive(recording && !captureFault, hasSpoken)} takeStartSample={recording && !captureFault ? liveTakeStartSample : undefined} takeEndSample={recording && !captureFault ? liveTakeEndSample : undefined} sampleRate={sampleRateForDisplay} />{captureActive ? <LiveSilenceHint liveMs={displayedLiveSilenceMs} requiredMs={effectiveSilenceDurationMs} /> : null}<div className="scope-scale"><span>−1.0</span><span>−0.5</span><span>0</span><span>+0.5</span><span>+1.0</span></div></div><div className="horizontal-meter"><i className="meter-rms" style={{ width: `${rmsPercent}%` }} /><i className="meter-peak" style={{ left: `${peakPercent}%` }} /></div></section>
           <section className="transport-panel">
             <div className="transport-review">
               {hasRetakeChoice
-                ? <span className="retake-decision-summary" data-testid="retake-decision-summary"><strong>{t('recorder.retakeCandidateVersion')}</strong><em>{t('recorder.retakeDecisionHint')}</em></span>
+                ? <div className="retake-ab-review" data-testid="retake-decision-summary">
+                  <button data-testid="preview-current-delivery" onClick={() => retainedDeliveryAttempt && void previewAttempt(retainedDeliveryAttempt.attempt_id)} disabled={Boolean(busy) || !retainedDeliveryAttempt || !safeAttemptIds.has(retainedDeliveryAttempt.attempt_id)}>
+                    <span className="retake-version">{t('recorder.currentDeliveryVersion')}</span>
+                    <strong><Icon name="play" size={12} />{t('recorder.preview')}</strong>
+                    {retainedDeliveryAttempt ? <span className="retake-version-meta">
+                      <time data-testid="retake-current-duration">{formatDuration(retainedDeliveryAttempt.end_sample - retainedDeliveryAttempt.start_sample, sampleRateForDisplay)}</time>
+                      <SilencePairReadout pair={retainedDeliveryPair} hint testId="retake-current-silence" />
+                    </span> : null}
+                  </button>
+                  <button data-testid="preview-retake" onClick={() => retakeCandidateAttempt && void previewAttempt(retakeCandidateAttempt.attempt_id)} disabled={Boolean(busy) || !retakeCandidateAttempt || !safeAttemptIds.has(retakeCandidateAttempt.attempt_id)}>
+                    <span className="retake-version">{t('recorder.retakeCandidateVersion')}</span>
+                    <strong><Icon name="play" size={12} />{t('recorder.previewCandidate')}</strong>
+                    {retakeCandidateAttempt ? <span className="retake-version-meta">
+                      <time data-testid="retake-candidate-duration">{formatDuration(retakeCandidateAttempt.end_sample - retakeCandidateAttempt.start_sample, sampleRateForDisplay)}</time>
+                      <SilencePairReadout pair={retakeCandidatePair} hint testId="retake-candidate-silence" />
+                    </span> : null}
+                  </button>
+                  <em>{t('recorder.retakeDecisionHint')}</em>
+                </div>
                 : hasRetainedPreviousWarning
                   ? <span className="retake-retained-warning" role="status"><Icon name="meter" size={13} />{t('recorder.retakeFailedPreviousRetained')}</span>
                   : showReviewSilenceBill && <span className={`silence-bill${silencePair.hint || silencePair.extra ? ' has-issue' : ''}`} data-testid="review-silence-bill"><SilencePairReadout pair={silencePair} hint /></span>}
             </div>
             <div className="transport-controls">
               <div className="transport-secondary">
-              <button data-testid={hasRetakeDecision ? 'preview-retake' : undefined} title={t('recorder.previewKey')} onClick={() => void previewAttempt()} disabled={recording || !reviewAttempt || Boolean(busy)}><Icon name="play" /><span>{hasRetakeDecision ? t('recorder.previewCandidate') : t('recorder.preview')}</span><kbd>P</kbd></button>
+              {!hasRetakeChoice && <button data-testid={hasRetakeDecision ? 'preview-retake' : undefined} title={t('recorder.previewKey')} onClick={() => void previewAttempt()} disabled={recording || !reviewAttempt || Boolean(busy)}><Icon name="play" /><span>{hasRetakeDecision ? t('recorder.previewCandidate') : t('recorder.preview')}</span><kbd>P</kbd></button>}
               {captureActive && <button title={t('recorder.retakeKey')} onClick={() => void startAttempt(currentItem, { beginRetakeSequence: true })} disabled={workspaceFaulted || captureFault || entryBlocksAttempt || recording || !currentItem || Boolean(busy)}><Icon name="retake" /><span>{t('recorder.retake')}</span><kbd>R</kbd></button>}
               </div>
               <div className="transport-primary">
@@ -4571,7 +5179,11 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
                 : captureFault
                 ? <button data-testid="main-transport" className="main-transport stop" onClick={finishSession} disabled={Boolean(busy)}><span><Icon name="stop" /></span><strong>{t('recorder.finishKeepMaster')}</strong><kbd>SPACE</kbd></button>
                 : entryBlocksAttempt && (primaryAction === 'start' || retakeSequenceReady)
-                  ? <button data-testid="main-transport" className="main-transport waiting" onClick={() => { if (deviceWarningOpen) { acknowledgeDeviceWarning(); return; } if (snapshot) void runSessionNoiseCheck(sessionDir, snapshot); }} disabled={noiseCheckRunning || Boolean(busy)}><span><Icon name="meter" /></span><strong>{deviceWarningOpen ? t('deviceWarning.pendingCue') : noiseCheckRunning ? t('recorder.noiseChecking') : t('recorder.finishNoiseFirst')}</strong></button>
+                  ? <button data-testid="main-transport" className="main-transport waiting" onClick={() => {
+                    if (deviceWarningOpen) { acknowledgeDeviceWarning(); return; }
+                    if (noiseCheckBlocksAttempt) { if (snapshot) void runSessionNoiseCheck(sessionDir, snapshot); return; }
+                    openInputAudition(false);
+                  }} disabled={noiseCheckRunning || Boolean(busy)}><span><Icon name={inputAuditionBlocksAttempt || inputAuditionOpen ? 'headphones' : 'meter'} /></span><strong>{deviceWarningOpen ? t('deviceWarning.pendingCue') : noiseCheckRunning ? t('recorder.noiseChecking') : noiseCheckBlocksAttempt ? t('recorder.finishNoiseFirst') : t('inputAudition.open')}</strong></button>
                 : recording
                   ? <button data-testid="main-transport" className={`main-transport ${isPendingTake || waitingForTailSilence ? 'waiting' : cue === 'ready' ? 'accept' : 'stop'}`} onClick={() => void stopAttempt()} disabled={Boolean(busy) || waitingForTailSilence}><span><Icon name="stop" /></span><strong>{isPendingTake ? t('recorder.pendingCancel') : waitingForTailSilence ? t('recorder.waitTailSilence') : t('recorder.finishSentence')}</strong>{isPendingTake ? <div className="transport-keys"><kbd>ESC</kbd><kbd>SPACE</kbd></div> : waitingForTailSilence ? null : <kbd>SPACE</kbd>}</button>
                 : primaryAction === 'accept'
@@ -4587,7 +5199,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
               <div className="transport-secondary right">
                 {captureActive && hasRetakeDecision && retainedDeliveryAttempt ? <button className="discard-retake-button" data-testid="discard-retake" onClick={() => void acceptAttempt(retainedDeliveryAttempt.attempt_id)} disabled={Boolean(busy) || !safeAttemptIds.has(retainedDeliveryAttempt.attempt_id)}><Icon name="close" /><span>{t('recorder.keepPreviousVersion')}</span></button> : null}
                 {captureActive && retakeSequenceReady && allHandled ? <button data-testid="finish-retake-sequence" onClick={requestFinishCapture} disabled={Boolean(busy)}><Icon name="check" /><span>{t('recorder.finishCapture')}</span></button> : null}
-                {captureActive && <button title={t('recorder.skipKey')} onClick={() => void skipItem()} disabled={captureFault || recording || Boolean(busy) || hasRetakeDecision || !currentItem || !['pending', 'review'].includes(currentItem.status)}><Icon name="skip" /><span>{t('recorder.skip')}</span><kbd>S</kbd></button>}
+                {captureActive && <button title={t('recorder.skipKey')} onClick={() => void skipItem()} disabled={captureFault || recording || Boolean(busy) || hasRetakeDecision || inputAuditionOpen || !inputAuditionDecision || !currentItem || !['pending', 'review'].includes(currentItem.status)}><Icon name="skip" /><span>{t('recorder.skip')}</span><kbd>S</kbd></button>}
               </div>
             </div>
           </section>
@@ -4605,10 +5217,44 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
               <section className="monitor-section"><h3>{t('recorder.currentState')}</h3><dl className="property-list"><div><dt>{t('recorder.sentence')}</dt><dd>{cueLabel}</dd></div><div><dt>{t('recorder.headTail')}</dt><dd><SilencePairReadout pair={silencePair} /></dd></div><div><dt>{t('recorder.disk')}</dt><dd>{meter.storage_status === 'healthy' ? t('recorder.diskHealthy') : meter.storage_status === 'warning' ? t('recorder.diskWarning') : t('recorder.diskCritical')}</dd></div></dl></section>
               <button className="detection-summary" onClick={() => setMonitorPanelTab('detection')}><span><strong>{t('recorder.silenceJudge')}</strong><small>{silenceDetector === 'vad' ? t('recorder.detectorVad') : `${noiseThresholdDbfs} dBFS`} / {(effectiveSilenceDurationMs / 1_000).toFixed(1)} {t('recorder.seconds')}</small></span><em>{t('recorder.adjust')}</em></button>
             </>}
-            {monitorPanelTab === 'detection' && <section className="monitor-section detection-settings"><h3>{t('recorder.detectionTitle')}</h3><p>{t('recorder.detectionHelp')}</p><div className="detection-setting detector-choice"><header><span><strong>{t('recorder.detectorTitle')}</strong><small>{t('recorder.detectorHelp')}</small></span></header><DetectorSelectCards value={silenceDetector} locked /></div>{silenceDetector === 'energy' ? <div className="detection-setting"><header><span><strong>{t('recorder.threshold')}</strong><small>{t('recorder.currentRms', { value: liveRmsDbfs <= -96 ? '−∞' : `${liveRmsDbfs.toFixed(1)} dBFS` })}</small></span><output>{silenceThresholdDraftDbfs} <small>dBFS</small></output></header><div className="threshold-track"><i style={{ left: `${liveRmsOnThresholdScale}%` }} title={t('quality.currentRmsTitle', { value: liveRmsDbfs.toFixed(1) })} /><input data-testid="task-silence-threshold" aria-label={t('recorder.threshold')} aria-valuetext={`${silenceThresholdDraftDbfs} dBFS`} type="range" min="-72" max="-12" step="1" value={silenceThresholdDraftDbfs} onChange={(event) => setSilenceThresholdDraftDbfs(Number(event.target.value))} onPointerUp={(event) => void applyTaskSilenceSettings(Number(event.currentTarget.value), silenceDurationDraftMs)} onKeyUp={(event) => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) void applyTaskSilenceSettings(Number(event.currentTarget.value), silenceDurationDraftMs); }} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving} /></div><div className="threshold-labels"><span>{t('recorder.moreSensitive')}</span><span>{t('recorder.moreReject')}</span></div></div> : null}<div className="detection-setting"><header><span><strong>{t('recorder.duration')}</strong><small>{t('recorder.sameDuration')}</small></span><output>{(silenceDurationDraftMs / 1_000).toFixed(1)} <small>{t('recorder.seconds')}</small></output></header><input data-testid="task-silence-duration" aria-label={t('recorder.duration')} aria-valuetext={`${(silenceDurationDraftMs / 1_000).toFixed(1)} ${t('recorder.seconds')}`} type="range" min="200" max="5000" step="100" value={silenceDurationDraftMs} onChange={(event) => setSilenceDurationDraftMs(Number(event.target.value))} onPointerUp={(event) => void applyTaskSilenceSettings(silenceThresholdDraftDbfs, Number(event.currentTarget.value))} onKeyUp={(event) => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) void applyTaskSilenceSettings(silenceThresholdDraftDbfs, Number(event.currentTarget.value)); }} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving} /><div className="threshold-labels"><span>0.2 {t('recorder.seconds')}</span><span>5.0 {t('recorder.seconds')}</span></div></div><div className="automation-rules"><header><strong>{t('recorder.automationRules')}</strong><small>{t('recorder.automationRulesHelp')}</small></header><AutomationRuleRow testId="rule-auto-start-next" checked={automationRules.autoStartNext} title={t('recorder.ruleAutoStartNext')} hint={t('recorder.ruleAutoStartNextHint')} onChange={(enabled) => applyAutomationRule('autoStartNext', enabled)} /><AutomationRuleRow testId="rule-pause-on-label-change" checked={automationRules.pauseOnLabelChange} title={t('recorder.rulePauseOnLabelChange')} hint={t('recorder.rulePauseOnLabelChangeHint')} onChange={(enabled) => applyAutomationRule('pauseOnLabelChange', enabled)} /><AutomationRuleRow testId="rule-enforce-head-tail" checked={automationRules.enforceHeadTailSilence} title={t('recorder.ruleEnforceHeadTail')} hint={t('recorder.ruleEnforceHeadTailHint')} onChange={(enabled) => applyAutomationRule('enforceHeadTailSilence', enabled)} /><AutomationRuleRow testId="rule-head-tail" checked={automationRules.headTailSilence} title={t('recorder.ruleHeadTail')} hint={t('recorder.ruleHeadTailHint')} onChange={(enabled) => applyAutomationRule('headTailSilence', enabled)} /><AutomationRuleRow testId="rule-discard-empty" checked={automationRules.discardEmpty} title={t('recorder.ruleDiscardEmpty')} hint={silenceDetector === 'vad' ? t('recorder.ruleDiscardEmptyHintVad') : t('recorder.ruleDiscardEmptyHint')} onChange={(enabled) => applyAutomationRule('discardEmpty', enabled)} /><AutomationRuleRow testId="rule-env-check" checked={automationRules.envCheck} title={t('recorder.ruleEnvCheck')} hint={t('recorder.ruleEnvCheckHint')} onChange={(enabled) => applyAutomationRule('envCheck', enabled)} /><AutomationRuleRow testId="rule-almost-silent" checked={automationRules.almostSilent} title={t('recorder.ruleAlmostSilent')} hint={t('recorder.ruleAlmostSilentHint')} onChange={(enabled) => applyAutomationRule('almostSilent', enabled)} /><AutomationRuleRow testId="rule-peak-high" checked={automationRules.peakHigh} title={t('recorder.rulePeakHigh')} hint={t('recorder.rulePeakHighHint')} onChange={(enabled) => applyAutomationRule('peakHigh', enabled)} /></div><p className={`settings-apply-state ${silenceSettingsError ? 'error' : ''}`}>{silenceSettingsSaving ? t('recorder.applyingSettings') : silenceSettingsError || (silenceDetector === 'vad'
-              ? t('recorder.appliedSettingsVad', { seconds: (effectiveSilenceDurationMs / 1_000).toFixed(1) })
-              : t('recorder.appliedSettings', { db: noiseThresholdDbfs, seconds: (effectiveSilenceDurationMs / 1_000).toFixed(1) }))}</p><button className="restore-settings" onClick={() => void applyTaskSilenceSettings(taskInitialSilenceThresholdDbfs, taskInitialSilenceDurationMs)} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving || (noiseThresholdDbfs === taskInitialSilenceThresholdDbfs && silenceDurationMs === taskInitialSilenceDurationMs)}>{t('recorder.restoreInitial')}</button></section>}
-            {monitorPanelTab === 'task' && <section className="monitor-section"><h3>{t('recorder.taskParams')}</h3><dl className="property-list"><div><dt>{t('setup.inputDevice')}</dt><dd title={snapshot?.device_name}>{snapshot?.device_name || t('common.dash')}</dd></div><div><dt>{t('recorder.detectorTitle')}</dt><dd>{silenceDetector === 'vad' ? t('recorder.detectorVad') : t('recorder.detectorEnergy')}</dd></div><div><dt>{t('setup.shareMode')}</dt><dd>{captureShareModeLabel(snapshot?.capture_share_mode ?? captureShareMode)}</dd></div><div><dt>{t('setup.inputChannel')}</dt><dd>{snapshot?.audio_format.input_channel ?? 1}</dd></div><div><dt>{t('recorder.exportFormat')}</dt><dd>{sampleRateForDisplay / 1000}k / {snapshot?.audio_format.bit_depth}-bit {snapshot?.audio_format.encoding ?? ''}</dd></div><div><dt>{t('recorder.driverInputFormat')}</dt><dd>{snapshot?.input_sample_format?.toUpperCase() ?? t('common.dash')}</dd></div><div><dt>{t('recorder.envCeiling')}</dt><dd>{snapshot?.noise_threshold_dbfs ?? snapshot?.noise_check?.threshold_dbfs ?? t('common.dash')} dBFS</dd></div><div><dt>{t('recorder.accepted')}</dt><dd>{counts.accepted ?? 0} / {items.length}</dd></div><div><dt>{t('recorder.skipped')}</dt><dd>{counts.skipped ?? 0}</dd></div></dl><button className="button panel-action" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? t('recorder.locatePrompter') : t('recorder.openPrompter')}</button></section>}
+            {monitorPanelTab === 'detection' && <section className="monitor-section detection-settings">
+              <h3>{t('recorder.detectionTitle')}</h3>
+              <p>{t('recorder.detectionHelp')}</p>
+              <div className="detection-setting detector-choice">
+                <header><span><strong>{t('recorder.detectorTitle')}</strong><small>{t('recorder.detectorHelp')}</small></span></header>
+                <DetectorSelectCards value={silenceDetector} locked />
+              </div>
+              {silenceDetector === 'energy' ? <div className="detection-setting">
+                <header><span><strong>{t('recorder.threshold')}</strong><small>{t('recorder.currentRms', { value: liveRmsDbfs <= -96 ? '−∞' : `${liveRmsDbfs.toFixed(1)} dBFS` })}</small></span><output>{silenceThresholdDraftDbfs} <small>dBFS</small></output></header>
+                <div className="threshold-track"><i style={{ left: `${liveRmsOnThresholdScale}%` }} title={t('quality.currentRmsTitle', { value: liveRmsDbfs.toFixed(1) })} /><input data-testid="task-silence-threshold" aria-label={t('recorder.threshold')} aria-valuetext={`${silenceThresholdDraftDbfs} dBFS`} type="range" min="-72" max="-12" step="1" value={silenceThresholdDraftDbfs} onChange={(event) => setSilenceThresholdDraftDbfs(Number(event.target.value))} onPointerUp={(event) => void applyTaskSilenceSettings(Number(event.currentTarget.value), silenceDurationDraftMs)} onKeyUp={(event) => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) void applyTaskSilenceSettings(Number(event.currentTarget.value), silenceDurationDraftMs); }} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving} /></div>
+                <div className="threshold-labels"><span>{t('recorder.moreSensitive')}</span><span>{t('recorder.moreReject')}</span></div>
+              </div> : null}
+              <div className="detection-setting">
+                <header><span><strong>{t('recorder.duration')}</strong><small>{t('recorder.sameDuration')}</small></span><output>{(silenceDurationDraftMs / 1_000).toFixed(1)} <small>{t('recorder.seconds')}</small></output></header>
+                <input data-testid="task-silence-duration" aria-label={t('recorder.duration')} aria-valuetext={`${(silenceDurationDraftMs / 1_000).toFixed(1)} ${t('recorder.seconds')}`} type="range" min="200" max="5000" step="100" value={silenceDurationDraftMs} onChange={(event) => setSilenceDurationDraftMs(Number(event.target.value))} onPointerUp={(event) => void applyTaskSilenceSettings(silenceThresholdDraftDbfs, Number(event.currentTarget.value))} onKeyUp={(event) => { if (['ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'].includes(event.key)) void applyTaskSilenceSettings(silenceThresholdDraftDbfs, Number(event.currentTarget.value)); }} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving} />
+                <div className="threshold-labels"><span>0.2 {t('recorder.seconds')}</span><span>5.0 {t('recorder.seconds')}</span></div>
+              </div>
+              <p className={`settings-apply-state ${silenceSettingsError ? 'error' : ''}`}>{silenceSettingsSaving ? t('recorder.applyingSettings') : silenceSettingsError || (silenceDetector === 'vad'
+                ? t('recorder.appliedSettingsVad', { seconds: (effectiveSilenceDurationMs / 1_000).toFixed(1) })
+                : t('recorder.appliedSettings', { db: noiseThresholdDbfs, seconds: (effectiveSilenceDurationMs / 1_000).toFixed(1) }))}</p>
+              <button className="restore-settings" onClick={() => void applyTaskSilenceSettings(taskInitialSilenceThresholdDbfs, taskInitialSilenceDurationMs)} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving || (noiseThresholdDbfs === taskInitialSilenceThresholdDbfs && silenceDurationMs === taskInitialSilenceDurationMs)}>{t('recorder.restoreInitial')}</button>
+            </section>}
+            {monitorPanelTab === 'settings' && <section className="monitor-section recording-settings" data-testid="task-recording-settings">
+              <h3>{t('recorder.recordingSettingsTitle')}</h3>
+              <p>{t('recorder.recordingSettingsHelp')}</p>
+              <RecordingRuleGroups
+                rules={automationRules}
+                testIdPrefix="rule"
+                discardEmptyHint={silenceDetector === 'vad' ? t('recorder.ruleDiscardEmptyHintVad') : t('recorder.ruleDiscardEmptyHint')}
+                onChange={applyAutomationRule}
+              />
+              <footer className="task-settings-scope">
+                <div><strong>{t('recorder.currentTaskOnly')}</strong><small>{t('recorder.currentTaskOnlyHint')}</small></div>
+                <button type="button" className="restore-settings" data-testid="restore-task-recording-settings" onClick={restoreTaskAutomationRules} disabled={automationRulesEqual(automationRules, taskInitialAutomationRules)}>{t('recorder.restoreTaskRules')}</button>
+                <button type="button" className="open-default-settings" data-testid="edit-new-task-defaults" onClick={() => setSettingsOpen(true)}>{t('recorder.editNewTaskDefaults')}</button>
+              </footer>
+            </section>}
+            {monitorPanelTab === 'task' && <section className="monitor-section"><h3>{t('recorder.taskParams')}</h3><dl className="property-list"><div><dt>{t('setup.inputDevice')}</dt><dd title={snapshot?.device_name}>{snapshot?.device_name || t('common.dash')}</dd></div><div><dt>{t('inputAudition.statusLabel')}</dt><dd className={inputAuditionDecision?.status === 'skipped' ? 'warning' : ''}>{inputAuditionStatusLabel}</dd></div><div><dt>{t('recorder.detectorTitle')}</dt><dd>{silenceDetector === 'vad' ? t('recorder.detectorVad') : t('recorder.detectorEnergy')}</dd></div><div><dt>{t('setup.shareMode')}</dt><dd>{snapshot?.capture_backend?.toUpperCase() || captureShareModeLabel(snapshot?.capture_share_mode ?? captureShareMode)}{snapshot?.capture_buffer_frames ? ` · ${t('setup.bufferFrames', { frames: snapshot.capture_buffer_frames })}` : ''}</dd></div><div><dt>{t('setup.inputChannel')}</dt><dd>{snapshot?.audio_format.input_channel ?? 1}</dd></div><div><dt>{t('recorder.exportFormat')}</dt><dd>{sampleRateForDisplay / 1000}k / {snapshot?.audio_format.bit_depth}-bit {snapshot?.audio_format.encoding ?? ''}</dd></div><div><dt>{t('recorder.driverInputFormat')}</dt><dd>{snapshot?.input_sample_format?.toUpperCase() ?? t('common.dash')}</dd></div><div><dt>{t('recorder.envCeiling')}</dt><dd>{snapshot?.noise_threshold_dbfs ?? snapshot?.noise_check?.threshold_dbfs ?? t('common.dash')} dBFS</dd></div><div><dt>{t('recorder.accepted')}</dt><dd>{counts.accepted ?? 0} / {items.length}</dd></div><div><dt>{t('recorder.skipped')}</dt><dd>{counts.skipped ?? 0}</dd></div></dl>{captureActive && <button data-testid="recheck-input-audition" className="button panel-action" onClick={() => openInputAudition(true)} disabled={recording || Boolean(busy) || Boolean(captureFault) || workspaceFaulted}><Icon name="headphones" size={13} />{t('inputAudition.recheck')}</button>}<button className="button panel-action" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? t('recorder.locatePrompter') : t('recorder.openPrompter')}</button></section>}
             {monitorPanelTab === 'export' && snapshot && <section className="monitor-section monitor-export"><h3>{t('recorder.exportCurrent')}</h3><p>{captureActive ? recording ? t('recorder.exportWhileRecording') : t('recorder.exportWillPause') : t('recorder.exportIndependent')}</p><dl className="property-list export-status-summary"><div><dt>{t('p1.blocker')}</dt><dd>{workflowSummary.blockerCount}</dd></div><div><dt>{t('p1.warning')}</dt><dd>{workflowSummary.warningCount}</dd></div><div><dt>{t('recorder.retainedPreviousShort')}</dt><dd>{retainedPreviousWarningCount}</dd></div></dl><div className="export-scope-control" role="group" aria-label={t('p1.exportScopeTitle')}><button className={exportScope === 'confirmed_only' ? 'active' : ''} onClick={() => { setExportScope('confirmed_only'); setAcknowledgedExportWarnings([]); }}><strong>{t('p1.confirmedOnly')}</strong><small>{t('p1.confirmedOnlyHint')}</small></button><button className={exportScope === 'complete_task' ? 'active' : ''} onClick={() => { setExportScope('complete_task'); setAcknowledgedExportWarnings([]); }}><strong>{t('p1.completeTask')}</strong><small>{t('p1.completeTaskHint')}</small></button></div><div className={`export-readiness ${cutsReadiness.health}`}><strong>{cutsReadiness.ready ? t('p1.exportReady') : t('p1.exportNotReady')}</strong><span>{t('p1.exportReadinessCounts', { included: cutsReadiness.includedItemIds.length, excluded: cutsReadiness.excluded.length, blockers: cutsReadiness.blockers.length })}</span></div>{cutsReadiness.warningCodes.length > 0 && <div className="export-warning-acks"><strong>{t('p1.exportWarningsTitle')}</strong>{cutsReadiness.warningCodes.map((code) => <label key={code}><input type="checkbox" checked={acknowledgedExportWarnings.includes(code)} onChange={(event) => setAcknowledgedExportWarnings((current) => event.target.checked ? [...new Set([...current, code])] : current.filter((value) => value !== code))} /><span>{t(`p1.warningCode.${code}`)}</span></label>)}</div>}{exportDestinationPicker(sessionDir)}<div>
               <button onClick={() => void exportRecordingArtifact({ session_id: snapshot.session_id, session_dir: sessionDir }, 'full_track')} disabled={Boolean(busy) || recording}><Icon name="meter" /><span><strong>{t('recorder.fullTrackShort')}</strong><small>{artifactStatusCopy(workspaceRecording, 'full_track')}</small></span></button>
               <button onClick={() => void exportRecordingArtifact({ session_id: snapshot.session_id, session_dir: sessionDir }, 'timestamps_json')} disabled={Boolean(busy) || recording}><Icon name="file" /><span><strong>{t('recorder.timestampsShort')}</strong><small>{artifactStatusCopy(workspaceRecording, 'timestamps_json')}</small></span></button>
@@ -4618,20 +5264,42 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
               <header><div><h3>{t('recorder.issuesTitle')}</h3><small>{t('p1.issueSummary', { blockers: workbenchIssues.filter((issue) => issue.severity === 'blocker').length, warnings: workbenchIssues.filter((issue) => issue.severity === 'warning').length })}</small></div><div className="issue-navigation"><button onClick={() => moveWorkbenchIssue(-1)} disabled={recording || visibleWorkbenchIssues.length === 0} title={t('p1.previousIssue')}><Icon name="chevron-left" size={12} /></button><button onClick={() => moveWorkbenchIssue(1)} disabled={recording || visibleWorkbenchIssues.length === 0} title={t('p1.nextIssue')}><Icon name="chevron-right" size={12} /></button></div></header>
               <div className="issue-filters" role="group" aria-label={t('p1.issueFilterAria')}>{(['all', 'blocker', 'warning'] as const).map((filter) => <button key={filter} className={issueFilter === filter ? 'active' : ''} onClick={() => { setIssueFilter(filter); setSelectedIssueId(null); }}>{t(`p1.issueFilter.${filter}`)}</button>)}</div>
               {qualityWarning && <p><strong>{t('quality.bannerTitle')}</strong><span>{qualityWarning}</span></p>}
-              {visibleWorkbenchIssues.length === 0 ? <div className="issue-empty"><Icon name="check" size={14} />{t('p1.noIssuesInFilter')}</div> : <div className="issue-list">{visibleWorkbenchIssues.map((issue) => <button key={issue.id} className={`${issue.severity}${selectedIssueId === issue.id ? ' active' : ''}`} onClick={() => locateWorkbenchIssue(issue)} disabled={recording}>
+              {visibleWorkbenchIssues.length === 0 ? <div className="issue-empty"><Icon name="check" size={14} /><span>{t('p1.noIssuesInFilter')}</span>{!hasMonitorIssues ? <button data-testid="go-to-delivery" className="button primary" onClick={() => setMonitorPanelTab('export')}>{t('p1.goToDelivery')}</button> : null}</div> : <div className="issue-list">{visibleWorkbenchIssues.map((issue) => <button key={issue.id} className={`${issue.severity}${selectedIssueId === issue.id ? ' active' : ''}`} onClick={() => locateWorkbenchIssue(issue)} disabled={recording}>
                 <i />
                 <span><strong>{t(`p1.issueKind.${issue.kind}`)}</strong><small>{issue.itemId ? t('p1.issueItem', { id: issue.itemId }) : t('p1.issueTaskLevel')}</small></span>
                 <em>{issue.severity === 'blocker' ? t('p1.blocker') : t('p1.warning')}</em>
               </button>)}</div>}
+              {selectedWorkbenchIssue && <div className={`issue-resolution ${selectedWorkbenchIssue.severity}`} data-testid="issue-resolution">
+                <div><strong>{t(`p1.issueKind.${selectedWorkbenchIssue.kind}`)}</strong><small>{selectedWorkbenchIssue.itemId ? t('p1.issueItem', { id: selectedWorkbenchIssue.itemId }) : t('p1.issueTaskLevel')}</small></div>
+                {selectedWorkbenchIssue.itemIndex !== null && items[selectedWorkbenchIssue.itemIndex]
+                  ? !captureActive
+                    ? <button className="button primary" onClick={() => void activateCapture(items[selectedWorkbenchIssue.itemIndex!]?.id)} disabled={Boolean(busy) || workspaceFaulted}><Icon name="microphone" size={13} />{t('recorder.enterCapture')}</button>
+                    : currentItem?.id !== items[selectedWorkbenchIssue.itemIndex]?.id
+                      ? <button className="button" onClick={() => locateWorkbenchIssue(selectedWorkbenchIssue)} disabled={recording || Boolean(busy)}>{t('p1.issueLocated')}</button>
+                      : currentItem.status === 'review'
+                        ? <div className="issue-resolution-actions">
+                          {hasRetakeChoice && retainedDeliveryAttempt ? <button onClick={() => void previewAttempt(retainedDeliveryAttempt.attempt_id)} disabled={Boolean(busy) || !safeAttemptIds.has(retainedDeliveryAttempt.attempt_id)}><Icon name="play" size={12} />{t('recorder.currentDeliveryVersion')}</button> : null}
+                          <button onClick={() => void previewAttempt()} disabled={Boolean(busy) || !reviewAttempt}><Icon name="play" size={12} />{hasRetakeChoice ? t('recorder.previewCandidate') : t('recorder.preview')}</button>
+                          <button className="primary" onClick={() => void acceptAttempt(undefined, { autoStartNext: false })} disabled={Boolean(busy) || !defaultAcceptAttemptSafe}><Icon name="check" size={12} />{hasRetakeChoice ? t('recorder.useRetakeCandidate') : t('recorder.acceptThis')}</button>
+                          {hasRetakeChoice && retainedDeliveryAttempt
+                            ? <button onClick={() => void acceptAttempt(retainedDeliveryAttempt.attempt_id, { autoStartNext: false })} disabled={Boolean(busy) || !safeAttemptIds.has(retainedDeliveryAttempt.attempt_id)}>{t('recorder.keepPreviousVersion')}</button>
+                            : <button onClick={() => void startAttempt(currentItem, { beginRetakeSequence: true })} disabled={Boolean(busy) || captureFault || entryBlocksAttempt}><Icon name="retake" size={12} />{t('recorder.retake')}</button>}
+                        </div>
+                        : selectedWorkbenchIssue.kind !== 'inconsistent'
+                          ? <button className="button primary" onClick={() => void startAttempt(currentItem, { beginRetakeSequence: true })} disabled={Boolean(busy) || captureFault || entryBlocksAttempt}><Icon name="retake" size={13} />{t('recorder.retake')}</button>
+                          : <small>{t('p1.issueNavigationHint')}</small>
+                  : <small>{t('p1.issueNavigationHint')}</small>}
+              </div>}
               <footer>{t('p1.issueNavigationHint')}</footer>
             </section>}
           </div>
           <nav className="monitor-tabs" aria-label={t('recorder.tabsAria')}>
             <button className={monitorPanelTab === 'monitor' ? 'active' : ''} onClick={() => setMonitorPanelTab('monitor')} title={t('recorder.tabMonitor')}><Icon name="headphones" /><span>{t('recorder.tabMonitor')}</span></button>
             <button className={monitorPanelTab === 'detection' ? 'active' : ''} onClick={() => setMonitorPanelTab('detection')} title={t('recorder.tabDetectionTitle')}><Icon name="sliders" /><span>{t('recorder.tabDetection')}</span></button>
+            <button className={monitorPanelTab === 'settings' ? 'active' : ''} onClick={() => setMonitorPanelTab('settings')} title={t('recorder.tabSettingsTitle')}><Icon name="settings" /><span>{t('recorder.tabSettings')}</span></button>
             <button className={monitorPanelTab === 'task' ? 'active' : ''} onClick={() => setMonitorPanelTab('task')} title={t('recorder.tabTask')}><Icon name="file" /><span>{t('recorder.tabTask')}</span></button>
             <button className={monitorPanelTab === 'export' ? 'active' : ''} onClick={() => setMonitorPanelTab('export')} title={t('recorder.tabExport')}><Icon name="export" /><span>{t('recorder.tabExport')}</span></button>
-            {hasMonitorIssues && <button className={monitorPanelTab === 'issues' ? 'active issue' : 'issue'} onClick={() => setMonitorPanelTab('issues')} title={t('recorder.tabIssues')}><Icon name="stop" /><span>{t('recorder.tabIssues')}</span></button>}
+            {(hasMonitorIssues || monitorPanelTab === 'issues') && <button className={monitorPanelTab === 'issues' ? 'active issue' : 'issue'} onClick={() => setMonitorPanelTab('issues')} title={t('recorder.tabIssues')}><Icon name="stop" /><span>{t('recorder.tabIssues')}</span></button>}
           </nav>
         </div>
         <div className="inspector-footer">
@@ -4645,6 +5313,14 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         </div>
       </aside>
     </div>
+    {inputAuditionOpen && snapshot && captureActive && <InputAuditionDialog
+      key={`${snapshot.session_id}:${activeInputAuditionConfigurationKey}:${inputAuditionForce ? 'force' : 'automatic'}`}
+      snapshot={snapshot}
+      force={inputAuditionForce}
+      onSnapshot={setSnapshot}
+      onResolved={resolveInputAudition}
+      onCancel={cancelInputAuditionGate}
+    />}
     {showDeviceWarningDialog && deviceWarningKind && <DeviceWarningDialog
       kind={deviceWarningKind}
       deviceName={snapshot?.device_name || deviceName}
@@ -4679,7 +5355,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             : t('pauseDialog.idle')}</p>
         <dl className="dialog-summary"><div><dt>{t('recorder.accepted')}</dt><dd>{counts.accepted ?? 0}</dd></div><div><dt>{t('recorder.skipped')}</dt><dd>{counts.skipped ?? 0}</dd></div><div><dt>{t('recorder.pending')}</dt><dd className={(counts.pending ?? 0) + (counts.review ?? 0) ? 'warning' : ''}>{(counts.pending ?? 0) + (counts.review ?? 0)}</dd></div></dl>
         <div className="dialog-warning">{pauseDestination === 'stay' ? t('pauseDialog.warningStay') : t('pauseDialog.warning')}</div>
-        <footer><button data-testid="pause-cancel" className="button" onClick={() => setPauseConfirmOpen(false)} disabled={Boolean(busy)}>{t('pauseDialog.keepRecording')}</button><button data-testid="pause-confirm" className="button primary" onClick={() => void safePauseAndReturn()} disabled={Boolean(busy)}><Icon name={pauseDestination === 'stay' ? 'pause' : 'stop'} size={14} />{pauseDestination === 'stay'
+        <footer><button data-testid="pause-cancel" data-dialog-initial className="button" onClick={() => setPauseConfirmOpen(false)} disabled={Boolean(busy)}>{t('pauseDialog.keepRecording')}</button><button data-testid="pause-confirm" data-dialog-default className="button primary" onClick={() => void safePauseAndReturn()} disabled={Boolean(busy)}><Icon name={pauseDestination === 'stay' ? 'pause' : 'stop'} size={14} />{pauseDestination === 'stay'
           ? recording ? t('pauseDialog.endAndStay') : t('pauseDialog.pauseStay')
           : recording ? t('pauseDialog.endAndLeave') : t('pauseDialog.pauseAndLeave')}</button></footer>
       </section>
@@ -4698,7 +5374,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         <header><span className="dialog-icon"><Icon name="stop" size={19} /></span><div><h2 id="finish-dialog-title">{captureFault ? t('finishDialog.titleFault') : t('finishDialog.titleNormal')}</h2></div></header>
         <p>{captureFault ? t('finishDialog.bodyFault') : t('finishDialog.bodyNormal')}</p>
         <dl className="dialog-summary"><div><dt>{t('recorder.accepted')}</dt><dd>{counts.accepted ?? 0}</dd></div><div><dt>{t('recorder.skipped')}</dt><dd>{counts.skipped ?? 0}</dd></div><div><dt>{t('recorder.pending')}</dt><dd className={(counts.pending ?? 0) + (counts.review ?? 0) ? 'warning' : ''}>{(counts.pending ?? 0) + (counts.review ?? 0)}</dd></div></dl>
-        <footer><button data-testid="finish-cancel" className="button" onClick={() => setFinishConfirmOpen(false)}>{captureFault ? t('finishDialog.stayFault') : t('common.cancel')}</button><button data-testid="finish-confirm" className="button primary" onClick={() => void confirmFinishSession()} disabled={Boolean(busy)}><Icon name={captureFault ? 'stop' : 'check'} size={14} />{captureFault ? t('finishDialog.confirmFault') : t('finishDialog.confirmNormal')}</button></footer>
+        <footer><button data-testid="finish-cancel" data-dialog-initial className="button" onClick={() => setFinishConfirmOpen(false)}>{captureFault ? t('finishDialog.stayFault') : t('common.cancel')}</button><button data-testid="finish-confirm" data-dialog-default className="button primary" onClick={() => void confirmFinishSession()} disabled={Boolean(busy)}><Icon name={captureFault ? 'stop' : 'check'} size={14} />{captureFault ? t('finishDialog.confirmFault') : t('finishDialog.confirmNormal')}</button></footer>
       </section>
     </div>}
     <StudioStatus engineStatus={engineStatus} message={error || dataSafetyAlert || busy || notice} isError={Boolean(error || dataSafetyAlert)} />

@@ -39,6 +39,30 @@ contextBridge.exposeInMainWorld('recorder', {
   platform: process.platform,
   devWebCapture: () => ipcRenderer.invoke('app:dev-web-capture'),
   request: (command: string, payload: unknown = {}) => ipcRenderer.invoke('engine:request', command, payload),
+  getInputAuditionDecision: (configuration: unknown) => (
+    ipcRenderer.invoke('input-audition:decision', configuration)
+  ),
+  clearInputAuditionDecision: (configuration: unknown) => (
+    ipcRenderer.invoke('input-audition:clear-decision', configuration)
+  ),
+  beginInputAudition: () => (
+    ipcRenderer.invoke('input-audition:begin_input_audition', {})
+  ),
+  finishInputAudition: (checkId: string) => (
+    ipcRenderer.invoke('input-audition:finish_input_audition', { check_id: checkId })
+  ),
+  confirmInputAudition: (checkId: string) => (
+    ipcRenderer.invoke('input-audition:confirm_input_audition', { check_id: checkId })
+  ),
+  skipInputAudition: (checkId?: string) => (
+    ipcRenderer.invoke(
+      'input-audition:skip_input_audition',
+      checkId ? { check_id: checkId } : {},
+    )
+  ),
+  cancelInputAudition: (checkId: string) => (
+    ipcRenderer.invoke('input-audition:cancel_input_audition', { check_id: checkId })
+  ),
   openScript: () => ipcRenderer.invoke('dialog:open-script'),
   chooseOutput: () => ipcRenderer.invoke('dialog:choose-output'),
   chooseExportDir: (defaultPath?: string, title?: string) => (

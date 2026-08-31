@@ -630,6 +630,54 @@ export function deriveTaskWorkflow(
   };
 }
 
+const HEAD_TAIL_WARNING_CODES = new Set<WorkflowReasonCode>([
+  'head_silence_short',
+  'tail_silence_short',
+]);
+
+/**
+ * Applies the task's operator-facing head/tail hint preference to derived UI
+ * and cuts-readiness state. The engine's attempt metrics and journal remain
+ * untouched; disabling the hint only removes the two corresponding warnings.
+ */
+export function applyHeadTailWarningPreference(
+  summary: TaskWorkflowSummary,
+  enabled: boolean,
+): TaskWorkflowSummary {
+  if (enabled) return summary;
+  const keep = (code: WorkflowReasonCode) => !HEAD_TAIL_WARNING_CODES.has(code);
+  const items = summary.items.map((item) => {
+    const warnings = item.warnings.filter(keep);
+    return {
+      ...item,
+      warnings,
+      deliveryHealth: item.deliveryHealth === 'warning' && warnings.length === 0
+        ? 'clear' as const
+        : item.deliveryHealth,
+    };
+  });
+  const filterReadiness = (readiness: DeliveryReadiness): DeliveryReadiness => {
+    const warningCodes = readiness.warningCodes.filter(keep);
+    return {
+      ...readiness,
+      warningCodes,
+      health: readiness.blockers.length > 0
+        ? 'blocked'
+        : warningCodes.length > 0
+          ? 'warning'
+          : 'clear',
+      requiresAcknowledgement: warningCodes.length > 0,
+    };
+  };
+  return {
+    ...summary,
+    items,
+    warningCount: items.filter((item) => item.deliveryHealth === 'warning').length,
+    confirmedOnly: filterReadiness(summary.confirmedOnly),
+    completeTask: filterReadiness(summary.completeTask),
+  };
+}
+
 export function deriveDataPreservationReadiness(
   snapshot: Partial<Pick<SessionSnapshot, 'status' | 'overflow_samples'>>,
 ): TaskWorkflowSummary['dataPreservation'] {
@@ -703,7 +751,15 @@ export function buildIssueWorkbench(
     && taskIssues.vadDiagnosticFaultCount > 0) {
     addTaskIssue('vad_diagnostics', 'warning');
   }
-  return issues;
+  const priority = (issue: WorkbenchIssue) => {
+    if (issue.severity === 'blocker' && issue.itemId === null) return 0;
+    if (issue.severity === 'blocker') return 1;
+    return 2;
+  };
+  return issues
+    .map((issue, index) => ({ issue, index }))
+    .sort((left, right) => priority(left.issue) - priority(right.issue) || left.index - right.index)
+    .map(({ issue }) => issue);
 }
 
 export function filterWorkbenchIssues(
@@ -725,6 +781,51 @@ export function adjacentWorkbenchIssue(
   const wrapped = raw < 0 || raw >= issues.length;
   const index = (raw + issues.length) % issues.length;
   return { issue: issues[index] ?? null, wrapped };
+}
+
+/**
+ * Keeps issue handling continuous without turning navigation into an implicit
+ * recording action. When the selected issue disappears after a mutation, use
+ * the first surviving issue that followed it in the previous queue; fall back
+ * to the nearest preceding survivor, then the new queue head.
+ */
+export function nextWorkbenchIssueAfterResolution(
+  previousIssues: readonly WorkbenchIssue[],
+  resolvedIssueId: string | null,
+  currentIssues: readonly WorkbenchIssue[],
+): WorkbenchIssue | null {
+  if (!currentIssues.length) return null;
+  if (!resolvedIssueId) return currentIssues[0] ?? null;
+  const stillSelected = currentIssues.find((issue) => issue.id === resolvedIssueId);
+  if (stillSelected) return stillSelected;
+  const previousIndex = previousIssues.findIndex((issue) => issue.id === resolvedIssueId);
+  if (previousIndex < 0) return currentIssues[0] ?? null;
+  const currentById = new Map(currentIssues.map((issue) => [issue.id, issue]));
+  for (let index = previousIndex + 1; index < previousIssues.length; index += 1) {
+    const survivor = currentById.get(previousIssues[index]?.id ?? '');
+    if (survivor) return survivor;
+  }
+  for (let index = previousIndex - 1; index >= 0; index -= 1) {
+    const survivor = currentById.get(previousIssues[index]?.id ?? '');
+    if (survivor) return survivor;
+  }
+  return currentIssues[0] ?? null;
+}
+
+export type SetupReadinessIssue = 'engine' | 'script' | 'output' | 'capture';
+
+export function setupReadinessIssues(input: {
+  engineReady: boolean;
+  scriptReady: boolean;
+  outputReady: boolean;
+  captureReady: boolean;
+}): SetupReadinessIssue[] {
+  const issues: SetupReadinessIssue[] = [];
+  if (!input.engineReady) issues.push('engine');
+  if (!input.scriptReady) issues.push('script');
+  if (!input.captureReady) issues.push('capture');
+  if (!input.outputReady) issues.push('output');
+  return issues;
 }
 
 export function normalizeWarningAcknowledgements(

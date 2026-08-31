@@ -203,6 +203,56 @@ async function main() {
     capture_provenance: fullProvenance,
     audio_format: fixture.audio_format,
   });
+
+  const headTailWarningSummary = structuredClone(healthSummary);
+  headTailWarningSummary.items[0].warnings = ['head_silence_short', 'tail_silence_short'];
+  headTailWarningSummary.items[0].deliveryHealth = 'warning';
+  headTailWarningSummary.warningCount = 1;
+  for (const readiness of [headTailWarningSummary.confirmedOnly, headTailWarningSummary.completeTask]) {
+    readiness.warningCodes = ['head_silence_short', 'tail_silence_short'];
+    readiness.health = 'warning';
+    readiness.requiresAcknowledgement = true;
+  }
+  assert.deepEqual(
+    headTailWarningSummary.completeTask.warningCodes,
+    ['head_silence_short', 'tail_silence_short'],
+    'enabled head/tail hints retain both derived warnings',
+  );
+  const headTailHintsOff = workflow.applyHeadTailWarningPreference(headTailWarningSummary, false);
+  assert.equal(headTailHintsOff.warningCount, 0, 'disabled head/tail hints clear item warning count');
+  assert.equal(headTailHintsOff.items[0].deliveryHealth, 'clear', 'disabled head/tail hints clear item health');
+  assert.deepEqual(headTailHintsOff.items[0].warnings, [], 'disabled head/tail hints clear item warnings');
+  assert.equal(headTailHintsOff.completeTask.health, 'clear', 'disabled head/tail hints clear export health');
+  assert.deepEqual(headTailHintsOff.completeTask.warningCodes, [], 'disabled head/tail hints clear export warnings');
+  assert.equal(headTailHintsOff.completeTask.requiresAcknowledgement, false, 'disabled hints need no acknowledgement');
+  assert.equal(
+    workflow.applyHeadTailWarningPreference(headTailWarningSummary, true),
+    headTailWarningSummary,
+    'enabled head/tail hints preserve the original summary',
+  );
+
+  const mixedHistoryHeadTailItem = structuredClone(byName.get('selected clean version'));
+  Object.assign(mixedHistoryHeadTailItem.attempts[0], {
+    head_silence_armed_sample: 100,
+    head_silence_passed_sample: 250,
+    required_head_silence_samples: 150,
+    tail_silence_samples: 0,
+    required_tail_silence_samples: 150,
+  });
+  const mixedHistoryWarnings = deriveHistorySummary({
+    status: 'stopped',
+    overflow_samples: 0,
+    committed_samples: fixture.committed_samples,
+    capture_provenance: fullProvenance,
+    items: [mixedHistoryHeadTailItem, byName.get('skipped item')],
+  });
+  assert.equal(mixedHistoryWarnings.warning_items, 2, 'history counts head/tail and skipped warning items');
+  assert.equal(
+    mixedHistoryWarnings.warning_items_without_head_tail,
+    1,
+    'disabling head/tail hints preserves the skipped history warning item',
+  );
+
   for (const scenario of fixture.vad_health_cases ?? []) {
     const healthIssues = workflow.buildIssueWorkbench(healthSummary, scenario.task_issues);
     assert.equal(
@@ -445,7 +495,43 @@ async function main() {
   assert.equal(first.issue, issues[0]);
   const wrapped = workflow.adjacentWorkbenchIssue(issues, issues.at(-1).id, 1);
   assert.equal(wrapped.issue, issues[0]);
+
+  const orderedIssues = workflow.buildIssueWorkbench(summary, { captureFault: true });
+  assert.equal(orderedIssues[0].kind, 'capture_fault', 'task blockers must lead the issue queue');
+  const firstWarning = orderedIssues.findIndex((issue) => issue.severity === 'warning');
+  const lastBlocker = orderedIssues.findLastIndex((issue) => issue.severity === 'blocker');
+  assert.ok(firstWarning < 0 || lastBlocker < firstWarning, 'all sentence blockers must precede warnings');
   assert.equal(wrapped.wrapped, true);
+
+  const issueA = { id: 'issue-a' };
+  const issueB = { id: 'issue-b' };
+  const issueC = { id: 'issue-c' };
+  assert.equal(
+    workflow.nextWorkbenchIssueAfterResolution([issueA, issueB, issueC], 'issue-b', [issueA, issueC]),
+    issueC,
+    'resolving a selected issue advances to the next surviving issue',
+  );
+  assert.equal(
+    workflow.nextWorkbenchIssueAfterResolution([issueA, issueB], 'issue-b', [issueA]),
+    issueA,
+    'resolving the last issue falls back to the nearest preceding survivor',
+  );
+  assert.equal(
+    workflow.nextWorkbenchIssueAfterResolution([issueA], 'issue-a', []),
+    null,
+    'resolving the final issue closes the queue',
+  );
+
+  assert.deepEqual(
+    workflow.setupReadinessIssues({ engineReady: false, scriptReady: false, captureReady: false, outputReady: false }),
+    ['engine', 'script', 'capture', 'output'],
+    'setup readiness reports every missing prerequisite in stable action order',
+  );
+  assert.deepEqual(
+    workflow.setupReadinessIssues({ engineReady: true, scriptReady: true, captureReady: true, outputReady: true }),
+    [],
+    'setup readiness is empty only when every structural prerequisite is satisfied',
+  );
 
   const values = new Map();
   const storage = {
@@ -457,6 +543,8 @@ async function main() {
   assert.deepEqual(context.loadWorkspaceContext('task-1', storage), {
     sessionId: 'task-1', currentItemId: '500', issueFilter: 'warning', panel: 'issues', updatedAt: 1,
   });
+  context.saveWorkspaceContext({ sessionId: 'task-settings', currentItemId: null, issueFilter: 'all', panel: 'settings', updatedAt: 2 }, storage);
+  assert.equal(context.loadWorkspaceContext('task-settings', storage)?.panel, 'settings', 'recording settings is a restorable inspector tab');
   for (let index = 2; index <= 102; index += 1) {
     context.saveWorkspaceContext({ sessionId: `task-${index}`, currentItemId: null, issueFilter: 'all', panel: 'monitor', updatedAt: index }, storage);
   }

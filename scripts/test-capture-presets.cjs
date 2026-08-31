@@ -64,6 +64,17 @@ async function main() {
   await assert.rejects(repository.save({ ...draft, name: 'Bad format', inputSampleFormat: 'pcm24' }), /采集格式/);
   const integerPreset = await repository.save({ ...draft, name: '32-int', bitDepth: 32, inputSampleFormat: 'i32' });
   assert.equal(integerPreset.presets.find((preset) => preset.name === '32-int').inputSampleFormat, 'i32');
+  const pcm16FromFloatInput = await repository.save({
+    ...draft,
+    name: 'PCM16 from ASIO F32',
+    bitDepth: 16,
+    inputSampleFormat: 'f32',
+  });
+  const decoupledPreset = pcm16FromFloatInput.presets.find((preset) => preset.name === 'PCM16 from ASIO F32');
+  assert.equal(decoupledPreset.bitDepth, 16,
+    '预设必须保留独立的 PCM16 交付位深');
+  assert.equal(decoupledPreset.inputSampleFormat, 'f32',
+    '预设必须同时保留驱动实际 F32 输入格式');
   const sharedPreset = await repository.save({ ...draft, name: 'Shared mixer', captureShareMode: 'shared' });
   assert.equal(sharedPreset.presets.find((preset) => preset.name === 'Shared mixer').captureShareMode, 'shared');
   const manyChannelDevice = await repository.save({ ...draft, name: 'Dante 128', inputChannel: 128 });

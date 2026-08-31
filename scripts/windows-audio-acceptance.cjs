@@ -93,7 +93,7 @@ function usage() {
   --device-id <id>               list_devices 返回的稳定设备 ID
   --device-index <n>             界面打印的 1-based 设备序号
   --sample-rate <hz>             默认 48000
-  --bit-depth <16|24|32>         交付 WAV 位深，默认 24
+  --bit-depth <16|24|32>         交付 WAV 位深，默认 16
   --share-mode <exclusive|shared> 开流模式，默认 exclusive（绕过 Windows 混音器）
   --minimum-input-format-bits <n> 驱动输入有效数字精度门槛；f32 按 24、f64 按 53；默认 16-bit 交付要求 16，24/32-bit 要求 24
   --channel <n>                  声卡输入通道（1-based），默认 1
@@ -170,7 +170,7 @@ function parseArgs(argv) {
     deviceId: null,
     deviceIndex: null,
     sampleRate: 48_000,
-    bitDepth: 24,
+    bitDepth: 16,
     shareMode: 'exclusive',
     minimumInputFormatBits: null,
     channel: 1,

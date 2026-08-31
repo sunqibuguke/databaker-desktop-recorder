@@ -23,8 +23,8 @@ use crate::vad::{
 };
 use crate::wav::{
     RecoverableWav, WavEncoding, WavExportMode, WavExportWriter, automatic_wav_container_name,
-    automatic_wav_file_size, slice_wav_mono, standard_wav_file_size, validate_standard_wav_size,
-    waveform_wav_mono,
+    automatic_wav_file_size, level_metrics_wav_mono, slice_wav_mono, standard_wav_file_size,
+    validate_standard_wav_size, waveform_wav_mono,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
@@ -104,6 +104,8 @@ const CAPTURE_CALLBACK_STALL_TIMEOUT: Duration = Duration::from_secs(5);
 // writing that valid timeline, but surface a strong operator warning after a
 // sustained run so it cannot be mistaken for a healthy microphone signal.
 const DIGITAL_SILENCE_WARNING_SECONDS: u64 = 10;
+const INPUT_AUDITION_SECONDS: u64 = 10;
+const INPUT_AUDITION_PREVIEW_FILE: &str = "input-audition.wav";
 const CAPTURE_FAULT_NONE: u32 = 0;
 const CAPTURE_FAULT_DEVICE_UNAVAILABLE: u32 = 1;
 const CAPTURE_FAULT_DEVICE_STALLED: u32 = 2;
@@ -255,7 +257,10 @@ pub struct ItemState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioFormat {
     pub sample_rate: u32,
-    #[serde(default = "default_bit_depth")]
+    // Historical snapshots that omitted this field were written when the
+    // engine default was 24-bit. Keep that read-time compatibility separate
+    // from the 16-bit default used for newly-created tasks.
+    #[serde(default = "legacy_default_bit_depth")]
     pub bit_depth: u16,
     #[serde(default = "default_audio_encoding")]
     pub encoding: String,
@@ -281,9 +286,102 @@ pub struct CaptureProvenanceSpan {
     pub capture_buffer_frames: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InputAuditionStatus {
+    Recording,
+    Ready,
+    Confirmed,
+    Skipped,
+    Warning,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InputAuditionDecisionSource {
+    CurrentAudition,
+    LaunchCache,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InputAuditionConfiguration {
+    /// Logical capture identity only. Raw endpoint IDs and USB topology are
+    /// intentionally excluded so moving the same interface to another port
+    /// does not invalidate an otherwise identical launch-scoped check.
+    pub device_name: String,
+    pub capture_backend: String,
+    pub sample_rate: u32,
+    pub bit_depth: u16,
+    pub input_sample_format: String,
+    pub input_channels: u16,
+    pub input_channel: u16,
+    pub capture_share_mode: CaptureShareMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_capture_buffer_frames: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_buffer_frames: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InputAuditionMetrics {
+    pub duration_samples: u64,
+    pub duration_seconds: f64,
+    pub peak_dbfs: f32,
+    pub rms_dbfs: f32,
+    pub waveform_bin_count: usize,
+    pub input_discontinuity_count: u64,
+    pub input_discontinuity_silence_samples: u64,
+    pub overflow_samples: u64,
+    #[serde(default)]
+    pub warning_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InputAudition {
+    pub status: InputAuditionStatus,
+    pub check_id: String,
+    pub capture_fingerprint: String,
+    pub configuration: InputAuditionConfiguration,
+    pub start_sample: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_sample: Option<u64>,
+    pub required_samples: u64,
+    #[serde(default)]
+    pub captured_samples: u64,
+    pub started_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_source: Option<InputAuditionDecisionSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_check_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_decided_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_capture_fingerprint: Option<String>,
+    #[serde(default)]
+    pub input_discontinuity_count_at_start: u64,
+    #[serde(default)]
+    pub input_discontinuity_silence_samples_at_start: u64,
+    #[serde(default)]
+    pub overflow_samples_at_start: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<InputAuditionMetrics>,
+    #[serde(default)]
+    pub warning_codes: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
     pub schema_version: u32,
+    #[serde(default = "legacy_unknown_version")]
+    pub app_version: String,
+    #[serde(default = "legacy_unknown_version")]
+    pub engine_version: String,
     #[serde(default)]
     pub journal_seq: u64,
     pub session_id: String,
@@ -342,6 +440,8 @@ pub struct SessionSnapshot {
     pub updated_at: String,
     #[serde(default)]
     pub noise_check: Option<NoiseCheckResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_audition: Option<InputAudition>,
     /// Ambient-room acceptance limit. This remains stable when the operator
     /// changes the task-wide silence threshold during capture.
     #[serde(default)]
@@ -385,8 +485,9 @@ pub struct StartSessionPayload {
     pub sample_rate: u32,
     #[serde(default = "default_bit_depth")]
     pub bit_depth: u16,
-    /// Requested WASAPI capture sample format (`i16` / `i24` / `i32` / `f32`).
-    /// Empty keeps the previous auto-pick from delivery bit depth.
+    /// Requested driver capture sample format (`i16` / `i24` / `i32` / `f32`).
+    /// This is independent from the WAV delivery bit depth. Empty lets the
+    /// engine choose a compatible native representation for the delivery.
     #[serde(default)]
     pub input_sample_format: String,
     #[serde(default = "default_input_channel")]
@@ -469,6 +570,25 @@ struct ExportSessionOptions<'a> {
 pub struct NoiseCheckPayload {
     #[serde(default = "default_noise_threshold_dbfs")]
     pub threshold_dbfs: f32,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct InputAuditionPayload {
+    pub check_id: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct SkipInputAuditionPayload {
+    #[serde(default)]
+    pub check_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdoptCachedInputAuditionPayload {
+    pub status: InputAuditionStatus,
+    pub source_check_id: String,
+    pub source_decided_at: String,
+    pub capture_fingerprint: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -589,7 +709,25 @@ fn default_sample_rate() -> u32 {
 }
 
 fn default_bit_depth() -> u16 {
+    16
+}
+
+fn legacy_default_bit_depth() -> u16 {
     24
+}
+
+fn legacy_unknown_version() -> String {
+    "unknown".to_string()
+}
+
+pub(crate) fn build_app_version() -> String {
+    option_env!("DATABAKER_APP_VERSION")
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+pub(crate) fn build_engine_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 fn default_storage_layout_version() -> u32 {
@@ -743,6 +881,15 @@ struct ActiveAttempt {
     recording_started_sample: u64,
     input_discontinuity_count_at_start: u64,
     input_discontinuity_silence_samples_at_start: u64,
+}
+
+#[derive(Debug, Clone)]
+struct InputAuditionRuntimeDecision {
+    check_id: String,
+    status: InputAuditionStatus,
+    capture_fingerprint: String,
+    input_discontinuity_count: u64,
+    overflow_samples: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1616,6 +1763,10 @@ pub struct RecordingSession {
     vad_tx: Option<Sender<VadControlMessage>>,
     vad_join: Option<JoinHandle<()>>,
     active_attempt: Option<ActiveAttempt>,
+    /// Process-local authorization for starting sentence attempts. Persisted
+    /// confirmed/skipped metadata alone cannot re-arm capture after an engine
+    /// rebuild; only a current decision or a main-process cache adoption can.
+    input_audition_decision: Option<InputAuditionRuntimeDecision>,
     metadata_fault: Option<String>,
     /// A stop command has already been placed behind every callback that
     /// entered the enqueue gate. Retries wait for the same writer instead of
@@ -1901,6 +2052,8 @@ impl Engine {
         })?;
         let snapshot = SessionSnapshot {
             schema_version: 1,
+            app_version: build_app_version(),
+            engine_version: build_engine_version(),
             journal_seq: 0,
             session_id: existing.session_id,
             script_name: existing.script_name,
@@ -1925,6 +2078,7 @@ impl Engine {
             started_at: now.clone(),
             updated_at: now,
             noise_check: None,
+            input_audition: None,
             noise_threshold_dbfs: Some(
                 existing
                     .noise_threshold_dbfs
@@ -2022,9 +2176,10 @@ impl Engine {
         }
         let requested_input_sample_format =
             parse_requested_input_sample_format(&payload.input_sample_format)?;
-        let bit_depth = requested_input_sample_format
-            .map(delivery_bit_depth_for_sample_format)
-            .unwrap_or(payload.bit_depth);
+        // The WAV delivery contract is independent from the driver's native
+        // sample representation. A professional interface may expose only
+        // I24/I32/F32 while the task still intentionally delivers PCM16.
+        let bit_depth = payload.bit_depth;
         let output_encoding = WavEncoding::for_bit_depth(bit_depth)?;
         let input_sample_format = requested_input_sample_format
             .map(|format| format.to_string())
@@ -2071,6 +2226,8 @@ impl Engine {
             normalize_capture_buffer_frames(&device_id, payload.capture_buffer_frames)?;
         let snapshot = SessionSnapshot {
             schema_version: 1,
+            app_version: build_app_version(),
+            engine_version: build_engine_version(),
             journal_seq: 0,
             session_id: payload.session_id,
             script_name: payload.script_name,
@@ -2102,6 +2259,7 @@ impl Engine {
             started_at: now.clone(),
             updated_at: now,
             noise_check: None,
+            input_audition: None,
             noise_threshold_dbfs: Some(
                 payload
                     .noise_threshold_dbfs
@@ -2614,6 +2772,25 @@ impl Engine {
         } else {
             0
         };
+        let interrupted_input_audition = if append
+            && snapshot.input_audition.as_ref().is_some_and(|audition| {
+                matches!(
+                    audition.status,
+                    InputAuditionStatus::Recording | InputAuditionStatus::Ready
+                )
+            }) {
+            let interrupted = terminalize_unresolved_input_audition(
+                &mut snapshot,
+                expected_existing_frames,
+                Utc::now().to_rfc3339(),
+            )?;
+            recovery_warnings.push(
+                "上次输入试听在进程结束前未完成，已按物理母轨边界标记为警告并保留。".to_string(),
+            );
+            interrupted
+        } else {
+            None
+        };
         begin_capture_provenance(
             &mut snapshot,
             previous_capture_source,
@@ -2629,32 +2806,7 @@ impl Engine {
             atomic_json(&session_dir.join("script/normalized.json"), &snapshot.items)?;
             atomic_json(
                 &session_dir.join("session.json"),
-                &json!({
-                    "schema_version": snapshot.schema_version,
-                    "journal_seq": snapshot.journal_seq,
-                    "session_id": snapshot.session_id,
-                    "script_name": snapshot.script_name,
-                    "status": snapshot.status,
-                    "device_name": snapshot.device_name,
-                    "device_id": snapshot.device_id,
-                    "input_sample_format": snapshot.input_sample_format,
-                    "capture_share_mode": snapshot.capture_share_mode,
-                    "capture_backend": snapshot.capture_backend,
-                    "requested_capture_buffer_frames": snapshot.requested_capture_buffer_frames,
-                    "capture_buffer_frames": snapshot.capture_buffer_frames,
-                    "capture_provenance": snapshot.capture_provenance,
-                    "audio_format": snapshot.audio_format,
-                    "storage_layout_version": snapshot.storage_layout_version,
-                    "segment_frames": snapshot.segment_frames,
-                    "input_discontinuity_count": snapshot.input_discontinuity_count,
-                    "input_discontinuity_silence_samples": snapshot.input_discontinuity_silence_samples,
-                    "noise_threshold_dbfs": snapshot.noise_threshold_dbfs,
-                    "silence_duration_ms": snapshot.silence_duration_ms,
-                    "silence_threshold_dbfs": snapshot.silence_threshold_dbfs,
-                    "silence_detector": snapshot.silence_detector,
-                    "started_at": snapshot.started_at,
-                    "updated_at": snapshot.updated_at,
-                }),
+                &session_summary_value(&snapshot),
             )?;
         }
 
@@ -2850,6 +3002,7 @@ impl Engine {
             vad_tx: Some(vad_tx),
             vad_join: Some(vad_join),
             active_attempt: None,
+            input_audition_decision: None,
             metadata_fault: None,
             stop_requested: false,
             capture_stopped: false,
@@ -3218,6 +3371,25 @@ impl Engine {
             }
         };
         session.telemetry_join = Some(telemetry_join);
+        if let Some(interrupted) = interrupted_input_audition
+            && let Err(error) = session.persist(
+                "input_audition_interrupted",
+                json!({
+                    "check_id": interrupted.check_id,
+                    "start_sample": interrupted.start_sample,
+                    "end_sample": interrupted.end_sample,
+                    "capture_fingerprint": interrupted.capture_fingerprint,
+                    "warning_codes": interrupted.warning_codes,
+                    "reason": "capture_process_interrupted",
+                }),
+            )
+        {
+            return Err(self.finish_activation_failure(
+                session,
+                "persist_interrupted_input_audition",
+                error.context("persist interrupted input audition range"),
+            ));
+        }
         if let Err(error) = session.persist(
             event_name,
             json!({
@@ -3431,6 +3603,572 @@ impl Engine {
         }))
     }
 
+    pub fn begin_input_audition(&mut self) -> Result<Value> {
+        let session = self.active_session_mut()?;
+        session.ensure_metadata_mutation_allowed()?;
+        if session.active_attempt.is_some() {
+            bail!("cannot begin input audition while an attempt is recording");
+        }
+        if session.faulted.load(Ordering::Acquire) || session.overflow.load(Ordering::Acquire) > 0 {
+            bail!("音频采集已发生故障或数据溢出，无法开始输入试听");
+        }
+        // Beginning a new check immediately retires every earlier runtime
+        // decision. Cancelling or warning out of this check must never revive
+        // an older confirmation from the same process.
+        session.input_audition_decision = None;
+        let capture_fingerprint = input_audition_capture_fingerprint(&session.snapshot)?;
+        if let Some(existing) = session.snapshot.input_audition.as_ref()
+            && existing.status == InputAuditionStatus::Recording
+        {
+            if existing.capture_fingerprint != capture_fingerprint {
+                bail!("输入设备参数已变化，请先取消当前输入试听后重试");
+            }
+            let mut audition = existing.clone();
+            audition.captured_samples = session
+                .captured
+                .load(Ordering::Acquire)
+                .saturating_sub(audition.start_sample)
+                .min(audition.required_samples);
+            return Ok(json!({
+                "check_id": audition.check_id,
+                "required_samples": audition.required_samples,
+                "captured_samples": audition.captured_samples,
+                "capture_fingerprint": audition.capture_fingerprint,
+                "input_audition": audition,
+                "snapshot": session.live_snapshot(),
+            }));
+        }
+
+        let started_at = Utc::now().to_rfc3339();
+        let start_sample = session.captured.load(Ordering::Acquire);
+        let required_samples =
+            input_audition_required_samples(session.snapshot.audio_format.sample_rate)?;
+        let audition = InputAudition {
+            status: InputAuditionStatus::Recording,
+            check_id: format!(
+                "input-audition-{}-{}",
+                session.snapshot.journal_seq.saturating_add(1),
+                Utc::now().timestamp_micros()
+            ),
+            capture_fingerprint: capture_fingerprint.clone(),
+            configuration: input_audition_configuration(&session.snapshot),
+            start_sample,
+            end_sample: None,
+            required_samples,
+            captured_samples: 0,
+            started_at,
+            completed_at: None,
+            confirmed_at: None,
+            skipped_at: None,
+            decision_source: None,
+            source_check_id: None,
+            source_decided_at: None,
+            source_capture_fingerprint: None,
+            input_discontinuity_count_at_start: session
+                .capture_recovery
+                .discontinuities
+                .load(Ordering::Acquire),
+            input_discontinuity_silence_samples_at_start: session
+                .capture_recovery
+                .inserted_silence_frames
+                .load(Ordering::Acquire),
+            overflow_samples_at_start: session.overflow.load(Ordering::Acquire),
+            metrics: None,
+            warning_codes: Vec::new(),
+        };
+        session.snapshot.input_audition = Some(audition.clone());
+        session.persist(
+            "input_audition_started",
+            json!({
+                "check_id": audition.check_id,
+                "start_sample": audition.start_sample,
+                "end_sample": Value::Null,
+                "required_samples": audition.required_samples,
+                "capture_fingerprint": audition.capture_fingerprint,
+                "configuration": audition.configuration,
+            }),
+        )?;
+        Ok(json!({
+            "check_id": audition.check_id,
+            "required_samples": audition.required_samples,
+            "captured_samples": 0,
+            "capture_fingerprint": capture_fingerprint,
+            "input_audition": session.snapshot.input_audition,
+            "snapshot": session.live_snapshot(),
+        }))
+    }
+
+    pub fn finish_input_audition(&mut self, check_id: &str) -> Result<Value> {
+        const CAPTURE_BOUNDARY_WAIT: Duration = Duration::from_secs(2);
+
+        let session = self.active_session_mut()?;
+        session.ensure_metadata_mutation_allowed()?;
+        if session.active_attempt.is_some() {
+            bail!("cannot finish input audition while an attempt is recording");
+        }
+        let mut audition = session
+            .snapshot
+            .input_audition
+            .clone()
+            .context("没有正在进行的输入试听")?;
+        if audition.check_id != check_id {
+            bail!("输入试听已更换，拒绝处理过期的完成命令");
+        }
+        let current_fingerprint = input_audition_capture_fingerprint(&session.snapshot)?;
+        if audition.capture_fingerprint != current_fingerprint {
+            bail!("输入设备参数已变化，请重新进行输入试听");
+        }
+
+        if matches!(
+            audition.status,
+            InputAuditionStatus::Ready | InputAuditionStatus::Warning
+        ) {
+            let end_sample = audition.end_sample.context("输入试听缺少结束样本")?;
+            let metrics = audition.metrics.clone().context("输入试听缺少完成指标")?;
+            let (destination, bins) =
+                render_input_audition_preview(session, &audition, end_sample)?;
+            return Ok(input_audition_finish_value(
+                session,
+                &audition,
+                destination,
+                bins,
+                &metrics,
+            ));
+        }
+        if audition.status != InputAuditionStatus::Recording {
+            bail!("输入试听已经确认或跳过，请重新开始后再生成试听文件");
+        }
+
+        let target_end = audition
+            .start_sample
+            .checked_add(audition.required_samples)
+            .context("输入试听结束样本溢出")?;
+        let captured = session.wait_until_captured(target_end, CAPTURE_BOUNDARY_WAIT);
+        let end_sample = captured.min(target_end);
+        if end_sample <= audition.start_sample {
+            bail!("输入试听没有捕获到可播放的音频");
+        }
+        session.wait_until_committed(end_sample)?;
+        let (destination, bins) = render_input_audition_preview(session, &audition, end_sample)?;
+        let duration_samples = end_sample - audition.start_sample;
+        let (peak, rms) = level_metrics_wav_mono(
+            &destination,
+            session.snapshot.audio_format.bit_depth,
+            0,
+            duration_samples,
+        )?;
+        let input_discontinuity_count = session
+            .capture_recovery
+            .discontinuities
+            .load(Ordering::Acquire)
+            .saturating_sub(audition.input_discontinuity_count_at_start);
+        let input_discontinuity_silence_samples = session
+            .capture_recovery
+            .inserted_silence_frames
+            .load(Ordering::Acquire)
+            .saturating_sub(audition.input_discontinuity_silence_samples_at_start);
+        let overflow_samples = session
+            .overflow
+            .load(Ordering::Acquire)
+            .saturating_sub(audition.overflow_samples_at_start);
+        let warning_codes = input_audition_warning_codes(
+            duration_samples,
+            audition.required_samples,
+            peak,
+            rms,
+            input_discontinuity_count,
+            overflow_samples,
+        );
+        let metrics = InputAuditionMetrics {
+            duration_samples,
+            duration_seconds: duration_samples as f64
+                / f64::from(session.snapshot.audio_format.sample_rate),
+            peak_dbfs: linear_to_dbfs(peak),
+            rms_dbfs: linear_to_dbfs(rms),
+            waveform_bin_count: bins.len(),
+            input_discontinuity_count,
+            input_discontinuity_silence_samples,
+            overflow_samples,
+            warning_codes: warning_codes.clone(),
+        };
+        audition.status = if warning_codes.is_empty() {
+            InputAuditionStatus::Ready
+        } else {
+            InputAuditionStatus::Warning
+        };
+        audition.end_sample = Some(end_sample);
+        audition.captured_samples = duration_samples;
+        audition.completed_at = Some(Utc::now().to_rfc3339());
+        audition.metrics = Some(metrics.clone());
+        audition.warning_codes = warning_codes.clone();
+        session.snapshot.input_audition = Some(audition.clone());
+        session.persist(
+            "input_audition_finished",
+            json!({
+                "check_id": audition.check_id,
+                "status": audition.status,
+                "start_sample": audition.start_sample,
+                "end_sample": end_sample,
+                "required_samples": audition.required_samples,
+                "capture_fingerprint": audition.capture_fingerprint,
+                "metrics": metrics,
+                "warning_codes": warning_codes,
+            }),
+        )?;
+        Ok(input_audition_finish_value(
+            session,
+            &audition,
+            destination,
+            bins,
+            &metrics,
+        ))
+    }
+
+    pub fn confirm_input_audition(&mut self, check_id: &str) -> Result<Value> {
+        let session = self.active_session_mut()?;
+        session.ensure_metadata_mutation_allowed()?;
+        if session.active_attempt.is_some() {
+            bail!("cannot confirm input audition while an attempt is recording");
+        }
+        let mut audition = session
+            .snapshot
+            .input_audition
+            .clone()
+            .context("没有可确认的输入试听")?;
+        if audition.check_id != check_id {
+            bail!("输入试听已更换，拒绝处理过期的确认命令");
+        }
+        if audition.status == InputAuditionStatus::Confirmed {
+            session.ensure_input_audition_decision()?;
+            return Ok(json!({
+                "capture_fingerprint": audition.capture_fingerprint,
+                "input_audition": audition,
+                "snapshot": session.live_snapshot(),
+            }));
+        }
+        if audition.status != InputAuditionStatus::Ready {
+            bail!("只有完整且无采集警告的 10 秒输入试听可以确认");
+        }
+        audition.status = InputAuditionStatus::Confirmed;
+        let confirmed_at = Utc::now().to_rfc3339();
+        audition.confirmed_at = Some(confirmed_at.clone());
+        audition.decision_source = Some(InputAuditionDecisionSource::CurrentAudition);
+        audition.source_check_id = Some(audition.check_id.clone());
+        audition.source_decided_at = Some(confirmed_at);
+        audition.source_capture_fingerprint = Some(audition.capture_fingerprint.clone());
+        session.snapshot.input_audition = Some(audition.clone());
+        session.persist(
+            "input_audition_confirmed",
+            json!({
+                "check_id": audition.check_id,
+                "capture_fingerprint": audition.capture_fingerprint,
+                "start_sample": audition.start_sample,
+                "end_sample": audition.end_sample,
+                "confirmed_at": audition.confirmed_at,
+                "decision_source": audition.decision_source,
+            }),
+        )?;
+        let persisted = session
+            .snapshot
+            .input_audition
+            .clone()
+            .context("输入试听确认已持久化但当前投影缺失")?;
+        session.arm_input_audition_decision(&persisted)?;
+        Ok(json!({
+            "capture_fingerprint": audition.capture_fingerprint,
+            "input_audition": session.snapshot.input_audition,
+            "snapshot": session.live_snapshot(),
+        }))
+    }
+
+    pub fn skip_input_audition(&mut self, check_id: Option<&str>) -> Result<Value> {
+        let session = self.active_session_mut()?;
+        session.ensure_metadata_mutation_allowed()?;
+        if session.active_attempt.is_some() {
+            bail!("cannot skip input audition while an attempt is recording");
+        }
+        if session.faulted.load(Ordering::Acquire) || session.overflow.load(Ordering::Acquire) > 0 {
+            bail!("音频采集已发生故障或数据溢出，无法记录输入试听跳过决定");
+        }
+        let capture_fingerprint = input_audition_capture_fingerprint(&session.snapshot)?;
+        let now = Utc::now().to_rfc3339();
+        let captured = session.checkpoint()?;
+        let existing_audition = match session.snapshot.input_audition.clone() {
+            // A terminal decision belongs to an earlier launch/gate. A new
+            // explicit skip has no check_id and must create a fresh audit
+            // decision instead of mutating that old terminal record.
+            Some(existing)
+                if matches!(
+                    existing.status,
+                    InputAuditionStatus::Confirmed | InputAuditionStatus::Skipped
+                ) && check_id.is_none() =>
+            {
+                None
+            }
+            Some(existing) if existing.status == InputAuditionStatus::Confirmed => {
+                bail!("输入试听已经确认，不能用旧操作标识改为跳过")
+            }
+            Some(existing) if existing.status == InputAuditionStatus::Skipped => {
+                if check_id.is_some_and(|provided| provided != existing.check_id) {
+                    bail!("输入试听已更换，拒绝处理过期的跳过命令");
+                }
+                session.ensure_input_audition_decision()?;
+                return Ok(json!({
+                    "capture_fingerprint": existing.capture_fingerprint,
+                    "input_audition": existing,
+                    "snapshot": session.live_snapshot(),
+                }));
+            }
+            Some(existing) if existing.status == InputAuditionStatus::Recording => {
+                bail!("输入试听仍在录制，请先完成或取消当前试听")
+            }
+            Some(existing) => {
+                let provided = check_id.context("跳过当前输入试听必须提供 check_id")?;
+                if provided != existing.check_id {
+                    bail!("输入试听已更换，拒绝处理过期的跳过命令");
+                }
+                Some(existing)
+            }
+            None => None,
+        };
+        let required_samples =
+            input_audition_required_samples(session.snapshot.audio_format.sample_rate)?;
+        let mut audition = existing_audition.unwrap_or_else(|| InputAudition {
+            status: InputAuditionStatus::Skipped,
+            check_id: format!(
+                "input-audition-{}-{}",
+                session.snapshot.journal_seq.saturating_add(1),
+                Utc::now().timestamp_micros()
+            ),
+            capture_fingerprint: capture_fingerprint.clone(),
+            configuration: input_audition_configuration(&session.snapshot),
+            start_sample: captured,
+            end_sample: Some(captured),
+            required_samples,
+            captured_samples: 0,
+            started_at: now.clone(),
+            completed_at: None,
+            confirmed_at: None,
+            skipped_at: None,
+            decision_source: None,
+            source_check_id: None,
+            source_decided_at: None,
+            source_capture_fingerprint: None,
+            input_discontinuity_count_at_start: session
+                .capture_recovery
+                .discontinuities
+                .load(Ordering::Acquire),
+            input_discontinuity_silence_samples_at_start: session
+                .capture_recovery
+                .inserted_silence_frames
+                .load(Ordering::Acquire),
+            overflow_samples_at_start: session.overflow.load(Ordering::Acquire),
+            metrics: None,
+            warning_codes: Vec::new(),
+        });
+        if session.snapshot.input_audition.is_none() && check_id.is_some() {
+            bail!("当前没有可与 check_id 匹配的输入试听");
+        }
+        audition.status = InputAuditionStatus::Skipped;
+        audition.capture_fingerprint = capture_fingerprint.clone();
+        audition.configuration = input_audition_configuration(&session.snapshot);
+        audition.end_sample.get_or_insert(captured);
+        audition.captured_samples = audition
+            .end_sample
+            .unwrap_or(captured)
+            .saturating_sub(audition.start_sample);
+        audition.skipped_at = Some(now.clone());
+        audition.decision_source = Some(InputAuditionDecisionSource::CurrentAudition);
+        audition.source_check_id = Some(audition.check_id.clone());
+        audition.source_decided_at = Some(now);
+        audition.source_capture_fingerprint = Some(audition.capture_fingerprint.clone());
+        session.snapshot.input_audition = Some(audition.clone());
+        session.persist(
+            "input_audition_skipped",
+            json!({
+                "check_id": audition.check_id,
+                "capture_fingerprint": audition.capture_fingerprint,
+                "start_sample": audition.start_sample,
+                "end_sample": audition.end_sample,
+                "skipped_at": audition.skipped_at,
+                "decision_source": audition.decision_source,
+            }),
+        )?;
+        let persisted = session
+            .snapshot
+            .input_audition
+            .clone()
+            .context("输入试听跳过决定已持久化但当前投影缺失")?;
+        session.arm_input_audition_decision(&persisted)?;
+        Ok(json!({
+            "capture_fingerprint": capture_fingerprint,
+            "input_audition": session.snapshot.input_audition,
+            "snapshot": session.live_snapshot(),
+        }))
+    }
+
+    pub fn cancel_input_audition(&mut self, check_id: &str) -> Result<Value> {
+        let session = self.active_session_mut()?;
+        session.ensure_metadata_mutation_allowed()?;
+        if session.active_attempt.is_some() {
+            bail!("cannot cancel input audition while an attempt is recording");
+        }
+        let Some(cancelled) = session.snapshot.input_audition.clone() else {
+            bail!("当前没有可取消的输入试听");
+        };
+        if cancelled.check_id != check_id {
+            bail!("输入试听已更换，拒绝处理过期的取消命令");
+        }
+        if matches!(
+            cancelled.status,
+            InputAuditionStatus::Confirmed | InputAuditionStatus::Skipped
+        ) {
+            bail!("输入试听已经确认或跳过，不能取消最终决定");
+        }
+        // A cancelled recheck must never revive the decision that existed
+        // before `begin_input_audition` retired it.
+        session.input_audition_decision = None;
+        let committed = session.checkpoint()?;
+        let end_sample = if cancelled.status == InputAuditionStatus::Recording {
+            committed
+        } else {
+            cancelled.end_sample.unwrap_or(committed)
+        };
+        if end_sample < cancelled.start_sample || end_sample > committed {
+            bail!("输入试听起点尚未写入母轨，暂时不能安全取消");
+        }
+        session.snapshot.input_audition = None;
+        session.persist(
+            "input_audition_cancelled",
+            json!({
+                "check_id": cancelled.check_id,
+                "previous_status": cancelled.status,
+                "capture_fingerprint": cancelled.capture_fingerprint,
+                "start_sample": cancelled.start_sample,
+                "end_sample": end_sample,
+                "cancelled_at": Utc::now().to_rfc3339(),
+            }),
+        )?;
+        Ok(json!({
+            "capture_fingerprint": cancelled.capture_fingerprint,
+            "input_audition": Value::Null,
+            "snapshot": session.live_snapshot(),
+        }))
+    }
+
+    pub fn invalidate_input_audition_decision(&mut self) -> Result<Value> {
+        let session = self.active_session_mut()?;
+        session.ensure_metadata_mutation_allowed()?;
+        if session.active_attempt.is_some() {
+            bail!("cannot invalidate input audition while an attempt is recording");
+        }
+        session.input_audition_decision = None;
+        Ok(json!({
+            "input_audition": session.snapshot.input_audition,
+            "snapshot": session.live_snapshot(),
+        }))
+    }
+
+    pub fn adopt_cached_input_audition(
+        &mut self,
+        payload: AdoptCachedInputAuditionPayload,
+    ) -> Result<Value> {
+        let session = self.active_session_mut()?;
+        session.ensure_metadata_mutation_allowed()?;
+        if session.active_attempt.is_some() {
+            bail!("cannot adopt input audition while an attempt is recording");
+        }
+        if session.faulted.load(Ordering::Acquire) || session.overflow.load(Ordering::Acquire) > 0 {
+            bail!("音频采集已发生故障或数据溢出，不能复用输入试听决定");
+        }
+        if !matches!(
+            payload.status,
+            InputAuditionStatus::Confirmed | InputAuditionStatus::Skipped
+        ) {
+            bail!("缓存的输入试听决定必须是已确认或已跳过");
+        }
+        let source_check_id = payload.source_check_id.trim();
+        if source_check_id.is_empty() || source_check_id.len() > 128 {
+            bail!("缓存的输入试听操作标识无效");
+        }
+        let source_decided_at = payload.source_decided_at.trim();
+        chrono::DateTime::parse_from_rfc3339(source_decided_at)
+            .context("缓存的输入试听决定时间无效")?;
+        let source_capture_fingerprint = payload.capture_fingerprint.trim();
+        if source_capture_fingerprint.is_empty() || source_capture_fingerprint.len() > 256 {
+            bail!("缓存的采集指纹无效");
+        }
+
+        let capture_fingerprint = input_audition_capture_fingerprint(&session.snapshot)?;
+        if source_capture_fingerprint != capture_fingerprint {
+            bail!("缓存的输入试听决定不属于当前采集配置，请重新试听");
+        }
+        let captured = session.checkpoint()?;
+        let now = Utc::now().to_rfc3339();
+        let required_samples =
+            input_audition_required_samples(session.snapshot.audio_format.sample_rate)?;
+        let check_id = format!(
+            "input-audition-cache-{}-{}",
+            session.snapshot.journal_seq.saturating_add(1),
+            Utc::now().timestamp_micros()
+        );
+        let audition = InputAudition {
+            status: payload.status,
+            check_id,
+            capture_fingerprint: capture_fingerprint.clone(),
+            configuration: input_audition_configuration(&session.snapshot),
+            start_sample: captured,
+            end_sample: Some(captured),
+            required_samples,
+            captured_samples: 0,
+            started_at: now.clone(),
+            completed_at: Some(now.clone()),
+            confirmed_at: (payload.status == InputAuditionStatus::Confirmed).then(|| now.clone()),
+            skipped_at: (payload.status == InputAuditionStatus::Skipped).then(|| now.clone()),
+            decision_source: Some(InputAuditionDecisionSource::LaunchCache),
+            source_check_id: Some(source_check_id.to_string()),
+            source_decided_at: Some(source_decided_at.to_string()),
+            source_capture_fingerprint: Some(source_capture_fingerprint.to_string()),
+            input_discontinuity_count_at_start: session
+                .capture_recovery
+                .discontinuities
+                .load(Ordering::Acquire),
+            input_discontinuity_silence_samples_at_start: session
+                .capture_recovery
+                .inserted_silence_frames
+                .load(Ordering::Acquire),
+            overflow_samples_at_start: session.overflow.load(Ordering::Acquire),
+            metrics: None,
+            warning_codes: Vec::new(),
+        };
+        session.snapshot.input_audition = Some(audition.clone());
+        session.persist(
+            "input_audition_adopted",
+            json!({
+                "check_id": audition.check_id,
+                "status": audition.status,
+                "capture_fingerprint": audition.capture_fingerprint,
+                "decision_source": audition.decision_source,
+                "source_check_id": audition.source_check_id,
+                "source_decided_at": audition.source_decided_at,
+                "source_capture_fingerprint": audition.source_capture_fingerprint,
+                "start_sample": audition.start_sample,
+                "end_sample": audition.end_sample,
+            }),
+        )?;
+        let persisted = session
+            .snapshot
+            .input_audition
+            .clone()
+            .context("缓存的输入试听决定已持久化但当前投影缺失")?;
+        session.arm_input_audition_decision(&persisted)?;
+        Ok(json!({
+            "capture_fingerprint": capture_fingerprint,
+            "input_audition": session.snapshot.input_audition,
+            "snapshot": session.live_snapshot(),
+        }))
+    }
+
     #[cfg(feature = "system-test")]
     pub fn system_test_checkpoint(&mut self) -> Result<Value> {
         let session = self.active_system_test_session_mut()?;
@@ -3588,12 +4326,13 @@ impl Engine {
     pub fn start_attempt(&mut self, item_id: &str, enforce_silence: bool) -> Result<Value> {
         let session = self.active_session_mut()?;
         session.ensure_metadata_mutation_allowed()?;
-        if session.faulted.load(Ordering::Acquire) {
+        if session.faulted.load(Ordering::Acquire) || session.overflow.load(Ordering::Acquire) > 0 {
             bail!("音频写盘异常，请结束并恢复当前录制");
         }
         if session.active_attempt.is_some() {
             bail!("an attempt is already recording");
         }
+        session.ensure_input_audition_decision()?;
         let item = session
             .snapshot
             .items
@@ -4289,6 +5028,12 @@ impl Engine {
         } else {
             snapshot.status == "stopped"
         };
+        let unresolved_input_audition = snapshot.input_audition.as_ref().is_some_and(|audition| {
+            matches!(
+                audition.status,
+                InputAuditionStatus::Recording | InputAuditionStatus::Ready
+            )
+        });
         if claimed_final
             && !final_audio_mismatch
             && !has_interrupted_recovery
@@ -4296,6 +5041,7 @@ impl Engine {
             && final_status_consistent
             && !journal_requires_rewrite
             && !provenance_recovered
+            && !unresolved_input_audition
         {
             return Ok(json!({
                 "session_dir": session_dir,
@@ -4325,6 +5071,16 @@ impl Engine {
         let fault_preserved =
             marker_present || snapshot.status == "faulted" || snapshot.overflow_samples > 0;
         let previous_status = snapshot.status.clone();
+        let terminal_input_audition = terminalize_unresolved_input_audition(
+            &mut snapshot,
+            durable_frames,
+            Utc::now().to_rfc3339(),
+        )?;
+        if terminal_input_audition.is_some() {
+            warnings.push(
+                "未确认的输入试听已在离线封存时归为警告，不会以运行态进入最终元数据。".to_string(),
+            );
+        }
         snapshot.status = if fault_preserved {
             "faulted".to_string()
         } else {
@@ -4346,6 +5102,7 @@ impl Engine {
                 "durable_frames": durable_frames,
                 "recovered_attempts": recovered_attempts,
                 "fault_preserved": fault_preserved,
+                "input_audition": terminal_input_audition,
             },
             "captured_samples": snapshot.captured_samples,
             "committed_samples": snapshot.committed_samples,
@@ -4391,7 +5148,8 @@ impl Engine {
             projection_failures.push(format!("update session summary: {error:#}"));
         }
         if projection_failures.is_empty()
-            && let Err(error) = atomic_json_line(&event_path, &event_value)
+            && let Err(error) =
+                compact_journal_preserving_input_auditions(&event_path, &event_value)
         {
             projection_failures.push(format!("compact journal: {error:#}"));
         }
@@ -5006,6 +5764,8 @@ impl Engine {
         }
         let metadata = json!({
             "schema_version": 1,
+            "app_version": snapshot.app_version,
+            "engine_version": snapshot.engine_version,
             "session_id": snapshot.session_id,
             "script_name": snapshot.script_name,
             "device_name": snapshot.device_name,
@@ -5022,6 +5782,7 @@ impl Engine {
             "input_discontinuity_count": snapshot.input_discontinuity_count,
             "input_discontinuity_silence_samples": snapshot.input_discontinuity_silence_samples,
             "noise_check": snapshot.noise_check,
+            "input_audition": snapshot.input_audition,
             "silence_policy": {
                 "duration_ms": snapshot.silence_duration_ms,
                 "threshold_dbfs": snapshot.silence_threshold_dbfs,
@@ -5069,8 +5830,8 @@ impl Engine {
                 .collect::<Result<Vec<_>>>()?;
             let manifest = json!({
                 "schema_version": 1,
-                "engine_version": env!("CARGO_PKG_VERSION"),
-                "app_version": option_env!("DATABAKER_APP_VERSION").unwrap_or("unknown"),
+                "engine_version": snapshot.engine_version,
+                "app_version": snapshot.app_version,
                 "session_id": snapshot.session_id,
                 "export_id": export_id,
                 "scope": export_scope,
@@ -5081,6 +5842,7 @@ impl Engine {
                 "excluded": metadata["skipped"],
                 "warnings": export_warnings,
                 "acknowledged_warning_codes": effective_acknowledged_warning_codes,
+                "input_audition": snapshot.input_audition,
             });
             atomic_json(&cuts_manifest_path, &manifest)?;
             let manifest_bytes =
@@ -5375,7 +6137,7 @@ fn persist_offline_snapshot(
         projection_failures.push(format!("update session summary: {error:#}"));
     }
     if projection_failures.is_empty()
-        && let Err(error) = atomic_json_line(&event_path, &event_value)
+        && let Err(error) = compact_journal_preserving_input_auditions(&event_path, &event_value)
     {
         projection_failures.push(format!("compact journal: {error:#}"));
     }
@@ -5829,9 +6591,209 @@ fn reconcile_capture_provenance_after_recovery(
     Ok(true)
 }
 
+fn input_audition_configuration(snapshot: &SessionSnapshot) -> InputAuditionConfiguration {
+    InputAuditionConfiguration {
+        device_name: snapshot.device_name.clone(),
+        capture_backend: snapshot.capture_backend.clone(),
+        sample_rate: snapshot.audio_format.sample_rate,
+        bit_depth: snapshot.audio_format.bit_depth,
+        input_sample_format: snapshot.input_sample_format.clone(),
+        input_channels: snapshot.audio_format.input_channels,
+        input_channel: snapshot.audio_format.input_channel,
+        capture_share_mode: snapshot.capture_share_mode,
+        requested_capture_buffer_frames: snapshot.requested_capture_buffer_frames,
+        capture_buffer_frames: snapshot.capture_buffer_frames,
+    }
+}
+
+fn input_audition_capture_fingerprint(snapshot: &SessionSnapshot) -> Result<String> {
+    let mut configuration = input_audition_configuration(snapshot);
+    configuration.device_name = normalize_logical_input_device_name(
+        &configuration.capture_backend,
+        &configuration.device_name,
+    );
+    let encoded = serde_json::to_vec(&configuration)
+        .context("serialize input audition capture configuration")?;
+    let mut digest = Sha256::new();
+    digest.update(encoded);
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+fn normalize_logical_input_device_name(backend: &str, device_name: &str) -> String {
+    if !backend.trim().eq_ignore_ascii_case("wasapi") {
+        return device_name.to_string();
+    }
+    let mut normalized = String::with_capacity(device_name.len());
+    let chars = device_name.chars().collect::<Vec<_>>();
+    let mut cursor = 0;
+    while cursor < chars.len() {
+        if chars[cursor] != '(' {
+            normalized.push(chars[cursor]);
+            cursor += 1;
+            continue;
+        }
+        normalized.push('(');
+        cursor += 1;
+        let digits_start = cursor;
+        while cursor < chars.len() && chars[cursor].is_ascii_digit() {
+            cursor += 1;
+        }
+        if cursor == digits_start {
+            continue;
+        }
+        while cursor < chars.len() && chars[cursor].is_whitespace() {
+            cursor += 1;
+        }
+        if cursor < chars.len() && chars[cursor] == '-' {
+            cursor += 1;
+            while cursor < chars.len() && chars[cursor].is_whitespace() {
+                cursor += 1;
+            }
+        } else {
+            normalized.extend(chars[digits_start..cursor].iter());
+        }
+    }
+    normalized
+}
+
+fn input_audition_required_samples(sample_rate: u32) -> Result<u64> {
+    if sample_rate == 0 {
+        bail!("录制任务的采样率无效");
+    }
+    u64::from(sample_rate)
+        .checked_mul(INPUT_AUDITION_SECONDS)
+        .context("计算输入试听样本数溢出")
+}
+
+fn input_audition_warning_codes(
+    duration_samples: u64,
+    required_samples: u64,
+    peak: f32,
+    rms: f32,
+    discontinuities: u64,
+    overflow_samples: u64,
+) -> Vec<String> {
+    let mut warning_codes = Vec::<String>::new();
+    if peak <= 0.000_031_7 && rms <= 0.000_031_7 {
+        warning_codes.push("digital_silence".to_string());
+    }
+    if peak >= 0.999 {
+        warning_codes.push("clipping".to_string());
+    }
+    if discontinuities > 0 {
+        warning_codes.push("input_discontinuity".to_string());
+    }
+    if overflow_samples > 0 {
+        warning_codes.push("overflow".to_string());
+    }
+    if duration_samples != required_samples {
+        warning_codes.push("too_short".to_string());
+    }
+    warning_codes
+}
+
+fn terminalize_unresolved_input_audition(
+    snapshot: &mut SessionSnapshot,
+    durable_samples: u64,
+    completed_at: String,
+) -> Result<Option<InputAudition>> {
+    let Some(audition) = snapshot.input_audition.as_mut() else {
+        return Ok(None);
+    };
+    if !matches!(
+        audition.status,
+        InputAuditionStatus::Recording | InputAuditionStatus::Ready
+    ) {
+        return Ok(None);
+    }
+    let was_recording = audition.status == InputAuditionStatus::Recording;
+    let end_sample = if was_recording {
+        durable_samples
+    } else {
+        audition
+            .end_sample
+            .context("已完成的输入试听缺少结束样本")?
+    };
+    if end_sample < audition.start_sample || end_sample > durable_samples {
+        bail!("输入试听范围超出已封存母轨边界");
+    }
+    let duration_samples = end_sample - audition.start_sample;
+    audition.status = InputAuditionStatus::Warning;
+    audition.end_sample = Some(end_sample);
+    audition.captured_samples = duration_samples;
+    audition.completed_at = Some(completed_at);
+    if was_recording
+        && duration_samples != audition.required_samples
+        && !audition
+            .warning_codes
+            .iter()
+            .any(|code| code == "too_short")
+    {
+        audition.warning_codes.push("too_short".to_string());
+    }
+    if !audition
+        .warning_codes
+        .iter()
+        .any(|code| code == "not_confirmed")
+    {
+        audition.warning_codes.push("not_confirmed".to_string());
+    }
+    if let Some(metrics) = audition.metrics.as_mut() {
+        metrics.warning_codes = audition.warning_codes.clone();
+    }
+    Ok(Some(audition.clone()))
+}
+
+fn render_input_audition_preview(
+    session: &mut RecordingSession,
+    audition: &InputAudition,
+    end_sample: u64,
+) -> Result<(PathBuf, Vec<[f32; 2]>)> {
+    if end_sample <= audition.start_sample {
+        bail!("输入试听范围无效");
+    }
+    session.wait_until_committed(end_sample)?;
+    let destination = session
+        .session_dir
+        .join("preview")
+        .join(INPUT_AUDITION_PREVIEW_FILE);
+    let expected_frames = end_sample - audition.start_sample;
+    let rendered = session.render_range(&destination, audition.start_sample, end_sample)?;
+    if rendered != expected_frames {
+        bail!("输入试听文件帧数与请求范围不一致");
+    }
+    let bins = session.waveform_range(audition.start_sample, end_sample)?;
+    Ok((destination, bins))
+}
+
+fn input_audition_finish_value(
+    session: &RecordingSession,
+    audition: &InputAudition,
+    destination: PathBuf,
+    bins: Vec<[f32; 2]>,
+    metrics: &InputAuditionMetrics,
+) -> Value {
+    json!({
+        "check_id": audition.check_id,
+        "start_sample": audition.start_sample,
+        "end_sample": audition.end_sample,
+        "file_path": destination,
+        "bins": bins,
+        "rms_dbfs": metrics.rms_dbfs,
+        "peak_dbfs": metrics.peak_dbfs,
+        "warning_codes": metrics.warning_codes,
+        "metrics": metrics,
+        "capture_fingerprint": audition.capture_fingerprint,
+        "input_audition": audition,
+        "snapshot": session.live_snapshot(),
+    })
+}
+
 fn session_summary_value(snapshot: &SessionSnapshot) -> Value {
     json!({
         "schema_version": snapshot.schema_version,
+        "app_version": snapshot.app_version,
+        "engine_version": snapshot.engine_version,
         "journal_seq": snapshot.journal_seq,
         "session_id": snapshot.session_id,
         "script_name": snapshot.script_name,
@@ -5849,6 +6811,9 @@ fn session_summary_value(snapshot: &SessionSnapshot) -> Value {
         "segment_frames": snapshot.segment_frames,
         "input_discontinuity_count": snapshot.input_discontinuity_count,
         "input_discontinuity_silence_samples": snapshot.input_discontinuity_silence_samples,
+        "noise_check": snapshot.noise_check,
+        "input_audition": snapshot.input_audition,
+        "noise_threshold_dbfs": snapshot.noise_threshold_dbfs,
         "silence_duration_ms": snapshot.silence_duration_ms,
         "silence_threshold_dbfs": snapshot.silence_threshold_dbfs,
         "silence_detector": snapshot.silence_detector,
@@ -6530,6 +7495,8 @@ fn load_recovery_snapshot_for_session(
         .cloned()
         .context("录制任务没有匹配身份的可恢复快照")?;
 
+    let compacted_gap_pairs =
+        validated_compacted_journal_gap_pairs(&journal.entries, expected_session_id.as_str());
     let mut seen_sequences = std::collections::HashSet::<u64>::new();
     let mut previous_sequence = None::<u64>;
     for entry in &journal.entries {
@@ -6551,6 +7518,7 @@ fn load_recovery_snapshot_for_session(
         }
         if let Some(previous) = previous_sequence
             && sequence != previous.saturating_add(1)
+            && !compacted_gap_pairs.contains(&(previous, sequence))
         {
             journal.warnings.push(format!(
                 "事件日志序号从 {previous} 跳到 {sequence}，已按最新完整投影恢复。"
@@ -6573,6 +7541,85 @@ fn load_recovery_snapshot_for_session(
         ));
     }
     Ok(selected.snapshot)
+}
+
+fn validated_compacted_journal_gap_pairs(
+    entries: &[Value],
+    expected_session_id: &str,
+) -> std::collections::HashSet<(u64, u64)> {
+    const COMPACTION_SCHEMA_VERSION: u64 = 1;
+
+    let same_session = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("snapshot")
+                .and_then(|snapshot| snapshot.get("session_id"))
+                .and_then(Value::as_str)
+                == Some(expected_session_id)
+        })
+        .collect::<Vec<_>>();
+    let Some((marker_index, marker)) = same_session
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, entry)| entry.get("journal_compaction").is_some())
+    else {
+        return std::collections::HashSet::new();
+    };
+    let Some(marker_sequence) = marker.get("journal_seq").and_then(Value::as_u64) else {
+        return std::collections::HashSet::new();
+    };
+    let Some(compaction) = marker.get("journal_compaction").and_then(Value::as_object) else {
+        return std::collections::HashSet::new();
+    };
+    if compaction.get("schema_version").and_then(Value::as_u64) != Some(COMPACTION_SCHEMA_VERSION)
+        || compaction
+            .get("compacted_through_sequence")
+            .and_then(Value::as_u64)
+            != Some(marker_sequence)
+    {
+        return std::collections::HashSet::new();
+    }
+    let Some(preserved_values) = compaction
+        .get("preserved_input_audition_sequences")
+        .and_then(Value::as_array)
+    else {
+        return std::collections::HashSet::new();
+    };
+    let preserved = preserved_values
+        .iter()
+        .map(Value::as_u64)
+        .collect::<Option<Vec<_>>>();
+    let Some(preserved) = preserved else {
+        return std::collections::HashSet::new();
+    };
+    if marker_index != preserved.len() || same_session.len() < marker_index.saturating_add(1) {
+        return std::collections::HashSet::new();
+    }
+    for (entry, expected_sequence) in same_session[..marker_index].iter().zip(&preserved) {
+        let is_expected_audition = entry.get("journal_seq").and_then(Value::as_u64)
+            == Some(*expected_sequence)
+            && entry
+                .get("event")
+                .and_then(Value::as_str)
+                .is_some_and(|event| event.starts_with("input_audition_"));
+        if !is_expected_audition || entry.get("journal_compaction").is_some() {
+            return std::collections::HashSet::new();
+        }
+    }
+    let mut compacted_sequences = preserved;
+    compacted_sequences.push(marker_sequence);
+    if compacted_sequences
+        .windows(2)
+        .any(|pair| pair[0] >= pair[1])
+    {
+        return std::collections::HashSet::new();
+    }
+    compacted_sequences
+        .windows(2)
+        .filter_map(|pair| (pair[1] != pair[0].saturating_add(1)).then_some((pair[0], pair[1])))
+        .collect()
 }
 
 #[cfg(test)]
@@ -7270,9 +8317,31 @@ impl RecordingSession {
         }
     }
 
+    fn wait_until_captured(&self, target: u64, timeout: Duration) -> u64 {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let captured = self.captured.load(Ordering::Acquire);
+            if captured >= target
+                || self.faulted.load(Ordering::Acquire)
+                || Instant::now() >= deadline
+            {
+                return captured;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn live_snapshot(&self) -> SessionSnapshot {
         let mut snapshot = self.snapshot.clone();
-        snapshot.captured_samples = self.captured.load(Ordering::Acquire);
+        let captured_samples = self.captured.load(Ordering::Acquire);
+        snapshot.captured_samples = captured_samples;
+        if let Some(audition) = snapshot.input_audition.as_mut()
+            && audition.status == InputAuditionStatus::Recording
+        {
+            audition.captured_samples = captured_samples
+                .saturating_sub(audition.start_sample)
+                .min(audition.required_samples);
+        }
         let committed_samples = self.committed.load(Ordering::Acquire);
         snapshot.committed_samples = committed_samples;
         if let Some(active_span) = snapshot.capture_provenance.last_mut()
@@ -7294,6 +8363,70 @@ impl RecordingSession {
         }
         snapshot.updated_at = Utc::now().to_rfc3339();
         snapshot
+    }
+
+    fn arm_input_audition_decision(&mut self, audition: &InputAudition) -> Result<()> {
+        if !matches!(
+            audition.status,
+            InputAuditionStatus::Confirmed | InputAuditionStatus::Skipped
+        ) {
+            bail!("输入试听尚未确认或明确跳过，不能开始正式录音");
+        }
+        if self.faulted.load(Ordering::Acquire) || self.overflow.load(Ordering::Acquire) > 0 {
+            bail!("音频采集已发生故障或数据溢出，输入试听决定不能用于正式录音");
+        }
+        let capture_fingerprint = input_audition_capture_fingerprint(&self.snapshot)?;
+        if audition.capture_fingerprint != capture_fingerprint {
+            bail!("采集配置已变化，需要重新进行输入试听");
+        }
+        self.input_audition_decision = Some(InputAuditionRuntimeDecision {
+            check_id: audition.check_id.clone(),
+            status: audition.status,
+            capture_fingerprint,
+            input_discontinuity_count: self
+                .capture_recovery
+                .discontinuities
+                .load(Ordering::Acquire),
+            overflow_samples: self.overflow.load(Ordering::Acquire),
+        });
+        Ok(())
+    }
+
+    fn ensure_input_audition_decision(&self) -> Result<()> {
+        if self.faulted.load(Ordering::Acquire) || self.overflow.load(Ordering::Acquire) > 0 {
+            bail!("音频采集已发生故障或数据溢出，请安全结束并重新试听");
+        }
+        let audition = self
+            .snapshot
+            .input_audition
+            .as_ref()
+            .context("第一句正式录音前必须完成输入试听或明确跳过")?;
+        if !matches!(
+            audition.status,
+            InputAuditionStatus::Confirmed | InputAuditionStatus::Skipped
+        ) {
+            bail!("输入试听尚未确认或明确跳过，不能开始正式录音");
+        }
+        let decision = self
+            .input_audition_decision
+            .as_ref()
+            .context("当前音频引擎尚未获得有效输入试听决定，请重新试听")?;
+        let capture_fingerprint = input_audition_capture_fingerprint(&self.snapshot)?;
+        let discontinuity_count = self
+            .capture_recovery
+            .discontinuities
+            .load(Ordering::Acquire);
+        let overflow_samples = self.overflow.load(Ordering::Acquire);
+        if decision.check_id != audition.check_id
+            || decision.status != audition.status
+            || decision.capture_fingerprint != capture_fingerprint
+            || audition.capture_fingerprint != capture_fingerprint
+            || decision.input_discontinuity_count != discontinuity_count
+            || decision.overflow_samples != overflow_samples
+        {
+            bail!("输入试听决定已因采集配置、故障或输入不连续而失效，请重新试听");
+        }
+        Ok(())
     }
 
     fn ensure_metadata_mutation_allowed(&self) -> Result<()> {
@@ -7611,29 +8744,7 @@ impl RecordingSession {
         }
         if let Err(error) = atomic_json(
             &self.session_dir.join("session.json"),
-            &json!({
-                "schema_version": self.snapshot.schema_version,
-                "journal_seq": self.snapshot.journal_seq,
-                "session_id": self.snapshot.session_id,
-                "script_name": self.snapshot.script_name,
-                "status": self.snapshot.status,
-                "device_name": self.snapshot.device_name,
-                "device_id": self.snapshot.device_id,
-                "input_sample_format": self.snapshot.input_sample_format,
-                "capture_share_mode": self.snapshot.capture_share_mode,
-                "capture_provenance": self.snapshot.capture_provenance,
-                "audio_format": self.snapshot.audio_format,
-                "storage_layout_version": self.snapshot.storage_layout_version,
-                "segment_frames": self.snapshot.segment_frames,
-                "input_discontinuity_count": self.snapshot.input_discontinuity_count,
-                "input_discontinuity_silence_samples": self.snapshot.input_discontinuity_silence_samples,
-                "noise_threshold_dbfs": self.snapshot.noise_threshold_dbfs,
-                "silence_duration_ms": self.snapshot.silence_duration_ms,
-                "silence_threshold_dbfs": self.snapshot.silence_threshold_dbfs,
-                "silence_detector": self.snapshot.silence_detector,
-                "started_at": self.snapshot.started_at,
-                "updated_at": self.snapshot.updated_at,
-            }),
+            &session_summary_value(&self.snapshot),
         ) {
             projection_failures.push(format!("update session summary: {error:#}"));
         }
@@ -7653,7 +8764,8 @@ impl RecordingSession {
             );
         if projection_failures.is_empty()
             && !active_attempt_remains_open
-            && let Err(error) = atomic_json_line(&event_path, &event_value)
+            && let Err(error) =
+                compact_journal_preserving_input_auditions(&event_path, &event_value)
         {
             projection_failures.push(format!("compact journal: {error:#}"));
         }
@@ -7684,6 +8796,15 @@ impl RecordingSession {
             warnings.push(format!("mark active attempt interrupted: {error:#}"));
         }
         self.snapshot = self.live_snapshot();
+        if let Err(error) = terminalize_unresolved_input_audition(
+            &mut self.snapshot,
+            committed,
+            Utc::now().to_rfc3339(),
+        ) {
+            warnings.push(format!(
+                "mark unresolved input audition as warning during fault seal: {error:#}"
+            ));
+        }
         self.snapshot.status = "faulted".to_string();
         if !persist_audio_fault_marker_fail_closed(
             &self.session_dir,
@@ -7711,29 +8832,7 @@ impl RecordingSession {
         }
         if let Err(error) = atomic_json(
             &self.session_dir.join("session.json"),
-            &json!({
-                "schema_version": self.snapshot.schema_version,
-                "journal_seq": self.snapshot.journal_seq,
-                "session_id": self.snapshot.session_id,
-                "script_name": self.snapshot.script_name,
-                "status": self.snapshot.status,
-                "device_name": self.snapshot.device_name,
-                "device_id": self.snapshot.device_id,
-                "input_sample_format": self.snapshot.input_sample_format,
-                "capture_share_mode": self.snapshot.capture_share_mode,
-                "capture_provenance": self.snapshot.capture_provenance,
-                "audio_format": self.snapshot.audio_format,
-                "storage_layout_version": self.snapshot.storage_layout_version,
-                "segment_frames": self.snapshot.segment_frames,
-                "input_discontinuity_count": self.snapshot.input_discontinuity_count,
-                "input_discontinuity_silence_samples": self.snapshot.input_discontinuity_silence_samples,
-                "noise_threshold_dbfs": self.snapshot.noise_threshold_dbfs,
-                "silence_duration_ms": self.snapshot.silence_duration_ms,
-                "silence_threshold_dbfs": self.snapshot.silence_threshold_dbfs,
-                "silence_detector": self.snapshot.silence_detector,
-                "started_at": self.snapshot.started_at,
-                "updated_at": self.snapshot.updated_at,
-            }),
+            &session_summary_value(&self.snapshot),
         ) {
             warnings.push(format!("publish faulted session summary: {error:#}"));
         }
@@ -7810,6 +8909,41 @@ impl RecordingSession {
                 return Err(error);
             }
             warnings.push("当前句因录制结束或写盘故障已标记为异常中断，不会进入交付。".to_string());
+        }
+        if self
+            .snapshot
+            .input_audition
+            .as_ref()
+            .is_some_and(|audition| {
+                matches!(
+                    audition.status,
+                    InputAuditionStatus::Recording | InputAuditionStatus::Ready
+                )
+            })
+        {
+            let interrupted = terminalize_unresolved_input_audition(
+                &mut self.snapshot,
+                committed,
+                Utc::now().to_rfc3339(),
+            )?
+            .context("输入试听停止状态缺失")?;
+            if let Err(error) = self.persist(
+                "input_audition_interrupted",
+                json!({
+                    "check_id": interrupted.check_id,
+                    "start_sample": interrupted.start_sample,
+                    "end_sample": interrupted.end_sample,
+                    "capture_fingerprint": interrupted.capture_fingerprint,
+                    "warning_codes": interrupted.warning_codes,
+                    "reason": "session_stopped",
+                }),
+            ) {
+                if self.metadata_fault.is_some() {
+                    return Err(self.metadata_seal_error(committed, warnings));
+                }
+                return Err(error);
+            }
+            warnings.push("未完成的输入试听已按母轨封存边界标记为警告。".to_string());
         }
         self.snapshot.status =
             if self.faulted.load(Ordering::Acquire) || self.overflow.load(Ordering::Acquire) > 0 {
@@ -8884,16 +10018,6 @@ fn parse_requested_input_sample_format(value: &str) -> Result<Option<SampleForma
         "f32" => SampleFormat::F32,
         other => bail!("不支持的采集格式：{other}。可选 i16、i24、i32、f32"),
     }))
-}
-
-fn delivery_bit_depth_for_sample_format(format: SampleFormat) -> u16 {
-    match format {
-        SampleFormat::I16 => 16,
-        SampleFormat::I24 => 24,
-        // i32 and f32 both land in the existing 32-bit Float WAV writer.
-        SampleFormat::I32 | SampleFormat::F32 => 32,
-        _ => 24,
-    }
 }
 
 #[derive(Default)]
@@ -10158,11 +11282,94 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     result
 }
 
+#[cfg(test)]
 fn atomic_json_line(path: &Path, value: &impl Serialize) -> Result<()> {
     let (temporary, mut file) = create_unique_temporary_file(path, "compact")?;
     let result = (|| -> Result<()> {
         serde_json::to_writer(&mut file, value)?;
         file.write_all(b"\n")?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        durable_replace(&temporary, path)?;
+        Ok(())
+    })();
+    remove_failed_temporary(&temporary, result.is_err());
+    result
+}
+
+fn compact_journal_preserving_input_auditions(path: &Path, current: &Value) -> Result<()> {
+    const COMPACTION_SCHEMA_VERSION: u64 = 1;
+
+    let source = std::fs::read(path)
+        .with_context(|| format!("read journal projection {}", path.display()))?;
+    let current_sequence = current
+        .get("journal_seq")
+        .and_then(Value::as_u64)
+        .context("journal compaction current projection has no sequence")?;
+    let mut retained = Vec::<Value>::new();
+    for line in source.split(|byte| *byte == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_slice::<Value>(line) else {
+            // A later full snapshot remains authoritative. Compaction is also
+            // the repair point for an older malformed journal line.
+            continue;
+        };
+        let is_audition = entry
+            .get("event")
+            .and_then(Value::as_str)
+            .is_some_and(|event| event.starts_with("input_audition_"));
+        let sequence = entry.get("journal_seq").and_then(Value::as_u64);
+        if is_audition && sequence.is_some_and(|sequence| sequence < current_sequence) {
+            let mut audit_entry = entry;
+            if let Some(object) = audit_entry.as_object_mut() {
+                object.remove("journal_compaction");
+            }
+            retained.push(audit_entry);
+        }
+    }
+    let preserved_input_audition_sequences = retained
+        .iter()
+        .filter_map(|entry| entry.get("journal_seq").and_then(Value::as_u64))
+        .collect::<Vec<_>>();
+    let mut compacted_current = current.clone();
+    let current_object = compacted_current
+        .as_object_mut()
+        .context("journal compaction current projection is not an object")?;
+    current_object.insert(
+        "journal_compaction".to_string(),
+        json!({
+            "schema_version": COMPACTION_SCHEMA_VERSION,
+            "compacted_through_sequence": current_sequence,
+            "preserved_input_audition_sequences": preserved_input_audition_sequences,
+        }),
+    );
+    retained.push(compacted_current);
+    if retained.len() > 1 {
+        let mut previous = None::<u64>;
+        for entry in &retained {
+            let sequence = entry
+                .get("journal_seq")
+                .and_then(Value::as_u64)
+                .context("retained journal projection has no sequence")?;
+            if previous.is_some_and(|previous| previous >= sequence) {
+                bail!("retained input audition journal sequences are not strictly increasing");
+            }
+            previous = Some(sequence);
+        }
+    }
+    atomic_json_lines(path, &retained)
+}
+
+fn atomic_json_lines(path: &Path, values: &[Value]) -> Result<()> {
+    let (temporary, mut file) = create_unique_temporary_file(path, "compact")?;
+    let result = (|| -> Result<()> {
+        for value in values {
+            serde_json::to_writer(&mut file, value)?;
+            file.write_all(b"\n")?;
+        }
         file.flush()?;
         file.sync_all()?;
         drop(file);
@@ -10771,6 +11978,7 @@ mod tests {
                 segment_frames: 48_000,
             })
             .unwrap();
+        engine.skip_input_audition(None).unwrap();
         engine.start_attempt("001", false).unwrap();
 
         let silence = engine
@@ -10803,6 +12011,261 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(feature = "system-test")]
+    #[test]
+    fn input_audition_is_exact_id_bound_and_does_not_create_an_attempt() {
+        let root = test_root("input-audition-lifecycle");
+        std::fs::remove_dir_all(&root).unwrap();
+        let mut engine = Engine::new(Emitter::new());
+        engine
+            .start_system_test_session(SystemTestStartSessionPayload {
+                session: StartSessionPayload {
+                    session_dir: root.to_string_lossy().into_owned(),
+                    session_id: "input-audition-lifecycle".to_string(),
+                    script_name: "script.csv".to_string(),
+                    device_id: None,
+                    device_name: None,
+                    sample_rate: 48_000,
+                    bit_depth: 16,
+                    input_sample_format: "f32".to_string(),
+                    input_channel: 1,
+                    capture_share_mode: CaptureShareMode::Shared,
+                    capture_buffer_frames: None,
+                    silence_duration_ms: 200,
+                    noise_threshold_dbfs: Some(-42.0),
+                    silence_threshold_dbfs: -42.0,
+                    silence_detector: SilenceDetector::Energy,
+                    items: vec![ScriptItem {
+                        id: "001".to_string(),
+                        text: "第一句".to_string(),
+                        label: String::new(),
+                    }],
+                },
+                segment_frames: 48_000,
+            })
+            .unwrap();
+
+        assert!(engine.start_attempt("001", false).is_err());
+        let cancelled_begin = engine.begin_input_audition().unwrap();
+        let cancelled_check_id = cancelled_begin["check_id"].as_str().unwrap().to_string();
+        engine
+            .system_test_feed(1_000, 11, 250, SystemTestSignalPattern::Speech)
+            .unwrap();
+        assert!(engine.cancel_input_audition("stale-check-id").is_err());
+        let cancelled = engine.cancel_input_audition(&cancelled_check_id).unwrap();
+        assert!(cancelled["input_audition"].is_null());
+
+        let begun = engine.begin_input_audition().unwrap();
+        let check_id = begun["check_id"].as_str().unwrap().to_string();
+        assert_eq!(begun["required_samples"], 480_000);
+        assert!(engine.start_attempt("001", false).is_err());
+        assert!(engine.finish_input_audition("stale-check-id").is_err());
+        engine
+            .system_test_feed(479_900, 17, 511, SystemTestSignalPattern::Speech)
+            .unwrap();
+        engine
+            .system_test_feed(200, 17, 200, SystemTestSignalPattern::Speech)
+            .unwrap();
+
+        let finished = engine.finish_input_audition(&check_id).unwrap();
+        let start_sample = begun["input_audition"]["start_sample"].as_u64().unwrap();
+        assert_eq!(start_sample, 1_000);
+        assert_eq!(finished["start_sample"], start_sample);
+        assert_eq!(finished["end_sample"], start_sample + 480_000);
+        assert_eq!(finished["metrics"]["duration_samples"], 480_000);
+        assert_eq!(finished["input_audition"]["status"], "ready");
+        assert!(engine.start_attempt("001", false).is_err());
+        assert_eq!(finished["warning_codes"], json!([]));
+        assert!(finished["rms_dbfs"].as_f64().unwrap().is_finite());
+        assert!(finished["peak_dbfs"].as_f64().unwrap().is_finite());
+        let preview = PathBuf::from(finished["file_path"].as_str().unwrap());
+        assert_eq!(preview, root.join("preview/input-audition.wav"));
+        assert!(preview.is_file());
+        assert!(engine.confirm_input_audition("stale-check-id").is_err());
+        let confirmed = engine.confirm_input_audition(&check_id).unwrap();
+        assert_eq!(confirmed["input_audition"]["status"], "confirmed");
+        assert!(
+            engine.session.as_ref().unwrap().snapshot.items[0]
+                .attempts
+                .is_empty()
+        );
+        assert!(engine.skip_input_audition(Some(&check_id)).is_err());
+        let restarted_skip = engine.skip_input_audition(None).unwrap();
+        let restarted_skip_id = restarted_skip["input_audition"]["check_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(restarted_skip_id, check_id);
+        assert_eq!(restarted_skip["input_audition"]["status"], "skipped");
+        assert_eq!(
+            restarted_skip["input_audition"]["start_sample"],
+            restarted_skip["input_audition"]["end_sample"]
+        );
+        let repeated_skip = engine
+            .skip_input_audition(Some(&restarted_skip_id))
+            .unwrap();
+        assert_eq!(
+            repeated_skip["input_audition"]["check_id"],
+            restarted_skip_id
+        );
+        let started = engine.start_attempt("001", false).unwrap();
+        assert_eq!(started["attempt_id"], "001-a1");
+        let discarded = engine.stop_attempt(true, true, false).unwrap();
+        assert_eq!(discarded["discarded"], true);
+
+        let journal = read_journal(&root).unwrap();
+        let audition_events = journal
+            .entries
+            .iter()
+            .filter_map(|entry| entry["event"].as_str())
+            .filter(|event| event.starts_with("input_audition_"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            audition_events,
+            vec![
+                "input_audition_started",
+                "input_audition_cancelled",
+                "input_audition_started",
+                "input_audition_finished",
+                "input_audition_confirmed",
+                "input_audition_skipped"
+            ]
+        );
+        for entry in &journal.entries {
+            if entry["event"]
+                .as_str()
+                .is_some_and(|event| event.starts_with("input_audition_"))
+            {
+                let event_check_id = entry["payload"]["check_id"].as_str().unwrap();
+                assert!(
+                    event_check_id == check_id
+                        || event_check_id == cancelled_check_id
+                        || event_check_id == restarted_skip_id
+                );
+                assert!(entry["payload"].get("start_sample").is_some());
+                assert!(entry["payload"].get("end_sample").is_some());
+                assert!(entry["payload"].get("file_path").is_none());
+            }
+        }
+        assert!(
+            !serde_json::to_string(&confirmed["snapshot"])
+                .unwrap()
+                .contains("input-audition.wav")
+        );
+        let stopped = engine.stop_session().unwrap();
+        assert_eq!(stopped["snapshot"]["input_audition"]["status"], "skipped");
+        assert!(
+            stopped["snapshot"]["items"][0]["attempts"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        engine
+            .export_session_artifact_expected(
+                &root,
+                "input-audition-lifecycle",
+                ExportArtifact::TimestampsJson,
+            )
+            .unwrap();
+        let timestamps: Value =
+            serde_json::from_slice(&std::fs::read(root.join("export/timestamps.json")).unwrap())
+                .unwrap();
+        assert_eq!(timestamps["input_audition"]["status"], "skipped");
+        assert!(
+            timestamps["items"][0]["attempts"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(feature = "system-test")]
+    #[test]
+    fn cached_audition_adoption_rearms_only_the_current_engine_runtime() {
+        let root = test_root("input-audition-cache-adoption");
+        std::fs::remove_dir_all(&root).unwrap();
+        let mut engine = Engine::new(Emitter::new());
+        engine
+            .start_system_test_session(SystemTestStartSessionPayload {
+                session: StartSessionPayload {
+                    session_dir: root.to_string_lossy().into_owned(),
+                    session_id: "input-audition-cache-adoption".to_string(),
+                    script_name: "script.csv".to_string(),
+                    device_id: None,
+                    device_name: None,
+                    sample_rate: 48_000,
+                    bit_depth: 16,
+                    input_sample_format: "f32".to_string(),
+                    input_channel: 1,
+                    capture_share_mode: CaptureShareMode::Shared,
+                    capture_buffer_frames: None,
+                    silence_duration_ms: 200,
+                    noise_threshold_dbfs: Some(-42.0),
+                    silence_threshold_dbfs: -42.0,
+                    silence_detector: SilenceDetector::Energy,
+                    items: vec![ScriptItem {
+                        id: "001".to_string(),
+                        text: "第一句".to_string(),
+                        label: String::new(),
+                    }],
+                },
+                segment_frames: 48_000,
+            })
+            .unwrap();
+
+        let skipped = engine.skip_input_audition(None).unwrap();
+        let source_check_id = skipped["input_audition"]["check_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let source_decided_at = skipped["input_audition"]["skipped_at"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let source_fingerprint = skipped["capture_fingerprint"].as_str().unwrap().to_string();
+
+        // A persisted terminal snapshot cannot authorize a rebuilt engine.
+        engine.invalidate_input_audition_decision().unwrap();
+        assert!(engine.start_attempt("001", false).is_err());
+        assert!(
+            engine
+                .adopt_cached_input_audition(AdoptCachedInputAuditionPayload {
+                    status: InputAuditionStatus::Skipped,
+                    source_check_id: source_check_id.clone(),
+                    source_decided_at: source_decided_at.clone(),
+                    capture_fingerprint: "wrong-capture-fingerprint".to_string(),
+                })
+                .is_err()
+        );
+        assert!(engine.start_attempt("001", false).is_err());
+
+        let adopted = engine
+            .adopt_cached_input_audition(AdoptCachedInputAuditionPayload {
+                status: InputAuditionStatus::Skipped,
+                source_check_id: source_check_id.clone(),
+                source_decided_at: source_decided_at.clone(),
+                capture_fingerprint: source_fingerprint.clone(),
+            })
+            .unwrap();
+        assert_eq!(adopted["input_audition"]["status"], "skipped");
+        assert_eq!(adopted["input_audition"]["decision_source"], "launch_cache");
+        assert_eq!(
+            adopted["input_audition"]["source_check_id"],
+            source_check_id
+        );
+        assert_eq!(
+            adopted["input_audition"]["source_capture_fingerprint"],
+            source_fingerprint
+        );
+        engine.start_attempt("001", false).unwrap();
+        let discarded = engine.stop_attempt(true, true, false).unwrap();
+        assert_eq!(discarded["discarded"], true);
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn test_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "recorder-engine-{name}-{}",
@@ -10813,6 +12276,40 @@ mod tests {
         ));
         std::fs::create_dir_all(root.join("metadata")).unwrap();
         root
+    }
+
+    fn arm_test_input_audition(session: &mut RecordingSession) {
+        let now = "2026-09-01T00:00:00Z".to_string();
+        let captured = session.captured.load(Ordering::Acquire);
+        let fingerprint = input_audition_capture_fingerprint(&session.snapshot).unwrap();
+        let audition = InputAudition {
+            status: InputAuditionStatus::Skipped,
+            check_id: "test-input-audition-skip".to_string(),
+            capture_fingerprint: fingerprint.clone(),
+            configuration: input_audition_configuration(&session.snapshot),
+            start_sample: captured,
+            end_sample: Some(captured),
+            required_samples: input_audition_required_samples(
+                session.snapshot.audio_format.sample_rate,
+            )
+            .unwrap(),
+            captured_samples: 0,
+            started_at: now.clone(),
+            completed_at: Some(now.clone()),
+            confirmed_at: None,
+            skipped_at: Some(now.clone()),
+            decision_source: Some(InputAuditionDecisionSource::CurrentAudition),
+            source_check_id: Some("test-input-audition-skip".to_string()),
+            source_decided_at: Some(now),
+            source_capture_fingerprint: Some(fingerprint),
+            input_discontinuity_count_at_start: 0,
+            input_discontinuity_silence_samples_at_start: 0,
+            overflow_samples_at_start: 0,
+            metrics: None,
+            warning_codes: Vec::new(),
+        };
+        session.snapshot.input_audition = Some(audition.clone());
+        session.arm_input_audition_decision(&audition).unwrap();
     }
 
     fn test_writer_queue() -> WriterQueueBudget {
@@ -11087,6 +12584,7 @@ mod tests {
         let telemetry = session.silence_analysis.telemetry.clone();
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
+        arm_test_input_audition(engine.session.as_mut().unwrap());
 
         let error = engine.start_attempt("001", false).unwrap_err();
         assert!(format!("{error:#}").contains("VAD reset"));
@@ -11521,6 +13019,8 @@ mod tests {
     fn test_snapshot() -> SessionSnapshot {
         SessionSnapshot {
             schema_version: 1,
+            app_version: build_app_version(),
+            engine_version: build_engine_version(),
             journal_seq: 0,
             session_id: "resume-test".to_string(),
             script_name: "test.csv".to_string(),
@@ -11552,6 +13052,7 @@ mod tests {
             started_at: "2026-08-10T11:00:00Z".to_string(),
             updated_at: "2026-08-10T12:00:00Z".to_string(),
             noise_check: None,
+            input_audition: None,
             noise_threshold_dbfs: Some(-42.0),
             silence_duration_ms: 1_000,
             silence_threshold_dbfs: -42.0,
@@ -11875,6 +13376,7 @@ mod tests {
             vad_tx: None,
             vad_join: None,
             active_attempt: None,
+            input_audition_decision: None,
             metadata_fault: None,
             stop_requested: false,
             capture_stopped: false,
@@ -12014,6 +13516,7 @@ mod tests {
         session.silence_samples.store(48_000, Ordering::Release);
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
+        arm_test_input_audition(engine.session.as_mut().unwrap());
 
         let started = engine.start_attempt("001", false).unwrap();
 
@@ -12035,6 +13538,7 @@ mod tests {
         session.analyzed_samples.store(12_345, Ordering::Release);
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
+        arm_test_input_audition(engine.session.as_mut().unwrap());
 
         let started = engine.start_attempt("001", false).unwrap();
 
@@ -12262,6 +13766,7 @@ mod tests {
         let session = prepare_metadata_test_session(&root);
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
+        arm_test_input_audition(engine.session.as_mut().unwrap());
 
         engine.start_attempt("001", false).unwrap();
         let before_pass = engine.stop_attempt(true, true, false).unwrap();
@@ -13301,6 +14806,7 @@ mod tests {
             vad_tx: None,
             vad_join: None,
             active_attempt: None,
+            input_audition_decision: None,
             metadata_fault: None,
             stop_requested: false,
             capture_stopped: false,
@@ -15414,6 +16920,7 @@ mod tests {
             vad_tx: None,
             vad_join: None,
             active_attempt: None,
+            input_audition_decision: None,
             metadata_fault: None,
             stop_requested: false,
             capture_stopped: false,
@@ -15520,6 +17027,7 @@ mod tests {
                 input_discontinuity_count_at_start: 0,
                 input_discontinuity_silence_samples_at_start: 0,
             }),
+            input_audition_decision: None,
             metadata_fault: None,
             stop_requested: false,
             capture_stopped: false,
@@ -15830,6 +17338,11 @@ mod tests {
         assert!(engine.session.is_none());
         assert_eq!(created["mode"], "inspect");
         assert_eq!(created["snapshot"]["status"], "stopped");
+        assert_eq!(created["snapshot"]["app_version"], build_app_version());
+        assert_eq!(
+            created["snapshot"]["engine_version"],
+            build_engine_version()
+        );
         assert_eq!(
             created["snapshot"]["capture_share_mode"],
             if cfg!(target_os = "windows") {
@@ -15839,6 +17352,11 @@ mod tests {
             }
         );
         assert!(!root.join(SEGMENTED_MASTER_AUDIO).exists());
+        let summary: Value =
+            serde_json::from_slice(&std::fs::read(root.join("session.json")).unwrap()).unwrap();
+        assert_eq!(summary["app_version"], build_app_version());
+        assert_eq!(summary["engine_version"], build_engine_version());
+        assert!(summary["input_audition"].is_null());
 
         let inspected = engine
             .inspect_session_expected(&root, "offline-create")
@@ -15855,6 +17373,12 @@ mod tests {
             )
             .unwrap();
         assert!(root.join("export/timestamps.json").is_file());
+        let timestamps: Value =
+            serde_json::from_slice(&std::fs::read(root.join("export/timestamps.json")).unwrap())
+                .unwrap();
+        assert_eq!(timestamps["app_version"], build_app_version());
+        assert_eq!(timestamps["engine_version"], build_engine_version());
+        assert!(timestamps["input_audition"].is_null());
         let error = engine
             .export_session_artifact_expected(&root, "offline-create", ExportArtifact::CutsZip)
             .unwrap_err();
@@ -16814,6 +18338,154 @@ mod tests {
     }
 
     #[test]
+    fn legacy_snapshot_versions_and_audio_bit_depth_do_not_impersonate_new_defaults() {
+        let mut value = serde_json::to_value(test_snapshot()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("app_version");
+        object.remove("engine_version");
+        object.remove("input_audition");
+        object
+            .get_mut("audio_format")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("bit_depth");
+        let snapshot: SessionSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(snapshot.app_version, "unknown");
+        assert_eq!(snapshot.engine_version, "unknown");
+        assert_eq!(snapshot.audio_format.bit_depth, 24);
+        assert!(snapshot.input_audition.is_none());
+    }
+
+    #[test]
+    fn input_audition_fingerprint_excludes_raw_endpoint_but_tracks_capture_parameters() {
+        let mut snapshot = test_snapshot();
+        snapshot.device_name = "Focusrite USB ASIO".to_string();
+        snapshot.device_id = "asio:raw-endpoint-at-usb-port-a".to_string();
+        snapshot.capture_backend = "asio".to_string();
+        snapshot.requested_capture_buffer_frames = Some(512);
+        snapshot.capture_buffer_frames = Some(512);
+        let first = input_audition_capture_fingerprint(&snapshot).unwrap();
+        let encoded = serde_json::to_value(input_audition_configuration(&snapshot)).unwrap();
+        assert!(encoded.get("device_id").is_none());
+        assert!(
+            !serde_json::to_string(&encoded)
+                .unwrap()
+                .contains("raw-endpoint-at-usb-port-a")
+        );
+
+        snapshot.device_id = "asio:raw-endpoint-at-usb-port-b".to_string();
+        assert_eq!(
+            input_audition_capture_fingerprint(&snapshot).unwrap(),
+            first
+        );
+        snapshot.capture_buffer_frames = Some(256);
+        assert_ne!(
+            input_audition_capture_fingerprint(&snapshot).unwrap(),
+            first
+        );
+
+        snapshot.capture_backend = "wasapi".to_string();
+        snapshot.capture_buffer_frames = Some(512);
+        snapshot.device_name = "Microphone (2- USB Audio Device)".to_string();
+        let usb_port_two = input_audition_capture_fingerprint(&snapshot).unwrap();
+        snapshot.device_name = "Microphone (3- USB Audio Device)".to_string();
+        assert_eq!(
+            input_audition_capture_fingerprint(&snapshot).unwrap(),
+            usb_port_two,
+            "Windows instance numbering must not make a USB-port move look like a new device"
+        );
+        snapshot.device_name = "Microphone (USB Audio Device)".to_string();
+        assert_eq!(
+            input_audition_capture_fingerprint(&snapshot).unwrap(),
+            usb_port_two,
+            "an unnumbered Windows friendly name is the same logical USB input"
+        );
+        snapshot.device_name = "RODE NT1 (2nd Generation)".to_string();
+        assert_ne!(
+            input_audition_capture_fingerprint(&snapshot).unwrap(),
+            usb_port_two,
+            "non-instance digits in a real product name must remain significant"
+        );
+        snapshot.device_name = "RODE NT-USB".to_string();
+        assert_ne!(
+            input_audition_capture_fingerprint(&snapshot).unwrap(),
+            usb_port_two,
+            "different product names must never share an audition fingerprint"
+        );
+    }
+
+    #[test]
+    fn stopped_snapshot_never_publishes_ready_as_a_final_audition_state() {
+        let mut snapshot = test_snapshot();
+        snapshot.committed_samples = 500_000;
+        let configuration = input_audition_configuration(&snapshot);
+        let fingerprint = input_audition_capture_fingerprint(&snapshot).unwrap();
+        snapshot.input_audition = Some(InputAudition {
+            status: InputAuditionStatus::Ready,
+            check_id: "ready-but-unconfirmed".to_string(),
+            capture_fingerprint: fingerprint,
+            configuration,
+            start_sample: 100,
+            end_sample: Some(480_100),
+            required_samples: 480_000,
+            captured_samples: 480_000,
+            started_at: "2026-09-01T00:00:00Z".to_string(),
+            completed_at: Some("2026-09-01T00:00:10Z".to_string()),
+            confirmed_at: None,
+            skipped_at: None,
+            decision_source: None,
+            source_check_id: None,
+            source_decided_at: None,
+            source_capture_fingerprint: None,
+            input_discontinuity_count_at_start: 0,
+            input_discontinuity_silence_samples_at_start: 0,
+            overflow_samples_at_start: 0,
+            metrics: Some(InputAuditionMetrics {
+                duration_samples: 480_000,
+                duration_seconds: 10.0,
+                peak_dbfs: -6.0,
+                rms_dbfs: -18.0,
+                waveform_bin_count: 7_500,
+                input_discontinuity_count: 0,
+                input_discontinuity_silence_samples: 0,
+                overflow_samples: 0,
+                warning_codes: Vec::new(),
+            }),
+            warning_codes: Vec::new(),
+        });
+
+        let terminal = terminalize_unresolved_input_audition(
+            &mut snapshot,
+            500_000,
+            "2026-09-01T00:00:11Z".to_string(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(terminal.status, InputAuditionStatus::Warning);
+        assert!(
+            terminal
+                .warning_codes
+                .iter()
+                .any(|code| code == "not_confirmed")
+        );
+        assert!(
+            !terminal
+                .warning_codes
+                .iter()
+                .any(|code| code == "too_short")
+        );
+        assert_eq!(
+            terminal.metrics.unwrap().warning_codes,
+            vec!["not_confirmed".to_string()]
+        );
+        assert_eq!(
+            session_summary_value(&snapshot)["input_audition"]["status"],
+            "warning"
+        );
+    }
+
+    #[test]
     fn wants_dev_web_capture_follows_env_only_off_windows() {
         let _guard = DEV_WEB_CAPTURE_ENV_LOCK.lock().expect("env lock");
         let previous = std::env::var_os("DATABAKER_DEV_WEB_CAPTURE");
@@ -16904,41 +18576,44 @@ mod tests {
         .unwrap();
         assert_eq!(payload.capture_share_mode, CaptureShareMode::Exclusive);
         assert_eq!(payload.input_sample_format, "");
+        assert_eq!(payload.bit_depth, 16);
     }
 
     #[test]
-    fn requested_input_sample_format_wins_over_bit_depth() {
-        let root = test_root("requested-input-format");
-        std::fs::remove_dir_all(&root).unwrap();
+    fn requested_input_sample_format_is_independent_from_delivery_bit_depth() {
         let engine = Engine::new(Emitter::new());
-        let created = engine
-            .create_session(StartSessionPayload {
-                session_dir: root.to_string_lossy().into_owned(),
-                session_id: "format-wins".to_string(),
-                script_name: "script.csv".to_string(),
-                device_id: Some("device:remembered".to_string()),
-                device_name: Some("Remembered input".to_string()),
-                sample_rate: 48_000,
-                bit_depth: 16,
-                input_sample_format: "I24".to_string(),
-                input_channel: 1,
-                capture_share_mode: CaptureShareMode::Exclusive,
-                capture_buffer_frames: None,
-                silence_duration_ms: 1_000,
-                noise_threshold_dbfs: Some(-42.0),
-                silence_threshold_dbfs: -42.0,
-                silence_detector: SilenceDetector::Energy,
-                items: vec![ScriptItem {
-                    id: "001".to_string(),
-                    text: "第一句".to_string(),
-                    label: String::new(),
-                }],
-            })
-            .unwrap();
-        assert_eq!(created["snapshot"]["input_sample_format"], "i24");
-        assert_eq!(created["snapshot"]["audio_format"]["bit_depth"], 24);
-        assert_eq!(created["snapshot"]["audio_format"]["encoding"], "pcm");
-        let _ = std::fs::remove_dir_all(root);
+        for (requested, normalized) in [("I24", "i24"), ("i32", "i32"), ("f32", "f32")] {
+            let root = test_root(&format!("requested-input-format-{normalized}"));
+            std::fs::remove_dir_all(&root).unwrap();
+            let created = engine
+                .create_session(StartSessionPayload {
+                    session_dir: root.to_string_lossy().into_owned(),
+                    session_id: format!("format-independent-{normalized}"),
+                    script_name: "script.csv".to_string(),
+                    device_id: Some("device:remembered".to_string()),
+                    device_name: Some("Remembered input".to_string()),
+                    sample_rate: 48_000,
+                    bit_depth: 16,
+                    input_sample_format: requested.to_string(),
+                    input_channel: 1,
+                    capture_share_mode: CaptureShareMode::Exclusive,
+                    capture_buffer_frames: None,
+                    silence_duration_ms: 1_000,
+                    noise_threshold_dbfs: Some(-42.0),
+                    silence_threshold_dbfs: -42.0,
+                    silence_detector: SilenceDetector::Energy,
+                    items: vec![ScriptItem {
+                        id: "001".to_string(),
+                        text: "第一句".to_string(),
+                        label: String::new(),
+                    }],
+                })
+                .unwrap();
+            assert_eq!(created["snapshot"]["input_sample_format"], normalized);
+            assert_eq!(created["snapshot"]["audio_format"]["bit_depth"], 16);
+            assert_eq!(created["snapshot"]["audio_format"]["encoding"], "pcm");
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -16950,7 +18625,6 @@ mod tests {
         );
         assert!(parse_requested_input_sample_format("").unwrap().is_none());
         assert!(parse_requested_input_sample_format("pcm24").is_err());
-        assert_eq!(delivery_bit_depth_for_sample_format(SampleFormat::I32), 32);
     }
 
     #[test]
@@ -17845,6 +19519,7 @@ mod tests {
             vad_tx: None,
             vad_join: None,
             active_attempt: None,
+            input_audition_decision: None,
             metadata_fault: Some("injected initial persist failure".to_string()),
             stop_requested: false,
             capture_stopped: false,
@@ -17964,6 +19639,56 @@ mod tests {
         assert_eq!(journal.entries[0]["journal_seq"], 8);
         let source = std::fs::read_to_string(root.join("metadata/events.jsonl")).unwrap();
         assert_eq!(source.lines().count(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn audition_audit_compaction_marks_only_intentional_sequence_gaps() {
+        let root = test_root("journal-audition-audit-compaction");
+        let mut started = test_snapshot();
+        started.journal_seq = 3;
+        let mut skipped = started.clone();
+        skipped.journal_seq = 8;
+        let mut stopped = skipped.clone();
+        stopped.journal_seq = 10;
+        stopped.status = "stopped".to_string();
+        let started_event = sequenced_event("input_audition_started", &started);
+        let skipped_event = sequenced_event("input_audition_skipped", &skipped);
+        let stopped_event = sequenced_event("session_stopped", &stopped);
+        write_journal(
+            &root,
+            &[started_event, skipped_event, stopped_event.clone()],
+        );
+        write_snapshot_file(&root.join("metadata/items.snapshot.json"), &stopped);
+
+        let path = root.join("metadata/events.jsonl");
+        compact_journal_preserving_input_auditions(&path, &stopped_event).unwrap();
+        let mut compacted = read_journal(&root).unwrap();
+        assert_eq!(compacted.entries.len(), 3);
+        assert_eq!(
+            compacted.entries[2]["journal_compaction"]["preserved_input_audition_sequences"],
+            json!([3, 8])
+        );
+        load_recovery_snapshot(&root, &mut compacted).unwrap();
+        assert!(
+            compacted
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("事件日志序号从")),
+            "{:?}",
+            compacted.warnings
+        );
+
+        let tampered = vec![compacted.entries[0].clone(), compacted.entries[2].clone()];
+        atomic_json_lines(&path, &tampered).unwrap();
+        let mut damaged = read_journal(&root).unwrap();
+        load_recovery_snapshot(&root, &mut damaged).unwrap();
+        assert!(
+            damaged
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("事件日志序号从 3 跳到 10"))
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
