@@ -506,6 +506,9 @@ mod tests {
             device_id: "missing:device".to_string(),
             input_sample_format: "f32".to_string(),
             capture_share_mode: crate::engine::CaptureShareMode::Exclusive,
+            capture_backend: "missing".to_string(),
+            requested_capture_buffer_frames: None,
+            capture_buffer_frames: None,
             capture_provenance: Vec::new(),
             audio_format: AudioFormat {
                 sample_rate: 48_000,

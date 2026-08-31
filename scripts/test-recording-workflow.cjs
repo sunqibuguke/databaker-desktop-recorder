@@ -290,6 +290,12 @@ async function main() {
     { id: 'focusrite', name: 'Analogue 1 + 2 (Focusrite USB Audio)' },
   ], 'senary');
   assert.equal(picked?.id, 'focusrite', 'must not auto-select a rejected laptop array even if it is the Windows default');
+  const asioPicked = preferredInputDevice([
+    { id: 'wasapi:focusrite', name: 'Analogue 1 + 2 (Focusrite USB Audio)', is_default: true },
+    { id: 'asio:generic', name: 'Generic Low Latency ASIO', production_recommended: true, production_priority: 100 },
+    { id: 'asio:focusrite', name: 'Focusrite USB ASIO', production_recommended: true, production_priority: 200 },
+  ], 'wasapi:focusrite');
+  assert.equal(asioPicked?.id, 'asio:focusrite', 'ASIO must win over the Focusrite WDM default endpoint');
   assert.deepEqual(productionSampleRates([16_000, 44_100, 48_000]), [44_100, 48_000]);
   assert.deepEqual(
     captureSampleFormatsForConfiguration(dualModeDevice.configurations, 48_000, 1),

@@ -99,11 +99,23 @@ export function inputDeviceNeedsWarning(kind: InputDeviceKind): boolean {
   return kind !== 'production';
 }
 
-export function preferredInputDevice<T extends { id: string; name: string; is_default?: boolean }>(
+export function preferredInputDevice<T extends {
+  id: string;
+  name: string;
+  is_default?: boolean;
+  production_recommended?: boolean;
+  production_priority?: number;
+}>(
   devices: readonly T[],
   defaultId?: string | null,
 ): T | null {
   if (!devices.length) return null;
+  const recommended = [...devices]
+    .filter((device) => device.production_recommended === true)
+    .sort((left, right) => (
+      (right.production_priority ?? 0) - (left.production_priority ?? 0)
+    ));
+  if (recommended.length) return recommended[0] ?? null;
   const production = devices.filter((device) => classifyInputDevice(device) === 'production');
   const usable = production.length
     ? production

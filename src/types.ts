@@ -72,6 +72,8 @@ export type ItemState = ScriptItem & {
 
 export type CaptureShareMode = 'exclusive' | 'shared';
 
+export type CaptureBackend = 'asio' | 'wasapi' | 'coreaudio' | string;
+
 export type SilenceDetector = 'energy' | 'vad';
 
 export function normalizeSilenceDetector(value: unknown): SilenceDetector {
@@ -87,6 +89,8 @@ export type CaptureProvenanceSpan = {
   input_channels: number;
   input_channel: number;
   sample_rate: number;
+  capture_backend?: CaptureBackend;
+  capture_buffer_frames?: number;
 };
 
 export type SessionSnapshot = {
@@ -100,6 +104,9 @@ export type SessionSnapshot = {
   device_id?: string;
   input_sample_format?: string;
   capture_share_mode?: CaptureShareMode;
+  capture_backend?: CaptureBackend;
+  requested_capture_buffer_frames?: number;
+  capture_buffer_frames?: number;
   capture_provenance?: CaptureProvenanceSpan[];
   audio_format: {
     sample_rate: number;
@@ -154,12 +161,20 @@ export type DeviceStreamConfiguration = {
   channels: number;
   sample_format: string;
   share_mode?: CaptureShareMode;
+  backend?: CaptureBackend;
+  buffer_size_min?: number;
+  buffer_size_max?: number;
 };
 
 export type AudioDevice = {
   id: string;
   name: string;
+  backend?: CaptureBackend;
   is_default: boolean;
+  production_recommended?: boolean;
+  production_priority?: number;
+  production_blocked_reason?: string | null;
+  recommended_buffer_frames?: number;
   sample_rates: number[];
   input_channels: number[];
   configurations?: DeviceStreamConfiguration[];

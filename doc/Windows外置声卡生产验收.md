@@ -9,7 +9,7 @@
 自动记录：
 
 - Windows 版本、CPU 和工具/引擎版本。
-- WASAPI 输入设备显示名、稳定设备 ID、是否系统默认设备。
+- ASIO/WASAPI 输入设备显示名、后端、稳定设备 ID、是否系统默认或专业推荐设备。
 - 驱动暴露的采样率范围、输入通道数、样本格式，以及每条配置的 `share_mode`（独占 / 系统混音）。
 - 请求值：开流模式、采样率、交付 WAV 位深、输入通道。
 - 实际值：引擎选中的设备 ID、开流模式、输入样本格式、输入通道数、WAV 编码。
@@ -19,7 +19,7 @@
 
 > `input_sample_format` 是最终交给引擎的数字样本表示，例如 `i16` / `i24` / `i32` / `f32`。`--bit-depth` 是交付 WAV 编码。验收门槛按有效数字精度计算：整数 `n` bit 按 `n`，IEEE-754 `f32` 按 24 bit 有效数字，`f64` 按 53 bit，不会把 `f32` 容器误认为 32 bit 有效精度。Windows shared mode 下，可枚举的客户端格式不得超过 `GetMixFormat` 声明的有效精度；`IsFormatSupported` 只能证明 Windows 音频引擎接受该客户端格式，不能用来把已知的低位深源判成高精度。把低精度硬件输入写成 24-bit 或 32-bit 不会凭空增加有效精度，因此报告会同时保留输入格式与交付编码。验收工具默认要求 16-bit 交付至少 16 bit 有效数字精度，24/32-bit 交付至少 24 bit；可用 `--minimum-input-format-bits` 按项目提高。这仍不能证明声卡 ADC 的 ENOB，声卡型号、驱动版本与厂商规格必须人工归档。
 
-> 默认开流是 WASAPI exclusive。`capture_share_mode` 记录实际路径；`sample_rate` 在独占模式下才更接近驱动接受的硬件格式。生成 96 kHz WAV 在系统混音（shared）下只能证明 Windows 音频引擎向应用交付了 96 kHz 样本，不能单凭元数据证明 ADC/驱动原生 96 kHz。独占失败必须可见，禁止静默降级成共享还显示独占。真机仍需用硬件回环、频谱和时钟测试验收原生时钟。
+> 专业声卡默认选择厂商 ASIO，Focusrite 使用 512 帧缓冲区；普通设备保留 WASAPI。`capture_backend`、请求/实际缓冲区和 `capture_share_mode` 分别记录实际路径。ASIO 或 WASAPI 独占失败都必须可见，禁止静默切换后端或降级成共享。真机仍需用硬件回环、频谱和时钟测试验收原生时钟。
 
 > 音频 PCM 仍持续写入活动分段；为避免每秒 `FlushFileBuffers` 对长录音造成抖动，引擎默认约每 10 秒执行一次昂贵的“音频落盘 → WAV 头落盘” checkpoint。磁盘余量查询与 checkpoint 独立，仍每秒执行，频繁完成短句不会推迟安全余量保护。`committed_samples` 表示这个可恢复水位，因此正常验收允许最多 15 秒 committed 延迟；真实断电的默认尾差也是 15 秒，项目可用 `--max-tail-loss-seconds` 放宽，但生产工具不允许超过 30 秒。
 
@@ -86,7 +86,7 @@ npm run acceptance:audio -- --mode inventory
 acceptance-report.json   最终配置、WAV 属性和判定
 telemetry.jsonl          长稳/故障过程的持续样本
 protocol.jsonl           命令、响应和低频引擎事件
-engine-stderr.log        Rust/WASAPI 日志
+engine-stderr.log        Rust 音频后端日志
 recording/               本次验收的原始录制目录
 ```
 
@@ -106,7 +106,7 @@ recording/               本次验收的原始录制目录
 - 设备 ID 非空且与同一台机器上其他输入端点不重复。
 - 需要的采样率和输入通道在 `configurations` 内，并带 `share_mode=exclusive` / `shared`。
 - 工位默认验独占格式；独占列表为空时不得假装可用，应改 `--share-mode shared` 后单独归档。
-- 声卡驱动版本、USB 端口和设备序列号（如有）由验收人补充到工单，因为 WASAPI 协议不保证提供厂商驱动版本。
+- 声卡驱动版本、USB 端口和设备序列号（如有）由验收人补充到工单，因为音频后端协议不保证提供完整厂商驱动版本。
 
 ## 5. 短录与 16/24/32-bit 矩阵
 
@@ -230,7 +230,7 @@ $device = "<inventory 返回的完整设备 ID>"
 
 报告中的 `replug.before`、`replug.transition`、`replug.after` 分别保存故障会话、消失/重现证据和新会话。资格聚合器不只信任报告内嵌的 `inspection`：它会重新读取两个录音目录中的 `items.snapshot.json`、`session.json`、fault marker 和所有分段 WAV，独立解析头部/EOF/物理帧并与会话身份、水位交叉绑定。它还会读取 `telemetry.jsonl` 验证“出现 → 提示后故障 → 消失 → 连续重现 → B 录制”的顺序，读取 `protocol.jsonl` 验证两次 start、两个会话的成功 stop、旧会话导出/恢复拒绝和引擎 shutdown，最后将两个录音目录都纳入证据哈希。
 
-这里验证的是 Windows/WASAPI endpoint 身份，不是声卡机身序列号。驱动更新、换 USB 口或 USB 拓扑变化可能生成不同 endpoint ID；遇到这种情况本项应 fail-closed，先按新的生产端口重新建立资格计划，不能用同名回退绕过。
+这里验证的是 Windows 音频后端的稳定设备 ID，不是声卡机身序列号。驱动更新、换 USB 口或 USB 拓扑变化可能生成不同 ID；遇到这种情况本项应 fail-closed，先按新的生产端口重新建立资格计划，不能用同名或另一后端回退绕过。
 
 ## 8. 磁盘临界/写满保护
 
@@ -422,7 +422,7 @@ $installerSha256 = "<SHA256SUMS.txt 中的 64 位哈希>"
 
 ## 11. 已知边界
 
-- 当前 Windows 基线是 WASAPI exclusive 开流，失败后才允许显式改用系统混音；不是 ASIO。需要 ASIO-only 的声卡不属于本门禁覆盖范围。独占成功仍不能单凭元数据宣称 bit-perfect，时钟与 ENOB 仍需硬件测量。
-- 工具可证明驱动交给应用的样本格式和最终 WAV 编码，不能仅凭 WASAPI 元数据证明声卡 ADC 的真实 ENOB。模拟前端、噪声底和失真仍需专业测量。
+- 当前 Windows 基线是 ASIO + WASAPI 双后端；专业声卡优先 ASIO，Focusrite 的 WASAPI/WDM 端点禁止正式录制。任一后端开流成功都不能单凭元数据宣称 bit-perfect，时钟与 ENOB 仍需硬件测量。
+- 工具可证明所选后端、驱动交给应用的样本格式、缓冲区和最终 WAV 编码，不能仅凭这些元数据证明声卡 ADC 的真实 ENOB。模拟前端、噪声底和失真仍需专业测量。
 - 标准 RIFF/WAV 容器有约 4 GiB 上限；整轨超过该边界时会自动切换为 RF64，五分钟分段、单句和预览仍保持普通 RIFF。RF64 的目标文件系统及播放器、标注、上传等下游兼容性必须按实际交付链路验收，FAT32 不能保存大于 4 GiB 的单文件。
 - 进程强杀/恢复的无硬件回归由 `npm run test:crash-recovery` 执行；真实断电必须按第 9 节在可丢弃的 Windows 测试机上执行并归档，不能用无硬件回归代替。

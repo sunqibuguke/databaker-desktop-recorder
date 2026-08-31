@@ -16,7 +16,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # Raise the platform audio callback to its realtime/MMCSS class where CPAL
 # supports it. This is particularly important for Windows USB interfaces under
 # CPU or DPC pressure; capture faults still remain fail-closed.
-cpal = { path = "vendor/cpal", features = ["realtime"] }
+cpal = { path = "vendor/cpal", features = ["realtime", "asio"] }
 crossbeam-channel = "0.5"
 earshot = "1.2.2"
 fs2 = "0.4.3"

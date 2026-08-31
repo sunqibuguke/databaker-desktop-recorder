@@ -77,7 +77,7 @@ function usage() {
   node scripts/windows-audio-acceptance.cjs --mode <mode> [options]
 
 模式:
-  inventory   只枚举 WASAPI 输入设备、稳定 ID 和驱动配置
+  inventory   枚举 ASIO/WASAPI 输入设备、稳定 ID 和驱动配置
   short       短录音、进度监测、安全停止、WAV 头和 RIFF/RF64 整轨导出验证
   soak        2–8 小时连续录音和文件增长监测（默认不拷贝整轨）
   unplug      进行中人工拔出 USB 声卡，验证 fail-closed 和故障标记
@@ -109,7 +109,7 @@ function usage() {
   --skip-noise-check             不执行 3 秒环境噪声检测
   --export                       soak 也生成 full-track.wav（可能很大）
   --no-export                    short 不生成 full-track.wav
-  --yes                          非交互执行；无设备参数时选系统默认设备
+  --yes                          非交互执行；无设备参数时优先选专业 ASIO 设备
   --session-dir <path>           power-cut / recover / inspect 共用的录制目录
   --phase1-report <path>         recover 必需：phase-1 acceptance-report.json 或独立证据 JSON
   --phase1-evidence <path>       --phase1-report 的等价别名
@@ -970,7 +970,10 @@ function printDevices(inventory) {
   process.stdout.write('\n可用输入设备:\n');
   for (const [index, device] of devices.entries()) {
     const marker = device.is_default ? ' [默认]' : '';
-    process.stdout.write(`  ${index + 1}. ${device.name}${marker}\n     ID: ${device.id}\n`);
+    const backend = device.backend ? ` [${String(device.backend).toUpperCase()}]` : '';
+    const recommended = device.production_recommended ? ' [推荐]' : '';
+    process.stdout.write(`  ${index + 1}. ${device.name}${backend}${marker}${recommended}\n     ID: ${device.id}\n`);
+    if (device.production_blocked_reason) process.stdout.write(`     禁止正式录制: ${device.production_blocked_reason}\n`);
     for (const config of device.configurations ?? []) {
       const shareMode = config.share_mode === 'exclusive' ? '独占' : config.share_mode === 'shared' ? '共享' : '未标注';
       process.stdout.write(`     ${shareMode} ${config.min_sample_rate}–${config.max_sample_rate} Hz / ${config.channels} ch / ${config.sample_format}\n`);
@@ -987,7 +990,18 @@ async function selectDevice(inventory, options) {
   if (options.deviceId && !selected) throw new Error(`未找到 --device-id ${options.deviceId}`);
   if (!selected && options.deviceIndex !== null) selected = devices[options.deviceIndex - 1];
   if (options.deviceIndex !== null && !selected) throw new Error(`--device-index ${options.deviceIndex} 超出范围`);
-  const defaultIndex = Math.max(0, devices.findIndex((device) => device.id === inventory.default_device_id));
+  const recommendedPriority = Math.max(
+    -1,
+    ...devices.map((device) => device.production_recommended === true
+      ? Number(device.production_priority ?? 0)
+      : -1),
+  );
+  const recommendedIndex = devices.findIndex((device) => (
+    device.production_recommended === true
+    && Number(device.production_priority ?? 0) === recommendedPriority
+  ));
+  const systemDefaultIndex = devices.findIndex((device) => device.id === inventory.default_device_id);
+  const defaultIndex = recommendedIndex >= 0 ? recommendedIndex : Math.max(0, systemDefaultIndex);
   if (!selected && !options.yes && process.stdin.isTTY && process.stdout.isTTY) {
     const prompt = createPrompt({ input: process.stdin, output: process.stdout });
     try {
@@ -2022,6 +2036,22 @@ function evaluateCommon(report, options, inspection) {
     requested: options.shareMode,
     actual: snapshot?.capture_share_mode,
   });
+  addCheck(checks, 'capture-backend-match', '实际录音后端与选择一致', snapshot?.capture_backend === selected?.backend, {
+    requested: selected?.backend,
+    actual: snapshot?.capture_backend,
+  });
+  if (selected?.recommended_buffer_frames) {
+    addCheck(
+      checks,
+      'capture-buffer-match',
+      'ASIO 实际缓冲区与请求一致',
+      snapshot?.capture_buffer_frames === selected.recommended_buffer_frames,
+      {
+        requested: selected.recommended_buffer_frames,
+        actual: snapshot?.capture_buffer_frames,
+      },
+    );
+  }
   addCheck(checks, 'input-format-recorded', '引擎记录驱动实际输入样本格式', Boolean(snapshot?.input_sample_format), {
     input_sample_format: snapshot?.input_sample_format,
     capture_share_mode: snapshot?.capture_share_mode,
@@ -2784,6 +2814,7 @@ function replugStartPayload(sessionDirectory, sessionId, selected, options, phas
     bit_depth: options.bitDepth,
     input_channel: options.channel,
     capture_share_mode: options.shareMode,
+    capture_buffer_frames: selected.recommended_buffer_frames,
     silence_duration_ms: 1_000,
     silence_threshold_dbfs: options.noiseThresholdDbfs,
     items: [{
@@ -2836,6 +2867,8 @@ async function runReplug(options, runDirectory, report) {
       sample_rate: options.sampleRate,
       wav_bit_depth: options.bitDepth,
       capture_share_mode: options.shareMode,
+      capture_backend: selected.backend,
+      capture_buffer_frames: selected.recommended_buffer_frames,
       minimum_input_format_bits: options.minimumInputFormatBits,
       output_channels: 1,
       input_channel: options.channel,
@@ -3273,6 +3306,8 @@ async function runCapture(options, runDirectory, report) {
       sample_rate: options.sampleRate,
       wav_bit_depth: options.bitDepth,
       capture_share_mode: options.shareMode,
+      capture_backend: selected.backend,
+      capture_buffer_frames: selected.recommended_buffer_frames,
       minimum_input_format_bits: options.minimumInputFormatBits,
       output_channels: 1,
       input_channel: options.channel,
@@ -3292,6 +3327,7 @@ async function runCapture(options, runDirectory, report) {
         bit_depth: options.bitDepth,
         input_channel: options.channel,
         capture_share_mode: options.shareMode,
+        capture_buffer_frames: selected.recommended_buffer_frames,
         silence_duration_ms: 1_000,
         silence_threshold_dbfs: options.noiseThresholdDbfs,
         items: [{ id: 'QA-001', text: 'DataBaker Windows external audio interface acceptance', label: options.mode }],

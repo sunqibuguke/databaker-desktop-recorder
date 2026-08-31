@@ -53,8 +53,8 @@ jobs:
       - name: Run strict Rust lints
         run: node scripts/run-cargo.cjs clippy --manifest-path engine/Cargo.toml --all-targets --all-features -- -D warnings
 
-      - name: Run vendored CPAL WASAPI patch tests
-        run: cargo test --manifest-path engine/vendor/cpal/Cargo.toml --lib
+      - name: Run vendored CPAL Windows audio patch tests
+        run: cargo test --manifest-path engine/vendor/cpal/Cargo.toml --lib --features asio
 
       - name: Run tests including deterministic engine kill recovery
         run: npm test

@@ -53,7 +53,15 @@ zero `DIRECTOUT` mask is rejected by many USB interfaces. Exclusive
 `AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED`. Shared enumeration and open paths are
 unchanged.
 
+The Windows build also enables CPAL's ASIO host. DataBaker extends its input
+sample mapping for the ASIO 32-bit container formats with 16/18/20/24 valid
+bits. Those formats are normalized to full-scale `i32` before CPAL hands the
+samples to the recorder, preventing a supported professional driver from being
+hidden during enumeration or recorded at the wrong digital level. The existing
+ASIO duplicate-buffer callback guard remains active for non-conformant drivers,
+including Focusrite USB ASIO.
+
 Remove this vendor only after a released CPAL version containing both upstream
-fixes, equivalent silent-packet handling, and equivalent explicit-endpoint
-disconnect notification has been adopted, and the Windows hardware fault suite
-passes again.
+fixes, equivalent silent-packet handling, equivalent explicit-endpoint
+disconnect notification, and the aligned ASIO integer input support has been
+adopted, and the Windows hardware fault suite passes again.

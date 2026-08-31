@@ -275,6 +275,10 @@ pub struct CaptureProvenanceSpan {
     pub input_channels: u16,
     pub input_channel: u16,
     pub sample_rate: u32,
+    #[serde(default)]
+    pub capture_backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_buffer_frames: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,6 +303,16 @@ pub struct SessionSnapshot {
     /// Windows mixer; other hosts keep their native path and ignore the flag.
     #[serde(default)]
     pub capture_share_mode: CaptureShareMode,
+    /// Concrete host selected from the stable device ID (`asio`, `wasapi`, ...).
+    #[serde(default)]
+    pub capture_backend: String,
+    /// Buffer requested from the driver. ASIO defaults to 512 frames for the
+    /// professional capture path; no other backend is silently substituted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_capture_buffer_frames: Option<u32>,
+    /// Buffer reported by the opened stream when the backend exposes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_buffer_frames: Option<u32>,
     /// Durable sample ranges attributed to each actual driver configuration.
     /// Older snapshots have no spans and retain their legacy top-level source
     /// fields; the first resume upgrades them without inventing sample data.
@@ -379,6 +393,8 @@ pub struct StartSessionPayload {
     pub input_channel: u16,
     #[serde(default)]
     pub capture_share_mode: CaptureShareMode,
+    #[serde(default)]
+    pub capture_buffer_frames: Option<u32>,
     #[serde(default = "default_silence_duration_ms")]
     pub silence_duration_ms: u32,
     #[serde(default)]
@@ -501,6 +517,47 @@ fn effective_capture_share_mode(requested: CaptureShareMode) -> CaptureShareMode
     } else {
         CaptureShareMode::Shared
     }
+}
+
+fn capture_backend_from_device_id(device_id: &str) -> String {
+    device_id
+        .split_once(':')
+        .map(|(backend, _)| backend.trim().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+fn is_asio_device_id(device_id: &str) -> bool {
+    capture_backend_from_device_id(device_id) == "asio"
+}
+
+fn production_backend_block_reason(device_name: &str, device_id: &str) -> Option<String> {
+    if device_name.to_ascii_lowercase().contains("focusrite")
+        && capture_backend_from_device_id(device_id) == "wasapi"
+    {
+        return Some(
+            "检测到 Focusrite 的 WASAPI/WDM 端点；正式录制必须选择 Focusrite USB ASIO。软件不会自动降级，请安装或修复 Focusrite 官方驱动后重新选择 ASIO 设备。"
+                .to_string(),
+        );
+    }
+    None
+}
+
+fn normalize_capture_buffer_frames(device_id: &str, requested: Option<u32>) -> Result<Option<u32>> {
+    if !is_asio_device_id(device_id) {
+        return Ok(None);
+    }
+    let Some(frames) = requested.or_else(|| {
+        device_id
+            .to_ascii_lowercase()
+            .contains("focusrite")
+            .then_some(512)
+    }) else {
+        return Ok(None);
+    };
+    if !(16..=16_384).contains(&frames) {
+        bail!("ASIO 缓冲区必须在 16 到 16384 帧之间，当前为 {frames}");
+    }
+    Ok(Some(frames))
 }
 
 fn default_true() -> bool {
@@ -1656,64 +1713,111 @@ impl Engine {
     }
 
     pub fn list_devices(&self) -> Result<Value> {
-        let host = cpal::default_host();
-        let default_device = host.default_input_device();
+        let default_host = cpal::default_host();
+        let default_host_id = default_host.id();
+        let default_device = default_host.default_input_device();
         let default_device_id = default_device
             .as_ref()
             .and_then(|device| device.id().ok())
             .map(|id| id.to_string());
         let mut default_name = None::<String>;
         let mut devices = Vec::new();
-        for device in host.input_devices().context("enumerate input devices")? {
-            let id = match device.id() {
-                Ok(id) => id.to_string(),
+        let mut host_ids = cpal::available_hosts();
+        host_ids.sort_by_key(|host_id| match host_id.to_string().as_str() {
+            "asio" => 0,
+            "wasapi" => 1,
+            _ => 2,
+        });
+        for host_id in host_ids {
+            let backend = host_id.to_string();
+            let host = match cpal::host_from_id(host_id) {
+                Ok(host) => host,
                 Err(error) => {
-                    eprintln!("skip input device without stable id: {error}");
+                    eprintln!("skip unavailable capture backend {backend}: {error:#}");
                     continue;
                 }
             };
-            let name = match input_device_name(&device) {
-                Ok(name) => name,
+            let host_default_device_id = if host_id == default_host_id {
+                default_device_id.as_deref()
+            } else {
+                None
+            };
+            let input_devices = match host.input_devices() {
+                Ok(devices) => devices,
                 Err(error) => {
-                    eprintln!("skip unavailable input device {id}: {error:#}");
+                    eprintln!("skip capture backend {backend}: {error:#}");
                     continue;
                 }
             };
-            let exclusive = collect_input_format_catalog(&device, true);
-            let shared = collect_input_format_catalog(&device, false);
-            if let Some(error) = exclusive.probe_error.as_deref() {
-                eprintln!("exclusive format probe failed for {name}: {error}");
-            } else if !exclusive.available {
-                eprintln!(
-                    "exclusive format probe empty for {name}; shared_rates={:?} shared_channels={:?}",
-                    shared.sample_rates, shared.input_channels
-                );
-            }
-            if exclusive.configurations.is_empty() && shared.configurations.is_empty() {
-                continue;
-            }
-            let mut rates = exclusive.sample_rates.clone();
-            rates.extend(shared.sample_rates.iter().copied());
-            rates.sort_unstable();
-            rates.dedup();
-            let mut input_channels = exclusive.input_channels.clone();
-            input_channels.extend(shared.input_channels.iter().copied());
-            input_channels.sort_unstable();
-            input_channels.dedup();
-            let exclusive_formats = catalog_sample_formats(&exclusive);
-            let mut configurations = exclusive.configurations;
-            configurations.extend(shared.configurations);
-            let is_default = default_device_id.as_deref() == Some(id.as_str());
-            if is_default {
-                // Derive the display name from the same explicitly enumerated
-                // endpoint as the ID. Querying the dynamic default handle a
-                // second time could pair the old ID with a newly-routed name.
-                default_name = Some(name.clone());
-            }
-            devices.push(json!({
+            for device in input_devices {
+                let id = match device.id() {
+                    Ok(id) => id.to_string(),
+                    Err(error) => {
+                        eprintln!("skip input device without stable id: {error}");
+                        continue;
+                    }
+                };
+                let name = match input_device_name(&device) {
+                    Ok(name) => name,
+                    Err(error) => {
+                        eprintln!("skip unavailable input device {id}: {error:#}");
+                        continue;
+                    }
+                };
+                let exclusive = collect_input_format_catalog(&device, true, &backend);
+                let shared = if backend == "asio" {
+                    InputFormatCatalog::default()
+                } else {
+                    collect_input_format_catalog(&device, false, &backend)
+                };
+                if let Some(error) = exclusive.probe_error.as_deref() {
+                    eprintln!("exclusive format probe failed for {name}: {error}");
+                } else if !exclusive.available {
+                    eprintln!(
+                        "exclusive format probe empty for {name}; shared_rates={:?} shared_channels={:?}",
+                        shared.sample_rates, shared.input_channels
+                    );
+                }
+                if exclusive.configurations.is_empty() && shared.configurations.is_empty() {
+                    continue;
+                }
+                let mut rates = exclusive.sample_rates.clone();
+                rates.extend(shared.sample_rates.iter().copied());
+                rates.sort_unstable();
+                rates.dedup();
+                let mut input_channels = exclusive.input_channels.clone();
+                input_channels.extend(shared.input_channels.iter().copied());
+                input_channels.sort_unstable();
+                input_channels.dedup();
+                let exclusive_formats = catalog_sample_formats(&exclusive);
+                let mut configurations = exclusive.configurations;
+                configurations.extend(shared.configurations);
+                let is_default = host_default_device_id == Some(id.as_str());
+                if is_default {
+                    // Derive the display name from the same explicitly enumerated
+                    // endpoint as the ID. Querying the dynamic default handle a
+                    // second time could pair the old ID with a newly-routed name.
+                    default_name = Some(name.clone());
+                }
+                devices.push(json!({
                 "id": id,
                 "name": name,
+                "backend": backend,
                 "is_default": is_default,
+                "production_recommended": backend == "asio",
+                "production_priority": if backend == "asio" && name.to_ascii_lowercase().contains("focusrite") {
+                    200
+                } else if backend == "asio" {
+                    100
+                } else {
+                    0
+                },
+                "production_blocked_reason": production_backend_block_reason(&name, &id),
+                "recommended_buffer_frames": if backend == "asio" && name.to_ascii_lowercase().contains("focusrite") {
+                    Some(512u32)
+                } else {
+                    None
+                },
                 "sample_rates": rates,
                 "input_channels": input_channels,
                 "configurations": configurations,
@@ -1725,6 +1829,7 @@ impl Engine {
                 "shared_sample_rates": shared.sample_rates,
                 "shared_input_channels": shared.input_channels,
             }));
+            }
         }
         Ok(json!({
             "devices": devices,
@@ -1804,6 +1909,9 @@ impl Engine {
             device_id: existing.device_id,
             input_sample_format: existing.input_sample_format,
             capture_share_mode: existing.capture_share_mode,
+            capture_backend: existing.capture_backend,
+            requested_capture_buffer_frames: existing.requested_capture_buffer_frames,
+            capture_buffer_frames: None,
             capture_provenance: Vec::new(),
             audio_format: existing.audio_format,
             master_audio: SEGMENTED_MASTER_AUDIO.to_string(),
@@ -1958,6 +2066,9 @@ impl Engine {
         }
 
         let now = Utc::now().to_rfc3339();
+        let device_id = payload.device_id.unwrap_or_default();
+        let requested_capture_buffer_frames =
+            normalize_capture_buffer_frames(&device_id, payload.capture_buffer_frames)?;
         let snapshot = SessionSnapshot {
             schema_version: 1,
             journal_seq: 0,
@@ -1965,9 +2076,12 @@ impl Engine {
             script_name: payload.script_name,
             status: "recording".to_string(),
             device_name: payload.device_name.unwrap_or_default(),
-            device_id: payload.device_id.unwrap_or_default(),
+            capture_backend: capture_backend_from_device_id(&device_id),
+            device_id,
             input_sample_format,
             capture_share_mode: effective_capture_share_mode(payload.capture_share_mode),
+            requested_capture_buffer_frames,
+            capture_buffer_frames: None,
             capture_provenance: Vec::new(),
             audio_format: AudioFormat {
                 sample_rate: payload.sample_rate,
@@ -2341,17 +2455,20 @@ impl Engine {
         let (device_name, device_id, input_channels, sample_format, stream_setup) =
             match capture_activation {
                 CaptureActivation::Device => {
-                    let host = cpal::default_host();
                     let requested_device_id = require_explicit_input_device_id(
                         Some(snapshot.device_id.as_str()),
                         "启动采集流",
                     )?;
-                    let device = select_device(&host, requested_device_id)?;
+                    let device = select_device(requested_device_id)?;
                     let device_id = device
                         .id()
                         .context("read stable input device id")?
                         .to_string();
                     let device_name = input_device_name(&device)?;
+                    if let Some(reason) = production_backend_block_reason(&device_name, &device_id)
+                    {
+                        bail!(reason);
+                    }
                     let requested_format =
                         parse_requested_input_sample_format(&snapshot.input_sample_format)?;
                     let candidates = select_config_candidates(
@@ -2407,6 +2524,10 @@ impl Engine {
         };
         snapshot.device_name = device_name.clone();
         snapshot.device_id = device_id.clone();
+        snapshot.capture_backend = capture_backend_from_device_id(&device_id);
+        snapshot.requested_capture_buffer_frames =
+            normalize_capture_buffer_frames(&device_id, snapshot.requested_capture_buffer_frames)?;
+        snapshot.capture_buffer_frames = None;
         snapshot.input_sample_format = sample_format.to_string();
         snapshot.audio_format.encoding = output_encoding.name().to_string();
         snapshot.audio_format.input_channels = input_channels;
@@ -2518,6 +2639,9 @@ impl Engine {
                     "device_id": snapshot.device_id,
                     "input_sample_format": snapshot.input_sample_format,
                     "capture_share_mode": snapshot.capture_share_mode,
+                    "capture_backend": snapshot.capture_backend,
+                    "requested_capture_buffer_frames": snapshot.requested_capture_buffer_frames,
+                    "capture_buffer_frames": snapshot.capture_buffer_frames,
                     "capture_provenance": snapshot.capture_provenance,
                     "audio_format": snapshot.audio_format,
                     "storage_layout_version": snapshot.storage_layout_version,
@@ -2775,7 +2899,11 @@ impl Engine {
                 let config = StreamConfig {
                     channels: supported.channels(),
                     sample_rate,
-                    buffer_size: cpal::BufferSize::Default,
+                    buffer_size: session
+                        .snapshot
+                        .requested_capture_buffer_frames
+                        .map(cpal::BufferSize::Fixed)
+                        .unwrap_or(cpal::BufferSize::Default),
                     share_mode,
                 };
                 match build_stream(
@@ -2813,7 +2941,13 @@ impl Engine {
                     },
                 ) {
                     Ok(stream) => {
-                        opened = Some((stream, supported.channels(), supported.sample_format()));
+                        let actual_buffer_frames = stream.buffer_size().ok();
+                        opened = Some((
+                            stream,
+                            supported.channels(),
+                            supported.sample_format(),
+                            actual_buffer_frames,
+                        ));
                         break;
                     }
                     Err(error) => {
@@ -2828,22 +2962,47 @@ impl Engine {
                 }
             }
             match opened {
-                Some((stream, input_channels, sample_format)) => {
+                Some((stream, input_channels, sample_format, actual_buffer_frames)) => {
                     session.snapshot.audio_format.input_channels = input_channels;
                     session.snapshot.input_sample_format = sample_format.to_string();
+                    session.snapshot.capture_buffer_frames = actual_buffer_frames;
+                    let opened_source = capture_span_from_snapshot(
+                        &session.snapshot,
+                        expected_existing_frames,
+                        expected_existing_frames,
+                    );
+                    let pending_source =
+                        session.snapshot.capture_provenance.last_mut().context(
+                            "missing pending capture provenance during stream activation",
+                        )?;
+                    if pending_source.start_sample != expected_existing_frames
+                        || pending_source.end_sample != expected_existing_frames
+                    {
+                        return Err(self.finish_activation_failure(
+                            session,
+                            "update_capture_provenance",
+                            anyhow!(
+                                "pending capture provenance boundary changed before stream open"
+                            ),
+                        ));
+                    }
+                    *pending_source = opened_source;
                     session.stream = Some(stream);
                 }
                 None => {
+                    let open_context = if session.snapshot.capture_backend == "asio" {
+                        "ASIO 开流失败。请关闭占用该 ASIO 驱动的其他软件，并确认声卡采样率和缓冲区设置；软件不会自动降级到 WASAPI/WDM"
+                    } else if exclusive_open {
+                        "独占开流失败。请确认声卡未被其他程序占用，并检查采样率/位深/通道；可改为「系统混音」，不会自动降级"
+                    } else {
+                        "build input stream"
+                    };
                     return Err(self.finish_activation_failure(
                         session,
                         "build_input_stream",
                         last_error
                             .unwrap_or_else(|| anyhow!("no compatible input stream candidate"))
-                            .context(if exclusive_open {
-                                "独占开流失败。请确认声卡未被其他程序占用，并检查采样率/位深/通道；可改为「系统混音」，不会自动降级"
-                            } else {
-                                "build input stream"
-                            }),
+                            .context(open_context),
                     ));
                 }
             }
@@ -2936,6 +3095,8 @@ impl Engine {
         let vad_analysis_thread = session.silence_analysis.clone();
         let telemetry_session_dir = session.session_dir.clone();
         let capture_share_mode = session.snapshot.capture_share_mode.as_str();
+        let capture_backend = session.snapshot.capture_backend.clone();
+        let capture_buffer_frames = session.snapshot.capture_buffer_frames;
         let telemetry_join = match thread::Builder::new()
             .name("telemetry".to_string())
             .spawn(move || {
@@ -2997,6 +3158,8 @@ impl Engine {
                             "input_discontinuity_count": capture_recovery_thread.discontinuities.load(Ordering::Acquire),
                             "input_discontinuity_silence_samples": capture_recovery_thread.inserted_silence_frames.load(Ordering::Acquire),
                             "capture_share_mode": capture_share_mode,
+                            "capture_backend": capture_backend,
+                            "capture_buffer_frames": capture_buffer_frames,
                             "storage_status": storage_status,
                             "storage_safe_remaining_seconds": storage_remaining_thread.load(Ordering::Acquire),
                             "peak": f32::from_bits(peak_thread.load(Ordering::Relaxed)),
@@ -3062,6 +3225,9 @@ impl Engine {
                 "device_id": device_id,
                 "input_sample_format": sample_format.to_string(),
                 "capture_share_mode": session.snapshot.capture_share_mode,
+                "capture_backend": session.snapshot.capture_backend,
+                "requested_capture_buffer_frames": session.snapshot.requested_capture_buffer_frames,
+                "capture_buffer_frames": session.snapshot.capture_buffer_frames,
                 "sample_rate": sample_rate,
                 "bit_depth": bit_depth,
                 "encoding": output_encoding.name(),
@@ -3683,15 +3849,15 @@ impl Engine {
             .discontinuities
             .load(Ordering::Acquire)
             > active.input_discontinuity_count_at_start;
-        // Some WASAPI drivers repeatedly set DATA_DISCONTINUITY while packet
-        // positions remain continuous. Keep that signal as session telemetry,
-        // but only invalidate the take when recovery inserted missing frames.
+        // A driver discontinuity is direct evidence that this take may contain
+        // a click/pop even when packet positions do not let us estimate missing
+        // frames. Never allow such a take into delivery silently.
         let recovered_discontinuity = session
             .capture_recovery
             .inserted_silence_frames
             .load(Ordering::Acquire)
             > active.input_discontinuity_silence_samples_at_start;
-        let quality_issues = if recovered_discontinuity {
+        let quality_issues = if observed_discontinuity {
             vec![AttemptQualityIssue {
                 code: "input_discontinuity".to_string(),
                 start_sample: None,
@@ -3716,7 +3882,7 @@ impl Engine {
             forced_without_tail_silence,
             tail_silence_samples: recorded_tail_silence_samples,
             required_tail_silence_samples: required_silence_samples,
-            status: if recovered_discontinuity {
+            status: if observed_discontinuity {
                 "needs_rerecord".to_string()
             } else {
                 "recorded".to_string()
@@ -3742,11 +3908,11 @@ impl Engine {
                 });
         // A clean retake is always an explicit review candidate. Keep the
         // previously accepted version selected until the operator adopts the
-        // new candidate or explicitly keeps the old one. A recovered input gap
-        // makes this take non-deliverable; when a known-good selection exists,
+        // new candidate or explicitly keeps the old one. Any reported input
+        // discontinuity makes this take non-deliverable; when a known-good selection exists,
         // preserve it and keep the item accepted while retaining the bad take
         // as durable warning evidence.
-        if recovered_discontinuity && has_accepted_selection {
+        if observed_discontinuity && has_accepted_selection {
             item.status = "accepted".to_string();
         } else {
             item.status = "review".to_string();
@@ -4846,6 +5012,9 @@ impl Engine {
             "device_id": snapshot.device_id,
             "input_sample_format": snapshot.input_sample_format,
             "capture_share_mode": snapshot.capture_share_mode,
+            "capture_backend": snapshot.capture_backend,
+            "requested_capture_buffer_frames": snapshot.requested_capture_buffer_frames,
+            "capture_buffer_frames": snapshot.capture_buffer_frames,
             "capture_provenance": snapshot.capture_provenance,
             "audio_format": snapshot.audio_format,
             "storage_layout_version": snapshot.storage_layout_version,
@@ -5547,6 +5716,8 @@ fn capture_span_from_snapshot(
         input_channels: snapshot.audio_format.input_channels,
         input_channel: snapshot.audio_format.input_channel,
         sample_rate: snapshot.audio_format.sample_rate,
+        capture_backend: snapshot.capture_backend.clone(),
+        capture_buffer_frames: snapshot.capture_buffer_frames,
     }
 }
 
@@ -5557,6 +5728,8 @@ fn same_capture_source(left: &CaptureProvenanceSpan, right: &CaptureProvenanceSp
         && left.input_channels == right.input_channels
         && left.input_channel == right.input_channel
         && left.sample_rate == right.sample_rate
+        && left.capture_backend == right.capture_backend
+        && left.capture_buffer_frames == right.capture_buffer_frames
 }
 
 fn validate_capture_provenance(
@@ -5667,6 +5840,9 @@ fn session_summary_value(snapshot: &SessionSnapshot) -> Value {
         "device_id": snapshot.device_id,
         "input_sample_format": snapshot.input_sample_format,
         "capture_share_mode": snapshot.capture_share_mode,
+        "capture_backend": snapshot.capture_backend,
+        "requested_capture_buffer_frames": snapshot.requested_capture_buffer_frames,
+        "capture_buffer_frames": snapshot.capture_buffer_frames,
         "capture_provenance": snapshot.capture_provenance,
         "audio_format": snapshot.audio_format,
         "storage_layout_version": snapshot.storage_layout_version,
@@ -8610,10 +8786,16 @@ fn input_device_name(device: &Device) -> Result<String> {
         .context("read input device description")
 }
 
-fn select_device(host: &cpal::Host, requested_id: &str) -> Result<Device> {
+fn select_device(requested_id: &str) -> Result<Device> {
     let parsed = requested_id
         .parse::<cpal::DeviceId>()
         .with_context(|| format!("invalid stable input device id: {requested_id}"))?;
+    let host = cpal::host_from_id(parsed.host()).with_context(|| {
+        format!(
+            "录音后端 {} 不可用；软件不会自动切换到其他后端",
+            parsed.host()
+        )
+    })?;
     let device = host.device_by_id(&parsed).ok_or_else(|| {
         anyhow!(
             "指定的录音设备已断开或设备 ID 已变化：{requested_id}；为避免录错输入，软件不会自动切换到系统默认或同名设备"
@@ -8714,6 +8896,7 @@ fn delivery_bit_depth_for_sample_format(format: SampleFormat) -> u16 {
     }
 }
 
+#[derive(Default)]
 struct InputFormatCatalog {
     sample_rates: Vec<u32>,
     input_channels: Vec<u16>,
@@ -8722,7 +8905,11 @@ struct InputFormatCatalog {
     probe_error: Option<String>,
 }
 
-fn collect_input_format_catalog(device: &Device, exclusive: bool) -> InputFormatCatalog {
+fn collect_input_format_catalog(
+    device: &Device,
+    exclusive: bool,
+    capture_backend: &str,
+) -> InputFormatCatalog {
     let mut sample_rates = Vec::<u32>::new();
     let mut input_channels = Vec::<u16>::new();
     let mut configurations = Vec::<Value>::new();
@@ -8736,12 +8923,19 @@ fn collect_input_format_catalog(device: &Device, exclusive: bool) -> InputFormat
                 input_channels.push(config.channels());
                 sample_rates.push(config.min_sample_rate());
                 sample_rates.push(config.max_sample_rate());
+                let (buffer_size_min, buffer_size_max) = match config.buffer_size() {
+                    cpal::SupportedBufferSize::Range { min, max } => (Some(*min), Some(*max)),
+                    cpal::SupportedBufferSize::Unknown => (None, None),
+                };
                 configurations.push(json!({
                     "min_sample_rate": config.min_sample_rate(),
                     "max_sample_rate": config.max_sample_rate(),
                     "channels": config.channels(),
                     "sample_format": config.sample_format().to_string(),
                     "share_mode": if exclusive { "exclusive" } else { "shared" },
+                    "backend": capture_backend,
+                    "buffer_size_min": buffer_size_min,
+                    "buffer_size_max": buffer_size_max,
                 }));
             }
         }
@@ -10563,6 +10757,7 @@ mod tests {
                     input_sample_format: "f32".to_string(),
                     input_channel: 1,
                     capture_share_mode: CaptureShareMode::Shared,
+                    capture_buffer_frames: None,
                     silence_duration_ms: 200,
                     noise_threshold_dbfs: Some(-42.0),
                     silence_threshold_dbfs: -42.0,
@@ -10926,9 +11121,40 @@ mod tests {
 
     #[test]
     fn device_selection_rejects_invalid_stable_id_without_fallback() {
-        let host = cpal::default_host();
-        let error = select_device(&host, "not-a-stable-device-id").unwrap_err();
+        let error = select_device("not-a-stable-device-id").unwrap_err();
         assert!(format!("{error:#}").contains("invalid stable input device id"));
+    }
+
+    #[test]
+    fn asio_capture_defaults_to_512_frames_without_changing_backends() {
+        assert_eq!(
+            normalize_capture_buffer_frames("asio:Focusrite USB ASIO", None).unwrap(),
+            Some(512)
+        );
+        assert_eq!(
+            normalize_capture_buffer_frames("asio:Focusrite USB ASIO", Some(1024)).unwrap(),
+            Some(1024)
+        );
+        assert_eq!(
+            normalize_capture_buffer_frames("wasapi:focusrite-wdm", Some(512)).unwrap(),
+            None
+        );
+        assert_eq!(
+            normalize_capture_buffer_frames("asio:another-professional-driver", None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn focusrite_wasapi_is_blocked_but_asio_is_allowed() {
+        assert!(
+            production_backend_block_reason("Focusrite USB Audio", "wasapi:endpoint").is_some()
+        );
+        assert!(
+            production_backend_block_reason("Focusrite USB ASIO", "asio:Focusrite USB ASIO")
+                .is_none()
+        );
+        assert!(production_backend_block_reason("USB Microphone", "wasapi:endpoint").is_none());
     }
 
     #[test]
@@ -11303,6 +11529,9 @@ mod tests {
             device_id: "null:test".to_string(),
             input_sample_format: "f32".to_string(),
             capture_share_mode: CaptureShareMode::Exclusive,
+            capture_backend: "null".to_string(),
+            requested_capture_buffer_frames: None,
+            capture_buffer_frames: None,
             capture_provenance: Vec::new(),
             audio_format: AudioFormat {
                 sample_rate: 48_000,
@@ -12640,8 +12869,8 @@ mod tests {
     }
 
     #[test]
-    fn driver_only_discontinuity_without_missing_frames_remains_deliverable() {
-        let root = test_root("driver-only-discontinuity-remains-deliverable");
+    fn driver_only_discontinuity_without_missing_frames_requires_rerecord() {
+        let root = test_root("driver-only-discontinuity-requires-rerecord");
         let mut session = prepare_metadata_test_session(&root);
         session.snapshot.audio_format.sample_rate = 100;
         session.snapshot.silence_duration_ms = 200;
@@ -12694,12 +12923,15 @@ mod tests {
 
         assert_eq!(stopped["observed_discontinuity"], true);
         assert_eq!(stopped["recovered_discontinuity"], false);
-        assert_eq!(stopped["attempt"]["status"], "recorded");
-        assert_eq!(stopped["attempt"]["quality_issues"], Value::Null);
-        assert!(engine.accept_attempt("001", "001-a1").is_ok());
+        assert_eq!(stopped["attempt"]["status"], "needs_rerecord");
+        assert_eq!(
+            stopped["attempt"]["quality_issues"][0]["code"],
+            "input_discontinuity"
+        );
+        assert!(engine.accept_attempt("001", "001-a1").is_err());
         assert_eq!(
             engine.session.as_ref().unwrap().snapshot.items[0].status,
-            "accepted"
+            "review"
         );
 
         engine
@@ -13257,6 +13489,8 @@ mod tests {
             input_channels: 1,
             input_channel: 1,
             sample_rate: 48_000,
+            capture_backend: "null".to_string(),
+            capture_buffer_frames: None,
         }];
         assert!(validate_capture_provenance(&snapshot, 10, true).is_err());
 
@@ -15580,6 +15814,7 @@ mod tests {
                 input_sample_format: String::new(),
                 input_channel: 1,
                 capture_share_mode: CaptureShareMode::Exclusive,
+                capture_buffer_frames: None,
                 silence_duration_ms: 1_000,
                 noise_threshold_dbfs: Some(-42.0),
                 silence_threshold_dbfs: -42.0,
@@ -16620,6 +16855,7 @@ mod tests {
             input_sample_format: String::new(),
             input_channel: 1,
             capture_share_mode: CaptureShareMode::Shared,
+            capture_buffer_frames: None,
             silence_duration_ms: 1_000,
             noise_threshold_dbfs: Some(-42.0),
             silence_threshold_dbfs: -42.0,
@@ -16687,6 +16923,7 @@ mod tests {
                 input_sample_format: "I24".to_string(),
                 input_channel: 1,
                 capture_share_mode: CaptureShareMode::Exclusive,
+                capture_buffer_frames: None,
                 silence_duration_ms: 1_000,
                 noise_threshold_dbfs: Some(-42.0),
                 silence_threshold_dbfs: -42.0,

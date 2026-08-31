@@ -61,6 +61,16 @@ enum StreamState {
     Playing = 2,
 }
 
+#[inline]
+fn normalize_aligned_asio_i32(sample: i32, little_endian: bool, valid_bits: u32) -> i32 {
+    let native = if little_endian {
+        i32::from_le(sample)
+    } else {
+        i32::from_be(sample)
+    };
+    native.wrapping_shl(32 - valid_bits)
+}
+
 impl StreamState {
     fn load(atom: &AtomicU8, order: Ordering) -> Self {
         match atom.load(order) {
@@ -151,7 +161,7 @@ impl Device {
 
         // Ensure that the desired sample type is supported.
         let expected_sample_format =
-            super::device::convert_data_type(&stream_type).ok_or_else(|| {
+            super::device::convert_input_data_type(&stream_type).ok_or_else(|| {
                 Error::with_message(
                     ErrorKind::UnsupportedConfig,
                     "Input sample format is not supported",
@@ -370,6 +380,118 @@ impl Device {
                         callback_instant,
                     );
                 }
+                (
+                    &sys::AsioSampleType::ASIOSTInt32LSB16,
+                    SampleFormat::I32,
+                ) => process_input_callback::<i32, _, _>(
+                    &mut data_callback,
+                    &mut interleaved,
+                    asio_stream,
+                    callback_info,
+                    config.sample_rate,
+                    SampleFormat::I32,
+                    |sample| normalize_aligned_asio_i32(sample, true, 16),
+                    hardware_input_latency,
+                    callback_instant,
+                ),
+                (
+                    &sys::AsioSampleType::ASIOSTInt32LSB18,
+                    SampleFormat::I32,
+                ) => process_input_callback::<i32, _, _>(
+                    &mut data_callback,
+                    &mut interleaved,
+                    asio_stream,
+                    callback_info,
+                    config.sample_rate,
+                    SampleFormat::I32,
+                    |sample| normalize_aligned_asio_i32(sample, true, 18),
+                    hardware_input_latency,
+                    callback_instant,
+                ),
+                (
+                    &sys::AsioSampleType::ASIOSTInt32LSB20,
+                    SampleFormat::I32,
+                ) => process_input_callback::<i32, _, _>(
+                    &mut data_callback,
+                    &mut interleaved,
+                    asio_stream,
+                    callback_info,
+                    config.sample_rate,
+                    SampleFormat::I32,
+                    |sample| normalize_aligned_asio_i32(sample, true, 20),
+                    hardware_input_latency,
+                    callback_instant,
+                ),
+                (
+                    &sys::AsioSampleType::ASIOSTInt32LSB24,
+                    SampleFormat::I32,
+                ) => process_input_callback::<i32, _, _>(
+                    &mut data_callback,
+                    &mut interleaved,
+                    asio_stream,
+                    callback_info,
+                    config.sample_rate,
+                    SampleFormat::I32,
+                    |sample| normalize_aligned_asio_i32(sample, true, 24),
+                    hardware_input_latency,
+                    callback_instant,
+                ),
+                (
+                    &sys::AsioSampleType::ASIOSTInt32MSB16,
+                    SampleFormat::I32,
+                ) => process_input_callback::<i32, _, _>(
+                    &mut data_callback,
+                    &mut interleaved,
+                    asio_stream,
+                    callback_info,
+                    config.sample_rate,
+                    SampleFormat::I32,
+                    |sample| normalize_aligned_asio_i32(sample, false, 16),
+                    hardware_input_latency,
+                    callback_instant,
+                ),
+                (
+                    &sys::AsioSampleType::ASIOSTInt32MSB18,
+                    SampleFormat::I32,
+                ) => process_input_callback::<i32, _, _>(
+                    &mut data_callback,
+                    &mut interleaved,
+                    asio_stream,
+                    callback_info,
+                    config.sample_rate,
+                    SampleFormat::I32,
+                    |sample| normalize_aligned_asio_i32(sample, false, 18),
+                    hardware_input_latency,
+                    callback_instant,
+                ),
+                (
+                    &sys::AsioSampleType::ASIOSTInt32MSB20,
+                    SampleFormat::I32,
+                ) => process_input_callback::<i32, _, _>(
+                    &mut data_callback,
+                    &mut interleaved,
+                    asio_stream,
+                    callback_info,
+                    config.sample_rate,
+                    SampleFormat::I32,
+                    |sample| normalize_aligned_asio_i32(sample, false, 20),
+                    hardware_input_latency,
+                    callback_instant,
+                ),
+                (
+                    &sys::AsioSampleType::ASIOSTInt32MSB24,
+                    SampleFormat::I32,
+                ) => process_input_callback::<i32, _, _>(
+                    &mut data_callback,
+                    &mut interleaved,
+                    asio_stream,
+                    callback_info,
+                    config.sample_rate,
+                    SampleFormat::I32,
+                    |sample| normalize_aligned_asio_i32(sample, false, 24),
+                    hardware_input_latency,
+                    callback_instant,
+                ),
 
                 (&sys::AsioSampleType::ASIOSTFloat64LSB, SampleFormat::F64) => {
                     process_input_callback::<u64, _, _>(
@@ -1447,4 +1569,22 @@ unsafe fn apply_input_callback_to_data<A, D>(
     };
     let info = InputCallbackInfo { timestamp };
     data_callback(&data, &info);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_aligned_asio_i32;
+
+    #[test]
+    fn aligned_integer_samples_use_the_full_i32_scale() {
+        assert_eq!(normalize_aligned_asio_i32(0x007f_ffff, true, 24), 0x7fff_ff00);
+        assert_eq!(normalize_aligned_asio_i32(0x0080_0000, true, 24), i32::MIN);
+        assert_eq!(normalize_aligned_asio_i32(0x0000_7fff, true, 16), 0x7fff_0000);
+
+        let big_endian_positive = i32::from_ne_bytes([0x00, 0x7f, 0xff, 0xff]);
+        assert_eq!(
+            normalize_aligned_asio_i32(big_endian_positive, false, 24),
+            0x7fff_ff00
+        );
+    }
 }

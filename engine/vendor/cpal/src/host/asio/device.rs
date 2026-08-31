@@ -201,7 +201,7 @@ impl Iterator for Devices {
                         let input_sample_format = driver
                             .input_data_type()
                             .ok()
-                            .and_then(|t| convert_data_type(&t));
+                            .and_then(|t| convert_input_data_type(&t));
                         let output_sample_format = driver
                             .output_data_type()
                             .ok()
@@ -262,4 +262,42 @@ pub(crate) fn convert_data_type(ty: &sys::AsioSampleType) -> Option<SampleFormat
         _ => return None,
     };
     Some(fmt)
+}
+
+pub(crate) fn convert_input_data_type(ty: &sys::AsioSampleType) -> Option<SampleFormat> {
+    match *ty {
+        sys::AsioSampleType::ASIOSTInt32MSB16
+        | sys::AsioSampleType::ASIOSTInt32MSB18
+        | sys::AsioSampleType::ASIOSTInt32MSB20
+        | sys::AsioSampleType::ASIOSTInt32MSB24
+        | sys::AsioSampleType::ASIOSTInt32LSB16
+        | sys::AsioSampleType::ASIOSTInt32LSB18
+        | sys::AsioSampleType::ASIOSTInt32LSB20
+        | sys::AsioSampleType::ASIOSTInt32LSB24 => Some(SampleFormat::I32),
+        _ => convert_data_type(ty),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aligned_int32_asio_formats_are_exposed_as_i32() {
+        for sample_type in [
+            sys::AsioSampleType::ASIOSTInt32MSB16,
+            sys::AsioSampleType::ASIOSTInt32MSB18,
+            sys::AsioSampleType::ASIOSTInt32MSB20,
+            sys::AsioSampleType::ASIOSTInt32MSB24,
+            sys::AsioSampleType::ASIOSTInt32LSB16,
+            sys::AsioSampleType::ASIOSTInt32LSB18,
+            sys::AsioSampleType::ASIOSTInt32LSB20,
+            sys::AsioSampleType::ASIOSTInt32LSB24,
+        ] {
+            assert_eq!(
+                convert_input_data_type(&sample_type),
+                Some(SampleFormat::I32)
+            );
+        }
+    }
 }
