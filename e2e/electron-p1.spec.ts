@@ -151,12 +151,31 @@ async function feedPaced(
   }
 }
 
+async function waitForInputAuditionGate(page: Page): Promise<'prompt' | 'decided'> {
+  const dialog = page.getByTestId('input-audition-dialog');
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    if (await dialog.isVisible().catch(() => false)) return 'prompt';
+    const noiseSkip = page.getByTestId('noise-skip-check');
+    if (await noiseSkip.isVisible().catch(() => false)) {
+      await noiseSkip.click();
+      continue;
+    }
+    try {
+      const audition = (await readEngineState(page)).snapshot.input_audition;
+      if ((audition?.status === 'confirmed' || audition?.status === 'skipped')
+        && audition.decision_source === 'launch_cache') return 'decided';
+    } catch {
+      // The engine may still be transitioning from activation to the entry gates.
+    }
+    await page.waitForTimeout(100);
+  }
+  throw new Error('input audition gate did not settle within 30 seconds');
+}
+
 async function skipInputAuditionIfPrompted(page: Page): Promise<void> {
   const dialog = page.getByTestId('input-audition-dialog');
-  const prompted = await dialog.waitFor({ state: 'visible', timeout: 5_000 })
-    .then(() => true)
-    .catch(() => false);
-  if (!prompted) return;
+  if (await waitForInputAuditionGate(page) === 'decided') return;
 
   await page.getByTestId('input-audition-skip').click();
   const confirmation = page.getByTestId('input-audition-skip-confirm');
@@ -167,6 +186,7 @@ async function skipInputAuditionIfPrompted(page: Page): Promise<void> {
 
 async function confirmInputAudition(page: Page): Promise<void> {
   const dialog = page.getByTestId('input-audition-dialog');
+  expect(await waitForInputAuditionGate(page)).toBe('prompt');
   await expect(dialog).toBeVisible();
   await page.getByTestId('input-audition-start').click();
   await expect(page.getByTestId('input-audition-progress')).toBeVisible();
@@ -1153,6 +1173,14 @@ test('real Electron exports cuts, verifies the external copy, writes a receipt, 
     const beforeExport = await readEngineState(page);
     const sessionDir = beforeExport.session_dir;
     const sessionId = beforeExport.snapshot.session_id;
+
+    // Delivery is an offline operation on Windows. Close the capture stream
+    // first so the test exercises the real safe-stop -> inspect -> deliver
+    // workflow instead of relying on platform-specific open-file semantics.
+    await transport.click();
+    await expect(page.getByTestId('finish-confirm')).toBeVisible();
+    await page.getByTestId('finish-confirm').click();
+    await expect(page.getByTestId('enter-capture')).toBeVisible();
 
     await page.locator('.monitor-tabs button').filter({ hasText: /导出/ }).click();
     const scopeButtons = page.locator('.export-scope-control > button');
