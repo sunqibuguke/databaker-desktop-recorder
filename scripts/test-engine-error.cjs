@@ -20,6 +20,15 @@ async function main() {
     canEditCaptureSettings: true,
   });
 
+  const accessDenied = 'build input stream: Failed to initialize audio client: Access is denied. (os error -2147024891)';
+  assert.deepEqual(classifyEngineError(accessDenied), {
+    kind: 'input_access_denied',
+    message: accessDenied,
+    canEditCaptureSettings: false,
+  });
+  assert.equal(classifyEngineError('Failed to initialize audio client (0x80070005 / E_ACCESSDENIED)').kind, 'input_access_denied');
+  assert.equal(classifyEngineError('failed to open session directory: Access is denied').kind, 'generic');
+
   const busy = new Error('无法以独占模式创建采集端点: 声卡正被其他程序独占使用，请关闭后重试 (0x8889000A)');
   assert.equal(classifyEngineError(busy).kind, 'exclusive_busy');
   assert.equal(classifyEngineError(busy).canEditCaptureSettings, true);

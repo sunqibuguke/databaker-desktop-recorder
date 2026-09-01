@@ -42,6 +42,13 @@ export type AttemptQualityIssue = {
   detector_generation?: number;
 };
 
+export type AttemptInputContinuityEvidence = {
+  input_discontinuity_count_at_start: number;
+  input_discontinuity_count_at_end: number;
+  input_discontinuity_silence_samples_at_start: number;
+  input_discontinuity_silence_samples_at_end: number;
+};
+
 export type Attempt = {
   attempt_id: string;
   start_sample: number;
@@ -57,6 +64,8 @@ export type Attempt = {
   required_tail_silence_samples?: number;
   /** True peak of this take, linear 0–1. Absent on older takes. */
   peak?: number;
+  /** Missing on legacy takes; required for cut delivery after any task-level input discontinuity. */
+  input_continuity?: AttemptInputContinuityEvidence;
   quality_issues?: AttemptQualityIssue[];
   status: string;
   created_at: string;

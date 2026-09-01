@@ -9,7 +9,7 @@ import {
 } from './history-recovery';
 import type { TaskListEntry } from './history-recovery';
 import type { EffectiveCaptureFaultKind } from './history-recovery';
-import { parseScript, type ParseResult } from './script-parser';
+import { parseScript, scriptPreviewFromSnapshotItems, type ParseResult } from './script-parser';
 import {
   areAllItemsHandled,
   captureExitAction,
@@ -83,10 +83,13 @@ import {
 } from './automation-rules.ts';
 import {
   DEFAULT_DELIVERY_BIT_DEPTH,
+  captureConfigurationSupported,
   captureSampleFormatFromBitDepth,
   captureSampleFormatLabel,
   captureSampleFormatsForConfiguration,
   captureShareModeLabel,
+  captureShareModeForDevice,
+  captureShareModeForSelection,
   classifyInputDevice,
   inputDeviceNeedsWarning,
   preferredInputDevice,
@@ -113,6 +116,7 @@ import {
   shouldShowDiscontinuityToast,
 } from './discontinuity-toast';
 import { classifyEngineError, userFacingEngineError, type ClassifiedEngineError } from './engine-error';
+import { captureActivationTarget, type CaptureActivationTarget } from './capture-activation';
 import { LogPanel } from './LogPanel';
 import { NoiseCheckDialog } from './NoiseCheckDialog';
 import { APP_LOCALES, LOCALE_NATIVE_NAMES, getLocale, t, useI18n } from './i18n';
@@ -239,6 +243,8 @@ function errorMessage(error: unknown): string {
 
 function activationErrorCopy(kind: ClassifiedEngineError['kind']): { title: string; body: string } {
   switch (kind) {
+    case 'input_access_denied':
+      return { title: t('activationError.accessDeniedTitle'), body: t('activationError.accessDeniedBody') };
     case 'exclusive_busy':
       return { title: t('activationError.busyTitle'), body: t('activationError.busyBody') };
     case 'exclusive_format':
@@ -1017,6 +1023,8 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   );
   const workspaceRecording = recordings.find((recording) => recording.session_dir === sessionDir);
   const selectedDevice = devices.find((device) => device.id === deviceId) ?? null;
+  const selectedDeviceIsAsio = selectedDevice?.backend?.trim().toLocaleLowerCase('en-US') === 'asio';
+  const sharedCaptureAvailable = configurationsForShareMode(selectedDevice, 'shared').length > 0;
   const selectedCapturePreset = capturePresetStore.presets.find((preset) => preset.id === capturePresetStore.lastSelectedPresetId) ?? null;
   const modeConfigurations = useMemo(
     () => configurationsForShareMode(selectedDevice, captureShareMode),
@@ -1064,15 +1072,31 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     sampleRate,
     inputChannel,
   );
+  const activationCaptureShareMode = captureShareModeForDevice(
+    selectedDevice,
+    normalizeCaptureShareMode(snapshot?.capture_share_mode ?? captureShareMode),
+    exclusiveCaptureAvailable,
+  );
+  const activationRecoveryChanged = recoveryShareMode !== activationCaptureShareMode
+    || normalizeCaptureSampleFormat(recoverySampleFormat) !== normalizeCaptureSampleFormat(
+      snapshot?.input_sample_format ?? inputSampleFormat,
+    );
+  const activationRecoveryValid = captureConfigurationSupported(
+    selectedDevice,
+    recoveryShareMode,
+    sampleRate,
+    inputChannel,
+    recoverySampleFormat,
+  );
   const captureFormats = formatOptions.map((format) => format.toUpperCase());
   const selectedDeviceKind = classifyInputDevice(selectedDevice);
   const selectedDeviceNeedsWarning = inputDeviceNeedsWarning(selectedDeviceKind);
-  const captureConfigurationValid = Boolean(
-    selectedDevice
-    && !selectedDevice.production_blocked_reason
-    && rateOptions.includes(sampleRate)
-    && inputChannel <= activeInputChannels
-    && formatOptions.some((format) => format === inputSampleFormat),
+  const captureConfigurationValid = captureConfigurationSupported(
+    selectedDevice,
+    captureShareMode,
+    sampleRate,
+    inputChannel,
+    inputSampleFormat,
   );
   const captureConfigurationIssue = !deviceId
     ? t('setup.pickDevice')
@@ -1890,21 +1914,38 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     }
   }
 
-  function applyCapturePreset(preset: CapturePreset) {
-    setDeviceId(preset.deviceId);
-    setDeviceName(preset.deviceName);
+  function capturePresetTarget(preset: CapturePreset) {
+    const device = devices.find((candidate) => candidate.id === preset.deviceId) ?? null;
+    const inputFormat = normalizeCaptureSampleFormat(preset.inputSampleFormat)
+      ?? captureSampleFormatFromBitDepth(preset.bitDepth);
+    const shareMode = captureShareModeForDevice(
+      device,
+      normalizeCaptureShareMode(preset.captureShareMode),
+      exclusiveCaptureAvailable,
+    );
+    if (!device || !captureConfigurationSupported(
+      device,
+      shareMode,
+      preset.sampleRate,
+      preset.inputChannel,
+      inputFormat,
+    )) return null;
+    return { device, inputFormat, shareMode };
+  }
+
+  function applyCapturePreset(preset: CapturePreset): boolean {
+    const target = capturePresetTarget(preset);
+    if (!target) return false;
+    setDeviceId(target.device.id);
+    setDeviceName(target.device.name);
     setSampleRate(preset.sampleRate);
-    setInputSampleFormat(
-      normalizeCaptureSampleFormat(preset.inputSampleFormat)
-      ?? captureSampleFormatFromBitDepth(preset.bitDepth),
-    );
+    setInputSampleFormat(target.inputFormat);
     setInputChannel(preset.inputChannel);
-    setCaptureShareMode(
-      exclusiveCaptureAvailable ? normalizeCaptureShareMode(preset.captureShareMode) : 'shared',
-    );
+    setCaptureShareMode(target.shareMode);
     setSilenceDurationMs(preset.silenceDurationMs);
     setNoiseThresholdDbfs(preset.silenceThresholdDbfs);
     setPresetName(preset.name);
+    return true;
   }
 
   async function loadCapturePresets() {
@@ -1970,6 +2011,11 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setPresetBusy(true);
     try {
       const selected = capturePresetStore.presets.find((preset) => preset.id === id) ?? null;
+      if (selected && !capturePresetTarget(selected)) {
+        setError(t('notice.presetDeviceInvalid'));
+        setPresetWarning(t('setup.presetDeviceUnavailable'));
+        return;
+      }
       const store = await window.recorder.setLastCapturePreset(selected?.id ?? null);
       setCapturePresetStore(store);
       if (selected) applyCapturePreset(selected);
@@ -2552,9 +2598,13 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   }, []);
 
   useEffect(() => {
-    if (!exclusiveCaptureAvailable || !selectedDevice) return;
-    if (deviceExclusiveAvailable(selectedDevice)) setCaptureShareMode('exclusive');
-  }, [exclusiveCaptureAvailable, selectedDevice]);
+    if (!selectedDevice) return;
+    setCaptureShareMode(captureShareModeForSelection(
+      selectedDevice,
+      selectedCapturePreset,
+      exclusiveCaptureAvailable,
+    ));
+  }, [exclusiveCaptureAvailable, selectedCapturePreset, selectedDevice]);
 
   useEffect(() => {
     if (!captureFault || !pauseConfirmOpen) return;
@@ -2579,7 +2629,17 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   useEffect(() => {
     if (!capturePresetsLoaded || !devicesLoaded || initialPresetAppliedRef.current || phase === 'running' || snapshot) return;
     initialPresetAppliedRef.current = true;
-    if (selectedCapturePreset) applyCapturePreset(selectedCapturePreset);
+    if (selectedCapturePreset && !applyCapturePreset(selectedCapturePreset)) {
+      const presetDeviceStillPresent = devices.some((device) => device.id === selectedCapturePreset.deviceId);
+      setCapturePresetStore((current) => ({ ...current, lastSelectedPresetId: null }));
+      setPresetName('');
+      setPresetWarning(t('setup.presetDeviceUnavailable'));
+      if (presetDeviceStillPresent) {
+        void window.recorder.setLastCapturePreset(null)
+          .then(setCapturePresetStore)
+          .catch((caught) => setError(`${t('notice.selectPresetPrefix')}${errorMessage(caught)}`));
+      }
+    }
   }, [capturePresetsLoaded, devicesLoaded, phase, selectedCapturePreset, snapshot]);
 
   useEffect(() => {
@@ -2647,6 +2707,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       keepItemId ?? localContext?.currentItemId,
     );
     const restoredItem = nextSnapshot.items[restoredIndex];
+    const authoritativeScriptPreview = scriptPreviewFromSnapshotItems(nextSnapshot.items);
     // A suspended renderer may still hold a healthy meter from the previous
     // engine/session generation. It must not overwrite this authoritative
     // recovery snapshot on the next animation frame.
@@ -2666,6 +2727,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     if (nextSessionDir) setSessionDir(nextSessionDir);
     setSessionName(nextSnapshot.session_id);
     setScriptFile(nextSnapshot.script_name ?? '');
+    setScriptItems(authoritativeScriptPreview.items);
+    setScriptPreview(authoritativeScriptPreview);
+    setScriptPreviewOpen(false);
+    setScriptErrors(authoritativeScriptPreview.errors);
     setDeviceId(nextSnapshot.device_id ?? availableDevices.find((device) => device.name === nextSnapshot.device_name)?.id ?? '');
     setDeviceName(nextSnapshot.device_name);
     setSampleRate(nextSnapshot.audio_format.sample_rate);
@@ -2756,6 +2821,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
 
   function enterInspectionWorkspace(current: InspectedSessionState) {
     const nextSnapshot = current.snapshot;
+    const authoritativeScriptPreview = scriptPreviewFromSnapshotItems(nextSnapshot.items);
     clearAudioPreview();
     meterFrameCommitterRef.current?.invalidate();
     resetInputAuditionGate(false);
@@ -2770,6 +2836,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     });
     setSessionName(nextSnapshot.session_id);
     setScriptFile(nextSnapshot.script_name ?? '');
+    setScriptItems(authoritativeScriptPreview.items);
+    setScriptPreview(authoritativeScriptPreview);
+    setScriptPreviewOpen(false);
+    setScriptErrors(authoritativeScriptPreview.errors);
     setDeviceId(nextSnapshot.device_id ?? '');
     setDeviceName(nextSnapshot.device_name);
     setSampleRate(nextSnapshot.audio_format.sample_rate);
@@ -2981,16 +3051,45 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   async function startSession(options?: {
     captureShareMode?: CaptureShareMode;
     inputSampleFormat?: string;
+    items?: ScriptItem[];
+    scriptName?: string;
     activateAfterCreate?: boolean;
   }): Promise<boolean> {
-    const nextShareMode = options?.captureShareMode ?? captureShareMode;
+    const requestedShareMode = options?.captureShareMode ?? captureShareMode;
+    const nextShareMode = captureShareModeForDevice(
+      selectedDevice,
+      requestedShareMode,
+      exclusiveCaptureAvailable,
+    );
     const nextSampleFormat = options?.inputSampleFormat ?? inputSampleFormat;
+    const nextItems = options?.items ?? scriptItems;
+    const nextScriptName = options?.scriptName ?? scriptFile;
     const nextBitDepth = DEFAULT_DELIVERY_BIT_DEPTH;
-    if (options?.captureShareMode) setCaptureShareMode(nextShareMode);
+    if (options?.captureShareMode || nextShareMode !== captureShareMode) setCaptureShareMode(nextShareMode);
     if (options?.inputSampleFormat) setInputSampleFormat(nextSampleFormat);
-    const settingsAlreadyChosen = Boolean(options?.captureShareMode || options?.inputSampleFormat);
-    if (!scriptItems.length || scriptErrors.length || !selectedDevice || !outputDir || selectedDevice.production_blocked_reason || (!settingsAlreadyChosen && !captureConfigurationValid)) {
-      if (captureConfigurationIssue) setError(captureConfigurationIssue);
+    const nextConfigurationValid = captureConfigurationSupported(
+      selectedDevice,
+      nextShareMode,
+      sampleRate,
+      inputChannel,
+      nextSampleFormat,
+    );
+    if (!nextItems.length
+      || (options?.items === undefined && scriptErrors.length > 0)
+      || !selectedDevice
+      || !outputDir
+      || !nextConfigurationValid) {
+      if (selectedDevice?.production_blocked_reason) {
+        setError(selectedDevice.production_blocked_reason);
+      } else if (!nextConfigurationValid) {
+        setError(t('setup.comboUnsupported', {
+          mode: captureShareModeLabel(nextShareMode),
+          rate: sampleRate.toLocaleString(locale),
+          channel: inputChannel,
+        }));
+      } else if (captureConfigurationIssue) {
+        setError(captureConfigurationIssue);
+      }
       return false;
     }
     const sessionId = `${safeSessionName(sessionName.replace(/-\d{8}-\d{6}$/, ''))}-${timestamp()}`;
@@ -2998,7 +3097,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     const result = await run(t('notice.creatingTask'), () => window.recorder.request<InspectedSessionState>('create_session', {
       session_dir: destination,
       session_id: sessionId,
-      script_name: scriptFile,
+      script_name: nextScriptName,
       device_id: selectedDevice.id,
       device_name: selectedDevice.name,
       sample_rate: sampleRate,
@@ -3011,14 +3110,14 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       noise_threshold_dbfs: noiseThresholdDbfs,
       silence_threshold_dbfs: noiseThresholdDbfs,
       silence_detector: silenceDetector,
-      items: scriptItems,
+      items: nextItems,
     }));
     if (!result) return false;
     setDataSafetyAlert('');
     logUserAction('ui.create_session', `已创建录制任务 ${sessionId}`, {
       session_id: sessionId,
       session_dir: destination,
-      script_name: scriptFile,
+      script_name: nextScriptName,
       device_id: selectedDevice.id,
       device_name: selectedDevice.name,
       sample_rate: sampleRate,
@@ -3027,7 +3126,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       input_channel: inputChannel,
       capture_backend: selectedDevice.backend,
       capture_buffer_frames: selectedDevice.recommended_buffer_frames,
-      item_count: scriptItems.length,
+      item_count: nextItems.length,
       env_check: automationRules.envCheck,
       discard_empty: automationRules.discardEmpty,
     });
@@ -3035,22 +3134,61 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     enterInspectionWorkspace(result);
     setNotice(options?.activateAfterCreate ? t('activationError.recreatedNotice') : t('notice.taskCreated'));
     if (options?.activateAfterCreate) {
-      return activateCapture(undefined, result.session_dir);
+      return activateCapture(undefined, captureActivationTarget(
+        result,
+        devices,
+      ));
     }
     return true;
   }
 
-  function presentActivationFailure(error: unknown) {
+  function presentActivationFailure(error: unknown, target?: CaptureActivationTarget) {
     const classified = classifyEngineError(error);
+    const activationSnapshot = target?.snapshot ?? snapshot;
+    const activationDevice = target ? target.device : selectedDevice;
+    const activationShareMode = captureShareModeForDevice(
+      activationDevice,
+      normalizeCaptureShareMode(activationSnapshot?.capture_share_mode ?? captureShareMode),
+      exclusiveCaptureAvailable,
+    );
+    const activationSampleRate = activationSnapshot?.audio_format.sample_rate ?? sampleRate;
+    const activationInputChannel = activationSnapshot?.audio_format.input_channel ?? inputChannel;
+    const activationInputSampleFormat = activationSnapshot
+      ? normalizeCaptureSampleFormat(activationSnapshot.input_sample_format)
+        ?? captureSampleFormatFromBitDepth(activationSnapshot.audio_format.bit_depth)
+      : inputSampleFormat;
+    const sharedRecoveryAvailable = configurationsForShareMode(activationDevice, 'shared').length > 0;
+    const requestedRecoveryMode = classified.canEditCaptureSettings
+      && exclusiveCaptureAvailable
+      && sharedRecoveryAvailable
+      ? 'shared'
+      : activationShareMode;
+    const nextRecoveryMode = captureShareModeForDevice(
+      activationDevice,
+      requestedRecoveryMode,
+      exclusiveCaptureAvailable,
+    );
+    const recoveryFormats = captureSampleFormatsForConfiguration(
+      configurationsForShareMode(activationDevice, nextRecoveryMode),
+      activationSampleRate,
+      activationInputChannel,
+    );
+    const normalizedCurrentFormat = normalizeCaptureSampleFormat(activationInputSampleFormat);
     setActivationFailure(classified);
-    setActivationFailureOpen(classified.canEditCaptureSettings);
-    setRecoveryShareMode(classified.canEditCaptureSettings && exclusiveCaptureAvailable ? 'shared' : captureShareMode);
-    setRecoverySampleFormat(inputSampleFormat);
+    setActivationFailureOpen(classified.canEditCaptureSettings || classified.kind === 'input_access_denied');
+    setRecoveryShareMode(nextRecoveryMode);
+    setRecoverySampleFormat(normalizedCurrentFormat && recoveryFormats.includes(normalizedCurrentFormat)
+      ? normalizedCurrentFormat
+      : preferredCaptureSampleFormat(recoveryFormats) ?? activationInputSampleFormat);
   }
 
-  async function activateCapture(keepItemId?: string | null, targetSessionDir?: string): Promise<boolean> {
-    const dir = targetSessionDir || sessionDir;
-    if (!dir || captureActive || workspaceFaulted) return captureActive;
+  async function activateCapture(
+    keepItemId?: string | null,
+    target?: CaptureActivationTarget,
+  ): Promise<boolean> {
+    const dir = target?.sessionDir || sessionDir;
+    const targetWorkspaceFaulted = target ? target.blocked : workspaceFaulted;
+    if (!dir || captureActive || targetWorkspaceFaulted) return captureActive;
     setBusy(t('notice.enablingCard'));
     setError('');
     lastOperationErrorRef.current = '';
@@ -3078,7 +3216,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       }, 'error');
       reportRendererError(t('notice.enablingCard'), caught);
       setError(message);
-      presentActivationFailure(caught);
+      presentActivationFailure(caught, target);
       return false;
     } finally {
       setBusy('');
@@ -3104,9 +3242,13 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   }
 
   async function recreateFromActivationFailure() {
+    const sourceItems = snapshot?.items.map(({ id, text, label }) => ({ id, text, label }))
+      ?? scriptItems;
     const created = await startSession({
       captureShareMode: recoveryShareMode,
       inputSampleFormat: recoverySampleFormat,
+      items: sourceItems,
+      scriptName: snapshot?.script_name ?? scriptFile,
       activateAfterCreate: true,
     });
     if (created) {
@@ -3568,7 +3710,12 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       setSelectedIssueId(null);
     }
     if (options.panel) setMonitorPanelTab(options.panel);
-    if (options.activate) await activateCapture(undefined, inspected.session_dir);
+    if (options.activate) {
+      await activateCapture(undefined, captureActivationTarget(
+        inspected,
+        devices,
+      ));
+    }
   }
 
   async function exportRecordingArtifact(
@@ -4314,9 +4461,44 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
 
   function beginNewRecording() {
     resetForNewSession();
-    setCaptureShareMode('shared');
-    setInputSampleFormat('i16');
-    if (selectedCapturePreset) applyCapturePreset(selectedCapturePreset);
+    const presetApplied = selectedCapturePreset ? applyCapturePreset(selectedCapturePreset) : false;
+    if (!presetApplied) {
+      const nextShareMode = captureShareModeForDevice(
+        selectedDevice,
+        deviceExclusiveAvailable(selectedDevice) ? 'exclusive' : 'shared',
+        exclusiveCaptureAvailable,
+      );
+      const configurations = configurationsForShareMode(selectedDevice, nextShareMode);
+      const availableRates = productionSampleRates([...new Set([
+        44_100,
+        48_000,
+        ...configurations.flatMap((configuration) => [
+          configuration.min_sample_rate,
+          configuration.max_sample_rate,
+        ]),
+      ])]).filter((rate) => configurations.some((configuration) => (
+        configuration.channels >= 1
+        && rate >= configuration.min_sample_rate
+        && rate <= configuration.max_sample_rate
+      ))).sort((left, right) => left - right);
+      const nextSampleRate = availableRates.includes(48_000)
+        ? 48_000
+        : availableRates[0] ?? 48_000;
+      const formats = captureSampleFormatsForConfiguration(configurations, nextSampleRate, 1);
+      setCaptureShareMode(nextShareMode);
+      setSampleRate(nextSampleRate);
+      setInputChannel(1);
+      setInputSampleFormat(preferredCaptureSampleFormat(formats) ?? formats[0] ?? 'i16');
+      if (selectedCapturePreset) {
+        const presetDeviceStillPresent = devices.some((device) => device.id === selectedCapturePreset.deviceId);
+        setCapturePresetStore((current) => ({ ...current, lastSelectedPresetId: null }));
+        setPresetName('');
+        setPresetWarning(t('setup.presetDeviceUnavailable'));
+        if (presetDeviceStillPresent) {
+          void window.recorder.setLastCapturePreset(null).then(setCapturePresetStore).catch(() => undefined);
+        }
+      }
+    }
     setScriptFile('');
     setScriptItems([]);
     setScriptErrors([]);
@@ -4782,9 +4964,9 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         <div><dt>{t('setup.sampleRate')}</dt><dd>{sampleRate.toLocaleString(locale)} Hz</dd></div>
         <div><dt>{t('setup.inputChannel')}</dt><dd>{inputChannel}</dd></div>
       </dl>
-      <div className="activation-failure-settings">
+      {activationFailure.kind !== 'input_access_denied' && <div className="activation-failure-settings">
         <p>{t('activationError.changeHint')}</p>
-        {exclusiveCaptureAvailable && <label className="field"><span>{t('setup.shareMode')}</span><select data-testid="activation-recovery-share-mode" value={recoveryShareMode} onChange={(event) => {
+        {exclusiveCaptureAvailable && !selectedDeviceIsAsio && sharedCaptureAvailable && deviceExclusiveAvailable(selectedDevice) && <label className="field"><span>{t('setup.shareMode')}</span><select data-testid="activation-recovery-share-mode" value={recoveryShareMode} onChange={(event) => {
           const next = normalizeCaptureShareMode(event.target.value);
           setRecoveryShareMode(next);
           const formats = captureSampleFormatsForConfiguration(
@@ -4797,15 +4979,20 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
           }
         }}><option value="exclusive">{t('setup.exclusiveRecommended')}</option><option value="shared">{t('setup.sharedNotProduction')}</option></select></label>}
         <label className="field"><span>{t('recorder.driverInputFormat')}</span><select data-testid="activation-recovery-format" value={recoverySampleFormat} onChange={(event) => setRecoverySampleFormat(event.target.value)}>{!recoveryFormatOptions.some((format) => format === recoverySampleFormat) && <option value={recoverySampleFormat}>{captureSampleFormatLabel(recoverySampleFormat)}</option>}{(recoveryFormatOptions.length ? recoveryFormatOptions : [recoverySampleFormat]).map((format) => <option value={format} key={format}>{captureSampleFormatLabel(format)}</option>)}</select></label>
-      </div>
+      </div>}
       <details className="activation-failure-detail">
         <summary>{t('activationError.detail')}</summary>
         <p>{activationFailure.message}</p>
       </details>
       <footer>
         <button data-dialog-initial className="button" onClick={() => setActivationFailureOpen(false)} disabled={Boolean(busy)}>{t('common.close')}</button>
-        <button data-testid="activation-back-to-setup" className="button" onClick={returnToSetupFromInspection} disabled={Boolean(busy)}>{t('activationError.backToSetup')}</button>
-        <button data-testid="activation-recreate" className="button primary" onClick={() => void recreateFromActivationFailure()} disabled={Boolean(busy)}>{t('activationError.recreateAndEnter')}</button>
+        {activationFailure.kind === 'input_access_denied'
+          ? <button data-testid="activation-retry" className="button primary" onClick={() => void activateCapture(currentItem?.id)} disabled={Boolean(busy)}>{t('activationError.retryCapture')}</button>
+          : <>
+            <button data-testid="activation-back-to-setup" className="button" onClick={returnToSetupFromInspection} disabled={Boolean(busy)}>{t('activationError.backToSetup')}</button>
+            <button data-testid="activation-retry" className={activationRecoveryChanged ? 'button' : 'button primary'} onClick={() => void activateCapture(currentItem?.id)} disabled={Boolean(busy)}>{t('activationError.retryCapture')}</button>
+            {activationRecoveryChanged && <button data-testid="activation-recreate" className="button primary" onClick={() => void recreateFromActivationFailure()} disabled={Boolean(busy) || !activationRecoveryValid}>{t('activationError.recreateAndEnter')}</button>}
+          </>}
       </footer>
     </section>
   </div>;
@@ -5017,7 +5204,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
                     emptyTestId="setup-rule-discard-empty"
                     onChange={applyAutomationRule}
                   />
-                  {exclusiveCaptureAvailable && <label className="field"><span>{t('setup.shareModeOverride')}</span><select data-testid="capture-share-mode-override" value={captureShareMode} onChange={(event) => setCaptureShareMode(normalizeCaptureShareMode(event.target.value))} disabled={Boolean(busy)}><option value="exclusive">{t('setup.exclusiveRecommended')}</option><option value="shared">{t('setup.sharedNotProduction')}</option></select></label>}
+                  {exclusiveCaptureAvailable && !selectedDeviceIsAsio && sharedCaptureAvailable && deviceExclusiveAvailable(selectedDevice) && <label className="field"><span>{t('setup.shareModeOverride')}</span><select data-testid="capture-share-mode-override" value={captureShareMode} onChange={(event) => setCaptureShareMode(normalizeCaptureShareMode(event.target.value))} disabled={Boolean(busy)}><option value="exclusive">{t('setup.exclusiveRecommended')}</option><option value="shared">{t('setup.sharedNotProduction')}</option></select></label>}
                 </div>
               </details>
               <div className={`hardware-line ${captureConfigurationIssue ? 'invalid' : selectedDeviceNeedsWarning ? 'warning' : ''}`}><span className={captureConfigurationValid && !selectedDeviceNeedsWarning ? 'ok' : ''}><i />{captureConfigurationIssue || (selectedDeviceNeedsWarning ? t('setup.deviceNotForCapture') : t('setup.configOk'))}</span><em>{selectedDevice?.backend?.toUpperCase() || captureShareModeLabel(captureShareMode)}</em><em>{t('setup.inputChannelOf', { channel: inputChannel, total: activeInputChannels })}</em><em>{t('setup.driverFormats', { formats: captureFormats.join(' / ') || t('setup.driverIncompatible') })}</em><em>{captureSampleFormatLabel(inputSampleFormat)}</em></div>
@@ -5117,7 +5304,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         <div className="editor-toolbar"><div className="editor-nav"><button title={t('recorder.prevItem')} disabled={recording || currentIndex === 0} onClick={() => { setRetakeSequenceActive(false); setCurrentIndex((index) => Math.max(0, index - 1)); }}><Icon name="chevron-left" /></button><span>{currentIndex + 1} / {items.length}</span><button title={t('recorder.nextItem')} disabled={recording || currentIndex >= items.length - 1} onClick={() => { setRetakeSequenceActive(false); setCurrentIndex((index) => Math.min(items.length - 1, index + 1)); }}><Icon name="chevron-right" /></button></div><div className="editor-time"><strong className={recording ? 'recording' : ''}>{recording ? attemptDuration : sessionDuration}</strong></div><div className="editor-toolbar-actions"><button className="prompter-launch" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? t('recorder.locatePrompter') : t('recorder.openPrompter')}</button></div><div className={`save-health ${workspaceFaulted || captureFault ? 'fault' : meter.storage_status === 'warning' ? 'warning' : ''}`}><i />{workspaceFaulted ? t('recorder.healthReadonly') : !captureActive ? t('recorder.healthView') : captureFault ? t('recorder.healthFaultStop', { title: captureFaultCopy.title }) : meter.storage_status === 'warning' ? t('recorder.healthWarning', { minutes: Math.max(0, Math.floor(meter.storage_safe_remaining_seconds / 60)) }) : t('recorder.healthLive')}</div></div>
         <div className="editor-canvas">
           {(activationFailure || captureFault || discontinuityToast || qualityWarning || vadHealth !== 'healthy') && <div className="workspace-toasts" aria-live="polite">
-            {activationFailure && !captureActive && <div className="session-noise-banner failed" role="alert" data-testid="activation-failure-banner"><Icon name="stop" size={16} /><div><strong>{activationErrorCopy(activationFailure.kind).title}</strong><span>{activationErrorCopy(activationFailure.kind).body}</span></div><button className="button" onClick={() => setActivationFailureOpen(true)} disabled={Boolean(busy)}>{t('activationError.openEditor')}</button></div>}
+            {activationFailure && !captureActive && <div className="session-noise-banner failed" role="alert" data-testid="activation-failure-banner"><Icon name="stop" size={16} /><div><strong>{activationErrorCopy(activationFailure.kind).title}</strong><span>{activationErrorCopy(activationFailure.kind).body}</span></div><button className="button" onClick={() => setActivationFailureOpen(true)} disabled={Boolean(busy)}>{activationFailure.kind === 'input_access_denied' ? t('activationError.openAccessHelp') : t('activationError.openEditor')}</button></div>}
             {captureFault && <div className="capture-fault-banner" role="alert"><Icon name="stop" size={16} /><div><strong>{captureFaultCopy.title}</strong><span>{captureFaultCopy.detail}{snapshot?.device_name ? ` ${t('issues.currentDevice', { name: snapshot.device_name })}` : ' '}{t('issues.stopThenFinish')}</span></div></div>}
             {discontinuityToast && !captureFault && <div className="input-quality-banner workspace-toast" data-testid="discontinuity-toast" role="status"><Icon name="meter" size={16} /><div><strong>{t('discontinuity.bannerTitle')}</strong><span>{discontinuityToast}. {t('discontinuity.bannerHint')}</span></div></div>}
             {qualityWarning && <div className="input-quality-banner" role="alert"><Icon name="meter" size={16} /><div><strong>{t('quality.bannerTitle')}</strong><span>{qualityWarning}. {t('quality.bannerHint')}</span></div></div>}

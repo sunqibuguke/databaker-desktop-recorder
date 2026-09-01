@@ -211,6 +211,8 @@ const es: MessageTree = {
     dataSafetyTitle: 'Aviso de seguridad de datos',
   },
   activationError: {
+    accessDeniedTitle: 'Windows denegó el acceso al dispositivo de entrada',
+    accessDeniedBody: 'En Configuración → Privacidad y seguridad → Micrófono, active el acceso al micrófono, el acceso de las aplicaciones y el acceso de las aplicaciones de escritorio. Si su organización administra estas opciones, solicite acceso al administrador y vuelva a intentarlo. No es necesario cambiar el modo ni recrear la grabación.',
     exclusiveTitle: 'No se pudo abrir la tarjeta en modo exclusivo',
     exclusiveBody: 'Windows rechazó la captura exclusiva. Otra aplicación puede estar usando el dispositivo, o la frecuencia / profundidad no coincide con el controlador. La app no cambia sola al modo compartido.',
     busyTitle: 'La tarjeta la está usando otra aplicación',
@@ -228,6 +230,8 @@ const es: MessageTree = {
     recreateAndEnter: 'Recrear y empezar a capturar',
     backToSetup: 'Volver a los ajustes completos',
     openEditor: 'Cambiar ajustes de captura',
+    openAccessHelp: 'Ver cómo resolverlo',
+    retryCapture: 'Reintentar captura',
     editSettingsNotice: 'Volvió a los ajustes de grabación. Tras cambiar el modo o el formato, cree la tarea de nuevo.',
     recreatedNotice: 'Se creó una tarea con los nuevos ajustes de captura.',
     detail: 'Detalles',

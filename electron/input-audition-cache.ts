@@ -4,9 +4,8 @@ export type InputAuditionCacheConfiguration = Readonly<{
   backend: string;
   deviceName: string;
   /**
-   * Kept only as diagnostic context. Windows endpoint ids can change when the
-   * same interface is moved to another USB socket, so this value is
-   * deliberately excluded from the logical cache key.
+   * Raw device identity is deliberately part of the cache key. Moving an
+   * interface or selecting another same-named unit requires a fresh audition.
    */
   deviceId?: string;
   driverName?: string;
@@ -31,7 +30,7 @@ type StoredInputAuditionDecision = InputAuditionDecision & Readonly<{
   logicalKey: string;
 }>;
 
-const CACHE_SCHEMA_VERSION = 1;
+const CACHE_SCHEMA_VERSION = 2;
 const MAX_TEXT_LENGTH = 512;
 
 function normalizeLogicalText(value: string): string {
@@ -109,9 +108,10 @@ export function normalizeInputAuditionCacheConfiguration(
 
 export function logicalInputAuditionKey(value: unknown): string {
   const configuration = normalizeInputAuditionCacheConfiguration(value);
-  // ASIO normally exposes a driver/display name, while WASAPI exposes an
-  // endpoint display name. Neither branch includes endpoint paths, container
-  // ids, USB topology, or the raw deviceId supplied to open the stream.
+  // The display/driver name keeps the key understandable in diagnostics. The
+  // raw id additionally prevents two same-named interfaces from sharing a
+  // launch-scoped decision and intentionally invalidates reuse after a USB
+  // endpoint move.
   const logicalDeviceName = configuration.backend === 'asio' && configuration.driverName
     ? configuration.driverName
     : normalizeWindowsAudioInstancePrefix(configuration.deviceName);
@@ -119,6 +119,7 @@ export function logicalInputAuditionKey(value: unknown): string {
     CACHE_SCHEMA_VERSION,
     configuration.backend,
     logicalDeviceName,
+    configuration.deviceId ?? null,
     configuration.inputChannels,
     configuration.sampleRate,
     configuration.outputBitDepth,
@@ -237,6 +238,60 @@ export function inputAuditionConfigurationFromEngineResult(
   }
 }
 
+/**
+ * Launch-cache adoption is intentionally stricter than a fresh audition in
+ * the current capture generation. Cumulative fault evidence in the
+ * authoritative state must reject adoption even when the first meter packet
+ * for this renderer has not arrived yet.
+ */
+export function inputAuditionCacheStateAllowsAdoption(result: unknown): boolean {
+  const envelope = record(result);
+  const snapshot = record(envelope?.snapshot);
+  if (!snapshot || String(snapshot.status).trim().toLocaleLowerCase('en-US') !== 'recording') {
+    return false;
+  }
+  if (envelope?.faulted === true || snapshot.faulted === true) return false;
+  return snapshot.input_discontinuity_count === 0
+    && snapshot.input_discontinuity_silence_samples === 0
+    && snapshot.overflow_samples === 0;
+}
+
+/**
+ * A decision already armed in this engine generation may use a non-zero
+ * historical continuity baseline. It remains valid only while the persisted
+ * completion epoch exactly matches the current cumulative counters.
+ */
+export function inputAuditionActiveDecisionStateMatches(
+  result: unknown,
+  expectedStatus: InputAuditionDecisionStatus,
+): boolean {
+  const envelope = record(result);
+  const snapshot = record(envelope?.snapshot);
+  const audition = record(snapshot?.input_audition);
+  if (!snapshot
+    || !audition
+    || String(snapshot.status).trim().toLocaleLowerCase('en-US') !== 'recording'
+    || envelope?.faulted === true
+    || snapshot.faulted === true
+    || audition.status !== expectedStatus) {
+    return false;
+  }
+  const currentDiscontinuities = snapshot.input_discontinuity_count;
+  const currentInsertedSilence = snapshot.input_discontinuity_silence_samples;
+  const currentOverflow = snapshot.overflow_samples;
+  if (!Number.isSafeInteger(currentDiscontinuities)
+    || (currentDiscontinuities as number) < 0
+    || !Number.isSafeInteger(currentInsertedSilence)
+    || (currentInsertedSilence as number) < 0
+    || !Number.isSafeInteger(currentOverflow)
+    || (currentOverflow as number) < 0) {
+    return false;
+  }
+  return audition.input_discontinuity_count_at_completion === currentDiscontinuities
+    && audition.input_discontinuity_silence_samples_at_completion === currentInsertedSilence
+    && audition.overflow_samples_at_completion === currentOverflow;
+}
+
 export function captureFingerprintFromInputAuditionResult(result: unknown): string | null {
   const envelope = record(result);
   const inputAudition = record(envelope?.input_audition)
@@ -308,11 +363,47 @@ export type InputAuditionInvalidationScope = Readonly<{
   sessionDir: string | null;
 }>;
 
+export type InputAuditionEpochSettlement<T> = Readonly<{
+  value: T;
+  current: boolean;
+}>;
+
+/**
+ * Guards async audition/cache operations against faults that arrive while an
+ * engine request is pending. Callers capture once, then settle every awaited
+ * request against that token before publishing or adopting its result.
+ */
+export class InputAuditionInvalidationEpoch {
+  private epoch = 0;
+
+  capture(): number {
+    return this.epoch;
+  }
+
+  invalidate(): number {
+    this.epoch += 1;
+    return this.epoch;
+  }
+
+  isCurrent(capturedEpoch: number): boolean {
+    return capturedEpoch === this.epoch;
+  }
+
+  async settle<T>(
+    capturedEpoch: number,
+    pending: PromiseLike<T>,
+  ): Promise<InputAuditionEpochSettlement<T>> {
+    const value = await pending;
+    return { value, current: this.isCurrent(capturedEpoch) };
+  }
+}
+
 /**
  * Meter counters are cumulative for the active capture. A stateless `> 0`
  * check would erase a newly confirmed audition on every later meter packet.
- * This tracker establishes a baseline per engine generation/session and only
- * invalidates on a new counter increase or fault transition.
+ * This tracker establishes a baseline per engine generation/session. A first
+ * packet that is already unhealthy also invalidates launch cache reuse; later
+ * packets only invalidate on a new counter increase or fault transition.
  */
 export class InputAuditionCacheInvalidationTracker {
   private scopeKey = '';
@@ -354,9 +445,15 @@ export class InputAuditionCacheInvalidationTracker {
     };
     const previous = this.baseline;
     this.baseline = current;
-    if (!previous || this.consumeNextMeterAsBaseline) {
+    if (this.consumeNextMeterAsBaseline) {
       this.consumeNextMeterAsBaseline = false;
       return false;
+    }
+    if (!previous) {
+      return current.inputDiscontinuityCount > 0
+        || current.overflowSamples > 0
+        || current.faulted
+        || current.storageCritical;
     }
     return current.inputDiscontinuityCount > previous.inputDiscontinuityCount
       || current.overflowSamples > previous.overflowSamples

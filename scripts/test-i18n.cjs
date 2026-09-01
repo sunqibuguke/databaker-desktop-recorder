@@ -125,6 +125,10 @@ async function main() {
   assert.equal(t('notice.copyingExport'), '正在复制到所选导出目录…');
   assert.equal(t('alertDialog.dataSafetyTitle'), '数据安全提示');
   assert.equal(t('activationError.exclusiveTitle'), '无法以独占模式打开声卡');
+  assert.equal(t('activationError.accessDeniedTitle'), 'Windows 已拒绝访问输入设备');
+  assert.match(t('activationError.accessDeniedBody'), /允许桌面应用访问麦克风/);
+  assert.equal(t('activationError.openAccessHelp'), '查看处理办法');
+  assert.equal(t('activationError.retryCapture'), '重试进入录制');
   assert.equal(t('activationError.recreateAndEnter'), '重新创建并进入录制');
   assert.equal(t('prompter.settings'), '显示设置');
   assert.equal(t('prompter.fontSize'), '正文字号');

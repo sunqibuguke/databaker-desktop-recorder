@@ -225,6 +225,8 @@ async function main() {
 
   assert.equal(isLicenseExemptEngineCommand('seal_interrupted_session'), true);
   assert.equal(isLicenseExemptEngineCommand('stop_session'), true);
+  assert.equal(isLicenseExemptEngineCommand('cancel_input_audition'), true,
+    'license expiry must not trap the operator in a live audition operation');
   assert.equal(isLicenseExemptEngineCommand('create_session'), false);
   assert.equal(isLicenseExemptEngineCommand('export_session'), false);
   assert.equal(isLicenseCheckDisabled({ DATABAKER_LICENSE_DISABLED: '1' }), true);

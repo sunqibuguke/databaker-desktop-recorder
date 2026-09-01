@@ -9,7 +9,10 @@ async function main() {
   const {
     InputAuditionDecisionCache,
     InputAuditionCacheInvalidationTracker,
+    InputAuditionInvalidationEpoch,
     captureFingerprintFromInputAuditionResult,
+    inputAuditionActiveDecisionStateMatches,
+    inputAuditionCacheStateAllowsAdoption,
     inputAuditionCheckIdFromResult,
     inputAuditionConfigurationFromEngineResult,
     inputAuditionDecidedAtFromResult,
@@ -44,10 +47,10 @@ async function main() {
     deviceName: 'Ｆｏｃｕｓｒｉｔｅ USB Audio',
     deviceId: 'endpoint:{usb-port-b}',
   };
-  assert.equal(
+  assert.notEqual(
     logicalInputAuditionKey(base),
     logicalInputAuditionKey(movedUsbPort),
-    'WASAPI raw endpoint/USB location must not be part of the logical cache key',
+    'moving a WASAPI endpoint or USB interface requires a fresh audition',
   );
   assert.equal(
     logicalInputAuditionConfigurationKey(base),
@@ -77,8 +80,8 @@ async function main() {
 
   const asioA = { ...base, backend: 'asio', driverName: 'Focusrite USB ASIO', deviceName: 'Input 1' };
   const asioB = { ...asioA, deviceId: 'different-endpoint', deviceName: 'Focusrite Input 1' };
-  assert.equal(logicalInputAuditionKey(asioA), logicalInputAuditionKey(asioB),
-    'ASIO must prefer the stable driver/display name over endpoint ids or per-port labels');
+  assert.notEqual(logicalInputAuditionKey(asioA), logicalInputAuditionKey(asioB),
+    'same-named ASIO devices with different raw identities must not share an audition');
 
   for (const [field, value] of [
     ['deviceName', 'Another Interface'],
@@ -112,7 +115,7 @@ async function main() {
     captureFingerprint: 'capture-sha-256',
     sourceCheckId: 'input-audition-1',
   });
-  assert.equal(cache.get(movedUsbPort).status, 'confirmed');
+  assert.equal(cache.get(movedUsbPort), null);
   assert.equal(cache.get({ ...base, sampleRate: 96_000 }), null);
   assert.equal(cache.remember(base, 'skipped', 'skip-fingerprint', 'input-audition-2').status, 'skipped');
   assert.equal(cache.get(base).status, 'skipped', 'confirmed and skipped remain distinct decisions');
@@ -165,6 +168,98 @@ async function main() {
     requestedBufferFrames: 512,
     actualBufferFrames: 512,
   });
+  const healthyAdoptionState = {
+    snapshot: {
+      ...engineResult.snapshot,
+      status: 'recording',
+      input_discontinuity_count: 0,
+      input_discontinuity_silence_samples: 0,
+      overflow_samples: 0,
+    },
+  };
+  assert.equal(inputAuditionCacheStateAllowsAdoption(healthyAdoptionState), true);
+  for (const unhealthySnapshot of [
+    { input_discontinuity_count: 1 },
+    { input_discontinuity_silence_samples: 512 },
+    { overflow_samples: 1 },
+    { status: 'faulted' },
+    { faulted: true },
+  ]) {
+    assert.equal(inputAuditionCacheStateAllowsAdoption({
+      snapshot: { ...healthyAdoptionState.snapshot, ...unhealthySnapshot },
+    }), false, `authoritative cache-adoption state must fail closed: ${JSON.stringify(unhealthySnapshot)}`);
+  }
+  assert.equal(inputAuditionCacheStateAllowsAdoption({
+    ...healthyAdoptionState,
+    faulted: true,
+  }), false, 'a top-level runtime fault must reject launch-cache adoption');
+  assert.equal(inputAuditionCacheStateAllowsAdoption({
+    snapshot: { ...healthyAdoptionState.snapshot, input_discontinuity_count: undefined },
+  }), false, 'missing continuity evidence must fail closed');
+
+  const historicalFreshDecisionState = {
+    snapshot: {
+      ...healthyAdoptionState.snapshot,
+      input_discontinuity_count: 3,
+      input_discontinuity_silence_samples: 1_024,
+      overflow_samples: 0,
+      input_audition: {
+        status: 'confirmed',
+        input_discontinuity_count_at_completion: 3,
+        input_discontinuity_silence_samples_at_completion: 1_024,
+        overflow_samples_at_completion: 0,
+      },
+    },
+  };
+  assert.equal(inputAuditionActiveDecisionStateMatches(
+    historicalFreshDecisionState,
+    'confirmed',
+  ), true, 'a fresh current-runtime audition remains armed on an equal non-zero historical baseline');
+  assert.equal(inputAuditionActiveDecisionStateMatches({
+    snapshot: {
+      ...historicalFreshDecisionState.snapshot,
+      input_discontinuity_count: 4,
+    },
+  }, 'confirmed'), false,
+  'a new discontinuity after completion must invalidate the current runtime arm');
+  assert.equal(inputAuditionCacheStateAllowsAdoption(historicalFreshDecisionState), false,
+    'the same historical baseline without an active runtime arm must not adopt a launch-cache decision');
+  assert.equal(inputAuditionActiveDecisionStateMatches({
+    snapshot: {
+      ...historicalFreshDecisionState.snapshot,
+      input_audition: {
+        ...historicalFreshDecisionState.snapshot.input_audition,
+        input_discontinuity_silence_samples_at_completion: 1_023,
+      },
+    },
+  }, 'confirmed'), false,
+  'a torn completion-silence epoch must invalidate the current runtime arm');
+
+  let resolveStateBeforeFirstMeter;
+  let adoptionCallsBeforeFirstMeter = 0;
+  const stateBeforeFirstMeter = new Promise((resolve) => {
+    resolveStateBeforeFirstMeter = resolve;
+  });
+  const decisionBeforeFirstMeter = (async () => {
+    const state = await stateBeforeFirstMeter;
+    if (!inputAuditionCacheStateAllowsAdoption(state)) return null;
+    adoptionCallsBeforeFirstMeter += 1;
+    return cache.get(base);
+  })();
+  resolveStateBeforeFirstMeter({
+    snapshot: {
+      ...healthyAdoptionState.snapshot,
+      input_discontinuity_count: 3,
+      input_discontinuity_silence_samples: 1_024,
+    },
+  });
+  const preMeterDecision = await decisionBeforeFirstMeter;
+  assert.equal(preMeterDecision, null,
+    'get_state must reject historical discontinuity evidence before the first meter packet races in');
+  assert.equal(adoptionCallsBeforeFirstMeter, 0,
+    'an unhealthy authoritative state must not call adopt_cached_input_audition');
+  assert.equal(shouldPromptInputAudition(preMeterDecision), true,
+    'the renderer must remain in the fresh-audition path after pre-meter rejection');
 
   assert.equal(invalidatesInputAuditionCache({ event: 'input_discontinuity', payload: {} }), true);
   assert.equal(invalidatesInputAuditionCache({ event: 'meter', payload: { faulted: true } }), true);
@@ -178,7 +273,7 @@ async function main() {
   assert.equal(invalidation.observe({
     event: 'meter',
     payload: { input_discontinuity_count: 1, overflow_samples: 0, faulted: false },
-  }, scope), false, 'the first meter packet establishes the active-session baseline');
+  }, scope), true, 'a first meter packet that is already discontinuous invalidates launch cache reuse');
   assert.equal(invalidation.observe({
     event: 'meter',
     payload: { input_discontinuity_count: 2, overflow_samples: 0, faulted: false },
@@ -195,8 +290,8 @@ async function main() {
   assert.equal(invalidation.observe({
     event: 'meter',
     payload: { input_discontinuity_count: 8, overflow_samples: 20, faulted: true },
-  }, { generation: 8, sessionDir: '/recordings/session-b' }), false,
-  'a resumed/new session establishes its own baseline even when counters are historical');
+  }, { generation: 8, sessionDir: '/recordings/session-b' }), true,
+  'a resumed/new session with historical faults must not adopt a launch-cached audition');
   assert.equal(invalidation.observe({
     event: 'meter',
     payload: { input_discontinuity_count: 8, overflow_samples: 21, faulted: true },
@@ -209,6 +304,33 @@ async function main() {
   assert.equal(invalidation.observe({
     event: 'meter', payload: { input_discontinuity_count: 0, overflow_samples: 0, faulted: true },
   }, scope), true, 'a healthy-to-faulted transition invalidates once');
+
+  const requestEpoch = new InputAuditionInvalidationEpoch();
+  const currentToken = requestEpoch.capture();
+  assert.deepEqual(
+    await requestEpoch.settle(currentToken, Promise.resolve('current-result')),
+    { value: 'current-result', current: true },
+    'an unchanged epoch may publish its async engine result',
+  );
+  let resolvePending;
+  const pendingEngineRequest = new Promise((resolve) => {
+    resolvePending = resolve;
+  });
+  const staleToken = requestEpoch.capture();
+  const staleSettlement = requestEpoch.settle(staleToken, pendingEngineRequest);
+  requestEpoch.invalidate();
+  resolvePending('late-result');
+  assert.deepEqual(
+    await staleSettlement,
+    { value: 'late-result', current: false },
+    'a fault arriving while an engine request is pending must retire its late result',
+  );
+  const replacementToken = requestEpoch.capture();
+  assert.deepEqual(
+    await requestEpoch.settle(replacementToken, Promise.resolve('replacement-result')),
+    { value: 'replacement-result', current: true },
+    'a request started after invalidation receives a fresh usable token',
+  );
 
   assert.equal(shouldPromptInputAudition(null), true);
   assert.equal(shouldPromptInputAudition(
@@ -250,6 +372,20 @@ async function main() {
       < cacheDecisionHandler.indexOf('inputAuditionDecisionCache.get(currentConfiguration)'),
     'cache adoption must derive its lookup key from authoritative engine state',
   );
+  assert.ok(
+    cacheDecisionHandler.indexOf('inputAuditionActiveDecisionStateMatches(currentState, decision.status)')
+      < cacheDecisionHandler.indexOf('inputAuditionCacheStateAllowsAdoption(currentState)'),
+    'a current-generation arm must be checked against its completion epoch before applying launch-cache rules',
+  );
+  assert.ok(
+    cacheDecisionHandler.indexOf('inputAuditionCacheStateAllowsAdoption(currentState)')
+      < cacheDecisionHandler.indexOf("engine.request('adopt_cached_input_audition'"),
+    'zero-baseline launch-cache validation must still run before engine adoption',
+  );
+  assert.match(cacheDecisionHandler, /inputAuditionInvalidationEpoch\.settle\([\s\S]*?engine\.request\('get_state'/,
+    'cache adoption must reject an input fault that races with the state lookup');
+  assert.match(cacheDecisionHandler, /inputAuditionInvalidationEpoch\.settle\([\s\S]*?adopt_cached_input_audition[\s\S]*?!settledAdoption\.current/,
+    'cache adoption must reject an input fault that races with the engine adoption request');
   const clearDecisionHandler = mainSource.slice(
     mainSource.indexOf("ipcMain.handle('input-audition:clear-decision'"),
     mainSource.indexOf('for (const command of INPUT_AUDITION_COMMANDS)'),

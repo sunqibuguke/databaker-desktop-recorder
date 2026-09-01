@@ -1,4 +1,5 @@
 export type EngineErrorKind =
+  | 'input_access_denied'
   | 'exclusive_open'
   | 'exclusive_busy'
   | 'exclusive_format'
@@ -57,6 +58,11 @@ export function classifyEngineError(error: unknown): ClassifiedEngineError {
   const raw = `${rawErrorText(error)}\n${userFacingEngineError(error)}`;
   const message = userFacingEngineError(error);
   const exclusive = /独占|exclusive|0x8889/i.test(raw);
+  const inputAccessDenied = /0x80070005|-2147024891|E_ACCESSDENIED|Access is denied|Access denied|访问被拒绝|拒绝访问/i.test(raw)
+    && /audio client|input stream|build\s+.*stream|capture|WASAPI|声卡|输入设备|麦克风/i.test(raw);
+  if (inputAccessDenied) {
+    return { kind: 'input_access_denied', message, canEditCaptureSettings: false };
+  }
   if (/0x8889000[aA]|声卡正被其他程序独占使用|DEVICE_IN_USE/i.test(raw)) {
     return { kind: 'exclusive_busy', message, canEditCaptureSettings: true };
   }

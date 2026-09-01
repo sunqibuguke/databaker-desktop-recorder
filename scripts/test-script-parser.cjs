@@ -5,7 +5,31 @@ const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
 async function main() {
-  const { parseScript } = await import(pathToFileURL(path.join(__dirname, '..', 'src', 'script-parser.ts')).href);
+  const {
+    parseScript,
+    scriptPreviewFromSnapshotItems,
+  } = await import(pathToFileURL(path.join(__dirname, '..', 'src', 'script-parser.ts')).href);
+
+  const snapshotItems = [
+    { id: 'snapshot-1', text: '历史任务第一句', label: '正常' },
+    { id: 'snapshot-2', text: '历史任务第二句', label: '' },
+  ];
+  const snapshotPreview = scriptPreviewFromSnapshotItems(snapshotItems);
+  assert.notStrictEqual(snapshotPreview.items, snapshotItems,
+    '历史任务预览必须是快照的独立副本');
+  assert.deepEqual(snapshotPreview.items, snapshotItems);
+  assert.deepEqual(snapshotPreview.errors, []);
+  assert.deepEqual(snapshotPreview.warnings, []);
+  assert.equal(snapshotPreview.mode, 'structured');
+  assert.deepEqual(snapshotPreview.summary, {
+    totalItems: 2,
+    emptyLabelCount: 1,
+    uniqueLabelCount: 1,
+    labelChangeCount: 1,
+  });
+  snapshotItems[0].text = '被后续代码修改';
+  assert.equal(snapshotPreview.items[0].text, '历史任务第一句',
+    '后续修改原数组不得篡改权威预览');
 
   const csv = parseScript('id,text,label\n0001,今天天气很好，适合出去散步。,正常语速\n0002,请保持自然、清晰的发音。,无杂音', 'script.csv');
   assert.equal(csv.delimiter, ',');

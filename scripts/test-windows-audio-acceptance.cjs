@@ -123,6 +123,20 @@ function testArgs() {
   assert.equal(shared.bitDepth, 16);
   assert.equal(shared.minimumInputFormatBits, 16);
   assert.throws(() => parseArgs(['--mode', 'short', '--share-mode', 'asio']), /share-mode/);
+  const expectedAsio = parseArgs([
+    '--mode', 'short',
+    '--expected-capture-backend', 'asio',
+  ]);
+  assert.equal(expectedAsio.expectedCaptureBackend, 'asio');
+  assert.equal(expectedAsio.expectedCaptureBufferFrames, 512);
+  assert.throws(
+    () => parseArgs([
+      '--mode', 'short',
+      '--expected-capture-backend', 'wasapi',
+      '--expected-capture-buffer-frames', '512',
+    ]),
+    /WASAPI/,
+  );
 
   const qualification = parseArgs([
     '--mode', 'inventory',
@@ -423,6 +437,7 @@ function testInventoryChecks() {
     ],
   });
   assert.equal(overallFromChecks(duplicate), 'FAIL');
+  assert.equal(overallFromChecks([{ id: 'warning', status: 'WARN' }]), 'FAIL');
 }
 
 function testEngineExitChecks() {
@@ -557,7 +572,7 @@ function testWavInspection() {
     );
     fs.writeFileSync(redundantDescriptor, '{malformed');
     const redundantDescriptorChecks = evaluateSealedSession(inspectSession(session));
-    assert.equal(overallFromChecks(redundantDescriptorChecks), 'PASS');
+    assert.equal(overallFromChecks(redundantDescriptorChecks), 'FAIL');
     assert.equal(
       redundantDescriptorChecks.find((check) => check.id === 'segment-descriptor-redundancy')?.status,
       'WARN',
@@ -680,13 +695,16 @@ function testShortProtocolIntegration() {
         '5',
         '--poll-seconds',
         '0.25',
-        '--skip-noise-check',
         '--qualification-id',
         'DB-WIN-FIXTURE-001',
         '--qualification-run-id',
         'short-48000-24-ch1',
         '--installer-sha256',
         'a'.repeat(64),
+        '--expected-capture-backend',
+        'asio',
+        '--expected-capture-buffer-frames',
+        '512',
         '--yes',
       ],
       {
@@ -716,9 +734,11 @@ function testShortProtocolIntegration() {
     assert.equal(report.inspection.full_track.exact_header, true);
     assert.equal(report.inspection.export_metadata.exported.length, 1);
     assert.equal(report.inspection.export_metadata.skipped.length, 0);
-    assert.equal(report.inspection.export_metadata.exported[0].head_silence_armed_sample, 0);
-    assert.equal(report.inspection.export_metadata.exported[0].head_silence_passed_sample, 1);
-    assert.equal(report.inspection.export_metadata.exported[0].required_head_silence_samples, 1);
+    const exportedAttempt = report.inspection.export_metadata.exported[0];
+    assert.equal(exportedAttempt.attempt_id, report.attempt.start.attempt_id);
+    assert.equal(exportedAttempt.head_silence_armed_sample, exportedAttempt.start_sample);
+    assert.equal(exportedAttempt.head_silence_passed_sample, exportedAttempt.start_sample);
+    assert.equal(exportedAttempt.required_head_silence_samples, 0);
     assert.equal(
       report.inspection.export_metadata.exported[0].forced_without_tail_silence,
       false,
@@ -745,6 +765,10 @@ function testShortProtocolIntegration() {
       report.checks.find((check) => check.id === 'engine-clean-exit')?.status,
       'PASS',
     );
+    assert.equal(report.checks.find((check) => check.id === 'ambient-noise-check')?.status, 'PASS');
+    assert.equal(report.checks.find((check) => check.id === 'no-input-discontinuity')?.status, 'PASS');
+    assert.equal(report.checks.find((check) => check.id === 'accepted-attempt-lifecycle')?.status, 'PASS');
+    assert.equal(report.checks.find((check) => check.id === 'accepted-attempt-exported')?.status, 'PASS');
     assert.equal(report.progress_rows, undefined);
     assert(report.progress_samples_recorded >= 10);
     assert(fs.statSync(path.join(root, runNames[0], 'telemetry.jsonl')).size > 0);
@@ -768,7 +792,6 @@ function testBadExportManifestRejected() {
         '--device-index', '1',
         '--seconds', '5',
         '--poll-seconds', '0.25',
-        '--skip-noise-check',
         '--yes',
       ],
       {
@@ -794,6 +817,120 @@ function testBadExportManifestRejected() {
   }
 }
 
+function testProductionEvidenceFailsClosed() {
+  const cases = [
+    {
+      name: 'noise-skipped',
+      arguments: ['--skip-noise-check'],
+      environment: {},
+      checkId: 'ambient-noise-check',
+    },
+    {
+      name: 'noise-failed',
+      arguments: [],
+      environment: { DATABAKER_ACCEPTANCE_MOCK_NOISE_FAILED: '1' },
+      checkId: 'ambient-noise-check',
+    },
+    {
+      name: 'noise-error',
+      arguments: [],
+      environment: { DATABAKER_ACCEPTANCE_MOCK_NOISE_ERROR: '1' },
+      checkId: 'ambient-noise-check',
+    },
+    {
+      name: 'noise-threshold-too-lenient',
+      arguments: ['--noise-threshold-dbfs', '-6'],
+      environment: {},
+      checkId: 'ambient-noise-check',
+    },
+    {
+      name: 'backend-missing',
+      arguments: [],
+      environment: { DATABAKER_ACCEPTANCE_MOCK_MISSING_BACKEND: '1' },
+      checkId: 'capture-backend-match',
+    },
+    {
+      name: 'requested-buffer-missing',
+      arguments: [],
+      environment: { DATABAKER_ACCEPTANCE_MOCK_MISSING_REQUESTED_BUFFER: '1' },
+      checkId: 'capture-buffer-match',
+    },
+    {
+      name: 'actual-buffer-missing',
+      arguments: [],
+      environment: { DATABAKER_ACCEPTANCE_MOCK_MISSING_ACTUAL_BUFFER: '1' },
+      checkId: 'capture-buffer-match',
+    },
+    {
+      name: 'input-discontinuity',
+      arguments: [],
+      environment: { DATABAKER_ACCEPTANCE_MOCK_DISCONTINUITY: '1' },
+      checkId: 'no-input-discontinuity',
+    },
+    {
+      name: 'overflow-field-missing',
+      arguments: [],
+      environment: { DATABAKER_ACCEPTANCE_MOCK_MISSING_OVERFLOW: '1' },
+      checkId: 'no-overflow',
+    },
+    {
+      name: 'audition-discontinuity-silence',
+      arguments: [],
+      environment: { DATABAKER_ACCEPTANCE_MOCK_AUDITION_DISCONTINUITY_SILENCE: '1' },
+      checkId: 'input-audition-confirmed',
+    },
+    {
+      name: 'audition-shorter-than-ten-seconds',
+      arguments: [],
+      environment: { DATABAKER_ACCEPTANCE_MOCK_SHORT_AUDITION: '1' },
+      checkId: 'input-audition-confirmed',
+    },
+  ];
+  for (const testCase of cases) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), `databaker-acceptance-${testCase.name}-`));
+    try {
+      const result = spawnSync(
+        process.execPath,
+        [
+          path.join(__dirname, 'windows-audio-acceptance.cjs'),
+          '--mode', 'short',
+          '--engine', path.join(__dirname, 'fixtures', 'mock-acceptance-engine.cjs'),
+          '--output', root,
+          '--device-index', '1',
+          '--seconds', '5',
+          '--poll-seconds', '0.25',
+          '--no-export',
+          '--yes',
+          ...testCase.arguments,
+        ],
+        {
+          encoding: 'utf8',
+          timeout: 30_000,
+          env: { ...process.env, ...testCase.environment },
+        },
+      );
+      assert.equal(result.error, undefined, `${testCase.name}: ${result.error?.stack}`);
+      assert.equal(result.status, 1, `${testCase.name}\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`);
+      const report = latestReport(root);
+      assert.equal(report.overall, 'FAIL', testCase.name);
+      assert.equal(
+        report.checks.find((check) => check.id === testCase.checkId)?.status,
+        'FAIL',
+        testCase.name,
+      );
+      if (testCase.name === 'input-discontinuity') {
+        assert.equal(
+          report.checks.find((check) => check.id === 'accepted-attempt-lifecycle')?.status,
+          'FAIL',
+        );
+        assert.equal(report.attempt.stop.observed_discontinuity, true);
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }
+}
+
 function writeInterruptedSessionFixture(session, phase1Report) {
   fs.mkdirSync(path.join(session, 'audio', 'segments'), { recursive: true });
   fs.mkdirSync(path.join(session, 'metadata'), { recursive: true });
@@ -813,6 +950,9 @@ function writeInterruptedSessionFixture(session, phase1Report) {
     device_id: 'mock:usb-interface',
     input_sample_format: 'f32',
     capture_share_mode: 'exclusive',
+    capture_backend: 'asio',
+    requested_capture_buffer_frames: 512,
+    capture_buffer_frames: 512,
     audio_format: {
       sample_rate: 48_000,
       bit_depth: 24,
@@ -827,6 +967,8 @@ function writeInterruptedSessionFixture(session, phase1Report) {
     captured_samples: 96_001,
     committed_samples: 96_000,
     overflow_samples: 0,
+    input_discontinuity_count: 0,
+    input_discontinuity_silence_samples: 0,
     started_at: '2026-08-10T23:59:58.000Z',
     updated_at: armedAt,
     noise_check: null,
@@ -886,6 +1028,12 @@ function writeInterruptedSessionFixture(session, phase1Report) {
     device_name: snapshot.device_name,
     input_sample_format: snapshot.input_sample_format,
     capture_share_mode: snapshot.capture_share_mode,
+    capture_backend: snapshot.capture_backend,
+    requested_capture_buffer_frames: snapshot.requested_capture_buffer_frames,
+    capture_buffer_frames: snapshot.capture_buffer_frames,
+    overflow_samples: 0,
+    input_discontinuity_count: 0,
+    input_discontinuity_silence_samples: 0,
     audio_format: snapshot.audio_format,
     required_duration_seconds: 2,
     production_minimum_seconds: 3_600,
@@ -996,6 +1144,52 @@ function testPowerCutArmingIntegration() {
     );
     assert.equal(report.stop.result.snapshot.status, 'stopped');
     assert.equal(report.checks.find((check) => check.id === 'power-cut-observed')?.status, 'FAIL');
+
+    const missingOverflowOutput = path.join(root, 'reports-missing-overflow');
+    const missingOverflowSession = path.join(root, 'missing-overflow-recording');
+    const missingOverflow = spawnSync(
+      process.execPath,
+      [
+        tool,
+        '--mode',
+        'power-cut',
+        '--engine',
+        mockEngine,
+        '--output',
+        missingOverflowOutput,
+        '--session-dir',
+        missingOverflowSession,
+        '--device-index',
+        '1',
+        '--seconds',
+        '5',
+        '--trigger-delay-seconds',
+        '2',
+        '--test-only-power-cut',
+        '--poll-seconds',
+        '0.25',
+        '--skip-noise-check',
+        '--yes',
+      ],
+      {
+        encoding: 'utf8',
+        timeout: 20_000,
+        env: { ...process.env, DATABAKER_ACCEPTANCE_MOCK_MISSING_OVERFLOW: '1' },
+      },
+    );
+    assert.equal(missingOverflow.error, undefined, missingOverflow.error?.stack);
+    assert.equal(
+      missingOverflow.status,
+      2,
+      `stdout:\n${missingOverflow.stdout}\nstderr:\n${missingOverflow.stderr}`,
+    );
+    const missingOverflowReport = latestReport(missingOverflowOutput);
+    assert.equal(missingOverflowReport.power_cut.phase, 'not-performed');
+    assert.equal(missingOverflowReport.power_cut.evidence, null);
+    assert.equal(
+      fs.existsSync(path.join(missingOverflowSession, 'metadata', 'power-cut.acceptance.json')),
+      false,
+    );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -1266,7 +1460,6 @@ function testReplugIntegration(scenario, expectedStatus, expectedOverall, failed
         '--trigger-delay-seconds', '2',
         '--fault-timeout-seconds', '10',
         '--poll-seconds', '0.25',
-        '--skip-noise-check',
         '--yes',
       ],
       {
@@ -1368,6 +1561,7 @@ testWavInspection();
 testTimestamp();
 testShortProtocolIntegration();
 testBadExportManifestRejected();
+testProductionEvidenceFailsClosed();
 testPowerCutArmingIntegration();
 testPowerCutRecoveryIntegration();
 testReplugIntegration('success', 0, 'PASS');

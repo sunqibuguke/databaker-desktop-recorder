@@ -33,6 +33,42 @@ export function deviceExclusiveAvailable(device: AudioDevice | null | undefined)
   if (device.exclusive_available === true) return true;
   return (device.configurations ?? []).some((configuration) => configuration.share_mode === 'exclusive');
 }
+
+export function captureShareModeForDevice(
+  device: AudioDevice | null | undefined,
+  requestedMode: CaptureShareMode,
+  exclusiveCaptureAvailable = true,
+): CaptureShareMode {
+  if (!exclusiveCaptureAvailable) return 'shared';
+  if (device?.backend?.trim().toLocaleLowerCase('en-US') === 'asio') return 'exclusive';
+  if (requestedMode === 'exclusive' && !deviceExclusiveAvailable(device)) {
+    return 'shared';
+  }
+  if (requestedMode === 'shared'
+    && configurationsForShareMode(device, 'shared').length === 0
+    && deviceExclusiveAvailable(device)) {
+    return 'exclusive';
+  }
+  return requestedMode;
+}
+
+export function captureShareModeForSelection(
+  device: AudioDevice | null | undefined,
+  selectedPreset: Readonly<{
+    deviceId: string;
+    captureShareMode?: CaptureShareMode;
+  }> | null | undefined,
+  exclusiveCaptureAvailable = true,
+): CaptureShareMode {
+  const matchingPreset = Boolean(device && selectedPreset?.deviceId === device.id);
+  const requestedMode = matchingPreset
+    ? normalizeCaptureShareMode(selectedPreset?.captureShareMode)
+    : deviceExclusiveAvailable(device)
+      ? 'exclusive'
+      : 'shared';
+  return captureShareModeForDevice(device, requestedMode, exclusiveCaptureAvailable);
+}
+
 export function inputSampleFormatRepresentationBits(format: string): number | null {
   switch (format.trim().toLowerCase()) {
     case 'i8':
@@ -86,7 +122,7 @@ export const DEFAULT_DELIVERY_BIT_DEPTH = 16 as const;
 const PREFERRED_CAPTURE_SAMPLE_FORMATS: readonly CaptureSampleFormat[] = ['i24', 'f32', 'i32', 'i16'];
 
 const REJECTED_INPUT_DEVICE = /阵列|array|senary|bluetooth|hands-?free|headset|communications|立体声混音|stereo mix|what u hear|wave out/i;
-const DISCOURAGED_INPUT_DEVICE = /built-?in|internal microphone|内置|realtek/i;
+const DISCOURAGED_INPUT_DEVICE = /built-?in|internal microphone|内置|realtek|generic low latency asio|asio4all|voicemeeter|fl studio asio|virtual asio/i;
 
 export type InputDeviceKind = 'production' | 'discouraged' | 'rejected';
 
@@ -114,7 +150,10 @@ export function preferredInputDevice<T extends {
 ): T | null {
   if (!devices.length) return null;
   const recommended = [...devices]
-    .filter((device) => device.production_recommended === true)
+    .filter((device) => (
+      device.production_recommended === true
+      && classifyInputDevice(device) === 'production'
+    ))
     .sort((left, right) => (
       (right.production_priority ?? 0) - (left.production_priority ?? 0)
     ));
@@ -167,6 +206,23 @@ export function captureSampleFormatsForConfiguration(
     if (format) available.add(format);
   }
   return CAPTURE_SAMPLE_FORMATS.filter((format) => available.has(format));
+}
+
+export function captureConfigurationSupported(
+  device: AudioDevice | null | undefined,
+  mode: CaptureShareMode,
+  sampleRate: number,
+  inputChannel: number,
+  inputSampleFormat: string,
+): boolean {
+  if (!device || device.production_blocked_reason) return false;
+  const normalizedFormat = normalizeCaptureSampleFormat(inputSampleFormat);
+  if (!normalizedFormat || !Number.isSafeInteger(inputChannel) || inputChannel < 1) return false;
+  return captureSampleFormatsForConfiguration(
+    configurationsForShareMode(device, mode),
+    sampleRate,
+    inputChannel,
+  ).includes(normalizedFormat);
 }
 
 export function captureSampleFormatLabel(format: string): string {

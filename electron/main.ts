@@ -54,8 +54,11 @@ import {
 } from './engine-client';
 import {
   captureFingerprintFromInputAuditionResult,
+  inputAuditionActiveDecisionStateMatches,
   InputAuditionCacheInvalidationTracker,
   InputAuditionDecisionCache,
+  InputAuditionInvalidationEpoch,
+  inputAuditionCacheStateAllowsAdoption,
   inputAuditionCheckIdFromResult,
   inputAuditionConfigurationFromEngineResult,
   inputAuditionDecidedAtFromResult,
@@ -184,6 +187,7 @@ type ActiveInputAuditionArm = Readonly<{
   status: 'confirmed' | 'skipped';
 }>;
 let activeInputAuditionArm: ActiveInputAuditionArm | null = null;
+const inputAuditionInvalidationEpoch = new InputAuditionInvalidationEpoch();
 let debugLog: DebugLogStore | null = null;
 const reportedExclusiveProbes = new Set<string>();
 let lastMeterFaultSignature = '';
@@ -4325,6 +4329,7 @@ function registerIpc(): void {
     if (engineIntent.phase !== 'active') throw new Error('只能在当前录制任务中进行输入试听');
     if (command === 'begin_input_audition' || command === 'cancel_input_audition') {
       activeInputAuditionArm = null;
+      inputAuditionInvalidationEpoch.invalidate();
     }
     let enginePayload: Record<string, unknown> = {};
     if (INPUT_AUDITION_CHECK_ID_COMMANDS.has(command)) {
@@ -4340,8 +4345,24 @@ function registerIpc(): void {
       enginePayload = { check_id: checkId };
     }
     const commandIntent = engineIntent;
-    const result = await engine.requestInputAudition(command, enginePayload);
+    const requestInvalidationEpoch = inputAuditionInvalidationEpoch.capture();
+    const settledRequest = await inputAuditionInvalidationEpoch.settle(
+      requestInvalidationEpoch,
+      engine.requestInputAudition(command, enginePayload),
+    );
+    const result = settledRequest.value;
     assertCurrentEngineIntent(commandIntent, ['active']);
+    if ((command === 'confirm_input_audition' || command === 'skip_input_audition')
+      && !settledRequest.current) {
+      activeInputAuditionArm = null;
+      try {
+        await engine.request('invalidate_input_audition_decision', {}, 20_000);
+      } catch {
+        // The runtime's start_attempt gate also checks its discontinuity epoch;
+        // keep the trusted-main arm closed even if the helper is already gone.
+      }
+      throw new Error('输入在试听决定期间发生异常，请重新试听');
+    }
     if (command === 'begin_input_audition') {
       const configuration = inputAuditionConfigurationFromEngineResult(result);
       if (configuration) inputAuditionDecisionCache.delete(configuration);
@@ -4467,10 +4488,16 @@ function registerIpc(): void {
     assertMainRenderer(event.sender);
     await assertAppLicensed();
     if (!engine || engineIntent.phase !== 'active') return null;
+    const lookupInvalidationEpoch = inputAuditionInvalidationEpoch.capture();
     const rendererLogicalKey = logicalInputAuditionKey(configuration);
     const commandIntent = engineIntent;
-    const currentState = await engine.request('get_state', {}, 20_000);
+    const settledState = await inputAuditionInvalidationEpoch.settle(
+      lookupInvalidationEpoch,
+      engine.request('get_state', {}, 20_000),
+    );
+    const currentState = settledState.value;
     assertCurrentEngineIntent(commandIntent, ['active']);
+    if (!settledState.current) return null;
     const currentConfiguration = inputAuditionConfigurationFromEngineResult(currentState);
     if (!currentConfiguration) return null;
     const logicalKey = logicalInputAuditionKey(currentConfiguration);
@@ -4484,23 +4511,44 @@ function registerIpc(): void {
     if (unresolvedAudition) return null;
     const decision = inputAuditionDecisionCache.get(currentConfiguration);
     if (!decision) return null;
-    if (activeInputAuditionArm?.generation === engineIntent.generation
-      && activeInputAuditionArm.logicalKey === logicalKey
-      && activeInputAuditionArm.status === decision.status) {
-      return decision;
+    const currentConfigurationArm = activeInputAuditionArm?.generation === engineIntent.generation
+      && activeInputAuditionArm.logicalKey === logicalKey;
+    if (currentConfigurationArm) {
+      if (activeInputAuditionArm?.status === decision.status
+        && !currentCaptureFault()
+        && inputAuditionActiveDecisionStateMatches(currentState, decision.status)) {
+        return decision;
+      }
+      inputAuditionDecisionCache.delete(currentConfiguration);
+      activeInputAuditionArm = null;
+      inputAuditionInvalidationEpoch.invalidate();
+      return null;
+    }
+    if (!inputAuditionCacheStateAllowsAdoption(currentState) || currentCaptureFault()) {
+      inputAuditionDecisionCache.delete(currentConfiguration);
+      activeInputAuditionArm = null;
+      inputAuditionInvalidationEpoch.invalidate();
+      return null;
     }
     if (!decision.captureFingerprint) {
       inputAuditionDecisionCache.delete(currentConfiguration);
       return null;
     }
     try {
-      const result = await engine.request('adopt_cached_input_audition', {
-        status: decision.status,
-        source_check_id: decision.sourceCheckId,
-        source_decided_at: decision.decidedAt,
-        capture_fingerprint: decision.captureFingerprint,
-      }, 20_000);
+      const settledAdoption = await inputAuditionInvalidationEpoch.settle(
+        lookupInvalidationEpoch,
+        engine.request('adopt_cached_input_audition', {
+          status: decision.status,
+          source_check_id: decision.sourceCheckId,
+          source_decided_at: decision.decidedAt,
+          capture_fingerprint: decision.captureFingerprint,
+        }, 20_000),
+      );
+      const result = settledAdoption.value;
       assertCurrentEngineIntent(commandIntent, ['active']);
+      if (!settledAdoption.current) {
+        throw new Error('输入在采用试听缓存期间发生异常');
+      }
       const adoptedStatus = inputAuditionStatusFromResult(result);
       const adoptedConfiguration = inputAuditionConfigurationFromEngineResult(result);
       if (adoptedStatus !== decision.status
@@ -4540,6 +4588,7 @@ function registerIpc(): void {
     const logicalKey = logicalInputAuditionKey(configuration);
     inputAuditionDecisionCache.delete(configuration);
     if (activeInputAuditionArm?.logicalKey === logicalKey) activeInputAuditionArm = null;
+    inputAuditionInvalidationEpoch.invalidate();
     if (!engine || engineIntent.phase !== 'active') return;
     const commandIntent = engineIntent;
     await engine.request('invalidate_input_audition_decision', {}, 20_000);
@@ -5332,6 +5381,7 @@ app.whenReady().then(async () => {
     })) {
       inputAuditionDecisionCache.clear();
       activeInputAuditionArm = null;
+      inputAuditionInvalidationEpoch.invalidate();
     }
     sendToMain('engine:event', message);
     handleCaptureFaultEvent(message);
@@ -5390,6 +5440,7 @@ app.whenReady().then(async () => {
     inputAuditionDecisionCache.clear();
     inputAuditionCacheInvalidationTracker.reset();
     activeInputAuditionArm = null;
+    inputAuditionInvalidationEpoch.invalidate();
     const interruptedIntent = engineIntent;
     if (interruptedIntent.phase === 'quitting') return;
     reportEngineOffline(interruptedIntent.phase, message);
@@ -5478,6 +5529,7 @@ app.whenReady().then(async () => {
     inputAuditionDecisionCache.clear();
     inputAuditionCacheInvalidationTracker.reset();
     activeInputAuditionArm = null;
+    inputAuditionInvalidationEpoch.invalidate();
     if (!outcome.safe) {
       if (!forceExitConfirmed) void handleUnsafeEngineStop(outcome);
       return;

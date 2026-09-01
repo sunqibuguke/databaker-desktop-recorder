@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
@@ -6,6 +7,7 @@ async function main() {
   const modulePath = path.join(__dirname, '..', 'src', 'recording-workflow.ts');
   const inputQualityModulePath = path.join(__dirname, '..', 'src', 'input-quality.ts');
   const captureConfigurationModulePath = path.join(__dirname, '..', 'src', 'capture-configuration.ts');
+  const captureActivationModulePath = path.join(__dirname, '..', 'src', 'capture-activation.ts');
   const {
     areAllItemsHandled,
     captureExitAction,
@@ -55,10 +57,13 @@ async function main() {
     preferredInputDevice,
     productionSampleRates,
     captureFormatsSupportBitDepth,
+    captureConfigurationSupported,
     captureSampleFormatFromBitDepth,
     captureSampleFormatLabel,
     captureSampleFormatsForConfiguration,
     captureShareModeLabel,
+    captureShareModeForDevice,
+    captureShareModeForSelection,
     configurationsForShareMode,
     inputSampleFormatRepresentationBits,
     minimumInputRepresentationBits,
@@ -66,6 +71,7 @@ async function main() {
     normalizeCaptureShareMode,
     preferredCaptureSampleFormat,
   } = await import(pathToFileURL(captureConfigurationModulePath).href);
+  const { captureActivationTarget } = await import(pathToFileURL(captureActivationModulePath).href);
 
   const item = (status) => ({ status });
 
@@ -256,6 +262,104 @@ async function main() {
   );
   assert.equal(configurationsForShareMode({ configurations: [{ min_sample_rate: 48_000, max_sample_rate: 48_000, channels: 1, sample_format: 'f32' }] }, 'exclusive').length, 0);
   assert.equal(configurationsForShareMode({ configurations: [{ min_sample_rate: 48_000, max_sample_rate: 48_000, channels: 1, sample_format: 'f32' }] }, 'shared').length, 1);
+  const asioOnlyDevice = {
+    id: 'asio:focusrite',
+    name: 'Focusrite USB ASIO',
+    backend: 'asio',
+    is_default: false,
+    sample_rates: [48_000],
+    input_channels: [2],
+    recommended_buffer_frames: 512,
+    configurations: [
+      { min_sample_rate: 48_000, max_sample_rate: 48_000, channels: 2, sample_format: 'i24', share_mode: 'exclusive' },
+    ],
+  };
+  assert.equal(captureShareModeForDevice(asioOnlyDevice, 'shared', true), 'exclusive',
+    'ASIO must never retain the WASAPI shared-mode state');
+  assert.equal(captureConfigurationSupported(asioOnlyDevice, 'exclusive', 48_000, 1, 'i24'), true);
+  assert.equal(captureConfigurationSupported(asioOnlyDevice, 'shared', 48_000, 1, 'i24'), false,
+    'ASIO-only configurations fail closed if a stale shared mode reaches validation');
+  assert.equal(captureConfigurationSupported(asioOnlyDevice, 'exclusive', 48_000, 1, 'i16'), false,
+    'explicit recovery settings must still match a driver-advertised input format');
+  const sharedOnlyDevice = {
+    id: 'wasapi:shared-only',
+    name: 'Shared-only WASAPI input',
+    backend: 'wasapi',
+    is_default: false,
+    exclusive_available: false,
+    sample_rates: [48_000],
+    input_channels: [1],
+    configurations: [
+      { min_sample_rate: 48_000, max_sample_rate: 48_000, channels: 1, sample_format: 'i16', share_mode: 'shared' },
+    ],
+  };
+  assert.equal(captureShareModeForDevice(sharedOnlyDevice, 'exclusive', true), 'shared',
+    'a shared-only WASAPI device must not retain a stale exclusive-mode state');
+  assert.equal(captureConfigurationSupported(sharedOnlyDevice, 'shared', 48_000, 1, 'i16'), true);
+  assert.equal(captureConfigurationSupported(sharedOnlyDevice, 'exclusive', 48_000, 1, 'i16'), false);
+  const dualModeWasapiDevice = {
+    ...sharedOnlyDevice,
+    id: 'wasapi:dual-mode',
+    exclusive_available: true,
+    configurations: [
+      { min_sample_rate: 48_000, max_sample_rate: 48_000, channels: 1, sample_format: 'i24', share_mode: 'exclusive' },
+      { min_sample_rate: 48_000, max_sample_rate: 48_000, channels: 1, sample_format: 'f32', share_mode: 'shared' },
+    ],
+  };
+  const sharedPreset = {
+    deviceId: dualModeWasapiDevice.id,
+    captureShareMode: 'shared',
+  };
+  assert.equal(captureShareModeForSelection(dualModeWasapiDevice, sharedPreset, true), 'shared',
+    'selecting a shared-mode preset for another WASAPI device must preserve its mode');
+  assert.equal(captureShareModeForSelection({ ...dualModeWasapiDevice }, sharedPreset, true), 'shared',
+    'refreshing the device inventory must not overwrite a matching shared-mode preset');
+  assert.equal(captureShareModeForSelection(dualModeWasapiDevice, null, true), 'exclusive',
+    'without a matching preset a dual-mode production device defaults to exclusive');
+  assert.equal(captureShareModeForSelection(
+    dualModeWasapiDevice,
+    { deviceId: 'wasapi:some-other-device', captureShareMode: 'shared' },
+    true,
+  ), 'exclusive', 'a preset for another device must not control the current device');
+  assert.equal(captureShareModeForSelection(
+    sharedOnlyDevice,
+    { deviceId: sharedOnlyDevice.id, captureShareMode: 'exclusive' },
+    true,
+  ), 'shared', 'a shared-only endpoint must normalize an unavailable exclusive preset to shared');
+  assert.equal(captureShareModeForSelection(
+    asioOnlyDevice,
+    { deviceId: asioOnlyDevice.id, captureShareMode: 'shared' },
+    true,
+  ), 'exclusive', 'ASIO must normalize even a legacy shared-mode preset to exclusive');
+  const inspectedSnapshot = {
+    device_id: 'wasapi:shared-only',
+    device_name: 'Shared-only WASAPI input',
+    status: 'stopped',
+    overflow_samples: 0,
+  };
+  const readonlyActivation = captureActivationTarget({
+    session_dir: '/recordings/readonly-task',
+    snapshot: inspectedSnapshot,
+    faulted: false,
+    data_health: 'readonly',
+  }, [sharedOnlyDevice]);
+  assert.equal(readonlyActivation.blocked, true,
+    'an authoritative readonly inspection must remain blocked even if its snapshot status still says stopped');
+  assert.equal(readonlyActivation.device, sharedOnlyDevice);
+  assert.equal(captureActivationTarget({
+    session_dir: '/recordings/marker-fault',
+    snapshot: inspectedSnapshot,
+    faulted: true,
+    data_health: 'normal',
+  }, [sharedOnlyDevice]).blocked, true,
+  'an out-of-band audio fault marker returned by inspection must block immediate activation');
+  assert.equal(captureActivationTarget({
+    session_dir: '/recordings/moved-device',
+    snapshot: { ...inspectedSnapshot, device_id: 'wasapi:old-endpoint' },
+    faulted: false,
+    data_health: 'normal',
+  }, [sharedOnlyDevice]).device, null,
+  'an explicit missing endpoint id must not fall back to a same-named stale device');
   assert.equal(captureFormatsSupportBitDepth(['I16'], 16), true);
   assert.equal(
     captureFormatsSupportBitDepth(['I16'], 24),
@@ -282,6 +386,7 @@ async function main() {
   assert.equal(classifyInputDevice({ name: 'Headset (Bluetooth)' }), 'rejected');
   assert.equal(classifyInputDevice({ name: 'Microphone Array (Realtek)' }), 'rejected');
   assert.equal(classifyInputDevice({ name: 'Internal Microphone' }), 'discouraged');
+  assert.equal(classifyInputDevice({ name: 'Generic Low Latency ASIO Driver' }), 'discouraged');
   assert.equal(inputDeviceNeedsWarning('production'), false);
   assert.equal(inputDeviceNeedsWarning('discouraged'), true);
   assert.equal(inputDeviceNeedsWarning('rejected'), true);
@@ -296,6 +401,12 @@ async function main() {
     { id: 'asio:focusrite', name: 'Focusrite USB ASIO', production_recommended: true, production_priority: 200 },
   ], 'wasapi:focusrite');
   assert.equal(asioPicked?.id, 'asio:focusrite', 'ASIO must win over the Focusrite WDM default endpoint');
+  const genericAsioNotPreferred = preferredInputDevice([
+    { id: 'wasapi:usb', name: 'Analogue Input (USB Audio Device)' },
+    { id: 'asio:generic', name: 'Generic Low Latency ASIO Driver', production_recommended: true, production_priority: 100 },
+  ]);
+  assert.equal(genericAsioNotPreferred?.id, 'wasapi:usb',
+    'a generic ASIO wrapper must not override a production USB input merely because it self-reports recommended');
   assert.deepEqual(productionSampleRates([16_000, 44_100, 48_000]), [44_100, 48_000]);
   assert.deepEqual(
     captureSampleFormatsForConfiguration(dualModeDevice.configurations, 48_000, 1),
@@ -773,6 +884,57 @@ async function main() {
     'a failed session seal must not report a successful pause',
   );
   assert.deepEqual(failedStopCalls, ['session'], 'the UI must stay put and keep the prompter when stop_session fails');
+
+  const recorderSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'Recorder.tsx'), 'utf8');
+  const newRecordingSource = recorderSource.slice(
+    recorderSource.indexOf('function beginNewRecording()'),
+    recorderSource.indexOf('function returnToRecordings()'),
+  );
+  assert.doesNotMatch(newRecordingSource, /setCaptureShareMode\('shared'\)/,
+    'new recording must not overwrite an ASIO-only device with WASAPI shared mode');
+  assert.match(newRecordingSource, /captureShareModeForDevice/);
+  const startSessionSource = recorderSource.slice(
+    recorderSource.indexOf('async function startSession('),
+    recorderSource.indexOf('function presentActivationFailure('),
+  );
+  assert.match(startSessionSource, /captureConfigurationSupported/,
+    'explicit recovery settings must pass the same device capability validation as setup');
+  assert.doesNotMatch(startSessionSource, /settingsAlreadyChosen/,
+    'supplying recovery settings must never bypass capture configuration validation');
+  assert.match(startSessionSource, /captureActivationTarget\([\s\S]*?result,[\s\S]*?devices/,
+    'recreate-and-activate must carry the newly created authoritative snapshot across the render boundary');
+  const activationFailureSource = recorderSource.slice(
+    recorderSource.indexOf('function presentActivationFailure('),
+    recorderSource.indexOf('function clearActivationFailure('),
+  );
+  assert.match(activationFailureSource, /const activationSnapshot = target\?\.snapshot \?\? snapshot/,
+    'activation recovery must prefer the explicitly activated snapshot over ambient React state');
+  assert.match(activationFailureSource, /const activationDevice = target \? target\.device : selectedDevice/,
+    'activation recovery must preserve an explicit missing device instead of falling back to a stale selection');
+  assert.match(activationFailureSource, /presentActivationFailure\(caught, target\)/,
+    'activation failures must be presented with the same target used by activate_session');
+  assert.match(activationFailureSource, /const targetWorkspaceFaulted = target \? target\.blocked : workspaceFaulted/,
+    'inspect-and-activate must preserve authoritative readonly/faulted health instead of checking snapshot status alone');
+  const inspectionSource = recorderSource.slice(
+    recorderSource.indexOf('function enterInspectionWorkspace('),
+    recorderSource.indexOf('function stageScriptPreview('),
+  );
+  assert.match(inspectionSource, /scriptPreviewFromSnapshotItems\(nextSnapshot\.items\)/,
+    'history inspection must rebuild preview and script items from its authoritative snapshot');
+  assert.match(inspectionSource, /setScriptPreview\(authoritativeScriptPreview\)/,
+    'history inspection must not retain a preview imported for an earlier task');
+  const recreateSource = recorderSource.slice(
+    recorderSource.indexOf('async function recreateFromActivationFailure('),
+    recorderSource.indexOf('async function refreshState('),
+  );
+  assert.match(recreateSource, /items: sourceItems/,
+    'history recovery must pass the failed task items explicitly instead of ambient setup state');
+  const historicalActivationSource = recorderSource.slice(
+    recorderSource.indexOf('async function openHistoricalRecording('),
+    recorderSource.indexOf('async function exportRecordingArtifact('),
+  );
+  assert.match(historicalActivationSource, /captureActivationTarget\([\s\S]*?inspected,[\s\S]*?devices/,
+    'inspect-and-activate must carry the inspected snapshot rather than relying on an old render closure');
 
   console.log('recording workflow policy tests passed');
 }

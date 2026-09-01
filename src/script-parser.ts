@@ -97,6 +97,20 @@ function result(
   return { items, errors, delimiter, mode, warnings, summary: summarize(items) };
 }
 
+/**
+ * Session snapshots already contain the engine's authoritative, normalized
+ * script. Rebuild the setup preview from those items instead of retaining a
+ * preview produced by an unrelated file import in an earlier workspace.
+ */
+export function scriptPreviewFromSnapshotItems(items: readonly ScriptItem[]): ParseResult {
+  return result(
+    items.map(({ id, text, label }) => ({ id, text, label })),
+    [],
+    ',',
+    'structured',
+  );
+}
+
 function parseDelimited(lines: string[], delimiter: ',' | '\t'): ParseResult {
   const errors: string[] = [];
   const first = parseRow(lines[0], delimiter);

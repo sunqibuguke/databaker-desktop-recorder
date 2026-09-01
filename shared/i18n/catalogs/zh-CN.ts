@@ -210,6 +210,8 @@ const zhCN = {
     dataSafetyTitle: '数据安全提示',
   },
   activationError: {
+    accessDeniedTitle: 'Windows 已拒绝访问输入设备',
+    accessDeniedBody: '请在“设置 → 隐私和安全性 → 麦克风”中开启“麦克风访问”“允许应用访问麦克风”和“允许桌面应用访问麦克风”。如果开关由单位管理，请联系管理员解除策略后再重试；无需更改采集模式或重新创建录制。',
     exclusiveTitle: '无法以独占模式打开声卡',
     exclusiveBody: 'Windows 拒绝了独占开流。常见原因是其他程序占用了该声卡，或采样率/位深与驱动不一致。应用不会自动改成系统混音。',
     busyTitle: '声卡正被其他程序占用',
@@ -227,6 +229,8 @@ const zhCN = {
     recreateAndEnter: '重新创建并进入录制',
     backToSetup: '返回完整设置',
     openEditor: '修改采集设置',
+    openAccessHelp: '查看处理办法',
+    retryCapture: '重试进入录制',
     editSettingsNotice: '已返回录制设置。改完采集模式或格式后，请重新创建任务。',
     recreatedNotice: '已用新采集设置创建任务。',
     detail: '详细原因',

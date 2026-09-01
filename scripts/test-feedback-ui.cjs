@@ -130,7 +130,11 @@ assert.match(recorder, /modalOpen: inputAuditionOpen[\s\S]*?Boolean\(document\.q
 assert.match(recorder, /formControl: Boolean\(target\?\.closest\('input, textarea, select, audio, \[contenteditable="true"\]'\)\)/);
 assert.match(recorder, /professionalItem: Boolean\(target\?\.closest\('\.professional-item'\)\)/);
 assert.doesNotMatch(recorder, /target\?\.closest\('input, textarea, select, button, audio'\)/, 'focused sentence rows must not be rejected by the blanket button guard');
-assert.match(recorder, /if \(options\.activate\) await activateCapture\(undefined, inspected\.session_dir\)/);
+assert.match(
+  recorder,
+  /if \(options\.activate\)[\s\S]*?activateCapture\(undefined, captureActivationTarget\([\s\S]*?inspected,[\s\S]*?devices/,
+  '历史任务的立即激活必须使用刚检查出来的权威任务上下文',
+);
 assert.match(recorder, /function showTaskIssues[\s\S]*?openHistoricalRecording\(recording, \{ panel: 'issues' \}\)/);
 assert.match(recorder, /function showTaskExportReview[\s\S]*?openHistoricalRecording\(recording, \{ panel: 'export' \}\)/);
 assert.match(recorder, /listEntry\.reason === 'warning' \? showTaskExportReview\(recording\) : listEntry\.reason === 'blocked' \? showTaskIssues\(recording\)/);

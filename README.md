@@ -106,7 +106,9 @@ Windows 安装包应在 Windows x64 构建机上执行 `npm run package`。Rust 
 npm run acceptance:audio -- --mode inventory
 ```
 
-Windows 安装包会把验收工具、启动器和文档放在 `resources/acceptance/`。工具覆盖 16/24/32-bit 短录、2–8 小时长稳、USB 拔出、专用测试卷磁盘保护，以及 `power-cut` → 重启 → `recover` 的真实断电两阶段门禁。生产 `power-cut` 只有在至少 1 小时样本已 committed、文件仍增长且尾差在预算内时才会落盘 nonce 证据并提示断电。`recover` 必须显式传入独立的 `--phase1-report`，并与会话内证据逐字段一致，同时匹配同一主机的新 boot、恢复前非终态和 `no_op=false`；正常 stopped 任务、仅杀进程、修改单份证据或丢失 armed committed 音频都不能 PASS。它还会严格检查 WAV 头部/EOF、分段编号、完整帧、物理样本水位、导出 status/metadata/CSV 一致性、overflow/fault marker 和引擎退出。显式的 `--test-only-power-cut` 短时回归只会生成 `TEST_ONLY_PASS` / `production_eligible=false`，不具备生产验收资格。Windows CI 还会静默安装实际 NSIS 产物、从安装目录运行验收启动器，并与安装包一起发布 `SHA256SUMS.txt`。完整命令和 PASS/FAIL 标准见 [Windows 外置声卡生产验收](doc/Windows外置声卡生产验收.md)。
+正常短录和长稳会先执行环境噪声检测与 10 秒输入试听，再真实执行一次句子开始、停止、确认和导出。噪声检测缺失、报错或 `passed=false`，期望/选择/实际后端不一致，ASIO 请求/实际缓冲区缺失，或 `input_discontinuity_count != 0` 都直接 FAIL。生产资格计划必须在 `target.noise_threshold_dbfs` 固定噪声阈值（`-96` 至 `-40` dBFS），采集 run 的 `--noise-threshold-dbfs` 必须与计划值精确一致且不得高于 `-40 dBFS`；10 秒输入试听必须恰好覆盖 `sample_rate * 10` 个样本。生产资格采集 run 还必须用 `--expected-capture-backend`（ASIO 同时用 `--expected-capture-buffer-frames`，默认 512）独立声明期望；`--skip-noise-check` 仅用于调试，不具备生产验收或资格证据效力。
+
+Windows 安装包会把验收工具、启动器和文档放在 `resources/acceptance/`。工具覆盖 16/24/32-bit 短录、2–8 小时长稳、USB 拔出、专用测试卷磁盘保护，以及 `power-cut` → 重启 → `recover` 的真实断电两阶段门禁。生产 `power-cut` 只有在至少 1 小时样本已 committed、文件仍增长、尾差在预算内且 `overflow_samples=0` 时，才会把该零溢出事实写入 nonce armed 证据并提示断电；资格汇总会在 phase-1 报告、独立证据、会话内证据和 armed telemetry 之间交叉验证。`recover` 必须显式传入独立的 `--phase1-report`，并与会话内证据逐字段一致，同时匹配同一主机的新 boot、恢复前非终态和 `no_op=false`；正常 stopped 任务、仅杀进程、修改单份证据或丢失 armed committed 音频都不能 PASS。它还会严格检查 WAV 头部/EOF、分段编号、完整帧、物理样本水位、导出 status/metadata/CSV 一致性、overflow/fault marker 和引擎退出。显式的 `--test-only-power-cut` 短时回归只会生成 `TEST_ONLY_PASS` / `production_eligible=false`，不具备生产验收资格。Windows CI 还会静默安装实际 NSIS 产物、从安装目录运行验收启动器，并与安装包一起发布 `SHA256SUMS.txt`。完整命令和 PASS/FAIL 标准见 [Windows 外置声卡生产验收](doc/Windows外置声卡生产验收.md)。
 
 当前交付仍属于小范围试运行，正式工位资格不是本版上线门槛；USB 物理插口也不会被绑定或比较。现场边界与回退条件见 [受控试运行说明](doc/受控试运行说明.md)。
 

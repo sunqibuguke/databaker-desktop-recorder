@@ -211,6 +211,8 @@ const en: MessageTree = {
     dataSafetyTitle: 'Data-safety notice',
   },
   activationError: {
+    accessDeniedTitle: 'Windows denied access to the input device',
+    accessDeniedBody: 'In Settings → Privacy & security → Microphone, turn on Microphone access, Let apps access your microphone, and Let desktop apps access your microphone. If these controls are managed by your organization, ask an administrator to allow access, then retry. You do not need to change capture mode or recreate the recording.',
     exclusiveTitle: 'Could not open the device in exclusive mode',
     exclusiveBody: 'Windows refused exclusive capture. Another app may be using the device, or the sample rate / bit depth does not match the driver. The app will not fall back to shared mode by itself.',
     busyTitle: 'The sound card is in use by another app',
@@ -228,6 +230,8 @@ const en: MessageTree = {
     recreateAndEnter: 'Recreate and start capture',
     backToSetup: 'Back to full settings',
     openEditor: 'Change capture settings',
+    openAccessHelp: 'View resolution steps',
+    retryCapture: 'Retry capture',
     editSettingsNotice: 'Returned to recording settings. After changing capture mode or format, create the task again.',
     recreatedNotice: 'Created a new task with the updated capture settings.',
     detail: 'Details',

@@ -8,7 +8,7 @@ import type {
 } from './types';
 
 export const INPUT_AUDITION_DURATION_SECONDS = 10;
-const INPUT_AUDITION_CACHE_SCHEMA_VERSION = 1;
+const INPUT_AUDITION_CACHE_SCHEMA_VERSION = 2;
 
 export type InputAuditionDialogPhase =
   | 'checking-cache'
@@ -66,6 +66,9 @@ export function logicalInputAuditionConfigurationKey(
     INPUT_AUDITION_CACHE_SCHEMA_VERSION,
     backend,
     logicalDeviceName,
+    configuration.deviceId
+      ? normalizeLogicalText(configuration.deviceId)
+      : null,
     configuration.inputChannels,
     configuration.sampleRate,
     configuration.outputBitDepth,

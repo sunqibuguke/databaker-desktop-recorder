@@ -211,6 +211,8 @@ const ja: MessageTree = {
     dataSafetyTitle: 'データ保護の通知',
   },
   activationError: {
+    accessDeniedTitle: 'Windows が入力デバイスへのアクセスを拒否しました',
+    accessDeniedBody: '「設定 → プライバシーとセキュリティ → マイク」で、マイクへのアクセス、アプリのアクセス、デスクトップアプリのアクセスを有効にしてください。組織によって管理されている場合は管理者に許可を依頼してから再試行してください。収録モードの変更やタスクの作り直しは不要です。',
     exclusiveTitle: '排他モードでサウンドカードを開けません',
     exclusiveBody: 'Windows が排他キャプチャを拒否しました。他のアプリが使っているか、サンプリングレート／ビット深度がドライバと一致していません。共有モードへは自動では切り替えません。',
     busyTitle: 'サウンドカードは他のアプリが使用中です',
@@ -228,6 +230,8 @@ const ja: MessageTree = {
     recreateAndEnter: '作り直して収録を開始',
     backToSetup: 'すべての設定に戻る',
     openEditor: '収録設定を変更',
+    openAccessHelp: '解決手順を表示',
+    retryCapture: '収録を再試行',
     editSettingsNotice: '収録設定に戻りました。モードや形式を変えたら、タスクを作り直してください。',
     recreatedNotice: '新しい収録設定でタスクを作成しました。',
     detail: '詳細',

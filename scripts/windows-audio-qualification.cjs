@@ -77,6 +77,11 @@ const CAPTURE_MODES = new Set([
   'replug',
   'abrupt-enospc',
 ]);
+const NORMAL_CAPTURE_MODES = new Set(['short', 'soak', 'replug']);
+const SEALED_NORMAL_CAPTURE_MODES = new Set(['short', 'soak', 'default-switch']);
+const FAULT_CAPTURE_MODES = new Set(['unplug', 'disk-full', 'abrupt-enospc']);
+const INPUT_AUDITION_SECONDS = 10;
+const PRODUCTION_MAX_NOISE_THRESHOLD_DBFS = -40;
 const HASH_PATTERN = /^[0-9a-f]{64}$/i;
 const SAFE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const RIFF_MAX_DATA_BYTES = 0xffff_ffff - 128;
@@ -383,6 +388,29 @@ function validatePlan(plan) {
   for (const field of ['hostname', 'windows_release', 'device_id', 'device_name', 'driver_version', 'usb_port', 'serial']) {
     add(`target-${field}`, typeof plan?.target?.[field] === 'string' && plan.target[field].trim() !== '', plan?.target?.[field]);
   }
+  add(
+    'target-capture-backend',
+    plan?.target?.capture_backend === 'asio' || plan?.target?.capture_backend === 'wasapi',
+    plan?.target?.capture_backend,
+  );
+  add(
+    'target-capture-buffer-frames',
+    plan?.target?.capture_backend === 'asio'
+      ? Number.isSafeInteger(plan?.target?.capture_buffer_frames) &&
+        plan.target.capture_buffer_frames >= 16 && plan.target.capture_buffer_frames <= 16_384
+      : plan?.target?.capture_buffer_frames === null,
+    plan?.target?.capture_buffer_frames,
+  );
+  add(
+    'target-noise-threshold-dbfs',
+    Number.isFinite(plan?.target?.noise_threshold_dbfs) &&
+      plan.target.noise_threshold_dbfs >= -96 &&
+      plan.target.noise_threshold_dbfs <= PRODUCTION_MAX_NOISE_THRESHOLD_DBFS,
+    {
+      actual: plan?.target?.noise_threshold_dbfs,
+      maximum: PRODUCTION_MAX_NOISE_THRESHOLD_DBFS,
+    },
+  );
   const channels = Array.isArray(plan?.target?.channels) ? plan.target.channels.map(Number) : [];
   add(
     'target-channels',
@@ -706,6 +734,11 @@ function validatePhase1Archive(entry, phase2Report, requirement, plan, reportsRo
       Number.isSafeInteger(requiredCommittedSamples) &&
       Number.isSafeInteger(armedCommittedSamples) && armedCommittedSamples >= requiredCommittedSamples &&
       Number.isSafeInteger(armedCapturedSamples) && armedCapturedSamples >= armedCommittedSamples &&
+      Number.isSafeInteger(originalEvidence?.overflow_samples) && originalEvidence.overflow_samples === 0 &&
+      Number.isSafeInteger(originalEvidence?.input_discontinuity_count) &&
+        originalEvidence.input_discontinuity_count === 0 &&
+      Number.isSafeInteger(originalEvidence?.input_discontinuity_silence_samples) &&
+        originalEvidence.input_discontinuity_silence_samples === 0 &&
       Number.isSafeInteger(maximumTailLossSamples) && maximumTailLossSamples >= 0 &&
       maximumTailLossSamples <= phase1SampleRate * 30 &&
       armedCapturedSamples - armedCommittedSamples <= maximumTailLossSamples &&
@@ -726,6 +759,9 @@ function validatePhase1Archive(entry, phase2Report, requirement, plan, reportsRo
       required_committed_samples: requiredCommittedSamples,
       armed_captured_samples: armedCapturedSamples,
       armed_committed_samples: armedCommittedSamples,
+      overflow_samples: originalEvidence?.overflow_samples,
+      input_discontinuity_count: originalEvidence?.input_discontinuity_count,
+      input_discontinuity_silence_samples: originalEvidence?.input_discontinuity_silence_samples,
       max_tail_loss_samples: maximumTailLossSamples,
       segment_count: originalEvidence?.segment_count,
       segment_total_bytes: originalEvidence?.segment_total_bytes,
@@ -844,6 +880,13 @@ function validatePhase1Archive(entry, phase2Report, requirement, plan, reportsRo
     row?.at === originalEvidence?.armed_at &&
     Number(row?.captured_samples) === armedCapturedSamples &&
     Number(row?.committed_samples) === armedCommittedSamples &&
+    Number.isSafeInteger(row?.overflow_samples) && row.overflow_samples === 0 &&
+    row.overflow_samples === originalEvidence?.overflow_samples &&
+    Number.isSafeInteger(row?.input_discontinuity_count) && row.input_discontinuity_count === 0 &&
+    row.input_discontinuity_count === originalEvidence?.input_discontinuity_count &&
+    Number.isSafeInteger(row?.input_discontinuity_silence_samples) &&
+    row.input_discontinuity_silence_samples === 0 &&
+    row.input_discontinuity_silence_samples === originalEvidence?.input_discontinuity_silence_samples &&
     Number(row?.segment_total_bytes) === Number(originalEvidence?.segment_total_bytes) &&
     Number(row?.segment_count) === Number(originalEvidence?.segment_count));
   add(
@@ -876,7 +919,8 @@ function validatePhase1Archive(entry, phase2Report, requirement, plan, reportsRo
       payload?.device_id === plan.target.device_id &&
       Number(payload?.sample_rate) === Number(requirement.sample_rate) &&
       Number(payload?.bit_depth) === Number(requirement.bit_depth) &&
-      Number(payload?.input_channel) === Number(requirement.channel);
+      Number(payload?.input_channel) === Number(requirement.channel) &&
+      payload?.capture_buffer_frames === plan.target.capture_buffer_frames;
   });
   const matchingStartResponses = matchingStartRequests.filter((requestRow) =>
     protocolRows.some((row) =>
@@ -885,6 +929,12 @@ function validatePhase1Archive(entry, phase2Report, requirement, plan, reportsRo
       row?.message?.ok === true &&
       row?.message?.result?.snapshot?.session_id === originalEvidence?.session_id &&
       row?.message?.result?.snapshot?.device_id === plan.target.device_id &&
+      row?.message?.result?.snapshot?.capture_backend === plan.target.capture_backend &&
+      row?.message?.result?.snapshot?.requested_capture_buffer_frames === plan.target.capture_buffer_frames &&
+      row?.message?.result?.snapshot?.capture_buffer_frames === plan.target.capture_buffer_frames &&
+      row?.message?.result?.snapshot?.overflow_samples === 0 &&
+      row?.message?.result?.snapshot?.input_discontinuity_count === 0 &&
+      row?.message?.result?.snapshot?.input_discontinuity_silence_samples === 0 &&
       isDeepStrictEqual(
         audioFormatIdentity(row?.message?.result?.snapshot?.audio_format),
         audioFormatIdentity(originalEvidence?.audio_format),
@@ -970,6 +1020,101 @@ function validatePhase1Archive(entry, phase2Report, requirement, plan, reportsRo
   );
 
   const snapshot = phase1Report.start?.snapshot;
+  const selectedBackend = typeof phase1Report.selected_device?.backend === 'string'
+    ? phase1Report.selected_device.backend.trim().toLowerCase()
+    : '';
+  const requestedBackend = typeof phase1Report.requested?.capture_backend === 'string'
+    ? phase1Report.requested.capture_backend.trim().toLowerCase()
+    : '';
+  const actualBackend = typeof snapshot?.capture_backend === 'string'
+    ? snapshot.capture_backend.trim().toLowerCase()
+    : '';
+  const expectedBackend = String(plan.target?.capture_backend ?? '').trim().toLowerCase();
+  add(
+    'phase1-production-noise-check',
+    phase1Report.options?.skipNoiseCheck !== true &&
+      Number(phase1Report.options?.noiseThresholdDbfs) === Number(plan.target?.noise_threshold_dbfs) &&
+      Number(phase1Report.options?.noiseThresholdDbfs) <= PRODUCTION_MAX_NOISE_THRESHOLD_DBFS &&
+      !phase1Report.noise_check_error &&
+      phase1Report.noise_check?.passed === true &&
+      Number(phase1Report.noise_check?.threshold_dbfs) === Number(plan.target?.noise_threshold_dbfs) &&
+      isDeepStrictEqual(originalEvidence?.noise_check, phase1Report.noise_check),
+    {
+      skip_noise_check: phase1Report.options?.skipNoiseCheck,
+      plan_threshold_dbfs: plan.target?.noise_threshold_dbfs,
+      report_threshold_dbfs: phase1Report.options?.noiseThresholdDbfs,
+      error: phase1Report.noise_check_error,
+      report: phase1Report.noise_check,
+      evidence: originalEvidence?.noise_check,
+    },
+  );
+  add(
+    'phase1-capture-backend-evidence',
+    expectedBackend.length > 0 &&
+      phase1Report.options?.expectedCaptureBackend === expectedBackend &&
+      selectedBackend === expectedBackend && requestedBackend === expectedBackend && actualBackend === expectedBackend &&
+      originalEvidence?.capture_backend === snapshot?.capture_backend,
+    {
+      plan_expected: plan.target?.capture_backend,
+      cli_expected: phase1Report.options?.expectedCaptureBackend,
+      selected: phase1Report.selected_device?.backend,
+      requested: phase1Report.requested?.capture_backend,
+      snapshot: snapshot?.capture_backend,
+      evidence: originalEvidence?.capture_backend,
+    },
+  );
+  const claimsAsio = expectedBackend === 'asio' || selectedBackend === 'asio' || requestedBackend === 'asio' || actualBackend === 'asio' ||
+    String(snapshot?.device_id ?? '').toLowerCase().startsWith('asio:');
+  if (claimsAsio) {
+    const selectedBuffer = Number(phase1Report.selected_device?.recommended_buffer_frames);
+    const requestedBuffer = Number(phase1Report.requested?.capture_buffer_frames);
+    const expectedBuffer = Number(plan.target?.capture_buffer_frames);
+    add(
+      'phase1-asio-buffer-evidence',
+      Number.isSafeInteger(expectedBuffer) && expectedBuffer > 0 &&
+        phase1Report.options?.expectedCaptureBufferFrames === expectedBuffer &&
+        Number.isSafeInteger(selectedBuffer) && selectedBuffer > 0 &&
+        Number.isSafeInteger(requestedBuffer) && requestedBuffer > 0 &&
+        selectedBuffer === expectedBuffer && requestedBuffer === expectedBuffer &&
+        snapshot?.requested_capture_buffer_frames === expectedBuffer &&
+        snapshot?.capture_buffer_frames === expectedBuffer &&
+        originalEvidence?.requested_capture_buffer_frames === expectedBuffer &&
+        originalEvidence?.capture_buffer_frames === expectedBuffer,
+      {
+        plan_expected: plan.target?.capture_buffer_frames,
+        cli_expected: phase1Report.options?.expectedCaptureBufferFrames,
+        selected: phase1Report.selected_device?.recommended_buffer_frames,
+        requested: phase1Report.requested?.capture_buffer_frames,
+        snapshot_requested: snapshot?.requested_capture_buffer_frames,
+        snapshot_actual: snapshot?.capture_buffer_frames,
+        evidence_requested: originalEvidence?.requested_capture_buffer_frames,
+        evidence_actual: originalEvidence?.capture_buffer_frames,
+      },
+    );
+  }
+  add(
+    'phase1-no-input-discontinuity-at-arm',
+    Number.isSafeInteger(originalEvidence?.overflow_samples) &&
+      originalEvidence.overflow_samples === 0 &&
+      Number.isSafeInteger(snapshot?.overflow_samples) && snapshot.overflow_samples === 0 &&
+      Number.isSafeInteger(originalEvidence?.input_discontinuity_count) &&
+      originalEvidence.input_discontinuity_count === 0 &&
+      Number.isSafeInteger(originalEvidence?.input_discontinuity_silence_samples) &&
+      originalEvidence.input_discontinuity_silence_samples === 0 &&
+      Number.isSafeInteger(snapshot?.input_discontinuity_count) && snapshot.input_discontinuity_count === 0 &&
+      Number.isSafeInteger(snapshot?.input_discontinuity_silence_samples) &&
+        snapshot.input_discontinuity_silence_samples === 0,
+    {
+      overflow_samples: originalEvidence?.overflow_samples,
+      count: originalEvidence?.input_discontinuity_count,
+      inserted_silence_samples: originalEvidence?.input_discontinuity_silence_samples,
+      start_snapshot: {
+        overflow_samples: snapshot?.overflow_samples,
+        count: snapshot?.input_discontinuity_count,
+        inserted_silence_samples: snapshot?.input_discontinuity_silence_samples,
+      },
+    },
+  );
   const expectedFormat = {
     sample_rate: Number(requirement.sample_rate),
     bit_depth: Number(requirement.bit_depth),
@@ -1014,6 +1159,43 @@ function validatePhase1Archive(entry, phase2Report, requirement, plan, reportsRo
     },
   );
 
+  const preRecoverySnapshot = phase2Report?.pre_recovery_inspection?.snapshot;
+  const sealedSnapshot = phase2Report?.recovery?.result?.snapshot;
+  const inspectedSealedSnapshot = phase2Report?.inspection?.snapshot;
+  const recoverySnapshots = [
+    { phase: 'phase1-start', snapshot },
+    { phase: 'phase2-pre-recovery', snapshot: preRecoverySnapshot },
+    { phase: 'phase2-seal-result', snapshot: sealedSnapshot },
+    { phase: 'phase2-final-inspection', snapshot: inspectedSealedSnapshot },
+  ];
+  add(
+    'phase1-recovery-input-health-binding',
+    recoverySnapshots.every(({ snapshot: candidate }) =>
+      Boolean(candidate) &&
+      Number.isSafeInteger(candidate.overflow_samples) && candidate.overflow_samples === 0 &&
+      Number.isSafeInteger(candidate.input_discontinuity_count) && candidate.input_discontinuity_count === 0 &&
+      Number.isSafeInteger(candidate.input_discontinuity_silence_samples) &&
+        candidate.input_discontinuity_silence_samples === 0 &&
+      candidate.capture_backend === originalEvidence?.capture_backend &&
+      candidate.requested_capture_buffer_frames === originalEvidence?.requested_capture_buffer_frames &&
+      candidate.capture_buffer_frames === originalEvidence?.capture_buffer_frames) &&
+      isDeepStrictEqual(preRecoverySnapshot?.noise_check, originalEvidence?.noise_check) &&
+      isDeepStrictEqual(sealedSnapshot?.noise_check, originalEvidence?.noise_check) &&
+      isDeepStrictEqual(inspectedSealedSnapshot?.noise_check, originalEvidence?.noise_check),
+    {
+      evidence: {
+        overflow_samples: originalEvidence?.overflow_samples,
+        input_discontinuity_count: originalEvidence?.input_discontinuity_count,
+        input_discontinuity_silence_samples: originalEvidence?.input_discontinuity_silence_samples,
+        capture_backend: originalEvidence?.capture_backend,
+        requested_capture_buffer_frames: originalEvidence?.requested_capture_buffer_frames,
+        capture_buffer_frames: originalEvidence?.capture_buffer_frames,
+        noise_check: originalEvidence?.noise_check,
+      },
+      snapshots: recoverySnapshots,
+    },
+  );
+
   add(
     'phase1-session-identity',
     typeof originalEvidence?.session_id === 'string' && originalEvidence.session_id.length > 0 &&
@@ -1030,6 +1212,643 @@ function validatePhase1Archive(entry, phase2Report, requirement, plan, reportsRo
   );
 
   return { checks, evidenceRoots, reportPath: entry.path };
+}
+
+const COMMON_CAPTURE_CHECK_IDS = Object.freeze([
+  'engine-ready',
+  'engine-clean-exit',
+  'device-id-match',
+  'sample-rate-match',
+  'wav-bit-depth-match',
+  'input-channel-match',
+  'capture-share-mode-match',
+  'capture-backend-match',
+  'input-format-recorded',
+  'input-format-minimum',
+  'captured-monotonic',
+  'committed-monotonic',
+  'file-growth-monotonic',
+  'commit-lag',
+  'segment-wav-readable',
+  'segment-format-match',
+  'physical-frame-watermark',
+]);
+
+const NORMAL_CAPTURE_CHECK_IDS = Object.freeze([
+  'safe-stop',
+  'stopped-status',
+  'exact-sample-watermark',
+  'no-overflow',
+  'no-input-discontinuity',
+  'ambient-noise-check',
+  'input-audition-confirmed',
+  'accepted-attempt-lifecycle',
+  'no-capture-fault',
+  'no-fault-marker',
+  'exact-segment-headers',
+  'continuous-file-growth',
+  'capture-clock-rate',
+  'signal-observed',
+  'no-clipping',
+  'storage-health',
+]);
+
+const FAULT_CAPTURE_CHECK_IDS = Object.freeze([
+  'ambient-noise-check',
+  'input-audition-confirmed',
+  'fault-attempt-blocked',
+  'healthy-prefix',
+  'fault-detected',
+  'fault-marker',
+  'faulted-status',
+  'normal-export-blocked',
+  'captured-prefix-preserved',
+  'timeline-stopped-after-fault',
+]);
+
+const SEALED_SESSION_CHECK_IDS = Object.freeze([
+  'real-recording-tree',
+  'metadata-readable',
+  'snapshot-present',
+  'segments-present',
+  'no-segment-errors',
+  'segment-layout-valid',
+  'segment-descriptors-valid',
+  'segment-descriptor-redundancy',
+  'exact-segment-headers',
+  'no-trailing-frame-bytes',
+  'segment-format-consistent',
+  'stopped-status',
+  'no-overflow',
+  'no-fault-marker',
+  'exact-sample-watermark',
+  'session-summary-consistent',
+  'full-track-readable-if-present',
+]);
+
+function requiredAcceptanceCheckIds(requirement, plan = null) {
+  const mode = requirement?.mode;
+  const commonCaptureIds = String(plan?.target?.capture_backend ?? '').trim().toLowerCase() === 'asio'
+    ? [...COMMON_CAPTURE_CHECK_IDS, 'capture-buffer-match']
+    : [...COMMON_CAPTURE_CHECK_IDS];
+  if (mode === 'inventory') {
+    return ['devices-present', 'stable-device-ids', 'unique-device-ids', 'driver-configurations', 'engine-clean-exit'];
+  }
+  if (SEALED_NORMAL_CAPTURE_MODES.has(mode)) {
+    const ids = [...commonCaptureIds, ...NORMAL_CAPTURE_CHECK_IDS, 'engine-no-panic'];
+    if (requirement?.export === true) {
+      ids.push('full-track-export', 'delivery-manifest-coherent', 'accepted-attempt-exported');
+    }
+    return ids;
+  }
+  if (FAULT_CAPTURE_MODES.has(mode)) {
+    const ids = [...commonCaptureIds, ...FAULT_CAPTURE_CHECK_IDS, 'engine-no-panic'];
+    if (mode === 'unplug') ids.push('fault-after-trigger', 'unplug-detection-latency', 'unplug-fault-kind');
+    if (mode === 'disk-full' || mode === 'abrupt-enospc') ids.push('disk-critical-latency');
+    return ids;
+  }
+  if (mode === 'replug') {
+    const before = [...commonCaptureIds, ...FAULT_CAPTURE_CHECK_IDS]
+      .map((id) => `replug-a-${id}`);
+    const after = [...commonCaptureIds, ...NORMAL_CAPTURE_CHECK_IDS]
+      .map((id) => `replug-b-${id}`);
+    return [
+      ...before,
+      ...after,
+      'replug-a-healthy-prefix-clock',
+      'replug-a-healthy-prefix-signal',
+      'replug-old-export-blocked',
+      'replug-old-resume-blocked',
+      'replug-target-disappeared',
+      'replug-same-endpoint-stable',
+      'replug-first-device-exact',
+      'replug-distinct-session',
+      'replug-second-device-exact',
+      'replug-b-duration',
+      'engine-no-panic',
+    ];
+  }
+  if (mode === 'inspect') return SEALED_SESSION_CHECK_IDS;
+  if (mode === 'recover') {
+    return [
+      'phase1-evidence-schema',
+      'phase1-source-bound',
+      'session-evidence-bound',
+      'recording-tree-safe-before-seal',
+      'interrupted-preseal-status',
+      'phase1-session-identity',
+      'phase1-input-health-at-arm',
+      'phase1-production-noise-check',
+      'power-cut-qualification-class',
+      'phase1-minimum-duration',
+      'phase1-tail-budget',
+      'host-rebooted-after-arm',
+      'phase1-binaries-match',
+      'engine-ready',
+      'offline-seal-complete',
+      ...SEALED_SESSION_CHECK_IDS,
+      'seal-watermark-consistent',
+      'armed-committed-preserved',
+      'power-cut-tail-loss-budget',
+      'engine-clean-exit',
+    ];
+  }
+  return [];
+}
+
+function inputAuditionEvidencePassed(evidence, sampleRate, persistedAudition) {
+  const expectedSamples = Number(sampleRate) * INPUT_AUDITION_SECONDS;
+  const begin = evidence?.begin;
+  const started = begin?.input_audition;
+  const finished = evidence?.finish?.input_audition;
+  const confirmed = evidence?.confirm?.input_audition;
+  const checkId = begin?.check_id;
+  const startSample = started?.start_sample;
+  return !evidence?.error &&
+    Number.isSafeInteger(expectedSamples) && expectedSamples > 0 &&
+    typeof checkId === 'string' && checkId.length > 0 &&
+    Number.isSafeInteger(startSample) && startSample >= 0 &&
+    begin?.required_samples === expectedSamples &&
+    started?.check_id === checkId &&
+    started?.status === 'recording' &&
+    started?.required_samples === expectedSamples &&
+    started?.captured_samples === 0 &&
+    Array.isArray(started?.warning_codes) && started.warning_codes.length === 0 &&
+    finished?.check_id === checkId &&
+    finished?.status === 'ready' &&
+    finished?.start_sample === startSample &&
+    finished?.required_samples === expectedSamples &&
+    finished?.captured_samples === expectedSamples &&
+    finished?.end_sample === startSample + expectedSamples &&
+    Array.isArray(finished?.warning_codes) && finished.warning_codes.length === 0 &&
+    finished?.metrics?.duration_samples === expectedSamples &&
+    Number(finished?.metrics?.duration_seconds) === INPUT_AUDITION_SECONDS &&
+    finished?.metrics?.input_discontinuity_count === 0 &&
+    finished?.metrics?.input_discontinuity_silence_samples === 0 &&
+    finished?.metrics?.overflow_samples === 0 &&
+    Array.isArray(finished?.metrics?.warning_codes) && finished.metrics.warning_codes.length === 0 &&
+    confirmed?.check_id === checkId &&
+    confirmed?.status === 'confirmed' &&
+    confirmed?.start_sample === startSample &&
+    confirmed?.required_samples === expectedSamples &&
+    confirmed?.captured_samples === expectedSamples &&
+    confirmed?.end_sample === startSample + expectedSamples &&
+    Array.isArray(confirmed?.warning_codes) && confirmed.warning_codes.length === 0 &&
+    isDeepStrictEqual(confirmed?.metrics, finished?.metrics) &&
+    isDeepStrictEqual(confirmed, persistedAudition);
+}
+
+function auditionPrecedesAttempt(evidence, lifecycle, snapshot) {
+  const auditionEnd = evidence?.confirm?.input_audition?.end_sample;
+  const attemptStart = lifecycle?.start?.start_sample;
+  return Number.isSafeInteger(auditionEnd) &&
+    Number.isSafeInteger(attemptStart) &&
+    Number.isSafeInteger(snapshot?.committed_samples) &&
+    auditionEnd <= attemptStart && attemptStart < snapshot.committed_samples;
+}
+
+function segmentEvidenceProjection(segments) {
+  if (!Array.isArray(segments)) return null;
+  return segments.map((segment) => ({
+    file_name: segment?.file_name,
+    container: segment?.container,
+    sample_rate: Number(segment?.sample_rate),
+    bits_per_sample: Number(segment?.bits_per_sample),
+    channels: Number(segment?.channels),
+    encoding: segment?.encoding,
+    physical_complete_frames: Number(segment?.physical_complete_frames),
+    declared_frames: Number(segment?.declared_frames),
+    trailing_bytes: Number(segment?.trailing_bytes),
+    exact_header: segment?.exact_header,
+  }));
+}
+
+function inputSampleFormatBits(format) {
+  const normalized = String(format ?? '').trim().toLowerCase();
+  if (/^[iu](8|16|24|32|64)$/.test(normalized)) return Number(normalized.slice(1));
+  if (normalized === 'f32') return 24;
+  if (normalized === 'f64') return 53;
+  return null;
+}
+
+function actualSnapshotMatchesRequirement(snapshot, requirement, plan) {
+  const bitDepth = Number(requirement?.bit_depth);
+  const minimumInputBits = bitDepth === 16 ? 16 : 24;
+  const expectedBackend = String(plan?.target?.capture_backend ?? '').trim().toLowerCase();
+  const expectedBuffer = plan?.target?.capture_buffer_frames;
+  return Boolean(snapshot) &&
+    snapshot.device_id === plan?.target?.device_id &&
+    snapshot.device_name === plan?.target?.device_name &&
+    inputSampleFormatBits(snapshot.input_sample_format) >= minimumInputBits &&
+    String(snapshot.capture_backend ?? '').trim().toLowerCase() === expectedBackend &&
+    (
+      expectedBackend === 'asio'
+        ? Number.isSafeInteger(expectedBuffer) &&
+          snapshot.requested_capture_buffer_frames === expectedBuffer &&
+          snapshot.capture_buffer_frames === expectedBuffer
+        : expectedBackend === 'wasapi' &&
+          snapshot.requested_capture_buffer_frames == null &&
+          snapshot.capture_buffer_frames == null
+    ) &&
+    Number(snapshot.audio_format?.sample_rate) === Number(requirement?.sample_rate) &&
+    Number(snapshot.audio_format?.bit_depth) === bitDepth &&
+    snapshot.audio_format?.encoding === (bitDepth === 32 ? 'float' : 'pcm') &&
+    Number(snapshot.audio_format?.channels) === 1 &&
+    Number(snapshot.audio_format?.input_channels) >= Number(requirement?.channel) &&
+    Number(snapshot.audio_format?.input_channel) === Number(requirement?.channel);
+}
+
+function actualAttemptMatchesNormal(snapshot, lifecycle) {
+  const itemId = lifecycle?.item_id;
+  const attemptId = lifecycle?.start?.attempt_id;
+  const item = Array.isArray(snapshot?.items)
+    ? snapshot.items.find((candidate) => candidate?.id === itemId)
+    : null;
+  const attempt = Array.isArray(item?.attempts)
+    ? item.attempts.find((candidate) => candidate?.attempt_id === attemptId)
+    : null;
+  return typeof itemId === 'string' && itemId.length > 0 &&
+    typeof attemptId === 'string' && attemptId.length > 0 &&
+    lifecycle?.stop?.attempt?.attempt_id === attemptId &&
+    lifecycle?.stop?.attempt?.status === 'recorded' &&
+    lifecycle?.stop?.observed_discontinuity === false &&
+    lifecycle?.accept?.item_id === itemId &&
+    lifecycle?.accept?.attempt_id === attemptId &&
+    item?.status === 'accepted' &&
+    item?.selected_attempt_id === attemptId &&
+    attempt?.status === 'accepted';
+}
+
+function actualAttemptMatchesFault(snapshot, lifecycle) {
+  const itemId = lifecycle?.item_id;
+  const attemptId = lifecycle?.start?.attempt_id;
+  const item = Array.isArray(snapshot?.items)
+    ? snapshot.items.find((candidate) => candidate?.id === itemId)
+    : null;
+  const attempt = Array.isArray(item?.attempts)
+    ? item.attempts.find((candidate) => candidate?.attempt_id === attemptId)
+    : null;
+  const stopped = lifecycle?.stop?.attempt;
+  return typeof itemId === 'string' && itemId.length > 0 &&
+    typeof attemptId === 'string' && attemptId.length > 0 &&
+    stopped?.attempt_id === attemptId &&
+    ['interrupted', 'needs_rerecord'].includes(stopped?.status) &&
+    attempt?.attempt_id === attemptId &&
+    attempt?.status === stopped.status &&
+    typeof lifecycle?.accept_error === 'string' && lifecycle.accept_error.length > 0 &&
+    lifecycle?.accept == null &&
+    item?.selected_attempt_id == null &&
+    !item?.attempts?.some((candidate) => candidate?.status === 'accepted');
+}
+
+function independentExportPassed(inspection, snapshot, lifecycle) {
+  const metadata = inspection?.export_metadata;
+  const status = inspection?.export_status;
+  const exported = Array.isArray(metadata?.exported) ? metadata.exported : null;
+  const skipped = Array.isArray(metadata?.skipped) ? metadata.skipped : null;
+  const itemId = lifecycle?.item_id;
+  const attemptId = lifecycle?.start?.attempt_id;
+  const expectedSelections = Array.isArray(snapshot?.items)
+    ? snapshot.items.map((item) => ({ id: item.id, attempt_id: item.selected_attempt_id }))
+    : null;
+  return inspection?.export_bundle_present === true &&
+    Array.isArray(inspection?.export_bundle_errors) && inspection.export_bundle_errors.length === 0 &&
+    inspection?.full_track?.exact_header === true &&
+    Number(inspection.full_track.physical_complete_frames) === Number(snapshot?.committed_samples) &&
+    Number(inspection.full_track.sample_rate) === Number(snapshot?.audio_format?.sample_rate) &&
+    Number(inspection.full_track.bits_per_sample) === Number(snapshot?.audio_format?.bit_depth) &&
+    Number(inspection.full_track.channels) === 1 &&
+    status?.schema_version === 2 && status?.status === 'complete' &&
+    status?.session_id === snapshot?.session_id &&
+    metadata?.schema_version === 1 && metadata?.session_id === snapshot?.session_id &&
+    metadata?.full_track === 'full-track.wav' &&
+    isDeepStrictEqual(metadata?.audio_format, snapshot?.audio_format) &&
+    isDeepStrictEqual(status?.source, metadata?.source) &&
+    Number(metadata?.source?.journal_seq) === Number(snapshot?.journal_seq) &&
+    Number(metadata?.source?.committed_samples) === Number(snapshot?.committed_samples) &&
+    expectedSelections !== null &&
+    isDeepStrictEqual(metadata?.source?.selected_attempts, expectedSelections) &&
+    exported !== null && skipped !== null &&
+    exported.length + skipped.length === expectedSelections.length &&
+    Number(status?.exported_count) === exported.length &&
+    Number(status?.skipped_count) === skipped.length &&
+    inspection?.export_csv?.matches_metadata === true &&
+    exported.some((row) => row?.id === itemId && row?.attempt_id === attemptId) &&
+    !skipped.some((row) => row?.id === itemId) &&
+    isDeepStrictEqual(
+      inspection?.export_sentence_file_names,
+      exported.map((row) => path.posix.basename(String(row?.file ?? ''))).sort(),
+    ) &&
+    inspection?.export_sentence_wavs?.length === exported.length &&
+    inspection.export_sentence_wavs.every((wav, index) =>
+      wav?.exact_header === true &&
+      Number(wav?.sample_rate) === Number(snapshot?.audio_format?.sample_rate) &&
+      Number(wav?.bits_per_sample) === Number(snapshot?.audio_format?.bit_depth) &&
+      Number(wav?.channels) === 1 &&
+      Number(wav?.physical_complete_frames) === Number(exported[index]?.duration_samples));
+}
+
+function validateIndependentCaptureArchive(evidence, requirement, plan, reportsRoot) {
+  const checks = [];
+  const add = (id, passed, details) => checks.push({ id, status: passed ? 'PASS' : 'FAIL', details });
+  const sessionDirectory = path.resolve(String(evidence?.session_dir ?? evidence?.inspection?.session_dir ?? ''));
+  let directorySafe = false;
+  try {
+    const metadata = fs.lstatSync(sessionDirectory);
+    directorySafe = sessionDirectory !== path.resolve('.') &&
+      isCanonicalWithin(reportsRoot, sessionDirectory) &&
+      metadata.isDirectory() && !metadata.isSymbolicLink();
+  } catch {}
+  add('independent-session-directory', directorySafe, sessionDirectory);
+  let inspection = null;
+  let inspectionError = null;
+  if (directorySafe) {
+    try {
+      inspection = inspectSession(sessionDirectory);
+    } catch (error) {
+      inspectionError = error.message;
+    }
+  }
+  add('independent-session-inspected', inspectionError === null && inspection !== null, {
+    session_dir: sessionDirectory,
+    error: inspectionError,
+  });
+  if (!inspection) return { checks, inspection, sessionDirectory };
+
+  const snapshot = inspection.snapshot;
+  const reportedFinal = evidence?.stop?.result?.snapshot ?? evidence?.inspection?.snapshot;
+  const reportInspection = evidence?.inspection;
+  const basePassed = inspection.exists === true &&
+    Array.isArray(inspection.tree_errors) && inspection.tree_errors.length === 0 &&
+    Array.isArray(inspection.metadata_errors) && inspection.metadata_errors.length === 0 &&
+    Array.isArray(inspection.segment_errors) && inspection.segment_errors.length === 0 &&
+    Array.isArray(inspection.segment_layout_errors) && inspection.segment_layout_errors.length === 0 &&
+    Array.isArray(inspection.descriptor_errors) && inspection.descriptor_errors.length === 0 &&
+    Array.isArray(inspection.descriptor_issues) && inspection.descriptor_issues.length === 0 &&
+    actualSnapshotMatchesRequirement(snapshot, requirement, plan) &&
+    sessionSummaryMatchesSnapshot(inspection) &&
+    Array.isArray(inspection.segments) && inspection.segments.length > 0 &&
+    inspection.segments.every((segment) =>
+      segment?.exact_header === true &&
+      Number(segment?.trailing_bytes) === 0 &&
+      Number(segment?.sample_rate) === Number(requirement.sample_rate) &&
+      Number(segment?.bits_per_sample) === Number(requirement.bit_depth) &&
+      Number(segment?.channels) === 1);
+  add('independent-recording-tree', basePassed, {
+    tree_errors: inspection.tree_errors,
+    metadata_errors: inspection.metadata_errors,
+    segment_errors: inspection.segment_errors,
+    segment_layout_errors: inspection.segment_layout_errors,
+    descriptor_errors: inspection.descriptor_errors,
+    descriptor_issues: inspection.descriptor_issues,
+    snapshot,
+    segments: segmentEvidenceProjection(inspection.segments),
+  });
+  add(
+    'independent-report-disk-binding',
+    snapshotWatermarksMatch(snapshot, reportedFinal) &&
+      snapshotWatermarksMatch(snapshot, reportInspection?.snapshot) &&
+      Number(reportInspection?.total_physical_frames) === Number(inspection.total_physical_frames) &&
+      isDeepStrictEqual(
+        segmentEvidenceProjection(reportInspection?.segments),
+        segmentEvidenceProjection(inspection.segments),
+      ) &&
+      isDeepStrictEqual(reportInspection?.export_status ?? null, inspection.export_status ?? null) &&
+      isDeepStrictEqual(reportInspection?.export_metadata ?? null, inspection.export_metadata ?? null),
+    {
+      actual_snapshot: snapshot,
+      reported_final: reportedFinal,
+      reported_inspection_snapshot: reportInspection?.snapshot,
+      actual_total_physical_frames: inspection.total_physical_frames,
+      reported_total_physical_frames: reportInspection?.total_physical_frames,
+    },
+  );
+  add(
+    'independent-noise-binding',
+    evidence?.noise_check?.passed === true &&
+      Number(evidence.noise_check.threshold_dbfs) === Number(plan.target.noise_threshold_dbfs) &&
+      isDeepStrictEqual(snapshot?.noise_check, evidence.noise_check),
+    { expected: plan.target.noise_threshold_dbfs, report: evidence?.noise_check, disk: snapshot?.noise_check },
+  );
+  add(
+    'independent-input-audition',
+    inputAuditionEvidencePassed(
+      evidence?.input_audition,
+      requirement.sample_rate,
+      snapshot?.input_audition,
+    ) &&
+      auditionPrecedesAttempt(evidence?.input_audition, evidence?.attempt, snapshot),
+    evidence?.input_audition ?? null,
+  );
+
+  if (FAULT_CAPTURE_MODES.has(requirement.mode)) {
+    add(
+      'independent-fault-session',
+      snapshot?.status === 'faulted' &&
+        faultMarkerPresent(inspection) && inspection.fault_marker_parse_error !== true &&
+        Number.isSafeInteger(snapshot?.overflow_samples) && snapshot.overflow_samples === 0 &&
+        Number.isSafeInteger(snapshot?.input_discontinuity_count) && snapshot.input_discontinuity_count === 0 &&
+        Number.isSafeInteger(snapshot?.input_discontinuity_silence_samples) &&
+          snapshot.input_discontinuity_silence_samples === 0 &&
+        Number.isSafeInteger(Number(inspection.total_physical_frames)) &&
+        Number(inspection.total_physical_frames) > 0 &&
+        Number(inspection.total_physical_frames) === Number(snapshot?.committed_samples) &&
+        actualAttemptMatchesFault(snapshot, evidence?.attempt) &&
+        evidence?.export?.expected_rejection === true &&
+        inspection.export_bundle_present === false,
+      {
+        snapshot,
+        fault_marker: inspection.fault_marker,
+        attempt: evidence?.attempt,
+        export: evidence?.export,
+      },
+    );
+  } else {
+    const sealedChecks = evaluateSealedSession(inspection);
+    add(
+      'independent-normal-session',
+      sealedChecks.every((check) => check.status === 'PASS') &&
+        Number.isSafeInteger(snapshot?.input_discontinuity_count) && snapshot.input_discontinuity_count === 0 &&
+        Number.isSafeInteger(snapshot?.input_discontinuity_silence_samples) &&
+          snapshot.input_discontinuity_silence_samples === 0 &&
+        actualAttemptMatchesNormal(snapshot, evidence?.attempt),
+      { failed_checks: sealedChecks.filter((check) => check.status !== 'PASS'), attempt: evidence?.attempt },
+    );
+    if (requirement.export === true) {
+      add(
+        'independent-export-bundle',
+        independentExportPassed(inspection, snapshot, evidence?.attempt) &&
+          (
+            requirement.expected_full_track_container === undefined ||
+            inspection.full_track?.container === requirement.expected_full_track_container
+          ),
+        {
+          full_track: inspection.full_track,
+          status: inspection.export_status,
+          metadata: inspection.export_metadata,
+          csv: inspection.export_csv,
+          errors: inspection.export_bundle_errors,
+        },
+      );
+    } else {
+      add('independent-no-export-bundle', inspection.export_bundle_present === false, {
+        export_bundle_present: inspection.export_bundle_present,
+      });
+    }
+  }
+  return { checks, inspection, sessionDirectory };
+}
+
+function validateIndependentSealedArchive(report, requirement, plan, reportsRoot) {
+  const checks = [];
+  const add = (id, passed, details) => checks.push({ id, status: passed ? 'PASS' : 'FAIL', details });
+  const sessionDirectory = path.resolve(String(report?.session_dir ?? report?.inspection?.session_dir ?? ''));
+  const reportedPaths = [report?.session_dir, report?.inspection?.session_dir];
+  if (requirement.mode === 'recover') reportedPaths.push(report?.recovery?.result?.session_dir);
+  let directorySafe = false;
+  let canonicalDirectory = null;
+  let canonicalReportedPaths = [];
+  let directoryError = null;
+  try {
+    const metadata = fs.lstatSync(sessionDirectory);
+    canonicalDirectory = canonicalPath(sessionDirectory);
+    canonicalReportedPaths = reportedPaths.map((value) => canonicalPath(String(value ?? '')));
+    directorySafe = sessionDirectory !== path.resolve('.') &&
+      metadata.isDirectory() && !metadata.isSymbolicLink() &&
+      isCanonicalWithin(reportsRoot, sessionDirectory) &&
+      reportedPaths.every((value) => typeof value === 'string' && value.length > 0) &&
+      canonicalReportedPaths.every((value) => value === canonicalDirectory);
+  } catch (error) {
+    directoryError = error.message;
+  }
+  add('independent-sealed-session-directory', directorySafe, {
+    session_dir: sessionDirectory,
+    reported_paths: reportedPaths,
+    canonical_paths: canonicalReportedPaths,
+    error: directoryError,
+  });
+
+  let inspection = null;
+  let inspectionError = null;
+  if (directorySafe) {
+    try {
+      inspection = inspectSession(sessionDirectory);
+    } catch (error) {
+      inspectionError = error.message;
+    }
+  }
+  add('independent-sealed-session-inspected', inspectionError === null && inspection !== null, {
+    session_dir: sessionDirectory,
+    error: inspectionError,
+  });
+  if (!inspection) return { checks, inspection, sessionDirectory };
+
+  const snapshot = inspection.snapshot;
+  const effectiveRequirement = {
+    ...requirement,
+    sample_rate: requirement.sample_rate ?? plan.target?.primary_format?.sample_rate,
+    bit_depth: requirement.bit_depth ?? plan.target?.primary_format?.bit_depth,
+    channel: requirement.channel ?? plan.target?.primary_format?.channel,
+  };
+  const sealedChecks = evaluateSealedSession(inspection);
+  const sealedFailures = sealedChecks.filter((check) => check.status !== 'PASS');
+  const actualTreePassed = sealedFailures.length === 0 &&
+    actualSnapshotMatchesRequirement(snapshot, effectiveRequirement, plan) &&
+    Number.isSafeInteger(snapshot?.overflow_samples) && snapshot.overflow_samples === 0 &&
+    Number.isSafeInteger(snapshot?.input_discontinuity_count) && snapshot.input_discontinuity_count === 0 &&
+    Number.isSafeInteger(snapshot?.input_discontinuity_silence_samples) &&
+      snapshot.input_discontinuity_silence_samples === 0;
+  add('independent-sealed-recording-tree', actualTreePassed, {
+    failed_checks: sealedFailures,
+    snapshot,
+    segments: segmentEvidenceProjection(inspection.segments),
+  });
+
+  const reportedInspection = report?.inspection;
+  const reportedSnapshots = requirement.mode === 'recover'
+    ? [report?.recovery?.result?.snapshot, reportedInspection?.snapshot]
+    : [reportedInspection?.snapshot];
+  const reportBindingPassed = reportedSnapshots.every((candidate) =>
+    snapshotWatermarksMatch(snapshot, candidate)) &&
+    Number(reportedInspection?.total_physical_frames) === Number(inspection.total_physical_frames) &&
+    isDeepStrictEqual(
+      segmentEvidenceProjection(reportedInspection?.segments),
+      segmentEvidenceProjection(inspection.segments),
+    ) &&
+    isDeepStrictEqual(reportedInspection?.export_status ?? null, inspection.export_status ?? null) &&
+    isDeepStrictEqual(reportedInspection?.export_metadata ?? null, inspection.export_metadata ?? null) &&
+    (
+      requirement.mode !== 'recover' ||
+      Number(report?.recovery?.result?.durable_frames) === Number(inspection.total_physical_frames)
+    );
+  add('independent-sealed-report-disk-binding', reportBindingPassed, {
+    actual_snapshot: snapshot,
+    reported_snapshots: reportedSnapshots,
+    actual_total_physical_frames: inspection.total_physical_frames,
+    reported_total_physical_frames: reportedInspection?.total_physical_frames,
+    recovery_durable_frames: report?.recovery?.result?.durable_frames,
+  });
+  add('independent-sealed-no-export-bundle', inspection.export_bundle_present === false, {
+    export_bundle_present: inspection.export_bundle_present,
+    export_bundle_errors: inspection.export_bundle_errors,
+  });
+
+  if (requirement.mode === 'recover') {
+    const evidence = report?.phase1?.evidence;
+    const preRecoverySnapshot = report?.pre_recovery_inspection?.snapshot;
+    const physicalFrames = Number(inspection.total_physical_frames);
+    const armedCommitted = Number(evidence?.armed_committed_samples);
+    const armedCaptured = Number(evidence?.armed_captured_samples);
+    const maximumTailLoss = Number(evidence?.max_tail_loss_samples);
+    const tailLoss = Math.max(0, armedCaptured - physicalFrames);
+    let evidenceDirectoryMatches = false;
+    try {
+      evidenceDirectoryMatches = canonicalPath(String(evidence?.session_dir ?? '')) === canonicalDirectory;
+    } catch {}
+    const recoveryBindingPassed = evidenceDirectoryMatches &&
+      snapshot?.session_id === evidence?.session_id &&
+      snapshot?.device_id === evidence?.device_id &&
+      snapshot?.device_name === evidence?.device_name &&
+      snapshot?.input_sample_format === evidence?.input_sample_format &&
+      snapshot?.capture_share_mode === evidence?.capture_share_mode &&
+      snapshot?.capture_backend === evidence?.capture_backend &&
+      snapshot?.requested_capture_buffer_frames === evidence?.requested_capture_buffer_frames &&
+      snapshot?.capture_buffer_frames === evidence?.capture_buffer_frames &&
+      isDeepStrictEqual(audioFormatIdentity(snapshot?.audio_format), audioFormatIdentity(evidence?.audio_format)) &&
+      Number.isSafeInteger(physicalFrames) &&
+      Number.isSafeInteger(armedCommitted) && physicalFrames >= armedCommitted &&
+      Number.isSafeInteger(armedCaptured) && armedCaptured >= armedCommitted &&
+      Number.isSafeInteger(maximumTailLoss) && maximumTailLoss >= 0 &&
+      tailLoss <= maximumTailLoss &&
+      Number.isSafeInteger(Number(evidence?.segment_count)) &&
+      inspection.segments.length >= Number(evidence.segment_count) &&
+      Number.isSafeInteger(Number(evidence?.segment_total_bytes)) &&
+      Number(inspection.total_file_bytes) >= Number(evidence.segment_total_bytes) &&
+      Number.isSafeInteger(preRecoverySnapshot?.overflow_samples) && preRecoverySnapshot.overflow_samples === 0 &&
+      Number.isSafeInteger(preRecoverySnapshot?.input_discontinuity_count) &&
+        preRecoverySnapshot.input_discontinuity_count === 0 &&
+      Number.isSafeInteger(preRecoverySnapshot?.input_discontinuity_silence_samples) &&
+        preRecoverySnapshot.input_discontinuity_silence_samples === 0 &&
+      preRecoverySnapshot?.session_id === evidence?.session_id &&
+      actualSnapshotMatchesRequirement(preRecoverySnapshot, effectiveRequirement, plan);
+    add('independent-recovery-phase1-binding', recoveryBindingPassed, {
+      evidence_session_dir: evidence?.session_dir,
+      actual_session_dir: sessionDirectory,
+      evidence_session_id: evidence?.session_id,
+      actual_session_id: snapshot?.session_id,
+      armed_committed_samples: armedCommitted,
+      armed_captured_samples: armedCaptured,
+      recovered_physical_frames: physicalFrames,
+      tail_loss_samples: tailLoss,
+      maximum_tail_loss_samples: maximumTailLoss,
+      armed_segment_count: evidence?.segment_count,
+      recovered_segment_count: inspection.segments.length,
+      armed_segment_total_bytes: evidence?.segment_total_bytes,
+      recovered_segment_total_bytes: inspection.total_file_bytes,
+      pre_recovery_snapshot: preRecoverySnapshot,
+    });
+  }
+  return { checks, inspection, sessionDirectory };
 }
 
 function validateReport(entry, requirement, plan, reportsRoot) {
@@ -1065,6 +1884,222 @@ function validateReport(entry, requirement, plan, reportsRoot) {
       normalizeHash(report.engine?.binary_sha256) === normalizeHash(plan.release.engine_sha256),
       { expected: plan.release.engine_sha256, actual: report.engine?.binary_sha256 },
     );
+  }
+  if (CAPTURE_MODES.has(requirement.mode)) {
+    const phases = requirement.mode === 'replug'
+      ? [
+          { name: 'before', evidence: report.replug?.before },
+          { name: 'after', evidence: report.replug?.after },
+        ]
+      : [{ name: 'capture', evidence: report }];
+    const noiseEvidence = phases.map(({ name, evidence }) => ({
+      phase: name,
+      result: evidence?.noise_check ?? null,
+      error: evidence?.noise_check_error ?? null,
+    }));
+    add(
+      'production-noise-check',
+      report.options?.skipNoiseCheck !== true &&
+        Number(report.options?.noiseThresholdDbfs) === Number(plan.target?.noise_threshold_dbfs) &&
+        Number(report.options?.noiseThresholdDbfs) <= PRODUCTION_MAX_NOISE_THRESHOLD_DBFS &&
+        noiseEvidence.every(({ result, error }) =>
+          !error && result?.passed === true &&
+          Number(result?.threshold_dbfs) === Number(plan.target?.noise_threshold_dbfs)),
+      {
+        skip_noise_check: report.options?.skipNoiseCheck,
+        plan_threshold_dbfs: plan.target?.noise_threshold_dbfs,
+        report_threshold_dbfs: report.options?.noiseThresholdDbfs,
+        maximum_threshold_dbfs: PRODUCTION_MAX_NOISE_THRESHOLD_DBFS,
+        phases: noiseEvidence,
+      },
+    );
+
+    const selectedBackend = typeof report.selected_device?.backend === 'string'
+      ? report.selected_device.backend.trim().toLowerCase()
+      : '';
+    const requestedBackend = typeof report.requested?.capture_backend === 'string'
+      ? report.requested.capture_backend.trim().toLowerCase()
+      : '';
+    const expectedBackend = String(plan.target?.capture_backend ?? '').trim().toLowerCase();
+    const phaseSnapshots = phases.flatMap(({ name, evidence }) => {
+      const start = evidence?.start?.snapshot;
+      const final = evidence?.stop?.result?.snapshot ?? evidence?.inspection?.snapshot;
+      return [
+        { phase: `${name}-start`, snapshot: start },
+        { phase: `${name}-final`, snapshot: final },
+      ];
+    });
+    const expectedShareMode = report.options?.shareMode;
+    add(
+      'capture-share-mode-evidence',
+      (expectedShareMode === 'exclusive' || expectedShareMode === 'shared') &&
+        report.requested?.capture_share_mode === expectedShareMode &&
+        phaseSnapshots.every(({ snapshot }) => snapshot?.capture_share_mode === expectedShareMode),
+      {
+        option: expectedShareMode,
+        requested: report.requested?.capture_share_mode,
+        snapshots: phaseSnapshots.map(({ phase, snapshot }) => ({
+          phase,
+          capture_share_mode: snapshot?.capture_share_mode,
+        })),
+      },
+    );
+    const requiredInputBits = Number(requirement.bit_depth) === 16 ? 16 : 24;
+    add(
+      'input-sample-format-evidence',
+      Number.isSafeInteger(report.options?.minimumInputFormatBits) &&
+        report.options.minimumInputFormatBits >= requiredInputBits &&
+        phaseSnapshots.every(({ snapshot }) =>
+          inputSampleFormatBits(snapshot?.input_sample_format) >= report.options.minimumInputFormatBits),
+      {
+        required_minimum_bits: requiredInputBits,
+        report_minimum_bits: report.options?.minimumInputFormatBits,
+        snapshots: phaseSnapshots.map(({ phase, snapshot }) => ({
+          phase,
+          input_sample_format: snapshot?.input_sample_format,
+          effective_bits: inputSampleFormatBits(snapshot?.input_sample_format),
+        })),
+      },
+    );
+    add(
+      'capture-backend-evidence',
+      expectedBackend.length > 0 &&
+        report.options?.expectedCaptureBackend === expectedBackend &&
+        selectedBackend === expectedBackend && requestedBackend === expectedBackend &&
+        phaseSnapshots.length > 0 &&
+        phaseSnapshots.every(({ snapshot }) =>
+          typeof snapshot?.capture_backend === 'string' &&
+          snapshot.capture_backend.trim().toLowerCase() === expectedBackend),
+      {
+        plan_expected: plan.target?.capture_backend,
+        cli_expected: report.options?.expectedCaptureBackend,
+        selected: report.selected_device?.backend,
+        requested: report.requested?.capture_backend,
+        snapshots: phaseSnapshots.map(({ phase, snapshot }) => ({
+          phase,
+          capture_backend: snapshot?.capture_backend,
+        })),
+      },
+    );
+    const claimsAsio = expectedBackend === 'asio' || selectedBackend === 'asio' || requestedBackend === 'asio' ||
+      String(report.selected_device?.id ?? '').toLowerCase().startsWith('asio:') ||
+      phaseSnapshots.some(({ snapshot }) =>
+        String(snapshot?.device_id ?? '').toLowerCase().startsWith('asio:') ||
+        String(snapshot?.capture_backend ?? '').toLowerCase() === 'asio');
+    if (claimsAsio) {
+      const selectedBuffer = Number(report.selected_device?.recommended_buffer_frames);
+      const requestedBuffer = Number(report.requested?.capture_buffer_frames);
+      const expectedBuffer = Number(plan.target?.capture_buffer_frames);
+      add(
+        'asio-buffer-evidence',
+        Number.isSafeInteger(expectedBuffer) && expectedBuffer > 0 &&
+          report.options?.expectedCaptureBufferFrames === expectedBuffer &&
+          Number.isSafeInteger(selectedBuffer) && selectedBuffer > 0 &&
+          Number.isSafeInteger(requestedBuffer) && requestedBuffer > 0 &&
+          selectedBuffer === expectedBuffer && requestedBuffer === expectedBuffer &&
+          phaseSnapshots.every(({ snapshot }) =>
+            Number.isSafeInteger(snapshot?.requested_capture_buffer_frames) &&
+            snapshot.requested_capture_buffer_frames === expectedBuffer &&
+            Number.isSafeInteger(snapshot?.capture_buffer_frames) &&
+            snapshot.capture_buffer_frames === expectedBuffer),
+        {
+          plan_expected: plan.target?.capture_buffer_frames,
+          cli_expected: report.options?.expectedCaptureBufferFrames,
+          selected: report.selected_device?.recommended_buffer_frames,
+          requested: report.requested?.capture_buffer_frames,
+          snapshots: phaseSnapshots.map(({ phase, snapshot }) => ({
+            phase,
+            requested_capture_buffer_frames: snapshot?.requested_capture_buffer_frames,
+            capture_buffer_frames: snapshot?.capture_buffer_frames,
+          })),
+        },
+      );
+    }
+
+    if (NORMAL_CAPTURE_MODES.has(requirement.mode)) {
+      const normalEvidence = requirement.mode === 'replug' ? report.replug?.after : report;
+      const finalSnapshot = normalEvidence?.stop?.result?.snapshot ?? normalEvidence?.inspection?.snapshot;
+      const startSnapshot = normalEvidence?.start?.snapshot;
+      add(
+        'no-input-discontinuity',
+        Number.isSafeInteger(startSnapshot?.input_discontinuity_count) &&
+          startSnapshot.input_discontinuity_count === 0 &&
+          Number.isSafeInteger(startSnapshot?.input_discontinuity_silence_samples) &&
+          startSnapshot.input_discontinuity_silence_samples === 0 &&
+          Number.isSafeInteger(finalSnapshot?.input_discontinuity_count) &&
+          finalSnapshot.input_discontinuity_count === 0 &&
+          Number.isSafeInteger(finalSnapshot?.input_discontinuity_silence_samples) &&
+          finalSnapshot.input_discontinuity_silence_samples === 0,
+        {
+          start: {
+            count: startSnapshot?.input_discontinuity_count,
+            inserted_silence_samples: startSnapshot?.input_discontinuity_silence_samples,
+          },
+          final: {
+            count: finalSnapshot?.input_discontinuity_count,
+            inserted_silence_samples: finalSnapshot?.input_discontinuity_silence_samples,
+          },
+        },
+      );
+      const attempt = normalEvidence?.attempt;
+      const itemId = attempt?.item_id;
+      const attemptId = attempt?.start?.attempt_id;
+      const item = Array.isArray(finalSnapshot?.items)
+        ? finalSnapshot.items.find((candidate) => candidate?.id === itemId)
+        : null;
+      const selectedAttempt = Array.isArray(item?.attempts)
+        ? item.attempts.find((candidate) => candidate?.attempt_id === attemptId)
+        : null;
+      const attemptPassed =
+        typeof itemId === 'string' && itemId.length > 0 &&
+        typeof attemptId === 'string' && attemptId.length > 0 &&
+        attempt?.stop?.attempt?.attempt_id === attemptId &&
+        attempt?.stop?.attempt?.status === 'recorded' &&
+        attempt?.stop?.observed_discontinuity === false &&
+        attempt?.accept?.item_id === itemId &&
+        attempt?.accept?.attempt_id === attemptId &&
+        item?.status === 'accepted' &&
+        item?.selected_attempt_id === attemptId &&
+        selectedAttempt?.status === 'accepted';
+      add('accepted-attempt-lifecycle', attemptPassed, { attempt, item });
+      add(
+        'input-audition-confirmed',
+        inputAuditionEvidencePassed(
+          normalEvidence?.input_audition,
+          requirement.sample_rate,
+          finalSnapshot?.input_audition,
+        ),
+        normalEvidence?.input_audition,
+      );
+      if (requirement.export === true) {
+        const exported = normalEvidence?.inspection?.export_metadata?.exported;
+        const skipped = normalEvidence?.inspection?.export_metadata?.skipped;
+        add(
+          'accepted-attempt-exported',
+          attemptPassed && Array.isArray(exported) && Array.isArray(skipped) &&
+            exported.some((row) => row?.id === itemId && row?.attempt_id === attemptId) &&
+            !skipped.some((row) => row?.id === itemId),
+          { item_id: itemId, attempt_id: attemptId, exported, skipped },
+        );
+      }
+    }
+    if (FAULT_CAPTURE_MODES.has(requirement.mode)) {
+      const finalSnapshot = report.stop?.result?.snapshot ?? report.inspection?.snapshot;
+      add(
+        'fault-input-audition-confirmed',
+        inputAuditionEvidencePassed(
+          report.input_audition,
+          requirement.sample_rate,
+          finalSnapshot?.input_audition,
+        ),
+        report.input_audition,
+      );
+      add(
+        'fault-attempt-not-deliverable',
+        actualAttemptMatchesFault(finalSnapshot, report.attempt),
+        { attempt: report.attempt, item: finalSnapshot?.items },
+      );
+    }
   }
   add(
     'host-identity',
@@ -1146,6 +2181,16 @@ function validateReport(entry, requirement, plan, reportsRoot) {
     );
   }
   const reportChecks = Array.isArray(report.checks) ? report.checks : [];
+  const checkIds = reportChecks.map((check) => check?.id);
+  const duplicateCheckIds = checkIds.filter((id, index) => typeof id !== 'string' || checkIds.indexOf(id) !== index);
+  const requiredCheckIds = requiredAcceptanceCheckIds(requirement, plan);
+  const missingCheckIds = requiredCheckIds.filter((id) => !checkIds.includes(id));
+  add('unique-acceptance-check-ids', duplicateCheckIds.length === 0, { duplicates: duplicateCheckIds });
+  add(
+    'required-acceptance-check-ids',
+    requiredCheckIds.length > 0 && missingCheckIds.length === 0,
+    { required: requiredCheckIds, missing: missingCheckIds },
+  );
   add(
     'all-acceptance-checks-pass',
     reportChecks.length > 0 && reportChecks.every((check) => check?.status === 'PASS'),
@@ -1177,6 +2222,20 @@ function validateReport(entry, requirement, plan, reportsRoot) {
     add('recording-evidence-contained', valid, sessionDirectory);
     if (valid) evidenceRoots.push(canonicalPath(sessionDirectory));
   }
+  if (
+    CAPTURE_MODES.has(requirement.mode) &&
+    requirement.mode !== 'replug' &&
+    requirement.mode !== 'power-cut'
+  ) {
+    const independent = validateIndependentCaptureArchive(report, requirement, plan, reportsRoot);
+    checks.push(...independent.checks);
+    if (independent.inspection) evidenceRoots.push(canonicalPath(independent.sessionDirectory));
+  }
+  if (requirement.mode === 'recover' || requirement.mode === 'inspect') {
+    const independent = validateIndependentSealedArchive(report, requirement, plan, reportsRoot);
+    checks.push(...independent.checks);
+    if (independent.inspection) evidenceRoots.push(canonicalPath(independent.sessionDirectory));
+  }
   return { checks, evidenceRoots };
 }
 
@@ -1189,10 +2248,19 @@ function replugConfigurationMatches(device, requirement) {
 
 function replugSnapshotMatches(snapshot, sessionDirectory, requirement, plan) {
   const bitDepth = Number(requirement.bit_depth);
+  const expectedBackend = String(plan.target?.capture_backend ?? '').trim().toLowerCase();
   return Boolean(snapshot) &&
     snapshot.device_id === plan.target.device_id &&
     snapshot.device_name === plan.target.device_name &&
     typeof snapshot.input_sample_format === 'string' && snapshot.input_sample_format.length > 0 &&
+    String(snapshot.capture_backend ?? '').trim().toLowerCase() === expectedBackend &&
+    (
+      expectedBackend === 'asio'
+        ? snapshot.requested_capture_buffer_frames === plan.target.capture_buffer_frames &&
+          snapshot.capture_buffer_frames === plan.target.capture_buffer_frames
+        : expectedBackend === 'wasapi' &&
+          snapshot.requested_capture_buffer_frames == null && snapshot.capture_buffer_frames == null
+    ) &&
     Number(snapshot.audio_format?.sample_rate) === Number(requirement.sample_rate) &&
     Number(snapshot.audio_format?.bit_depth) === bitDepth &&
     snapshot.audio_format?.encoding === (bitDepth === 32 ? 'float' : 'pcm') &&
@@ -1209,10 +2277,22 @@ function snapshotWatermarksMatch(actual, reported) {
     Number(actual.journal_seq) === Number(reported.journal_seq) &&
     Number(actual.captured_samples) === Number(reported.captured_samples) &&
     Number(actual.committed_samples) === Number(reported.committed_samples) &&
-    Number(actual.overflow_samples ?? 0) === Number(reported.overflow_samples ?? 0) &&
+    Number.isSafeInteger(actual.overflow_samples) &&
+    actual.overflow_samples === reported.overflow_samples &&
+    Number.isSafeInteger(actual.input_discontinuity_count) &&
+    actual.input_discontinuity_count === reported.input_discontinuity_count &&
+    Number.isSafeInteger(actual.input_discontinuity_silence_samples) &&
+    actual.input_discontinuity_silence_samples === reported.input_discontinuity_silence_samples &&
     actual.device_id === reported.device_id &&
     actual.device_name === reported.device_name &&
     actual.input_sample_format === reported.input_sample_format &&
+    actual.capture_share_mode === reported.capture_share_mode &&
+    actual.capture_backend === reported.capture_backend &&
+    actual.requested_capture_buffer_frames === reported.requested_capture_buffer_frames &&
+    actual.capture_buffer_frames === reported.capture_buffer_frames &&
+    isDeepStrictEqual(actual.noise_check ?? null, reported.noise_check ?? null) &&
+    isDeepStrictEqual(actual.input_audition ?? null, reported.input_audition ?? null) &&
+    isDeepStrictEqual(actual.items, reported.items) &&
     isDeepStrictEqual(audioFormatIdentity(actual.audio_format), audioFormatIdentity(reported.audio_format));
 }
 
@@ -1225,7 +2305,7 @@ function sessionSummaryMatchesSnapshot(inspection) {
     Number(summary.journal_seq) === Number(snapshot.journal_seq);
 }
 
-function independentFaultSessionChecks(inspection, reportedFinal, startSnapshot, requirement, plan) {
+function independentFaultSessionChecks(inspection, reportedFinal, startSnapshot, requirement, plan, evidence) {
   const snapshot = inspection?.snapshot;
   const segments = Array.isArray(inspection?.segments) ? inspection.segments : [];
   return {
@@ -1236,6 +2316,7 @@ function independentFaultSessionChecks(inspection, reportedFinal, startSnapshot,
       Array.isArray(inspection?.segment_errors) && inspection.segment_errors.length === 0 &&
       Array.isArray(inspection?.segment_layout_errors) && inspection.segment_layout_errors.length === 0 &&
       Array.isArray(inspection?.descriptor_errors) && inspection.descriptor_errors.length === 0 &&
+      Array.isArray(inspection?.descriptor_issues) && inspection.descriptor_issues.length === 0 &&
       snapshot?.status === 'faulted' &&
       replugSnapshotMatches(snapshot, null, requirement, plan) &&
       snapshot?.session_id === startSnapshot?.session_id &&
@@ -1243,6 +2324,27 @@ function independentFaultSessionChecks(inspection, reportedFinal, startSnapshot,
       sessionSummaryMatchesSnapshot(inspection) &&
       faultMarkerPresent(inspection) &&
       inspection?.fault_marker_parse_error !== true &&
+      Number.isSafeInteger(snapshot?.overflow_samples) && snapshot.overflow_samples === 0 &&
+      Number.isSafeInteger(snapshot?.input_discontinuity_count) && snapshot.input_discontinuity_count === 0 &&
+      Number.isSafeInteger(snapshot?.input_discontinuity_silence_samples) &&
+        snapshot.input_discontinuity_silence_samples === 0 &&
+      evidence?.noise_check?.passed === true &&
+      Number(evidence.noise_check.threshold_dbfs) === Number(plan.target.noise_threshold_dbfs) &&
+      isDeepStrictEqual(snapshot?.noise_check, evidence.noise_check) &&
+      inputAuditionEvidencePassed(
+        evidence?.input_audition,
+        requirement.sample_rate,
+        snapshot?.input_audition,
+      ) &&
+      auditionPrecedesAttempt(evidence?.input_audition, evidence?.attempt, snapshot) &&
+      actualAttemptMatchesFault(snapshot, evidence?.attempt) &&
+      evidence?.export?.expected_rejection === true &&
+      inspection?.export_bundle_present === false &&
+      Number(evidence?.inspection?.total_physical_frames) === Number(inspection?.total_physical_frames) &&
+      isDeepStrictEqual(
+        segmentEvidenceProjection(evidence?.inspection?.segments),
+        segmentEvidenceProjection(inspection?.segments),
+      ) &&
       Number.isSafeInteger(Number(inspection?.total_physical_frames)) &&
       Number(inspection.total_physical_frames) > 0 &&
       Number(inspection.total_physical_frames) === Number(snapshot?.committed_samples) &&
@@ -1257,6 +2359,7 @@ function independentFaultSessionChecks(inspection, reportedFinal, startSnapshot,
       inspection,
       reported_final: reportedFinal,
       expected_session_id: startSnapshot?.session_id,
+      attempt: evidence?.attempt,
     },
   };
 }
@@ -1354,6 +2457,7 @@ function validateReplugArchive(entry, requirement, plan, reportsRoot) {
     beforeStart,
     requirement,
     plan,
+    before,
   );
   add(
     'replug-before-independent-recording-tree',
@@ -1371,13 +2475,34 @@ function validateReplugArchive(entry, requirement, plan, reportsRoot) {
       actualAfterFailures.length === 0 &&
       replugSnapshotMatches(actualAfterInspection.snapshot, null, requirement, plan) &&
       actualAfterInspection.snapshot?.session_id === afterStart?.session_id &&
-      snapshotWatermarksMatch(actualAfterInspection.snapshot, afterFinal),
+      snapshotWatermarksMatch(actualAfterInspection.snapshot, afterFinal) &&
+      Number.isSafeInteger(actualAfterInspection.snapshot?.input_discontinuity_count) &&
+      actualAfterInspection.snapshot.input_discontinuity_count === 0 &&
+      Number.isSafeInteger(actualAfterInspection.snapshot?.input_discontinuity_silence_samples) &&
+      actualAfterInspection.snapshot.input_discontinuity_silence_samples === 0 &&
+      after?.noise_check?.passed === true &&
+      Number(after.noise_check.threshold_dbfs) === Number(plan.target.noise_threshold_dbfs) &&
+      isDeepStrictEqual(actualAfterInspection.snapshot?.noise_check, after.noise_check) &&
+      inputAuditionEvidencePassed(
+        after?.input_audition,
+        requirement.sample_rate,
+        actualAfterInspection.snapshot?.input_audition,
+      ) &&
+      auditionPrecedesAttempt(after?.input_audition, after?.attempt, actualAfterInspection.snapshot) &&
+      actualAttemptMatchesNormal(actualAfterInspection.snapshot, after?.attempt) &&
+      actualAfterInspection.export_bundle_present === false &&
+      Number(after?.inspection?.total_physical_frames) === Number(actualAfterInspection.total_physical_frames) &&
+      isDeepStrictEqual(
+        segmentEvidenceProjection(after?.inspection?.segments),
+        segmentEvidenceProjection(actualAfterInspection.segments),
+      ),
     {
       error: actualAfterError,
       failed_checks: actualAfterFailures,
       checks: actualAfterChecks,
       actual_inspection: actualAfterInspection,
       reported_final: afterFinal,
+      attempt: after?.attempt,
     },
   );
 
@@ -1743,7 +2868,7 @@ function validateReplugArchive(entry, requirement, plan, reportsRoot) {
   return { checks, evidenceRoots };
 }
 
-function validateBoundRuns(results) {
+function validateBoundRuns(results, reportsRoot) {
   const byId = new Map(results.map((result) => [result.id, result]));
   for (const result of results) {
     if (!result.bound_to || !result.report) continue;
@@ -1760,6 +2885,139 @@ function validateBoundRuns(results) {
       id: 'bound-run-identity',
       status: passed ? 'PASS' : 'FAIL',
       details: { bound_to: result.bound_to, source_session: sourceSession, current_session: currentSession, source_directory: sourceDirectory, current_directory: currentDirectory },
+    });
+    if (!passed) result.status = 'FAIL';
+  }
+
+  const claims = [];
+  for (const result of results) {
+    const sealedMode = result.mode === 'recover' || result.mode === 'inspect';
+    if ((!CAPTURE_MODES.has(result.mode) && !sealedMode) || !result.report || !result.report_path) continue;
+    const phases = result.mode === 'replug'
+      ? [
+          { name: 'before', evidence: result.report.replug?.before },
+          { name: 'after', evidence: result.report.replug?.after },
+        ]
+      : [{ name: 'capture', evidence: result.report }];
+    const reportDirectory = path.dirname(result.report_path);
+    const claimDetails = [];
+    let allBound = phases.length > 0;
+    for (const { name, evidence } of phases) {
+      const pathValues = result.mode === 'recover'
+        ? [
+            evidence?.session_dir,
+            evidence?.inspection?.session_dir,
+            evidence?.recovery?.result?.session_dir,
+            evidence?.phase1?.evidence?.session_dir,
+          ].filter((value) => typeof value === 'string' && value.length > 0)
+        : [evidence?.session_dir, evidence?.inspection?.session_dir]
+          .filter((value) => typeof value === 'string' && value.length > 0);
+      const sessionIds = result.mode === 'recover'
+        ? [
+            evidence?.phase1?.evidence?.session_id,
+            evidence?.pre_recovery_inspection?.snapshot?.session_id,
+            evidence?.recovery?.result?.snapshot?.session_id,
+            evidence?.inspection?.snapshot?.session_id,
+          ]
+        : result.mode === 'inspect'
+          ? [evidence?.inspection?.snapshot?.session_id]
+          : [
+              evidence?.start?.snapshot?.session_id,
+              evidence?.stop?.result?.snapshot?.session_id,
+              evidence?.inspection?.snapshot?.session_id,
+            ];
+      let canonicalDirectory = null;
+      let canonicalPathValues = [];
+      let pathError = null;
+      try {
+        canonicalDirectory = canonicalPath(String(evidence?.session_dir ?? ''));
+        canonicalPathValues = pathValues.map((value) => canonicalPath(value));
+      } catch (error) {
+        pathError = error.message;
+      }
+      const pathsBound = canonicalDirectory !== null &&
+        pathValues.length === (result.mode === 'recover' ? 4 : 2) &&
+        canonicalPathValues.every((value) => value === canonicalDirectory) &&
+        (
+          sealedMode
+            ? isCanonicalWithin(reportsRoot, canonicalDirectory)
+            : isCanonicalWithin(reportDirectory, canonicalDirectory)
+        );
+      const identity = sessionIds[0];
+      const idsBound = typeof identity === 'string' && identity.length > 0 &&
+        sessionIds.every((value) => value === identity);
+      const bound = pathError === null && pathsBound && idsBound;
+      allBound = allBound && bound;
+      const claim = {
+        result,
+        run_id: result.id,
+        mode: result.mode,
+        phase: name,
+        report_directory: reportDirectory,
+        canonical_directory: canonicalDirectory,
+        session_id: identity,
+        path_values: pathValues,
+        session_ids: sessionIds,
+        path_error: pathError,
+        binding_group: result.mode === 'inspect' ? result.bound_to : result.id,
+        allows_bound_sharing: sealedMode,
+        bound,
+      };
+      claims.push(claim);
+      claimDetails.push({ ...claim, result: undefined });
+    }
+    result.checks.push({
+      id: 'capture-session-claims-bound',
+      status: allBound ? 'PASS' : 'FAIL',
+      details: claimDetails,
+    });
+    if (!allBound) result.status = 'FAIL';
+  }
+
+  const directoryClaims = new Map();
+  const sessionIdClaims = new Map();
+  for (const claim of claims) {
+    if (claim.canonical_directory) {
+      const matching = directoryClaims.get(claim.canonical_directory) ?? [];
+      matching.push(claim);
+      directoryClaims.set(claim.canonical_directory, matching);
+    }
+    if (typeof claim.session_id === 'string' && claim.session_id.length > 0) {
+      const matching = sessionIdClaims.get(claim.session_id) ?? [];
+      matching.push(claim);
+      sessionIdClaims.set(claim.session_id, matching);
+    }
+  }
+  const peersMayShare = (claim, peers) => peers.every((peer) =>
+    peer === claim ||
+    claim.allows_bound_sharing === true &&
+      peer.allows_bound_sharing === true &&
+      typeof claim.binding_group === 'string' &&
+      claim.binding_group.length > 0 &&
+      peer.binding_group === claim.binding_group);
+  for (const result of results) {
+    const ownClaims = claims.filter((claim) => claim.result === result);
+    if (ownClaims.length === 0) continue;
+    const duplicates = ownClaims.filter((claim) =>
+      (claim.canonical_directory && !peersMayShare(
+        claim,
+        directoryClaims.get(claim.canonical_directory) ?? [],
+      )) ||
+      (claim.session_id && !peersMayShare(claim, sessionIdClaims.get(claim.session_id) ?? [])));
+    const passed = duplicates.length === 0;
+    result.checks.push({
+      id: 'capture-session-claims-unique',
+      status: passed ? 'PASS' : 'FAIL',
+      details: duplicates.map((claim) => ({
+        run_id: claim.run_id,
+        mode: claim.mode,
+        phase: claim.phase,
+        canonical_directory: claim.canonical_directory,
+        directory_claim_count: (directoryClaims.get(claim.canonical_directory) ?? []).length,
+        session_id: claim.session_id,
+        session_id_claim_count: (sessionIdClaims.get(claim.session_id) ?? []).length,
+        binding_group: claim.binding_group,
+      })),
     });
     if (!passed) result.status = 'FAIL';
   }
@@ -1985,7 +3243,7 @@ async function runQualification(options) {
     evidenceRoots.push(...validation.evidenceRoots);
     results.push(result);
   }
-  validateBoundRuns(results);
+  validateBoundRuns(results, reportsRoot);
 
   let overall = planChecks.every((check) => check.status === 'PASS') &&
     results.length > 0 && results.every((result) => result.status === 'PASS')
@@ -2086,6 +3344,7 @@ module.exports = {
   REQUIRED_BIT_DEPTHS,
   REQUIRED_SAMPLE_RATES,
   parseArgs,
+  requiredAcceptanceCheckIds,
   runQualification,
   validatePlan,
   validatePlanSchema,

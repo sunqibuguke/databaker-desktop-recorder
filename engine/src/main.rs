@@ -544,6 +544,7 @@ mod tests {
             requested_capture_buffer_frames: None,
             capture_buffer_frames: None,
             capture_provenance: Vec::new(),
+            input_sample_format_recovery_audits: Vec::new(),
             audio_format: AudioFormat {
                 sample_rate: 48_000,
                 bit_depth: 24,

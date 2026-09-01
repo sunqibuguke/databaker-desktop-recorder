@@ -266,14 +266,22 @@ pub(crate) fn convert_data_type(ty: &sys::AsioSampleType) -> Option<SampleFormat
 
 pub(crate) fn convert_input_data_type(ty: &sys::AsioSampleType) -> Option<SampleFormat> {
     match *ty {
-        sys::AsioSampleType::ASIOSTInt32MSB16
-        | sys::AsioSampleType::ASIOSTInt32MSB18
+        // CPAL has exact semantic formats for 16- and 24-bit signed samples. The ASIO
+        // transport still uses a 32-bit container; stream.rs strips the padding before
+        // handing these values to callers.
+        sys::AsioSampleType::ASIOSTInt32MSB16 | sys::AsioSampleType::ASIOSTInt32LSB16 => {
+            Some(SampleFormat::I16)
+        }
+        sys::AsioSampleType::ASIOSTInt32MSB24 | sys::AsioSampleType::ASIOSTInt32LSB24 => {
+            Some(SampleFormat::I24)
+        }
+        // CPAL has no 18- or 20-bit SampleFormat and SupportedStreamConfig has no
+        // separate valid-bits field. Reject these instead of advertising padding bits as
+        // valid I32 audio, which would corrupt bit-depth and delivery validation.
+        sys::AsioSampleType::ASIOSTInt32MSB18
         | sys::AsioSampleType::ASIOSTInt32MSB20
-        | sys::AsioSampleType::ASIOSTInt32MSB24
-        | sys::AsioSampleType::ASIOSTInt32LSB16
         | sys::AsioSampleType::ASIOSTInt32LSB18
-        | sys::AsioSampleType::ASIOSTInt32LSB20
-        | sys::AsioSampleType::ASIOSTInt32LSB24 => Some(SampleFormat::I32),
+        | sys::AsioSampleType::ASIOSTInt32LSB20 => None,
         _ => convert_data_type(ty),
     }
 }
@@ -283,21 +291,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn aligned_int32_asio_formats_are_exposed_as_i32() {
+    fn aligned_int32_asio_formats_preserve_representable_valid_bits() {
         for sample_type in [
             sys::AsioSampleType::ASIOSTInt32MSB16,
-            sys::AsioSampleType::ASIOSTInt32MSB18,
-            sys::AsioSampleType::ASIOSTInt32MSB20,
-            sys::AsioSampleType::ASIOSTInt32MSB24,
             sys::AsioSampleType::ASIOSTInt32LSB16,
-            sys::AsioSampleType::ASIOSTInt32LSB18,
-            sys::AsioSampleType::ASIOSTInt32LSB20,
+        ] {
+            assert_eq!(
+                convert_input_data_type(&sample_type),
+                Some(SampleFormat::I16)
+            );
+        }
+
+        for sample_type in [
+            sys::AsioSampleType::ASIOSTInt32MSB24,
             sys::AsioSampleType::ASIOSTInt32LSB24,
         ] {
             assert_eq!(
                 convert_input_data_type(&sample_type),
-                Some(SampleFormat::I32)
+                Some(SampleFormat::I24)
             );
+        }
+    }
+
+    #[test]
+    fn aligned_int32_formats_without_a_cpal_semantic_type_are_rejected() {
+        for sample_type in [
+            sys::AsioSampleType::ASIOSTInt32MSB18,
+            sys::AsioSampleType::ASIOSTInt32MSB20,
+            sys::AsioSampleType::ASIOSTInt32LSB18,
+            sys::AsioSampleType::ASIOSTInt32LSB20,
+        ] {
+            assert_eq!(convert_input_data_type(&sample_type), None);
         }
     }
 }

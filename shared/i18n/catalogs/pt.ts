@@ -211,6 +211,8 @@ const pt: MessageTree = {
     dataSafetyTitle: 'Aviso de segurança dos dados',
   },
   activationError: {
+    accessDeniedTitle: 'O Windows recusou o acesso ao dispositivo de entrada',
+    accessDeniedBody: 'Em Definições → Privacidade e segurança → Microfone, ative o acesso ao microfone, o acesso das aplicações e o acesso das aplicações de ambiente de trabalho. Se estas opções forem geridas pela organização, peça acesso ao administrador e tente novamente. Não precisa de mudar o modo nem recriar a gravação.',
     exclusiveTitle: 'Não foi possível abrir a placa em modo exclusivo',
     exclusiveBody: 'O Windows recusou a captura exclusiva. Outra aplicação pode estar a usar o dispositivo, ou a taxa / profundidade não coincide com o controlador. A app não muda sozinha para o modo partilhado.',
     busyTitle: 'A placa está a ser usada por outra aplicação',
@@ -228,6 +230,8 @@ const pt: MessageTree = {
     recreateAndEnter: 'Recriar e iniciar a captura',
     backToSetup: 'Voltar às definições completas',
     openEditor: 'Alterar definições de captura',
+    openAccessHelp: 'Ver como resolver',
+    retryCapture: 'Tentar captura novamente',
     editSettingsNotice: 'Voltou às definições de gravação. Depois de alterar o modo ou o formato, crie a tarefa de novo.',
     recreatedNotice: 'Foi criada uma tarefa com as novas definições de captura.',
     detail: 'Detalhes',

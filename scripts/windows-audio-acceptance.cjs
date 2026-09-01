@@ -24,12 +24,15 @@ const MODES = new Set([
 ]);
 const DEVICE_UNPLUG_MODES = new Set(['unplug', 'replug']);
 const FAULT_MODES = new Set(['unplug', 'replug', 'disk-full']);
+const CAPTURE_MODES = new Set(['short', 'soak', 'unplug', 'replug', 'disk-full', 'power-cut']);
 const BIT_DEPTHS = new Set([16, 24, 32]);
 const PRODUCTION_POWER_CUT_SECONDS = 3_600;
 const DEFAULT_POWER_CUT_MAXIMUM_SECONDS = 3_900;
 const DEFAULT_MAX_TAIL_LOSS_SECONDS = 15;
 const MAX_POWER_CUT_TAIL_LOSS_SECONDS = 30;
 const MAX_NORMAL_COMMIT_LAG_SECONDS = 15;
+const INPUT_AUDITION_SECONDS = 10;
+const PRODUCTION_MAX_NOISE_THRESHOLD_DBFS = -40;
 const POWER_CUT_EVIDENCE_KIND = 'databaker.power-cut-phase-1';
 const POWER_CUT_SESSION_EVIDENCE = path.join('metadata', 'power-cut.acceptance.json');
 const SEGMENT_DESCRIPTOR_KIND = 'databaker.segmented-wav-header';
@@ -95,6 +98,8 @@ function usage() {
   --sample-rate <hz>             默认 48000
   --bit-depth <16|24|32>         交付 WAV 位深，默认 16
   --share-mode <exclusive|shared> 开流模式，默认 exclusive（绕过 Windows 混音器）
+  --expected-capture-backend <asio|wasapi> 独立指定本轮应使用的录音后端；生产资格 run 必填
+  --expected-capture-buffer-frames <n> 独立指定 ASIO 缓冲区；ASIO 默认 512
   --minimum-input-format-bits <n> 驱动输入有效数字精度门槛；f32 按 24、f64 按 53；默认 16-bit 交付要求 16，24/32-bit 要求 24
   --channel <n>                  声卡输入通道（1-based），默认 1
   --seconds <n>                  short 录制秒数（默认 20）/ power-cut 最长等待（生产默认 3900）
@@ -105,8 +110,8 @@ function usage() {
   --max-tail-loss-seconds <n>    断电证据允许的最大 captured/committed 尾差，默认 15，上限 30
   --confirm-dedicated-volume     disk-full 确认 1：输出位于可丢弃测试卷
   --confirm-not-system-drive     disk-full 确认 2：该卷不是 Windows 系统盘
-  --noise-threshold-dbfs <n>     环境噪声阈值，默认 -40
-  --skip-noise-check             不执行 3 秒环境噪声检测
+  --noise-threshold-dbfs <n>     环境噪声阈值，默认 -40；生产验收不得高于 -40
+  --skip-noise-check             仅用于调试；不执行 3 秒环境噪声检测，结果不具备生产验收资格
   --export                       soak 也生成 full-track.wav（可能很大）
   --no-export                    short 不生成 full-track.wav
   --yes                          非交互执行；无设备参数时优先选专业 ASIO 设备
@@ -172,6 +177,8 @@ function parseArgs(argv) {
     sampleRate: 48_000,
     bitDepth: 16,
     shareMode: 'exclusive',
+    expectedCaptureBackend: null,
+    expectedCaptureBufferFrames: null,
     minimumInputFormatBits: null,
     channel: 1,
     seconds: 20,
@@ -241,6 +248,14 @@ function parseArgs(argv) {
         break;
       case '--share-mode':
         options.shareMode = valueFor(index, flag);
+        index += 1;
+        break;
+      case '--expected-capture-backend':
+        options.expectedCaptureBackend = valueFor(index, flag).trim().toLowerCase();
+        index += 1;
+        break;
+      case '--expected-capture-buffer-frames':
+        options.expectedCaptureBufferFrames = parseInteger(valueFor(index, flag), flag);
         index += 1;
         break;
       case '--minimum-input-format-bits':
@@ -369,6 +384,35 @@ function parseArgs(argv) {
   if (!BIT_DEPTHS.has(options.bitDepth)) throw new Error('--bit-depth 必须是 16、24 或 32');
   if (options.shareMode !== 'exclusive' && options.shareMode !== 'shared') {
     throw new Error('--share-mode 必须是 exclusive 或 shared');
+  }
+  if (
+    options.expectedCaptureBackend !== null &&
+    !['asio', 'wasapi'].includes(options.expectedCaptureBackend)
+  ) {
+    throw new Error('--expected-capture-backend 必须是 asio 或 wasapi');
+  }
+  if (
+    options.expectedCaptureBufferFrames !== null &&
+    (
+      !Number.isSafeInteger(options.expectedCaptureBufferFrames) ||
+      options.expectedCaptureBufferFrames < 16 ||
+      options.expectedCaptureBufferFrames > 16_384
+    )
+  ) {
+    throw new Error('--expected-capture-buffer-frames 必须是 16–16384 的整数');
+  }
+  if (options.expectedCaptureBackend === 'asio' && options.expectedCaptureBufferFrames === null) {
+    options.expectedCaptureBufferFrames = 512;
+  }
+  if (options.expectedCaptureBackend === 'wasapi' && options.expectedCaptureBufferFrames !== null) {
+    throw new Error('WASAPI 验收不应设置 --expected-capture-buffer-frames');
+  }
+  if (
+    options.qualificationId !== null &&
+    CAPTURE_MODES.has(options.mode) &&
+    options.expectedCaptureBackend === null
+  ) {
+    throw new Error('生产资格采集 run 必须显式提供 --expected-capture-backend');
   }
   if (options.minimumInputFormatBits === null) {
     // 32-bit Float 交付通常来自 24-bit ADC。这里只拒绝明显低于
@@ -644,6 +688,13 @@ function buildPowerCutEvidence(report, options, sessionDirectory, row) {
     device_name: snapshot?.device_name,
     input_sample_format: snapshot?.input_sample_format,
     capture_share_mode: snapshot?.capture_share_mode,
+    capture_backend: snapshot?.capture_backend,
+    requested_capture_buffer_frames: snapshot?.requested_capture_buffer_frames,
+    capture_buffer_frames: snapshot?.capture_buffer_frames,
+    overflow_samples: row?.overflow_samples,
+    input_discontinuity_count: row?.input_discontinuity_count,
+    input_discontinuity_silence_samples: row?.input_discontinuity_silence_samples,
+    noise_check: report.noise_check ?? null,
     audio_format: snapshot?.audio_format,
     required_duration_seconds: requiredDurationSeconds,
     production_minimum_seconds: PRODUCTION_POWER_CUT_SECONDS,
@@ -1921,13 +1972,28 @@ function evaluatePhase1Evidence(phase1, options, inspection, currentHost) {
   addCheck(
     checks,
     'phase1-session-identity',
-    'phase-1 证据与磁盘会话的目录、ID、设备和音频格式完全一致',
+    'phase-1 证据与磁盘会话的目录、ID、设备、录音路径和音频格式完全一致',
     Boolean(snapshot) &&
       pathsEqual(String(evidence?.session_dir ?? ''), options.sessionDir) &&
       snapshot.session_id === evidence?.session_id &&
       snapshot.device_id === evidence?.device_id &&
       snapshot.input_sample_format === evidence?.input_sample_format &&
       snapshot.capture_share_mode === evidence?.capture_share_mode &&
+      typeof evidence?.capture_backend === 'string' && evidence.capture_backend.length > 0 &&
+      snapshot.capture_backend === evidence.capture_backend &&
+      (
+        evidence.capture_backend === 'asio'
+          ? Number.isSafeInteger(evidence?.requested_capture_buffer_frames) &&
+            evidence.requested_capture_buffer_frames > 0 &&
+            evidence.capture_buffer_frames === evidence.requested_capture_buffer_frames &&
+            snapshot.requested_capture_buffer_frames === evidence.requested_capture_buffer_frames &&
+            snapshot.capture_buffer_frames === evidence.capture_buffer_frames
+          : evidence.capture_backend === 'wasapi' &&
+            evidence?.requested_capture_buffer_frames == null &&
+            evidence?.capture_buffer_frames == null &&
+            snapshot.requested_capture_buffer_frames == null &&
+            snapshot.capture_buffer_frames == null
+      ) &&
       snapshotFormat?.sample_rate === evidenceFormat?.sample_rate &&
       snapshotFormat?.bit_depth === evidenceFormat?.bit_depth &&
       snapshotFormat?.encoding === evidenceFormat?.encoding &&
@@ -1936,8 +2002,50 @@ function evaluatePhase1Evidence(phase1, options, inspection, currentHost) {
       snapshotFormat?.input_channels === evidenceFormat?.input_channels,
     { session_dir: options.sessionDir, snapshot, evidence },
   );
+  addCheck(
+    checks,
+    'phase1-input-health-at-arm',
+    'phase-1 armed 时 overflow 和输入不连续计数均已记录且为 0',
+    Number.isSafeInteger(evidence?.overflow_samples) && evidence.overflow_samples === 0 &&
+      Number.isSafeInteger(evidence?.input_discontinuity_count) && evidence.input_discontinuity_count === 0 &&
+      Number.isSafeInteger(evidence?.input_discontinuity_silence_samples) &&
+        evidence.input_discontinuity_silence_samples === 0 &&
+      Number.isSafeInteger(snapshot?.overflow_samples) && snapshot.overflow_samples === 0 &&
+      Number.isSafeInteger(snapshot?.input_discontinuity_count) && snapshot.input_discontinuity_count === 0 &&
+      Number.isSafeInteger(snapshot?.input_discontinuity_silence_samples) &&
+        snapshot.input_discontinuity_silence_samples === 0,
+    {
+      evidence: {
+        overflow_samples: evidence?.overflow_samples,
+        input_discontinuity_count: evidence?.input_discontinuity_count,
+        input_discontinuity_silence_samples: evidence?.input_discontinuity_silence_samples,
+      },
+      snapshot: {
+        overflow_samples: snapshot?.overflow_samples,
+        input_discontinuity_count: snapshot?.input_discontinuity_count,
+        input_discontinuity_silence_samples: snapshot?.input_discontinuity_silence_samples,
+      },
+    },
+  );
   const testEvidence = evidence?.test_only === true;
   const productionEvidence = evidence?.test_only === false && evidence?.production_eligible === true;
+  addCheck(
+    checks,
+    'phase1-production-noise-check',
+    '生产 phase-1 噪声阈值不得放宽且结果与磁盘快照一致',
+    testEvidence || (
+      evidence?.noise_check?.passed === true &&
+      Number.isFinite(Number(evidence.noise_check.threshold_dbfs)) &&
+      Number(evidence.noise_check.threshold_dbfs) <= PRODUCTION_MAX_NOISE_THRESHOLD_DBFS &&
+      isDeepStrictEqual(snapshot?.noise_check, evidence.noise_check)
+    ),
+    {
+      test_only: testEvidence,
+      maximum_production_threshold_dbfs: PRODUCTION_MAX_NOISE_THRESHOLD_DBFS,
+      evidence: evidence?.noise_check ?? null,
+      snapshot: snapshot?.noise_check ?? null,
+    },
+  );
   addCheck(
     checks,
     'power-cut-qualification-class',
@@ -2007,6 +2115,23 @@ function evaluatePhase1Evidence(phase1, options, inspection, currentHost) {
   return checks;
 }
 
+function expectedCaptureConfiguration(options, selected) {
+  const selectedBackend = typeof selected?.backend === 'string'
+    ? selected.backend.trim().toLowerCase()
+    : '';
+  const selectedId = String(selected?.id ?? '').toLowerCase();
+  const idBackend = selectedId.startsWith('asio:')
+    ? 'asio'
+    : selectedId.startsWith('wasapi:')
+      ? 'wasapi'
+      : '';
+  const backend = options.expectedCaptureBackend ?? (idBackend || selectedBackend);
+  const bufferFrames = backend === 'asio'
+    ? options.expectedCaptureBufferFrames ?? 512
+    : null;
+  return { backend, bufferFrames };
+}
+
 function evaluateCommon(report, options, inspection) {
   const checks = [];
   const snapshot = report.start?.snapshot ?? null;
@@ -2036,18 +2161,57 @@ function evaluateCommon(report, options, inspection) {
     requested: options.shareMode,
     actual: snapshot?.capture_share_mode,
   });
-  addCheck(checks, 'capture-backend-match', '实际录音后端与选择一致', snapshot?.capture_backend === selected?.backend, {
-    requested: selected?.backend,
-    actual: snapshot?.capture_backend,
-  });
-  if (selected?.recommended_buffer_frames) {
+  const selectedBackend = typeof selected?.backend === 'string' ? selected.backend.trim().toLowerCase() : '';
+  const requestedBackend = typeof report.requested?.capture_backend === 'string'
+    ? report.requested.capture_backend.trim().toLowerCase()
+    : '';
+  const actualBackend = typeof snapshot?.capture_backend === 'string'
+    ? snapshot.capture_backend.trim().toLowerCase()
+    : '';
+  const expectedCapture = expectedCaptureConfiguration(options, selected);
+  addCheck(
+    checks,
+    'capture-backend-match',
+    '独立期望、选择、请求与实际录音后端均非空且一致',
+    expectedCapture.backend.length > 0 &&
+      selectedBackend.length > 0 &&
+      requestedBackend.length > 0 &&
+      actualBackend.length > 0 &&
+      selectedBackend === expectedCapture.backend &&
+      selectedBackend === requestedBackend &&
+      requestedBackend === actualBackend,
+    {
+      expected: expectedCapture.backend,
+      selected: selected?.backend,
+      requested: report.requested?.capture_backend,
+      actual: snapshot?.capture_backend,
+    },
+  );
+  const asioRequested = expectedCapture.backend === 'asio' || selectedBackend === 'asio' || requestedBackend === 'asio' || actualBackend === 'asio' ||
+    String(selected?.id ?? snapshot?.device_id ?? '').toLowerCase().startsWith('asio:');
+  if (asioRequested) {
+    const selectedBufferFrames = Number(selected?.recommended_buffer_frames);
+    const requestedBufferFrames = Number(report.requested?.capture_buffer_frames);
+    const snapshotRequestedBufferFrames = Number(snapshot?.requested_capture_buffer_frames);
+    const actualBufferFrames = Number(snapshot?.capture_buffer_frames);
     addCheck(
       checks,
       'capture-buffer-match',
-      'ASIO 实际缓冲区与请求一致',
-      snapshot?.capture_buffer_frames === selected.recommended_buffer_frames,
+      'ASIO 独立期望、选择、请求与驱动实际缓冲区均存在且一致',
+      Number.isSafeInteger(expectedCapture.bufferFrames) && expectedCapture.bufferFrames > 0 &&
+        Number.isSafeInteger(selectedBufferFrames) && selectedBufferFrames > 0 &&
+        Number.isSafeInteger(requestedBufferFrames) && requestedBufferFrames > 0 &&
+        Number.isSafeInteger(snapshotRequestedBufferFrames) && snapshotRequestedBufferFrames > 0 &&
+        Number.isSafeInteger(actualBufferFrames) && actualBufferFrames > 0 &&
+        selectedBufferFrames === expectedCapture.bufferFrames &&
+        selectedBufferFrames === requestedBufferFrames &&
+        requestedBufferFrames === snapshotRequestedBufferFrames &&
+        snapshotRequestedBufferFrames === actualBufferFrames,
       {
-        requested: selected.recommended_buffer_frames,
+        expected: expectedCapture.bufferFrames,
+        selected: selected?.recommended_buffer_frames,
+        requested: report.requested?.capture_buffer_frames,
+        snapshot_requested: snapshot?.requested_capture_buffer_frames,
         actual: snapshot?.capture_buffer_frames,
       },
     );
@@ -2115,6 +2279,57 @@ function evaluateCommon(report, options, inspection) {
   return checks;
 }
 
+function inputAuditionEvidencePassed(evidence, sampleRate, persistedAudition) {
+  const expectedSamples = Number(sampleRate) * INPUT_AUDITION_SECONDS;
+  const begin = evidence?.begin;
+  const started = begin?.input_audition;
+  const finished = evidence?.finish?.input_audition;
+  const confirmed = evidence?.confirm?.input_audition;
+  const checkId = begin?.check_id;
+  const startSample = started?.start_sample;
+  return !evidence?.error &&
+    Number.isSafeInteger(expectedSamples) && expectedSamples > 0 &&
+    typeof checkId === 'string' && checkId.length > 0 &&
+    Number.isSafeInteger(startSample) && startSample >= 0 &&
+    begin?.required_samples === expectedSamples &&
+    started?.check_id === checkId &&
+    started?.status === 'recording' &&
+    started?.required_samples === expectedSamples &&
+    started?.captured_samples === 0 &&
+    Array.isArray(started?.warning_codes) && started.warning_codes.length === 0 &&
+    finished?.check_id === checkId &&
+    finished?.status === 'ready' &&
+    finished?.start_sample === startSample &&
+    finished?.required_samples === expectedSamples &&
+    finished?.captured_samples === expectedSamples &&
+    finished?.end_sample === startSample + expectedSamples &&
+    Array.isArray(finished?.warning_codes) && finished.warning_codes.length === 0 &&
+    finished?.metrics?.duration_samples === expectedSamples &&
+    Number(finished?.metrics?.duration_seconds) === INPUT_AUDITION_SECONDS &&
+    finished?.metrics?.input_discontinuity_count === 0 &&
+    finished?.metrics?.input_discontinuity_silence_samples === 0 &&
+    finished?.metrics?.overflow_samples === 0 &&
+    Array.isArray(finished?.metrics?.warning_codes) && finished.metrics.warning_codes.length === 0 &&
+    confirmed?.check_id === checkId &&
+    confirmed?.status === 'confirmed' &&
+    confirmed?.start_sample === startSample &&
+    confirmed?.required_samples === expectedSamples &&
+    confirmed?.captured_samples === expectedSamples &&
+    confirmed?.end_sample === startSample + expectedSamples &&
+    Array.isArray(confirmed?.warning_codes) && confirmed.warning_codes.length === 0 &&
+    isDeepStrictEqual(confirmed?.metrics, finished?.metrics) &&
+    isDeepStrictEqual(confirmed, persistedAudition);
+}
+
+function auditionPrecedesAttempt(evidence, lifecycle, snapshot) {
+  const auditionEnd = evidence?.confirm?.input_audition?.end_sample;
+  const attemptStart = lifecycle?.start?.start_sample;
+  return Number.isSafeInteger(auditionEnd) &&
+    Number.isSafeInteger(attemptStart) &&
+    Number.isSafeInteger(snapshot?.committed_samples) &&
+    auditionEnd <= attemptStart && attemptStart < snapshot.committed_samples;
+}
+
 function evaluateNormal(report, options, inspection) {
   const checks = evaluateCommon(report, options, inspection);
   const progress = report.progress_summary;
@@ -2136,9 +2351,76 @@ function evaluateNormal(report, options, inspection) {
       committed === physical,
     { captured_samples: captured, committed_samples: committed, physical_frames: physical },
   );
-  addCheck(checks, 'no-overflow', '无音频队列溢出', Number(finalSnapshot?.overflow_samples ?? 0) === 0, {
+  addCheck(checks, 'no-overflow', '无音频队列溢出', Number.isSafeInteger(finalSnapshot?.overflow_samples) && finalSnapshot.overflow_samples === 0, {
     overflow_samples: finalSnapshot?.overflow_samples,
   });
+  const discontinuityCount = finalSnapshot?.input_discontinuity_count;
+  const discontinuitySilenceSamples = finalSnapshot?.input_discontinuity_silence_samples;
+  addCheck(
+    checks,
+    'no-input-discontinuity',
+    '输入连续性计数已记录且为 0',
+    Number.isSafeInteger(discontinuityCount) && discontinuityCount === 0 &&
+      Number.isSafeInteger(discontinuitySilenceSamples) && discontinuitySilenceSamples === 0,
+    {
+      input_discontinuity_count: discontinuityCount,
+      input_discontinuity_silence_samples: discontinuitySilenceSamples,
+    },
+  );
+  addCheck(
+    checks,
+    'ambient-noise-check',
+    '生产验收已执行且通过环境噪声检测',
+    options.skipNoiseCheck !== true &&
+      options.noiseThresholdDbfs <= PRODUCTION_MAX_NOISE_THRESHOLD_DBFS &&
+      !report.noise_check_error &&
+      report.noise_check?.passed === true &&
+      Number(report.noise_check?.threshold_dbfs) === Number(options.noiseThresholdDbfs),
+    {
+      skipped: options.skipNoiseCheck === true,
+      error: report.noise_check_error ?? null,
+      result: report.noise_check ?? null,
+      required_threshold_dbfs: options.noiseThresholdDbfs,
+      maximum_production_threshold_dbfs: PRODUCTION_MAX_NOISE_THRESHOLD_DBFS,
+    },
+  );
+  addCheck(
+    checks,
+    'input-audition-confirmed',
+    '正式句子前完成无警告的 10 秒输入试听',
+    inputAuditionEvidencePassed(
+      report.input_audition,
+      options.sampleRate,
+      finalSnapshot?.input_audition,
+    ),
+    report.input_audition ?? null,
+  );
+  const attemptItemId = report.attempt?.item_id ?? 'QA-001';
+  const attemptId = report.attempt?.start?.attempt_id;
+  const stoppedAttempt = report.attempt?.stop?.attempt;
+  const acceptedItem = Array.isArray(finalSnapshot?.items)
+    ? finalSnapshot.items.find((item) => item?.id === attemptItemId)
+    : null;
+  const acceptedAttempt = Array.isArray(acceptedItem?.attempts)
+    ? acceptedItem.attempts.find((attempt) => attempt?.attempt_id === attemptId)
+    : null;
+  const attemptLifecyclePassed =
+    typeof attemptId === 'string' && attemptId.length > 0 &&
+    auditionPrecedesAttempt(report.input_audition, report.attempt, finalSnapshot) &&
+    stoppedAttempt?.attempt_id === attemptId &&
+    stoppedAttempt?.status === 'recorded' &&
+    report.attempt?.stop?.observed_discontinuity === false &&
+    report.attempt?.accept?.attempt_id === attemptId &&
+    acceptedItem?.status === 'accepted' &&
+    acceptedItem?.selected_attempt_id === attemptId &&
+    acceptedAttempt?.status === 'accepted';
+  addCheck(
+    checks,
+    'accepted-attempt-lifecycle',
+    '真实执行句子开始、停止和确认，最终选中录音可交付',
+    attemptLifecyclePassed,
+      { item_id: attemptItemId, lifecycle: report.attempt ?? null, item: acceptedItem ?? null },
+  );
   addCheck(checks, 'no-capture-fault', '监测期间无采集故障', !progress.first_fault, progress.first_fault);
   addCheck(checks, 'no-fault-marker', '无 audio-fault 标记', !faultMarkerPresent(inspection), {
     marker: inspection.fault_marker,
@@ -2272,6 +2554,15 @@ function evaluateNormal(report, options, inspection) {
         export_result: exportResult,
       },
     );
+    addCheck(
+      checks,
+      'accepted-attempt-exported',
+      '验收句已以当次确认的 attempt 导出，不得跳过',
+      attemptLifecyclePassed &&
+        exported?.some((row) => row?.id === attemptItemId && row?.attempt_id === attemptId) === true &&
+        skipped?.some((row) => row?.id === attemptItemId) !== true,
+      { item_id: attemptItemId, attempt_id: attemptId, exported, skipped },
+    );
   }
   return checks;
 }
@@ -2281,6 +2572,54 @@ function evaluateFault(report, options, inspection) {
   const progress = report.progress_summary;
   const finalSnapshot = report.stop?.result?.snapshot ?? inspection.snapshot;
   const fault = report.fault;
+  addCheck(
+    checks,
+    'ambient-noise-check',
+    '生产故障验收已执行且通过环境噪声检测',
+    options.skipNoiseCheck !== true &&
+      options.noiseThresholdDbfs <= PRODUCTION_MAX_NOISE_THRESHOLD_DBFS &&
+      !report.noise_check_error &&
+      report.noise_check?.passed === true &&
+      Number(report.noise_check?.threshold_dbfs) === Number(options.noiseThresholdDbfs),
+    {
+      skipped: options.skipNoiseCheck === true,
+      error: report.noise_check_error ?? null,
+      result: report.noise_check ?? null,
+      required_threshold_dbfs: options.noiseThresholdDbfs,
+      maximum_production_threshold_dbfs: PRODUCTION_MAX_NOISE_THRESHOLD_DBFS,
+    },
+  );
+  addCheck(
+    checks,
+    'input-audition-confirmed',
+    '故障注入前完成无警告的 10 秒输入试听',
+    inputAuditionEvidencePassed(
+      report.input_audition,
+      options.sampleRate,
+      finalSnapshot?.input_audition,
+    ),
+    report.input_audition ?? null,
+  );
+  const attemptItemId = report.attempt?.item_id;
+  const attemptId = report.attempt?.start?.attempt_id;
+  const stoppedAttempt = report.attempt?.stop?.attempt;
+  const finalItem = Array.isArray(finalSnapshot?.items)
+    ? finalSnapshot.items.find((item) => item?.id === attemptItemId)
+    : null;
+  addCheck(
+    checks,
+    'fault-attempt-blocked',
+    '故障发生在真实活动 attempt 内，受损录音被标记不可交付且确认被拒绝',
+    typeof attemptItemId === 'string' && attemptItemId.length > 0 &&
+      typeof attemptId === 'string' && attemptId.length > 0 &&
+      auditionPrecedesAttempt(report.input_audition, report.attempt, finalSnapshot) &&
+      stoppedAttempt?.attempt_id === attemptId &&
+      ['interrupted', 'needs_rerecord'].includes(stoppedAttempt?.status) &&
+      typeof report.attempt?.accept_error === 'string' && report.attempt.accept_error.length > 0 &&
+      finalItem?.selected_attempt_id == null &&
+      !finalItem?.attempts?.some((attempt) => attempt?.status === 'accepted'),
+    { lifecycle: report.attempt ?? null, item: finalItem ?? null },
+  );
   addCheck(checks, 'healthy-prefix', '故障前已持续采集至少 2 秒', Number(fault?.captured_before_trigger ?? 0) >= options.sampleRate * 2, fault);
   addCheck(checks, 'fault-detected', '引擎检测到采集/存储故障', Boolean(fault?.detected_at), fault);
   if (DEVICE_UNPLUG_MODES.has(options.mode)) {
@@ -2355,7 +2694,7 @@ function evaluateFault(report, options, inspection) {
 
 function overallFromChecks(checks, incomplete = false) {
   if (incomplete) return 'INCOMPLETE';
-  return checks.some((check) => check.status === 'FAIL') ? 'FAIL' : 'PASS';
+  return checks.every((check) => check.status === 'PASS') ? 'PASS' : 'FAIL';
 }
 
 async function safeStopSession(client) {
@@ -2370,6 +2709,165 @@ async function safeStopSession(client) {
     }
   }
   return { result: null, error: lastError?.message ?? '未知停止错误', attempts: 4 };
+}
+
+async function runProductionInputAudition(client, report) {
+  const audition = {};
+  report.input_audition = audition;
+  try {
+    audition.begin = await client.request('begin_input_audition', {}, 30_000);
+    const checkId = audition.begin?.check_id;
+    const startSample = Number(audition.begin?.input_audition?.start_sample);
+    const requiredSamples = Number(audition.begin?.required_samples);
+    const sampleRate = Number(audition.begin?.snapshot?.audio_format?.sample_rate);
+    const expectedRequiredSamples = sampleRate * INPUT_AUDITION_SECONDS;
+    if (
+      typeof checkId !== 'string' || checkId.length === 0 ||
+      !Number.isSafeInteger(startSample) || startSample < 0 ||
+      !Number.isSafeInteger(sampleRate) || sampleRate <= 0 ||
+      !Number.isSafeInteger(expectedRequiredSamples) ||
+      !Number.isSafeInteger(requiredSamples) || requiredSamples !== expectedRequiredSamples
+    ) {
+      throw new Error(`引擎返回的输入试听边界无效：必须恰好为 ${INPUT_AUDITION_SECONDS} 秒（${expectedRequiredSamples} samples）`);
+    }
+    const targetSample = startSample + requiredSamples;
+    const deadline = Date.now() + Math.ceil(requiredSamples / sampleRate * 1_000) + 10_000;
+    let capturedSamples = Number(audition.begin?.snapshot?.captured_samples ?? 0);
+    while (!abortRequested && capturedSamples < targetSample && Date.now() < deadline) {
+      await sleep(250);
+      const state = await client.request('get_state', {}, 30_000);
+      capturedSamples = Number(state?.snapshot?.captured_samples);
+    }
+    audition.observed_captured_samples = capturedSamples;
+    if (!Number.isSafeInteger(capturedSamples) || capturedSamples < targetSample) {
+      throw new Error(`10 秒输入试听未捕获完整样本（${capturedSamples}/${targetSample}）`);
+    }
+    audition.finish = await client.request(
+      'finish_input_audition',
+      { check_id: checkId },
+      60_000,
+    );
+    const finished = audition.finish?.input_audition;
+    if (
+      finished?.status !== 'ready' ||
+      finished?.check_id !== checkId ||
+      finished?.start_sample !== startSample ||
+      finished?.required_samples !== expectedRequiredSamples ||
+      finished?.captured_samples !== expectedRequiredSamples ||
+      finished?.end_sample !== startSample + expectedRequiredSamples ||
+      !Array.isArray(finished?.warning_codes) || finished.warning_codes.length > 0 ||
+      finished?.metrics?.duration_samples !== expectedRequiredSamples ||
+      Number(finished?.metrics?.duration_seconds) !== INPUT_AUDITION_SECONDS ||
+      !Array.isArray(finished?.metrics?.warning_codes) || finished.metrics.warning_codes.length > 0 ||
+      finished?.metrics?.input_discontinuity_count !== 0 ||
+      finished?.metrics?.input_discontinuity_silence_samples !== 0 ||
+      finished?.metrics?.overflow_samples !== 0
+    ) {
+      throw new Error(`输入试听未通过: ${JSON.stringify({
+        status: finished?.status,
+        warning_codes: finished?.warning_codes,
+        metrics: finished?.metrics,
+      })}`);
+    }
+    audition.confirm = await client.request(
+      'confirm_input_audition',
+      { check_id: checkId },
+      30_000,
+    );
+    if (audition.confirm?.input_audition?.status !== 'confirmed') {
+      throw new Error('引擎未确认本轮输入试听');
+    }
+  } catch (error) {
+    audition.error = error.message;
+  }
+  return audition;
+}
+
+async function startAcceptanceAttempt(client, report, itemId = 'QA-001') {
+  report.attempt = { item_id: itemId };
+  try {
+    report.attempt.start = await client.request(
+      'start_attempt',
+      { item_id: itemId, enforce_silence: false },
+      30_000,
+    );
+  } catch (error) {
+    report.attempt.start_error = error.message;
+  }
+}
+
+async function finishAcceptanceAttempt(client, report) {
+  if (!report.attempt?.start?.attempt_id) return;
+  try {
+    report.attempt.stop = await client.request(
+      'stop_attempt',
+      { force: true, discard_empty: false, enforce_silence: false },
+      60_000,
+    );
+  } catch (error) {
+    report.attempt.stop_error = error.message;
+    return;
+  }
+  const attemptId = report.attempt.stop?.attempt?.attempt_id;
+  if (typeof attemptId !== 'string' || attemptId.length === 0) return;
+  try {
+    report.attempt.accept = await client.request(
+      'accept_attempt',
+      { item_id: report.attempt.item_id, attempt_id: attemptId },
+      30_000,
+    );
+  } catch (error) {
+    report.attempt.accept_error = error.message;
+  }
+}
+
+function assertProductionPowerCutPreflight(report, options, row) {
+  if (options.testOnlyPowerCut) return;
+  if (
+    options.skipNoiseCheck === true ||
+    options.noiseThresholdDbfs > PRODUCTION_MAX_NOISE_THRESHOLD_DBFS ||
+    report.noise_check_error ||
+    report.noise_check?.passed !== true ||
+    Number(report.noise_check?.threshold_dbfs) !== Number(options.noiseThresholdDbfs)
+  ) {
+    throw new Error('生产 power-cut 未通过环境噪声检测，拒绝写入 armed 证据');
+  }
+  const selected = report.selected_device;
+  const snapshot = report.start?.snapshot;
+  const expected = expectedCaptureConfiguration(options, selected);
+  const selectedBackend = String(selected?.backend ?? '').trim().toLowerCase();
+  const requestedBackend = String(report.requested?.capture_backend ?? '').trim().toLowerCase();
+  const actualBackend = String(snapshot?.capture_backend ?? '').trim().toLowerCase();
+  if (
+    !expected.backend || selectedBackend !== expected.backend ||
+    requestedBackend !== expected.backend || actualBackend !== expected.backend
+  ) {
+    throw new Error('生产 power-cut 的期望/选择/请求/实际录音后端不一致，拒绝 armed');
+  }
+  if (expected.backend === 'asio') {
+    const buffers = [
+      selected?.recommended_buffer_frames,
+      report.requested?.capture_buffer_frames,
+      snapshot?.requested_capture_buffer_frames,
+      snapshot?.capture_buffer_frames,
+    ];
+    if (
+      !Number.isSafeInteger(expected.bufferFrames) || expected.bufferFrames <= 0 ||
+      buffers.some((value) => !Number.isSafeInteger(value) || value !== expected.bufferFrames)
+    ) {
+      throw new Error('生产 power-cut 的 ASIO 期望/请求/实际缓冲区不一致，拒绝 armed');
+    }
+  }
+  if (
+    !Number.isSafeInteger(row?.overflow_samples) ||
+    row.overflow_samples !== 0 ||
+    !Number.isSafeInteger(row?.input_discontinuity_count) ||
+    row.input_discontinuity_count !== 0 ||
+    !Number.isSafeInteger(row?.input_discontinuity_silence_samples) ||
+    row.input_discontinuity_silence_samples !== 0
+  ) {
+    throw new Error('生产 power-cut 在 armed 前的 overflow/输入连续性证据缺失或非零，拒绝生成资格证据');
+  }
 }
 
 async function monitorCapture(
@@ -2436,7 +2934,13 @@ async function monitorCapture(
       session_id: state?.snapshot?.session_id ?? null,
       captured_samples: Number(state?.snapshot?.captured_samples ?? meter.captured_samples ?? 0),
       committed_samples: Number(state?.snapshot?.committed_samples ?? meter.committed_samples ?? 0),
-      overflow_samples: Number(state?.snapshot?.overflow_samples ?? meter.overflow_samples ?? 0),
+      overflow_samples: Number.isSafeInteger(state?.snapshot?.overflow_samples)
+        ? state.snapshot.overflow_samples
+        : Number.isSafeInteger(meter.overflow_samples)
+          ? meter.overflow_samples
+          : null,
+      input_discontinuity_count: state?.snapshot?.input_discontinuity_count,
+      input_discontinuity_silence_samples: state?.snapshot?.input_discontinuity_silence_samples,
       faulted: Boolean(meter.faulted),
       fault_kind: typeof meter.fault_kind === 'string' ? meter.fault_kind : '',
       fault_reason: typeof meter.fault_reason === 'string' ? meter.fault_reason : '',
@@ -2454,7 +2958,7 @@ async function monitorCapture(
     };
     const isFault =
       row.faulted ||
-      row.overflow_samples > 0 ||
+      (Number.isSafeInteger(row.overflow_samples) && row.overflow_samples > 0) ||
       markerExists ||
       state?.snapshot?.status === 'faulted';
     if (expectedFault && announcedTrigger && capturedBeforeTrigger === null) {
@@ -2476,6 +2980,12 @@ async function monitorCapture(
         row.committed_samples >= requiredFrames &&
         row.captured_samples >= row.committed_samples &&
         row.captured_samples - row.committed_samples <= maximumLagFrames &&
+        Number.isSafeInteger(row.overflow_samples) &&
+        row.overflow_samples === 0 &&
+        Number.isSafeInteger(row.input_discontinuity_count) &&
+        row.input_discontinuity_count === 0 &&
+        Number.isSafeInteger(row.input_discontinuity_silence_samples) &&
+        row.input_discontinuity_silence_samples === 0 &&
         progressing;
       if (eligible) {
         if (typeof onPowerCutArm !== 'function') throw new Error('power-cut 缺少持久证据回调');
@@ -2804,6 +3314,7 @@ async function runRecover(options, runDirectory, report) {
 }
 
 function replugStartPayload(sessionDirectory, sessionId, selected, options, phase) {
+  const expectedCapture = expectedCaptureConfiguration(options, selected);
   return {
     session_dir: sessionDirectory,
     session_id: sessionId,
@@ -2814,7 +3325,7 @@ function replugStartPayload(sessionDirectory, sessionId, selected, options, phas
     bit_depth: options.bitDepth,
     input_channel: options.channel,
     capture_share_mode: options.shareMode,
-    capture_buffer_frames: selected.recommended_buffer_frames,
+    capture_buffer_frames: expectedCapture.bufferFrames,
     silence_duration_ms: 1_000,
     silence_threshold_dbfs: options.noiseThresholdDbfs,
     items: [{
@@ -2858,6 +3369,7 @@ async function runReplug(options, runDirectory, report) {
     report.inventory = inventory;
     printDevices(inventory);
     const selected = await selectDevice(inventory, options);
+    const expectedCapture = expectedCaptureConfiguration(options, selected);
     const configurations = matchingConfigurations(selected, options.sampleRate, options.channel, options.shareMode);
     if (configurations.length === 0) {
       throw new Error(`设备 ${selected.name} 不支持 ${options.shareMode} / ${options.sampleRate} Hz / 输入 ${options.channel}`);
@@ -2867,8 +3379,10 @@ async function runReplug(options, runDirectory, report) {
       sample_rate: options.sampleRate,
       wav_bit_depth: options.bitDepth,
       capture_share_mode: options.shareMode,
-      capture_backend: selected.backend,
-      capture_buffer_frames: selected.recommended_buffer_frames,
+      capture_backend: expectedCapture.backend,
+      capture_buffer_frames: expectedCapture.bufferFrames,
+      selected_capture_backend: selected.backend,
+      selected_recommended_buffer_frames: selected.recommended_buffer_frames,
       minimum_input_format_bits: options.minimumInputFormatBits,
       output_channels: 1,
       input_channel: options.channel,
@@ -2917,6 +3431,8 @@ async function runReplug(options, runDirectory, report) {
         report.replug.before.noise_check_error = error.message;
       }
     }
+    await runProductionInputAudition(client, report.replug.before);
+    await startAcceptanceAttempt(client, report.replug.before, 'QA-REPLUG-A');
     const beforeMonitor = await monitorCapture(
       client,
       beforeDirectory,
@@ -2943,6 +3459,7 @@ async function runReplug(options, runDirectory, report) {
       first_fault_kind_row: beforeMonitor.first_fault_kind_row,
       fault_before_trigger: beforeMonitor.fault_before_trigger,
     };
+    await finishAcceptanceAttempt(client, report.replug.before);
     report.replug.before.stop = await safeStopSession(client);
     activeSession = !report.replug.before.stop.result;
     try {
@@ -3063,6 +3580,8 @@ async function runReplug(options, runDirectory, report) {
             report.replug.after.noise_check_error = error.message;
           }
         }
+        await runProductionInputAudition(client, report.replug.after);
+        await startAcceptanceAttempt(client, report.replug.after, 'QA-REPLUG-B');
         const afterMonitor = await monitorCapture(
           client,
           afterDirectory,
@@ -3082,6 +3601,7 @@ async function runReplug(options, runDirectory, report) {
           options.sampleRate,
           options.pollSeconds,
         );
+        await finishAcceptanceAttempt(client, report.replug.after);
         report.replug.after.stop = await safeStopSession(client);
         activeSession = !report.replug.after.stop.result;
         report.replug.after.export = { skipped: true };
@@ -3107,6 +3627,10 @@ async function runReplug(options, runDirectory, report) {
       progress_summary: report.replug.before.progress_summary,
       progress_rows: beforeRows,
       fault: report.replug.before.fault,
+      noise_check: report.replug.before.noise_check,
+      noise_check_error: report.replug.before.noise_check_error,
+      input_audition: report.replug.before.input_audition,
+      attempt: report.replug.before.attempt,
     };
     checks.push(...prefixChecks(
       'replug-a',
@@ -3206,6 +3730,10 @@ async function runReplug(options, runDirectory, report) {
         inspection: report.replug.after.inspection,
         progress_summary: report.replug.after.progress_summary,
         progress_rows: afterRows,
+        noise_check: report.replug.after.noise_check,
+        noise_check_error: report.replug.after.noise_check_error,
+        input_audition: report.replug.after.input_audition,
+        attempt: report.replug.after.attempt,
       };
       checks.push(...prefixChecks(
         'replug-b',
@@ -3297,6 +3825,7 @@ async function runCapture(options, runDirectory, report) {
     report.inventory = inventory;
     printDevices(inventory);
     const selected = await selectDevice(inventory, options);
+    const expectedCapture = expectedCaptureConfiguration(options, selected);
     report.selected_device = selected;
     const configs = matchingConfigurations(selected, options.sampleRate, options.channel, options.shareMode);
     if (configs.length === 0) {
@@ -3306,8 +3835,10 @@ async function runCapture(options, runDirectory, report) {
       sample_rate: options.sampleRate,
       wav_bit_depth: options.bitDepth,
       capture_share_mode: options.shareMode,
-      capture_backend: selected.backend,
-      capture_buffer_frames: selected.recommended_buffer_frames,
+      capture_backend: expectedCapture.backend,
+      capture_buffer_frames: expectedCapture.bufferFrames,
+      selected_capture_backend: selected.backend,
+      selected_recommended_buffer_frames: selected.recommended_buffer_frames,
       minimum_input_format_bits: options.minimumInputFormatBits,
       output_channels: 1,
       input_channel: options.channel,
@@ -3327,7 +3858,7 @@ async function runCapture(options, runDirectory, report) {
         bit_depth: options.bitDepth,
         input_channel: options.channel,
         capture_share_mode: options.shareMode,
-        capture_buffer_frames: selected.recommended_buffer_frames,
+        capture_buffer_frames: expectedCapture.bufferFrames,
         silence_duration_ms: 1_000,
         silence_threshold_dbfs: options.noiseThresholdDbfs,
         items: [{ id: 'QA-001', text: 'DataBaker Windows external audio interface acceptance', label: options.mode }],
@@ -3376,8 +3907,16 @@ async function runCapture(options, runDirectory, report) {
       if (options.mode === 'short') process.stdout.write('现在请持续朗读或播放测试音。\n');
     }
 
+    const attemptCapture = options.mode !== 'power-cut';
+    if (attemptCapture) {
+      process.stdout.write('开始 10 秒输入试听和正式句子链路验证。\n');
+      await runProductionInputAudition(client, report);
+      await startAcceptanceAttempt(client, report);
+    }
+
     const onPowerCutArm = options.mode === 'power-cut'
       ? async (row) => {
+          assertProductionPowerCutPreflight(report, options, row);
           report.power_cut.nonce = randomUUID();
           const evidence = buildPowerCutEvidence(report, options, sessionDirectory, row);
           const sessionEvidencePath = path.join(sessionDirectory, POWER_CUT_SESSION_EVIDENCE);
@@ -3418,6 +3957,9 @@ async function runCapture(options, runDirectory, report) {
       };
     }
     report.aborted = monitor.aborted;
+    if (attemptCapture) {
+      await finishAcceptanceAttempt(client, report);
+    }
     if (options.mode === 'power-cut') {
       // Reaching this branch proves that no real power loss happened. Seal the
       // fixture safely so an unattended or mistimed run cannot be mistaken for

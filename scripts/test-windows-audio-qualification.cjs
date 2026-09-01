@@ -11,13 +11,15 @@ const {
   IMPLEMENTED_ACCEPTANCE_MODES,
   KNOWN_ACCEPTANCE_MODES,
   parseArgs,
+  requiredAcceptanceCheckIds,
   runQualification,
   validatePlan,
 } = require('./windows-audio-qualification.cjs');
+const { inspectSession } = require('./windows-audio-acceptance.cjs');
 
 const ENGINE_HASH = '1'.repeat(64);
 const TOOL_HASH = '2'.repeat(64);
-const DEVICE_ID = 'wasapi:{fixture-usb-interface}';
+const DEVICE_ID = 'asio:fixture-usb-interface';
 const HOSTNAME = 'qa-windows-host';
 const WINDOWS_RELEASE = '10.0.26100';
 
@@ -59,17 +61,99 @@ function makeWav(sampleRate, bitDepth, frames) {
   return buffer;
 }
 
-function writeReplugSessionFixture(directory, snapshot, faulted) {
+function writeSparseWav(filePath, sampleRate, bitDepth, frames, container = 'riff') {
+  const sampleBytes = bitDepth / 8;
+  const dataBytes = frames * sampleBytes;
+  let header;
+  let totalBytes;
+  if (container === 'rf64') {
+    const isFloat = bitDepth === 32;
+    const baseHeaderLength = isFloat ? 56 : 44;
+    const headerLength = baseHeaderLength + 36;
+    const paddingBytes = dataBytes % 2;
+    totalBytes = headerLength + dataBytes + paddingBytes;
+    header = Buffer.alloc(headerLength);
+    header.write('RF64', 0, 'ascii');
+    header.writeUInt32LE(0xffffffff, 4);
+    header.write('WAVE', 8, 'ascii');
+    header.write('ds64', 12, 'ascii');
+    header.writeUInt32LE(28, 16);
+    header.writeBigUInt64LE(BigInt(totalBytes - 8), 20);
+    header.writeBigUInt64LE(BigInt(dataBytes), 28);
+    header.writeBigUInt64LE(BigInt(frames), 36);
+    header.writeUInt32LE(0, 44);
+    header.write('fmt ', 48, 'ascii');
+    header.writeUInt32LE(16, 52);
+    header.writeUInt16LE(isFloat ? 3 : 1, 56);
+    header.writeUInt16LE(1, 58);
+    header.writeUInt32LE(sampleRate, 60);
+    header.writeUInt32LE(sampleRate * sampleBytes, 64);
+    header.writeUInt16LE(sampleBytes, 68);
+    header.writeUInt16LE(bitDepth, 70);
+    let dataMarker = 72;
+    if (isFloat) {
+      header.write('fact', 72, 'ascii');
+      header.writeUInt32LE(4, 76);
+      header.writeUInt32LE(0xffffffff, 80);
+      dataMarker = 84;
+    }
+    header.write('data', dataMarker, 'ascii');
+    header.writeUInt32LE(0xffffffff, dataMarker + 4);
+  } else {
+    header = makeWav(sampleRate, bitDepth, 0);
+    const paddingBytes = dataBytes % 2;
+    totalBytes = header.length + dataBytes + paddingBytes;
+    header.writeUInt32LE(totalBytes - 8, 4);
+    const dataMarker = bitDepth === 32 ? 48 : 36;
+    if (bitDepth === 32) header.writeUInt32LE(frames, 44);
+    header.writeUInt32LE(dataBytes, dataMarker + 4);
+  }
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, header);
+  fs.truncateSync(filePath, totalBytes);
+}
+
+const EXPORT_CSV_HEADER = 'id,text,label,attempt_id,start_sample,recording_started_sample,head_silence_armed_sample,head_silence_passed_sample,required_head_silence_samples,content_started_sample,content_started_seconds,end_sample,duration_samples,file,forced_without_tail_silence,tail_silence_samples,required_tail_silence_samples';
+
+function exportCsvCell(value) {
+  return `"${String(value ?? '').replace(/"/g, '""')}"`;
+}
+
+function fixtureExportCsv(exported) {
+  const lines = [EXPORT_CSV_HEADER];
+  for (const row of exported) {
+    lines.push([
+      exportCsvCell(row.id),
+      exportCsvCell(row.text),
+      exportCsvCell(row.label),
+      exportCsvCell(row.attempt_id),
+      row.start_sample,
+      row.recording_started_sample,
+      row.head_silence_armed_sample,
+      row.head_silence_passed_sample,
+      row.required_head_silence_samples,
+      row.content_started_sample,
+      Number(row.content_started_seconds).toFixed(6),
+      row.end_sample,
+      row.duration_samples,
+      exportCsvCell(row.file),
+      String(Boolean(row.forced_without_tail_silence)),
+      row.tail_silence_samples,
+      row.required_tail_silence_samples,
+    ].join(','));
+  }
+  return `${lines.join('\n')}\n`;
+}
+
+function writeSessionFixture(directory, snapshot, { faulted = false, exportContainer = null } = {}) {
   for (const name of ['audio/segments', 'metadata', 'script']) {
     fs.mkdirSync(path.join(directory, name), { recursive: true });
   }
-  fs.writeFileSync(
+  writeSparseWav(
     path.join(directory, 'audio', 'segments', 'master-000001.wav'),
-    makeWav(
-      snapshot.audio_format.sample_rate,
-      snapshot.audio_format.bit_depth,
-      snapshot.committed_samples,
-    ),
+    snapshot.audio_format.sample_rate,
+    snapshot.audio_format.bit_depth,
+    snapshot.committed_samples,
   );
   writeJson(path.join(directory, 'metadata', 'items.snapshot.json'), snapshot);
   writeJson(path.join(directory, 'session.json'), {
@@ -85,6 +169,75 @@ function writeReplugSessionFixture(directory, snapshot, faulted) {
       at: '2026-08-11T00:00:03.750Z',
     });
   }
+  writeJson(path.join(directory, 'script', 'normalized.json'), snapshot.items);
+  if (exportContainer) {
+    const exportDirectory = path.join(directory, 'export');
+    const sentenceDirectory = path.join(exportDirectory, 'sentences');
+    fs.mkdirSync(sentenceDirectory, { recursive: true });
+    writeSparseWav(
+      path.join(exportDirectory, 'full-track.wav'),
+      snapshot.audio_format.sample_rate,
+      snapshot.audio_format.bit_depth,
+      snapshot.committed_samples,
+      exportContainer,
+    );
+    const item = snapshot.items[0];
+    const attempt = item.attempts.find((candidate) => candidate.attempt_id === item.selected_attempt_id);
+    const sentenceName = 'QA-FIXTURE.wav';
+    const durationSamples = attempt.end_sample - attempt.start_sample;
+    writeSparseWav(
+      path.join(sentenceDirectory, sentenceName),
+      snapshot.audio_format.sample_rate,
+      snapshot.audio_format.bit_depth,
+      durationSamples,
+    );
+    const exported = [{
+      id: item.id,
+      text: item.text,
+      label: item.label,
+      attempt_id: attempt.attempt_id,
+      start_sample: attempt.start_sample,
+      recording_started_sample: attempt.recording_started_sample,
+      head_silence_armed_sample: attempt.head_silence_armed_sample,
+      head_silence_passed_sample: attempt.head_silence_passed_sample,
+      required_head_silence_samples: attempt.required_head_silence_samples,
+      content_started_sample: attempt.content_started_sample,
+      content_started_seconds: attempt.content_started_sample / snapshot.audio_format.sample_rate,
+      end_sample: attempt.end_sample,
+      duration_samples: durationSamples,
+      file: `sentences/${sentenceName}`,
+      forced_without_tail_silence: attempt.forced_without_tail_silence,
+      tail_silence_samples: attempt.tail_silence_samples,
+      required_tail_silence_samples: attempt.required_tail_silence_samples,
+    }];
+    const source = {
+      journal_seq: snapshot.journal_seq,
+      committed_samples: snapshot.committed_samples,
+      selected_attempts: snapshot.items.map((candidate) => ({
+        id: candidate.id,
+        attempt_id: candidate.selected_attempt_id,
+      })),
+    };
+    writeJson(path.join(exportDirectory, 'metadata.json'), {
+      schema_version: 1,
+      session_id: snapshot.session_id,
+      full_track: 'full-track.wav',
+      audio_format: snapshot.audio_format,
+      source,
+      exported,
+      skipped: [],
+    });
+    writeJson(path.join(exportDirectory, 'status.json'), {
+      schema_version: 2,
+      status: 'complete',
+      session_id: snapshot.session_id,
+      source,
+      exported_count: exported.length,
+      skipped_count: 0,
+    });
+    fs.writeFileSync(path.join(exportDirectory, 'metadata.csv'), fixtureExportCsv(exported));
+  }
+  return inspectSession(directory);
 }
 
 function buildRequiredRuns() {
@@ -142,7 +295,14 @@ function buildRequiredRuns() {
   return runs;
 }
 
-function makeSnapshot(requirement, sessionId) {
+function makeSnapshot(requirement, sessionId, committedSamples = null) {
+  const itemId = 'QA-FIXTURE';
+  const attemptId = `${itemId}-a1`;
+  const sampleRate = requirement.sample_rate ?? 48_000;
+  const auditionSamples = sampleRate * 10;
+  const finalSamples = committedSamples ?? auditionSamples + 2;
+  const attemptStart = auditionSamples;
+  const audition = fixtureInputAudition(sampleRate);
   return {
     schema_version: 1,
     journal_seq: 2,
@@ -151,18 +311,156 @@ function makeSnapshot(requirement, sessionId) {
     device_id: DEVICE_ID,
     device_name: 'Fixture USB Interface',
     input_sample_format: 'f32',
+    capture_share_mode: 'exclusive',
+    capture_backend: 'asio',
+    requested_capture_buffer_frames: 512,
+    capture_buffer_frames: 512,
     audio_format: {
-      sample_rate: requirement.sample_rate ?? 48_000,
+      sample_rate: sampleRate,
       bit_depth: requirement.bit_depth ?? 24,
       encoding: requirement.bit_depth === 32 ? 'float' : 'pcm',
       channels: 1,
       input_channels: 2,
       input_channel: requirement.channel ?? 1,
     },
-    captured_samples: 1,
-    committed_samples: 1,
+    captured_samples: finalSamples,
+    committed_samples: finalSamples,
     overflow_samples: 0,
-    items: [],
+    input_discontinuity_count: 0,
+    input_discontinuity_silence_samples: 0,
+    noise_check: fixtureNoiseCheck(),
+    input_audition: audition.confirm.input_audition,
+    items: [{
+      id: itemId,
+      text: 'qualification fixture sentence',
+      label: 'fixture',
+      status: 'accepted',
+      selected_attempt_id: attemptId,
+      attempts: [{
+        attempt_id: attemptId,
+        start_sample: attemptStart,
+        recording_started_sample: attemptStart,
+        head_silence_armed_sample: attemptStart,
+        head_silence_passed_sample: attemptStart,
+        required_head_silence_samples: 0,
+        content_started_sample: attemptStart,
+        end_sample: finalSamples,
+        forced_without_tail_silence: false,
+        tail_silence_samples: 1,
+        required_tail_silence_samples: 1,
+        status: 'accepted',
+      }],
+    }],
+  };
+}
+
+function fixtureNoiseCheck() {
+  return {
+    passed: true,
+    threshold_dbfs: -40,
+    average_dbfs: -70,
+    maximum_dbfs: -65,
+    failing_windows: 0,
+  };
+}
+
+function fixtureAttemptLifecycle(snapshot) {
+  const item = snapshot.items[0];
+  const accepted = item.attempts[0];
+  return {
+    item_id: item.id,
+    start: { attempt_id: accepted.attempt_id, start_sample: accepted.start_sample },
+    stop: {
+      item_id: item.id,
+      attempt: { ...accepted, status: 'recorded' },
+      observed_discontinuity: false,
+    },
+    accept: { item_id: item.id, attempt_id: accepted.attempt_id },
+  };
+}
+
+function fixtureFaultSnapshot(requirement, sessionId, committedSamples = null) {
+  const snapshot = makeSnapshot(requirement, sessionId, committedSamples);
+  snapshot.status = 'faulted';
+  const item = snapshot.items[0];
+  item.status = 'review';
+  item.selected_attempt_id = null;
+  item.attempts[0].status = 'interrupted';
+  item.attempts[0].quality_issues = [{ code: 'capture_fault' }];
+  return snapshot;
+}
+
+function fixtureFaultAttemptLifecycle(snapshot) {
+  const item = snapshot.items[0];
+  const interrupted = item.attempts[0];
+  return {
+    item_id: item.id,
+    start: { attempt_id: interrupted.attempt_id, start_sample: interrupted.start_sample },
+    stop: {
+      item_id: item.id,
+      attempt: { ...interrupted },
+      observed_discontinuity: false,
+    },
+    accept_error: 'faulted attempt is not delivery safe',
+  };
+}
+
+function fixtureStartSnapshot(finalSnapshot) {
+  return {
+    ...structuredClone(finalSnapshot),
+    journal_seq: 1,
+    status: 'recording',
+    captured_samples: 0,
+    committed_samples: 0,
+    noise_check: null,
+    input_audition: null,
+    items: finalSnapshot.items.map((item) => ({
+      id: item.id,
+      text: item.text,
+      label: item.label,
+      status: 'pending',
+      selected_attempt_id: null,
+      attempts: [],
+    })),
+  };
+}
+
+function fixtureInputAudition(sampleRate = 48_000, startSample = 0) {
+  const requiredSamples = sampleRate * 10;
+  const checkId = 'fixture-audition';
+  const metrics = {
+    duration_samples: requiredSamples,
+    duration_seconds: 10,
+    input_discontinuity_count: 0,
+    input_discontinuity_silence_samples: 0,
+    overflow_samples: 0,
+    warning_codes: [],
+  };
+  const ready = {
+    status: 'ready',
+    check_id: checkId,
+    start_sample: startSample,
+    required_samples: requiredSamples,
+    captured_samples: requiredSamples,
+    end_sample: startSample + requiredSamples,
+    warning_codes: [],
+    metrics,
+  };
+  return {
+    begin: {
+      check_id: checkId,
+      required_samples: requiredSamples,
+      input_audition: {
+        status: 'recording',
+        check_id: checkId,
+        start_sample: startSample,
+        required_samples: requiredSamples,
+        captured_samples: 0,
+        warning_codes: [],
+      },
+    },
+    finish: { input_audition: ready },
+    confirm: { input_audition: { ...ready, status: 'confirmed' } },
   };
 }
 
@@ -181,6 +479,8 @@ function configureReplugFixture(report, requirement, runDirectory, afterDirector
   const device = {
     id: DEVICE_ID,
     name: 'Fixture USB Interface',
+    backend: 'asio',
+    recommended_buffer_frames: 512,
     configurations: [{
       min_sample_rate: requirement.sample_rate,
       max_sample_rate: requirement.sample_rate,
@@ -190,32 +490,20 @@ function configureReplugFixture(report, requirement, runDirectory, afterDirector
   };
   const beforeSessionId = 'session-replug-before-fixture';
   const afterSessionId = 'session-replug-after-fixture';
-  const beforeStart = {
-    ...makeSnapshot(requirement, beforeSessionId),
-    status: 'recording',
-    captured_samples: 0,
-    committed_samples: 0,
-  };
-  const beforeFinal = {
-    ...beforeStart,
-    status: 'faulted',
-    journal_seq: 8,
-    captured_samples: 144_000,
-    committed_samples: 144_000,
-  };
-  const afterStart = {
-    ...makeSnapshot(requirement, afterSessionId),
-    status: 'recording',
-    captured_samples: 0,
-    committed_samples: 0,
-  };
-  const afterFinal = {
-    ...afterStart,
-    status: 'stopped',
-    journal_seq: 7,
-    captured_samples: 240_000,
-    committed_samples: 240_000,
-  };
+  const beforeFinal = fixtureFaultSnapshot(
+    requirement,
+    beforeSessionId,
+    requirement.sample_rate * 13,
+  );
+  beforeFinal.journal_seq = 8;
+  const beforeStart = fixtureStartSnapshot(beforeFinal);
+  const afterFinal = makeSnapshot(
+    requirement,
+    afterSessionId,
+    requirement.sample_rate * 15,
+  );
+  afterFinal.journal_seq = 7;
+  const afterStart = fixtureStartSnapshot(afterFinal);
   const segment = (frames) => ({
     file_name: 'master-000001.wav',
     sample_rate: requirement.sample_rate,
@@ -250,22 +538,8 @@ function configureReplugFixture(report, requirement, runDirectory, afterDirector
     target_device: present ? device : null,
     consecutive_matches: consecutiveMatches,
   });
-  const beforeInspection = {
-    session_dir: beforeDirectory,
-    snapshot: beforeFinal,
-    fault_marker_exists: true,
-    fault_marker_parse_error: false,
-    total_physical_frames: 144_000,
-    segments: [segment(144_000)],
-  };
-  const afterInspection = {
-    session_dir: afterDirectory,
-    snapshot: afterFinal,
-    fault_marker_exists: false,
-    fault_marker_parse_error: false,
-    total_physical_frames: 240_000,
-    segments: [segment(240_000)],
-  };
+  const beforeInspection = writeSessionFixture(beforeDirectory, beforeFinal, { faulted: true });
+  const afterInspection = writeSessionFixture(afterDirectory, afterFinal);
   report.options.seconds = 5;
   report.start = { snapshot: afterStart };
   report.stop = { result: { snapshot: afterFinal }, error: null };
@@ -290,6 +564,9 @@ function configureReplugFixture(report, requirement, runDirectory, afterDirector
       export: { expected_rejection: true, error: 'faulted session cannot be exported' },
       resume: { expected_rejection: true, error: 'faulted session cannot be resumed' },
       inspection: beforeInspection,
+      noise_check: fixtureNoiseCheck(),
+      input_audition: fixtureInputAudition(requirement.sample_rate),
+      attempt: fixtureFaultAttemptLifecycle(beforeFinal),
     },
     transition: {
       target_id: DEVICE_ID,
@@ -314,11 +591,11 @@ function configureReplugFixture(report, requirement, runDirectory, afterDirector
       progress_summary: afterProgress,
       stop: { result: { snapshot: afterFinal }, error: null },
       inspection: afterInspection,
+      noise_check: fixtureNoiseCheck(),
+      input_audition: fixtureInputAudition(requirement.sample_rate),
+      attempt: fixtureAttemptLifecycle(afterFinal),
     },
   };
-
-  writeReplugSessionFixture(beforeDirectory, beforeFinal, true);
-  writeReplugSessionFixture(afterDirectory, afterFinal, false);
 
   const telemetryRows = [
     { at: '2026-08-11T00:00:00.100Z', phase: 'replug-inventory', state: 'present-before-unplug', ...inventoryEvidence(true, 0) },
@@ -413,6 +690,9 @@ function createFixture() {
       windows_release: WINDOWS_RELEASE,
       device_id: DEVICE_ID,
       device_name: 'Fixture USB Interface',
+      capture_backend: 'asio',
+      capture_buffer_frames: 512,
+      noise_threshold_dbfs: -40,
       driver_version: '1.2.3-fixture',
       usb_port: 'USB-ROOT-1/PORT-2',
       serial: 'FIXTURE-001',
@@ -456,6 +736,14 @@ function createFixture() {
     device_id: DEVICE_ID,
     device_name: 'Fixture USB Interface',
     input_sample_format: 'f32',
+    capture_share_mode: 'exclusive',
+    capture_backend: 'asio',
+    requested_capture_buffer_frames: 512,
+    capture_buffer_frames: 512,
+    overflow_samples: 0,
+    input_discontinuity_count: 0,
+    input_discontinuity_silence_samples: 0,
+    noise_check: fixtureNoiseCheck(),
     audio_format: phase1Snapshot.audio_format,
     required_duration_seconds: 3_600,
     production_minimum_seconds: 3_600,
@@ -464,7 +752,7 @@ function createFixture() {
     armed_committed_samples: 172_800_000,
     max_tail_loss_samples: 720_000,
     segment_total_bytes: 518_400_044,
-    segment_count: 2,
+    segment_count: 1,
     tool_version: 1,
     protocol_version: 1,
     qualification: phase1Qualification,
@@ -493,11 +781,31 @@ function createFixture() {
     production_eligible: true,
     host: makeHost('fixture-phase1-boot', '2026-08-10T20:00:00.000Z'),
     qualification: phase1Qualification,
-    options: { sampleRate: 48_000, bitDepth: 24, channel: 1 },
+    options: {
+      sampleRate: 48_000,
+      bitDepth: 24,
+      channel: 1,
+      skipNoiseCheck: false,
+      noiseThresholdDbfs: -40,
+      expectedCaptureBackend: 'asio',
+      expectedCaptureBufferFrames: 512,
+    },
     engine: { binary_sha256: ENGINE_HASH, ready: engineReady },
-    selected_device: { id: DEVICE_ID, name: 'Fixture USB Interface' },
+    selected_device: {
+      id: DEVICE_ID,
+      name: 'Fixture USB Interface',
+      backend: 'asio',
+      recommended_buffer_frames: 512,
+    },
     start: { snapshot: phase1Snapshot },
-    requested: { sample_rate: 48_000, wav_bit_depth: 24, input_channel: 1 },
+    requested: {
+      sample_rate: 48_000,
+      wav_bit_depth: 24,
+      input_channel: 1,
+      capture_backend: 'asio',
+      capture_buffer_frames: 512,
+    },
+    noise_check: fixtureNoiseCheck(),
     session_dir: powerSession,
     power_cut: {
       phase: 'armed',
@@ -520,6 +828,9 @@ function createFixture() {
       phase: 'power-cut-armed',
       captured_samples: phase1Evidence.armed_captured_samples,
       committed_samples: phase1Evidence.armed_committed_samples,
+      overflow_samples: 0,
+      input_discontinuity_count: 0,
+      input_discontinuity_silence_samples: 0,
       segment_total_bytes: phase1Evidence.segment_total_bytes,
       segment_count: phase1Evidence.segment_count,
     })}\n`,
@@ -544,9 +855,12 @@ function createFixture() {
             session_dir: powerSession,
             session_id: phase1SessionId,
             device_id: DEVICE_ID,
+            device_name: 'Fixture USB Interface',
             sample_rate: 48_000,
             bit_depth: 24,
             input_channel: 1,
+            capture_share_mode: 'exclusive',
+            capture_buffer_frames: 512,
           },
         },
       },
@@ -565,20 +879,40 @@ function createFixture() {
   fs.writeFileSync(path.join(phase1RunDirectory, 'engine-stderr.log'), '');
   reportPaths.set(recoverRequirement.phase1_evidence_run_id, phase1ReportPath);
   recoverRequirement.phase1_report = path.relative(root, phase1ReportPath);
+  const recoveredSnapshot = makeSnapshot(
+    recoverRequirement,
+    phase1SessionId,
+    phase1Evidence.armed_committed_samples,
+  );
+  recoveredSnapshot.segment_frames = phase1Evidence.armed_committed_samples;
+  recoveredSnapshot.journal_seq = 3;
+  const recoveredInspection = writeSessionFixture(powerSession, recoveredSnapshot);
   for (const requirement of requiredRuns) {
     const runDirectory = path.join(root, 'runs', requirement.id);
     fs.mkdirSync(runDirectory, { recursive: true });
     const sessionId = requirement.mode === 'recover' || requirement.mode === 'inspect'
       ? 'power-cut-session-fixture'
       : `session-${requirement.id}`;
-    const snapshot = makeSnapshot(requirement, sessionId);
+    const faultMode = ['unplug', 'disk-full', 'abrupt-enospc'].includes(requirement.mode);
+    const snapshot = requirement.mode === 'recover' || requirement.mode === 'inspect'
+      ? structuredClone(recoveredSnapshot)
+      : faultMode
+        ? fixtureFaultSnapshot(requirement, sessionId)
+        : makeSnapshot(requirement, sessionId);
+    const startSnapshot = fixtureStartSnapshot(snapshot);
     const sessionDirectory = requirement.mode === 'recover' || requirement.mode === 'inspect'
       ? powerSession
       : path.join(runDirectory, 'recording');
-    if (!['inventory', 'recover', 'inspect'].includes(requirement.mode)) {
-      fs.mkdirSync(path.join(sessionDirectory, 'audio'), { recursive: true });
-      fs.writeFileSync(path.join(sessionDirectory, 'audio', 'master-fixture.wav'), 'fixture-audio\n');
-    }
+    const realInspection = requirement.mode === 'recover' || requirement.mode === 'inspect'
+      ? structuredClone(recoveredInspection)
+      : !['inventory', 'replug'].includes(requirement.mode)
+        ? writeSessionFixture(sessionDirectory, snapshot, {
+          faulted: faultMode,
+          exportContainer: requirement.export === true
+            ? requirement.expected_full_track_container ?? 'riff'
+            : null,
+          })
+        : null;
     const report = {
       schema_version: 1,
       tool_version: 1,
@@ -597,21 +931,36 @@ function createFixture() {
         sampleRate: requirement.sample_rate ?? 48_000,
         bitDepth: requirement.bit_depth ?? 24,
         channel: requirement.channel ?? 1,
+        shareMode: 'exclusive',
+        minimumInputFormatBits: requirement.bit_depth === 16 ? 16 : 24,
         seconds: requirement.min_seconds ?? 30,
         hours: requirement.min_hours ?? 2,
         export: requirement.export ?? false,
+        skipNoiseCheck: false,
+        noiseThresholdDbfs: -40,
+        expectedCaptureBackend: 'asio',
+        expectedCaptureBufferFrames: 512,
       },
       engine: {
         binary_sha256: ENGINE_HASH,
         ready: { engine_version: 'fixture', protocol_version: 1, platform: 'windows', arch: 'x86_64' },
         exit: { code: 0, signal: null },
       },
-      selected_device: { id: DEVICE_ID, name: 'Fixture USB Interface' },
-      start: { snapshot },
+      selected_device: {
+        id: DEVICE_ID,
+        name: 'Fixture USB Interface',
+        backend: 'asio',
+        recommended_buffer_frames: 512,
+      },
+      start: { snapshot: startSnapshot },
+      stop: { result: { snapshot }, error: null },
       requested: {
         sample_rate: requirement.sample_rate ?? 48_000,
         wav_bit_depth: requirement.bit_depth ?? 24,
         input_channel: requirement.channel ?? 1,
+        capture_share_mode: 'exclusive',
+        capture_backend: 'asio',
+        capture_buffer_frames: 512,
       },
       progress_summary: {
         first: { elapsed_seconds: 0 },
@@ -622,15 +971,26 @@ function createFixture() {
         },
       },
       session_dir: sessionDirectory,
-      inspection: {
-        session_dir: sessionDirectory,
-        snapshot,
-        full_track: requirement.expected_full_track_container
-          ? { container: requirement.expected_full_track_container, exact_header: true }
-          : null,
-      },
-      checks: [{ id: 'fixture-pass', status: 'PASS' }],
+      inspection: realInspection ?? { session_dir: sessionDirectory, snapshot },
+      noise_check: fixtureNoiseCheck(),
+      input_audition: fixtureInputAudition(requirement.sample_rate ?? 48_000),
+      attempt: faultMode
+        ? fixtureFaultAttemptLifecycle(snapshot)
+        : fixtureAttemptLifecycle(snapshot),
+      checks: [],
     };
+    if (faultMode) {
+      report.export = { expected_rejection: true, error: 'faulted session cannot be exported' };
+    } else if (requirement.export === true && realInspection) {
+      report.export = {
+        result: {
+          export_dir: path.join(sessionDirectory, 'export'),
+          master_file: path.join(sessionDirectory, 'export', 'full-track.wav'),
+          exported_count: 1,
+          skipped_count: 0,
+        },
+      };
+    }
     if (requirement.mode === 'inventory') {
       report.inventory = {
         devices: [{
@@ -654,12 +1014,29 @@ function createFixture() {
         evidence: phase1Evidence,
         session_evidence: phase1Evidence,
       };
-      report.recovery = { result: { snapshot } };
+      report.pre_recovery_inspection = {
+        session_dir: powerSession,
+        snapshot: {
+          ...structuredClone(snapshot),
+          status: 'recording',
+          captured_samples: phase1Evidence.armed_captured_samples,
+          committed_samples: phase1Evidence.armed_committed_samples,
+        },
+      };
+      report.recovery = {
+        result: {
+          snapshot,
+          durable_frames: recoveredInspection.total_physical_frames,
+          no_op: false,
+          session_dir: powerSession,
+        },
+      };
     }
     if (requirement.mode === 'abrupt-enospc') report.production_eligible = true;
     const replugEvidence = requirement.mode === 'replug'
       ? configureReplugFixture(report, requirement, runDirectory, sessionDirectory)
       : null;
+    report.checks = requiredAcceptanceCheckIds(requirement, plan).map((id) => ({ id, status: 'PASS' }));
     const companionNames = requirement.mode === 'inspect'
       ? []
       : requirement.mode === 'inventory' || requirement.mode === 'recover'
@@ -739,6 +1116,18 @@ async function testQualifiedWithFutureModesInjected() {
       }, null, 2),
     );
     assert(result.report.requirements.every((item) => item.status === 'PASS'));
+    assert.equal(
+      requirement(result, 'power-cut-recover-48000-24-ch1').checks.find(
+        (check) => check.id === 'capture-session-claims-unique',
+      )?.status,
+      'PASS',
+    );
+    assert.equal(
+      requirement(result, 'power-cut-inspect').checks.find(
+        (check) => check.id === 'capture-session-claims-unique',
+      )?.status,
+      'PASS',
+    );
     assert.equal(fs.existsSync(output), true);
     assert.equal(fs.existsSync(result.manifestPath), true);
     const manifest = fs.readFileSync(result.manifestPath, 'utf8');
@@ -920,6 +1309,51 @@ async function testPhase1ArchiveFailClosed() {
     fs.rmSync(badTelemetry.root, { recursive: true, force: true });
   }
 
+  const missingOverflowTelemetry = createFixture();
+  try {
+    const telemetryPath = path.join(missingOverflowTelemetry.phase1RunDirectory, 'telemetry.jsonl');
+    const row = JSON.parse(fs.readFileSync(telemetryPath, 'utf8').trim());
+    delete row.overflow_samples;
+    fs.writeFileSync(telemetryPath, `${JSON.stringify(row)}\n`);
+    const result = await runQualification({
+      plan: missingOverflowTelemetry.planPath,
+      reports: missingOverflowTelemetry.root,
+      output: path.join(missingOverflowTelemetry.root, 'missing-overflow-telemetry', 'qualification-report.json'),
+      implementedModes: new Set(KNOWN_ACCEPTANCE_MODES),
+    });
+    assert.equal(result.report.overall, 'NOT_QUALIFIED');
+    assert.equal(
+      requirement(result, 'power-cut-recover-48000-24-ch1').checks.find(
+        (check) => check.id === 'phase1-armed-telemetry-bound',
+      )?.status,
+      'FAIL',
+    );
+  } finally {
+    fs.rmSync(missingOverflowTelemetry.root, { recursive: true, force: true });
+  }
+
+  const recoveryOverflowMismatch = createFixture();
+  try {
+    mutateReport(recoveryOverflowMismatch, 'power-cut-recover-48000-24-ch1', (report) => {
+      report.pre_recovery_inspection.snapshot.overflow_samples = 1;
+    });
+    const result = await runQualification({
+      plan: recoveryOverflowMismatch.planPath,
+      reports: recoveryOverflowMismatch.root,
+      output: path.join(recoveryOverflowMismatch.root, 'recovery-overflow-mismatch', 'qualification-report.json'),
+      implementedModes: new Set(KNOWN_ACCEPTANCE_MODES),
+    });
+    assert.equal(result.report.overall, 'NOT_QUALIFIED');
+    assert.equal(
+      requirement(result, 'power-cut-recover-48000-24-ch1').checks.find(
+        (check) => check.id === 'phase1-recovery-input-health-binding',
+      )?.status,
+      'FAIL',
+    );
+  } finally {
+    fs.rmSync(recoveryOverflowMismatch.root, { recursive: true, force: true });
+  }
+
   const badProtocol = createFixture();
   try {
     fs.writeFileSync(path.join(badProtocol.phase1RunDirectory, 'protocol.jsonl'), '{}\n');
@@ -994,6 +1428,31 @@ async function testPhase1ArchiveFailClosed() {
       name: 'format',
       checkId: 'phase1-device-format-identity',
       mutate: (report) => { report.requested.sample_rate = 44_100; },
+    },
+    {
+      name: 'noise',
+      checkId: 'phase1-production-noise-check',
+      mutate: (report) => { report.noise_check.passed = false; },
+    },
+    {
+      name: 'backend',
+      checkId: 'phase1-capture-backend-evidence',
+      mutate: (report) => { delete report.start.snapshot.capture_backend; },
+    },
+    {
+      name: 'buffer',
+      checkId: 'phase1-asio-buffer-evidence',
+      mutate: (report) => { delete report.start.snapshot.capture_buffer_frames; },
+    },
+    {
+      name: 'discontinuity',
+      checkId: 'phase1-no-input-discontinuity-at-arm',
+      mutate: (report) => { report.power_cut.evidence.input_discontinuity_count = 1; },
+    },
+    {
+      name: 'overflow',
+      checkId: 'phase1-no-input-discontinuity-at-arm',
+      mutate: (report) => { delete report.power_cut.evidence.overflow_samples; },
     },
   ];
   for (const testCase of identityCases) {
@@ -1111,6 +1570,123 @@ async function testCurrentModesFailClosed() {
     assert.equal(IMPLEMENTED_ACCEPTANCE_MODES.has('abrupt-enospc'), false);
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+}
+
+async function testCaptureSessionClaimsFailClosed() {
+  const reusedDirectory = createFixture();
+  try {
+    const sourceId = 'short-44100-16-ch1';
+    const targetId = 'short-48000-24-ch1';
+    const source = JSON.parse(fs.readFileSync(reusedDirectory.reportPaths.get(sourceId), 'utf8'));
+    mutateReport(reusedDirectory, targetId, (report) => {
+      report.session_dir = source.session_dir;
+      report.inspection.session_dir = source.session_dir;
+    });
+    const result = await runQualification({
+      plan: reusedDirectory.planPath,
+      reports: reusedDirectory.root,
+      output: path.join(reusedDirectory.root, 'reused-capture-directory', 'qualification-report.json'),
+      implementedModes: new Set(KNOWN_ACCEPTANCE_MODES),
+    });
+    assert.equal(result.report.overall, 'NOT_QUALIFIED');
+    assert.equal(
+      requirement(result, targetId).checks.find((check) => check.id === 'capture-session-claims-bound')?.status,
+      'FAIL',
+    );
+    assert.equal(
+      requirement(result, sourceId).checks.find((check) => check.id === 'capture-session-claims-unique')?.status,
+      'FAIL',
+    );
+  } finally {
+    fs.rmSync(reusedDirectory.root, { recursive: true, force: true });
+  }
+
+  const reusedSessionId = createFixture();
+  try {
+    const sourceId = 'short-44100-16-ch1';
+    const targetId = 'short-48000-24-ch1';
+    const source = JSON.parse(fs.readFileSync(reusedSessionId.reportPaths.get(sourceId), 'utf8'));
+    const duplicatedId = source.inspection.snapshot.session_id;
+    mutateReport(reusedSessionId, targetId, (report) => {
+      report.start.snapshot.session_id = duplicatedId;
+      report.stop.result.snapshot.session_id = duplicatedId;
+      report.inspection.snapshot.session_id = duplicatedId;
+      const snapshotPath = path.join(report.session_dir, 'metadata', 'items.snapshot.json');
+      const diskSnapshot = JSON.parse(fs.readFileSync(snapshotPath, 'utf8'));
+      diskSnapshot.session_id = duplicatedId;
+      writeJson(snapshotPath, diskSnapshot);
+      const summaryPath = path.join(report.session_dir, 'session.json');
+      const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'));
+      summary.session_id = duplicatedId;
+      writeJson(summaryPath, summary);
+    });
+    const result = await runQualification({
+      plan: reusedSessionId.planPath,
+      reports: reusedSessionId.root,
+      output: path.join(reusedSessionId.root, 'reused-capture-session-id', 'qualification-report.json'),
+      implementedModes: new Set(KNOWN_ACCEPTANCE_MODES),
+    });
+    assert.equal(result.report.overall, 'NOT_QUALIFIED');
+    assert.equal(
+      requirement(result, targetId).checks.find((check) => check.id === 'capture-session-claims-bound')?.status,
+      'PASS',
+    );
+    assert.equal(
+      requirement(result, targetId).checks.find((check) => check.id === 'capture-session-claims-unique')?.status,
+      'FAIL',
+    );
+  } finally {
+    fs.rmSync(reusedSessionId.root, { recursive: true, force: true });
+  }
+
+  const captureReusesRecovery = createFixture();
+  try {
+    const soakId = 'soak-primary-48000-24-ch1-8h';
+    const recoverId = 'power-cut-recover-48000-24-ch1';
+    const recover = JSON.parse(fs.readFileSync(captureReusesRecovery.reportPaths.get(recoverId), 'utf8'));
+    mutateReport(captureReusesRecovery, soakId, (report) => {
+      report.session_dir = recover.session_dir;
+      report.inspection.session_dir = recover.session_dir;
+    });
+    const result = await runQualification({
+      plan: captureReusesRecovery.planPath,
+      reports: captureReusesRecovery.root,
+      output: path.join(captureReusesRecovery.root, 'capture-reuses-recovery', 'qualification-report.json'),
+      implementedModes: new Set(KNOWN_ACCEPTANCE_MODES),
+    });
+    assert.equal(result.report.overall, 'NOT_QUALIFIED');
+    assert.equal(
+      requirement(result, soakId).checks.find((check) => check.id === 'capture-session-claims-unique')?.status,
+      'FAIL',
+    );
+    assert.equal(
+      requirement(result, recoverId).checks.find((check) => check.id === 'capture-session-claims-unique')?.status,
+      'FAIL',
+    );
+  } finally {
+    fs.rmSync(captureReusesRecovery.root, { recursive: true, force: true });
+  }
+
+  const wrongReplugPhase = createFixture();
+  try {
+    const runId = 'replug-48000-24-ch1';
+    mutateReport(wrongReplugPhase, runId, (report) => {
+      report.replug.before.session_dir = report.replug.after.session_dir;
+    });
+    const result = await runQualification({
+      plan: wrongReplugPhase.planPath,
+      reports: wrongReplugPhase.root,
+      output: path.join(wrongReplugPhase.root, 'wrong-replug-phase', 'qualification-report.json'),
+      implementedModes: new Set(KNOWN_ACCEPTANCE_MODES),
+    });
+    assert.equal(result.report.overall, 'NOT_QUALIFIED');
+    assert.equal(
+      requirement(result, runId).checks.find((check) => check.id === 'capture-session-claims-bound')?.status,
+      'FAIL',
+    );
+  } finally {
+    fs.rmSync(wrongReplugPhase.root, { recursive: true, force: true });
   }
 }
 
@@ -1294,6 +1870,116 @@ async function testIdentityAndEvidenceFailures() {
       mutate: (report) => { report.checks.push({ id: 'clipping', status: 'WARN' }); },
       checkId: 'all-acceptance-checks-pass',
     },
+    {
+      name: 'required acceptance check omitted',
+      runId: 'short-48000-24-ch1',
+      mutate: (report) => {
+        report.checks = report.checks.filter((check) => check.id !== 'accepted-attempt-lifecycle');
+      },
+      checkId: 'required-acceptance-check-ids',
+    },
+    {
+      name: 'noise check skipped and absent',
+      runId: 'short-48000-24-ch1',
+      mutate: (report) => {
+        report.options.skipNoiseCheck = true;
+        delete report.noise_check;
+      },
+      checkId: 'production-noise-check',
+    },
+    {
+      name: 'noise check explicitly failed',
+      runId: 'short-48000-24-ch1',
+      mutate: (report) => { report.noise_check.passed = false; },
+      checkId: 'production-noise-check',
+    },
+    {
+      name: 'noise threshold self-consistently weakened',
+      runId: 'short-48000-24-ch1',
+      mutate: (report) => {
+        report.options.noiseThresholdDbfs = -6;
+        report.noise_check.threshold_dbfs = -6;
+      },
+      checkId: 'production-noise-check',
+    },
+    {
+      name: 'audition self-reports only one sample',
+      runId: 'short-48000-24-ch1',
+      mutate: (report) => {
+        report.input_audition.begin.required_samples = 1;
+        report.input_audition.begin.input_audition.required_samples = 1;
+        report.input_audition.finish.input_audition.required_samples = 1;
+        report.input_audition.finish.input_audition.captured_samples = 1;
+        report.input_audition.finish.input_audition.end_sample = 1;
+        report.input_audition.finish.input_audition.metrics.duration_samples = 1;
+        report.input_audition.confirm.input_audition = {
+          ...structuredClone(report.input_audition.finish.input_audition),
+          status: 'confirmed',
+        };
+      },
+      checkId: 'input-audition-confirmed',
+    },
+    {
+      name: 'fault attempt accept rejection omitted',
+      runId: 'unplug-48000-24-ch1',
+      mutate: (report) => { delete report.attempt.accept_error; },
+      checkId: 'fault-attempt-not-deliverable',
+    },
+    {
+      name: 'capture backend missing',
+      runId: 'short-48000-24-ch1',
+      mutate: (report) => {
+        delete report.selected_device.backend;
+        delete report.requested.capture_backend;
+        delete report.start.snapshot.capture_backend;
+        delete report.inspection.snapshot.capture_backend;
+      },
+      checkId: 'capture-backend-evidence',
+    },
+    {
+      name: 'ASIO requested buffer missing',
+      runId: 'short-48000-24-ch1',
+      mutate: (report) => {
+        delete report.requested.capture_buffer_frames;
+        delete report.start.snapshot.requested_capture_buffer_frames;
+        delete report.inspection.snapshot.requested_capture_buffer_frames;
+      },
+      checkId: 'asio-buffer-evidence',
+    },
+    {
+      name: 'ASIO actual buffer missing',
+      runId: 'short-48000-24-ch1',
+      mutate: (report) => {
+        delete report.start.snapshot.capture_buffer_frames;
+        delete report.inspection.snapshot.capture_buffer_frames;
+      },
+      checkId: 'asio-buffer-evidence',
+    },
+    {
+      name: 'ASIO self-consistent buffer differs from independent plan',
+      runId: 'short-48000-24-ch1',
+      mutate: (report) => {
+        report.options.expectedCaptureBufferFrames = 1024;
+        report.selected_device.recommended_buffer_frames = 1024;
+        report.requested.capture_buffer_frames = 1024;
+        report.start.snapshot.requested_capture_buffer_frames = 1024;
+        report.start.snapshot.capture_buffer_frames = 1024;
+        report.inspection.snapshot.requested_capture_buffer_frames = 1024;
+        report.inspection.snapshot.capture_buffer_frames = 1024;
+      },
+      checkId: 'asio-buffer-evidence',
+    },
+    {
+      name: 'input discontinuity observed',
+      runId: 'short-48000-24-ch1',
+      mutate: (report) => {
+        report.stop.result.snapshot.input_discontinuity_count = 1;
+        report.stop.result.snapshot.input_discontinuity_silence_samples = 128;
+        report.inspection.snapshot.input_discontinuity_count = 1;
+        report.inspection.snapshot.input_discontinuity_silence_samples = 128;
+      },
+      checkId: 'no-input-discontinuity',
+    },
   ];
   for (const testCase of cases) {
     const fixture = createFixture();
@@ -1352,6 +2038,168 @@ async function testIdentityAndEvidenceFailures() {
     );
   } finally {
     fs.rmSync(unboundPowerCut.root, { recursive: true, force: true });
+  }
+}
+
+async function testIndependentCaptureArchiveFailClosed() {
+  const changedDiskItems = createFixture();
+  try {
+    const runId = 'short-48000-24-ch1';
+    const report = JSON.parse(fs.readFileSync(changedDiskItems.reportPaths.get(runId), 'utf8'));
+    const snapshotPath = path.join(report.session_dir, 'metadata', 'items.snapshot.json');
+    const snapshot = JSON.parse(fs.readFileSync(snapshotPath, 'utf8'));
+    snapshot.items[0].status = 'review';
+    snapshot.items[0].selected_attempt_id = null;
+    snapshot.items[0].attempts[0].status = 'recorded';
+    writeJson(snapshotPath, snapshot);
+    const result = await runQualification({
+      plan: changedDiskItems.planPath,
+      reports: changedDiskItems.root,
+      output: path.join(changedDiskItems.root, 'disk-items-tampered', 'qualification-report.json'),
+      implementedModes: new Set(KNOWN_ACCEPTANCE_MODES),
+    });
+    const failed = requirement(result, runId);
+    assert.equal(result.report.overall, 'NOT_QUALIFIED');
+    assert.equal(
+      failed.checks.find((check) => check.id === 'independent-report-disk-binding')?.status,
+      'FAIL',
+    );
+    assert.equal(
+      failed.checks.find((check) => check.id === 'independent-normal-session')?.status,
+      'FAIL',
+    );
+  } finally {
+    fs.rmSync(changedDiskItems.root, { recursive: true, force: true });
+  }
+
+  const changedExport = createFixture();
+  try {
+    const runId = 'short-48000-24-ch1';
+    const report = JSON.parse(fs.readFileSync(changedExport.reportPaths.get(runId), 'utf8'));
+    const metadataPath = path.join(report.session_dir, 'export', 'metadata.json');
+    const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+    metadata.exported[0].attempt_id = 'forged-attempt';
+    writeJson(metadataPath, metadata);
+    const result = await runQualification({
+      plan: changedExport.planPath,
+      reports: changedExport.root,
+      output: path.join(changedExport.root, 'export-tampered', 'qualification-report.json'),
+      implementedModes: new Set(KNOWN_ACCEPTANCE_MODES),
+    });
+    const failed = requirement(result, runId);
+    assert.equal(result.report.overall, 'NOT_QUALIFIED');
+    assert.equal(
+      failed.checks.find((check) => check.id === 'independent-export-bundle')?.status,
+      'FAIL',
+    );
+  } finally {
+    fs.rmSync(changedExport.root, { recursive: true, force: true });
+  }
+
+  const forgedAudition = createFixture();
+  try {
+    const runId = 'short-48000-24-ch1';
+    const reportPath = forgedAudition.reportPaths.get(runId);
+    const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+    const snapshotPath = path.join(report.session_dir, 'metadata', 'items.snapshot.json');
+    const diskSnapshot = JSON.parse(fs.readFileSync(snapshotPath, 'utf8'));
+    diskSnapshot.input_audition = {
+      ...diskSnapshot.input_audition,
+      status: 'skipped',
+    };
+    writeJson(snapshotPath, diskSnapshot);
+    report.stop.result.snapshot.input_audition = structuredClone(diskSnapshot.input_audition);
+    report.inspection.snapshot.input_audition = structuredClone(diskSnapshot.input_audition);
+    writeJson(reportPath, report);
+    const result = await runQualification({
+      plan: forgedAudition.planPath,
+      reports: forgedAudition.root,
+      output: path.join(forgedAudition.root, 'forged-audition', 'qualification-report.json'),
+      implementedModes: new Set(KNOWN_ACCEPTANCE_MODES),
+    });
+    const failed = requirement(result, runId);
+    assert.equal(result.report.overall, 'NOT_QUALIFIED');
+    assert.equal(
+      failed.checks.find((check) => check.id === 'independent-report-disk-binding')?.status,
+      'PASS',
+    );
+    assert.equal(
+      failed.checks.find((check) => check.id === 'input-audition-confirmed')?.status,
+      'FAIL',
+    );
+    assert.equal(
+      failed.checks.find((check) => check.id === 'independent-input-audition')?.status,
+      'FAIL',
+    );
+  } finally {
+    fs.rmSync(forgedAudition.root, { recursive: true, force: true });
+  }
+}
+
+async function testIndependentSealedArchiveFailClosed() {
+  const corruptedRecoveryWav = createFixture();
+  try {
+    const recovery = JSON.parse(fs.readFileSync(
+      corruptedRecoveryWav.reportPaths.get('power-cut-recover-48000-24-ch1'),
+      'utf8',
+    ));
+    const segmentPath = path.join(
+      recovery.session_dir,
+      'audio',
+      'segments',
+      'master-000001.wav',
+    );
+    const descriptor = fs.openSync(segmentPath, 'r+');
+    try {
+      fs.writeSync(descriptor, Buffer.from('NOPE'), 0, 4, 0);
+    } finally {
+      fs.closeSync(descriptor);
+    }
+    const result = await runQualification({
+      plan: corruptedRecoveryWav.planPath,
+      reports: corruptedRecoveryWav.root,
+      output: path.join(corruptedRecoveryWav.root, 'corrupt-recovery-wav', 'qualification-report.json'),
+      implementedModes: new Set(KNOWN_ACCEPTANCE_MODES),
+    });
+    const recover = requirement(result, 'power-cut-recover-48000-24-ch1');
+    const inspect = requirement(result, 'power-cut-inspect');
+    assert.equal(result.report.overall, 'NOT_QUALIFIED');
+    assert.equal(
+      recover.checks.find((check) => check.id === 'independent-sealed-recording-tree')?.status,
+      'FAIL',
+    );
+    assert.equal(
+      inspect.checks.find((check) => check.id === 'independent-sealed-recording-tree')?.status,
+      'FAIL',
+    );
+  } finally {
+    fs.rmSync(corruptedRecoveryWav.root, { recursive: true, force: true });
+  }
+
+  const forgedRecoveryWatermark = createFixture();
+  try {
+    mutateReport(forgedRecoveryWatermark, 'power-cut-recover-48000-24-ch1', (report) => {
+      report.phase1.evidence.armed_committed_samples = report.inspection.total_physical_frames + 1;
+      report.phase1.report.power_cut.evidence.armed_committed_samples =
+        report.phase1.evidence.armed_committed_samples;
+      report.phase1.session_evidence.armed_committed_samples =
+        report.phase1.evidence.armed_committed_samples;
+    });
+    const result = await runQualification({
+      plan: forgedRecoveryWatermark.planPath,
+      reports: forgedRecoveryWatermark.root,
+      output: path.join(forgedRecoveryWatermark.root, 'forged-recovery-watermark', 'qualification-report.json'),
+      implementedModes: new Set(KNOWN_ACCEPTANCE_MODES),
+    });
+    assert.equal(result.report.overall, 'NOT_QUALIFIED');
+    assert.equal(
+      requirement(result, 'power-cut-recover-48000-24-ch1').checks.find(
+        (check) => check.id === 'independent-recovery-phase1-binding',
+      )?.status,
+      'FAIL',
+    );
+  } finally {
+    fs.rmSync(forgedRecoveryWatermark.root, { recursive: true, force: true });
   }
 }
 
@@ -1493,6 +2341,20 @@ function testPlanAndArgs() {
   assert.equal(path.isAbsolute(parsed.plan), true);
   assert.equal(path.isAbsolute(parsed.reports), true);
   assert.throws(() => parseArgs(['--plan', 'plan.json']), /--reports/);
+  assert.equal(
+    requiredAcceptanceCheckIds(
+      { mode: 'short', export: false },
+      { target: { capture_backend: 'asio' } },
+    ).includes('capture-buffer-match'),
+    true,
+  );
+  assert.equal(
+    requiredAcceptanceCheckIds(
+      { mode: 'short', export: false },
+      { target: { capture_backend: 'wasapi' } },
+    ).includes('capture-buffer-match'),
+    false,
+  );
 
   const example = JSON.parse(fs.readFileSync(
     path.join(__dirname, '..', 'doc', 'Windows外置声卡资格计划.example.json'),
@@ -1514,6 +2376,13 @@ function testPlanAndArgs() {
   const invalidRecover = structuredClone(example);
   delete invalidRecover.required_runs.find((run) => run.mode === 'recover').phase1_evidence_run_id;
   assert.equal(validateSchema(invalidRecover), false);
+  const weakNoiseGate = structuredClone(example);
+  weakNoiseGate.target.noise_threshold_dbfs = -6;
+  assert.equal(validateSchema(weakNoiseGate), false);
+  assert.equal(
+    validatePlan(weakNoiseGate).find((check) => check.id === 'target-noise-threshold-dbfs')?.status,
+    'FAIL',
+  );
 }
 
 async function main() {
@@ -1521,8 +2390,11 @@ async function main() {
   await testRuntimeSchemaValidation();
   await testQualifiedWithFutureModesInjected();
   await testCurrentModesFailClosed();
+  await testCaptureSessionClaimsFailClosed();
   await testReplugArchiveFailClosed();
   await testIdentityAndEvidenceFailures();
+  await testIndependentCaptureArchiveFailClosed();
+  await testIndependentSealedArchiveFailClosed();
   await testDuplicateBindingFailsEvenWithExplicitReport();
   await testAggregateOutputDoesNotHashItself();
   await testCanonicalContainmentRejectsSymlinkAncestor();

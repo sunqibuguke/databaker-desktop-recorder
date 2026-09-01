@@ -87,7 +87,8 @@ export function isLicenseCheckDisabled(env: NodeJS.ProcessEnv = process.env): bo
 export function isLicenseExemptEngineCommand(command: string): boolean {
   return command === 'seal_interrupted_session'
     || command === 'stop_session'
-    || command === 'stop_attempt';
+    || command === 'stop_attempt'
+    || command === 'cancel_input_audition';
 }
 
 export function licenseRequiredMessage(reason: LicenseReason): string {

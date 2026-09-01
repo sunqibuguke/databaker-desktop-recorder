@@ -131,6 +131,11 @@ static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 struct CaptureRecoveryTelemetry {
     discontinuities: Arc<AtomicU64>,
     inserted_silence_frames: Arc<AtomicU64>,
+    /// Immutable counter values from the moment this capture runtime was
+    /// activated. Launch-scoped audition cache adoption must not establish a
+    /// new baseline after this point, otherwise an early driver gap could be
+    /// silently absorbed before the renderer asks to adopt the cached check.
+    activation_discontinuities: u64,
 }
 
 #[derive(Debug)]
@@ -217,8 +222,21 @@ pub struct Attempt {
     pub required_tail_silence_samples: u64,
     pub status: String,
     pub created_at: String,
+    /// Absolute driver-continuity counters bracketing this take. Older
+    /// projections omit the field; once a task has any global discontinuity
+    /// evidence, that absence cannot prove an accepted take was unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_continuity: Option<AttemptInputContinuityEvidence>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub quality_issues: Vec<AttemptQualityIssue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttemptInputContinuityEvidence {
+    pub input_discontinuity_count_at_start: u64,
+    pub input_discontinuity_count_at_end: u64,
+    pub input_discontinuity_silence_samples_at_start: u64,
+    pub input_discontinuity_silence_samples_at_end: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -286,6 +304,22 @@ pub struct CaptureProvenanceSpan {
     pub capture_buffer_frames: Option<u32>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InputSampleFormatRecoveryAudit {
+    pub at: String,
+    pub reason_code: String,
+    pub device_name: String,
+    pub device_id: String,
+    pub capture_backend: String,
+    pub from_sample_format: String,
+    pub to_sample_format: String,
+    pub sample_rate: u32,
+    pub input_channels: u16,
+    pub input_channel: u16,
+    pub boundary_sample: u64,
+    pub original_selection_error: String,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InputAuditionStatus {
@@ -305,10 +339,13 @@ pub enum InputAuditionDecisionSource {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InputAuditionConfiguration {
-    /// Logical capture identity only. Raw endpoint IDs and USB topology are
-    /// intentionally excluded so moving the same interface to another port
-    /// does not invalidate an otherwise identical launch-scoped check.
+    /// Human-readable driver/device label.
     pub device_name: String,
+    /// Stable backend endpoint identity. Older audition records omit this
+    /// field and deserialize as empty; they therefore remain readable but
+    /// cannot authorize a different current endpoint without a fresh check.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub device_id: String,
     pub capture_backend: String,
     pub sample_rate: u32,
     pub bit_depth: u16,
@@ -369,6 +406,16 @@ pub struct InputAudition {
     pub input_discontinuity_silence_samples_at_start: u64,
     #[serde(default)]
     pub overflow_samples_at_start: u64,
+    /// Absolute input-health generation captured when the audition finished
+    /// (or when an explicit skip/cache adoption made its decision). These are
+    /// deliberately absolute rather than deltas: confirmation and sentence
+    /// arming must prove that no callback gap appeared after that boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_discontinuity_count_at_completion: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_discontinuity_silence_samples_at_completion: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overflow_samples_at_completion: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<InputAuditionMetrics>,
     #[serde(default)]
@@ -416,6 +463,11 @@ pub struct SessionSnapshot {
     /// fields; the first resume upgrades them without inventing sample data.
     #[serde(default)]
     pub capture_provenance: Vec<CaptureProvenanceSpan>,
+    /// Explicit, persistent record of a constrained recovery-only capture
+    /// representation migration. Unlike an individual journal event this
+    /// survives normal full-projection compaction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_sample_format_recovery_audits: Vec<InputSampleFormatRecoveryAudit>,
     pub audio_format: AudioFormat,
     pub master_audio: String,
     /// Version of the on-disk master-audio layout. Version 1 is the numbered
@@ -648,6 +700,32 @@ fn capture_backend_from_device_id(device_id: &str) -> String {
 
 fn is_asio_device_id(device_id: &str) -> bool {
     capture_backend_from_device_id(device_id) == "asio"
+}
+
+fn is_production_recommended_asio(device_name: &str, device_id: &str) -> bool {
+    if !is_asio_device_id(device_id) {
+        return false;
+    }
+    // These endpoints are compatibility shims, consumer-codec adapters, or
+    // virtual routing layers rather than the hardware vendor's native ASIO
+    // driver. Keep them selectable for diagnostics, but never present them as
+    // production-qualified merely because their host API is ASIO.
+    const WRAPPER_MARKERS: &[&str] = &[
+        "asio4all",
+        "generic low latency",
+        "low latency asio",
+        "realtek asio",
+        "fl studio asio",
+        "flexasio",
+        "voicemeeter",
+        "vb-audio",
+        "virtual audio cable",
+        "virtual asio",
+    ];
+    let identity = format!("{} {}", device_name, device_id).to_ascii_lowercase();
+    !WRAPPER_MARKERS
+        .iter()
+        .any(|marker| identity.contains(marker))
 }
 
 fn production_backend_block_reason(device_name: &str, device_id: &str) -> Option<String> {
@@ -888,8 +966,50 @@ struct InputAuditionRuntimeDecision {
     check_id: String,
     status: InputAuditionStatus,
     capture_fingerprint: String,
+    completion_epoch: InputContinuityEpoch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InputContinuityEpoch {
     input_discontinuity_count: u64,
     overflow_samples: u64,
+}
+
+impl ActiveAttempt {
+    fn from_input_continuity_epoch(
+        item_id: String,
+        attempt_id: String,
+        start_sample: u64,
+        recording_started_sample: u64,
+        epoch: InputContinuityEpoch,
+        input_discontinuity_silence_samples_at_start: u64,
+    ) -> Self {
+        Self {
+            item_id,
+            attempt_id,
+            start_sample,
+            recording_started_sample,
+            input_discontinuity_count_at_start: epoch.input_discontinuity_count,
+            input_discontinuity_silence_samples_at_start,
+        }
+    }
+}
+
+fn attempt_input_discontinuity_state(
+    active: &ActiveAttempt,
+    current_discontinuities: u64,
+    current_inserted_silence_samples: u64,
+) -> (bool, bool) {
+    let recovered_discontinuity =
+        current_inserted_silence_samples > active.input_discontinuity_silence_samples_at_start;
+    // The driver discontinuity counter is the authorization epoch and is
+    // published before optional recovered-silence telemetry. Treat the latter
+    // as independently invalidating as well, so even a deliberately injected
+    // torn/recovered-only observation can never remain deliverable.
+    let observed_discontinuity = current_discontinuities
+        > active.input_discontinuity_count_at_start
+        || recovered_discontinuity;
+    (observed_discontinuity, recovered_discontinuity)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1950,15 +2070,16 @@ impl Engine {
                     // second time could pair the old ID with a newly-routed name.
                     default_name = Some(name.clone());
                 }
+                let production_recommended = is_production_recommended_asio(&name, &id);
                 devices.push(json!({
                 "id": id,
                 "name": name,
                 "backend": backend,
                 "is_default": is_default,
-                "production_recommended": backend == "asio",
-                "production_priority": if backend == "asio" && name.to_ascii_lowercase().contains("focusrite") {
+                "production_recommended": production_recommended,
+                "production_priority": if production_recommended && name.to_ascii_lowercase().contains("focusrite") {
                     200
-                } else if backend == "asio" {
+                } else if production_recommended {
                     100
                 } else {
                     0
@@ -2066,6 +2187,7 @@ impl Engine {
             requested_capture_buffer_frames: existing.requested_capture_buffer_frames,
             capture_buffer_frames: None,
             capture_provenance: Vec::new(),
+            input_sample_format_recovery_audits: Vec::new(),
             audio_format: existing.audio_format,
             master_audio: SEGMENTED_MASTER_AUDIO.to_string(),
             storage_layout_version: STORAGE_LAYOUT_VERSION,
@@ -2240,6 +2362,7 @@ impl Engine {
             requested_capture_buffer_frames,
             capture_buffer_frames: None,
             capture_provenance: Vec::new(),
+            input_sample_format_recovery_audits: Vec::new(),
             audio_format: AudioFormat {
                 sample_rate: payload.sample_rate,
                 bit_depth,
@@ -2544,6 +2667,11 @@ impl Engine {
         if !attempt_is_delivery_safe(&snapshot, selected)? {
             bail!("异常中断或样本边界越界的录音不能设为当前使用录音");
         }
+        ensure_attempt_has_proven_clean_input_continuity(
+            &snapshot,
+            &snapshot.items[item_index],
+            selected,
+        )?;
         waveform_offline_range(
             session_dir,
             &snapshot,
@@ -2610,70 +2738,87 @@ impl Engine {
         snapshot.capture_share_mode = effective_capture_share_mode(snapshot.capture_share_mode);
         let previous_capture_source = capture_span_from_snapshot(&snapshot, 0, 0);
         let input_channel_index = usize::from(snapshot.audio_format.input_channel - 1);
-        let (device_name, device_id, input_channels, sample_format, stream_setup) =
-            match capture_activation {
-                CaptureActivation::Device => {
-                    let requested_device_id = require_explicit_input_device_id(
-                        Some(snapshot.device_id.as_str()),
-                        "启动采集流",
-                    )?;
-                    let device = select_device(requested_device_id)?;
-                    let device_id = device
-                        .id()
-                        .context("read stable input device id")?
-                        .to_string();
-                    let device_name = input_device_name(&device)?;
-                    if let Some(reason) = production_backend_block_reason(&device_name, &device_id)
-                    {
-                        bail!(reason);
-                    }
-                    let requested_format =
-                        parse_requested_input_sample_format(&snapshot.input_sample_format)?;
-                    let candidates = select_config_candidates(
-                        &device,
-                        snapshot.audio_format.sample_rate,
-                        input_channel_index,
-                        snapshot.audio_format.bit_depth,
-                        snapshot.capture_share_mode,
-                        requested_format,
-                    )?;
-                    let supported = candidates
-                        .first()
-                        .expect("select_config_candidates returns at least one config");
-                    let input_channels = supported.channels();
-                    let sample_format = supported.sample_format();
-                    (
-                        device_name,
-                        device_id,
-                        input_channels,
-                        sample_format,
-                        Some((device, candidates)),
-                    )
+        let (
+            device_name,
+            device_id,
+            input_channels,
+            sample_format,
+            stream_setup,
+            input_sample_format_recovery,
+        ) = match capture_activation {
+            CaptureActivation::Device => {
+                let requested_device_id = require_explicit_input_device_id(
+                    Some(snapshot.device_id.as_str()),
+                    "启动采集流",
+                )?;
+                let device = select_device(requested_device_id)?;
+                let device_id = device
+                    .id()
+                    .context("read stable input device id")?
+                    .to_string();
+                let device_name = input_device_name(&device)?;
+                if let Some(reason) = production_backend_block_reason(&device_name, &device_id) {
+                    bail!(reason);
                 }
-                #[cfg(not(windows))]
-                CaptureActivation::DevWebFeed => (
-                    if snapshot.device_name.trim().is_empty() {
-                        "Mac development web capture".to_string()
-                    } else {
-                        snapshot.device_name.clone()
-                    },
-                    snapshot.device_id.clone(),
-                    snapshot
-                        .audio_format
-                        .input_channels
-                        .max(snapshot.audio_format.input_channel),
-                    SampleFormat::F32,
-                    None,
-                ),
-                #[cfg(feature = "system-test")]
-                CaptureActivation::SystemTestSynthetic => (
-                    "DataBaker system-test synthetic input".to_string(),
-                    "system-test:synthetic".to_string(),
-                    1,
-                    SampleFormat::F32,
-                    None,
-                ),
-            };
+                let requested_format =
+                    parse_requested_input_sample_format(&snapshot.input_sample_format)?;
+                let (candidates, input_sample_format_recovery) =
+                    select_config_candidates_with_legacy_asio_i24_recovery(
+                        &snapshot,
+                        append,
+                        &device_id,
+                        requested_format,
+                        |format| {
+                            select_config_candidates(
+                                &device,
+                                snapshot.audio_format.sample_rate,
+                                input_channel_index,
+                                snapshot.audio_format.bit_depth,
+                                snapshot.capture_share_mode,
+                                format,
+                            )
+                        },
+                    )?;
+                let supported = candidates
+                    .first()
+                    .expect("select_config_candidates returns at least one config");
+                let input_channels = supported.channels();
+                let sample_format = supported.sample_format();
+                (
+                    device_name,
+                    device_id,
+                    input_channels,
+                    sample_format,
+                    Some((device, candidates)),
+                    input_sample_format_recovery,
+                )
+            }
+            #[cfg(not(windows))]
+            CaptureActivation::DevWebFeed => (
+                if snapshot.device_name.trim().is_empty() {
+                    "Mac development web capture".to_string()
+                } else {
+                    snapshot.device_name.clone()
+                },
+                snapshot.device_id.clone(),
+                snapshot
+                    .audio_format
+                    .input_channels
+                    .max(snapshot.audio_format.input_channel),
+                SampleFormat::F32,
+                None,
+                None,
+            ),
+            #[cfg(feature = "system-test")]
+            CaptureActivation::SystemTestSynthetic => (
+                "DataBaker system-test synthetic input".to_string(),
+                "system-test:synthetic".to_string(),
+                1,
+                SampleFormat::F32,
+                None,
+                None,
+            ),
+        };
         if usize::from(input_channels) <= input_channel_index {
             bail!(
                 "input channel {} exceeds the active device channel count {input_channels}",
@@ -2686,9 +2831,14 @@ impl Engine {
         snapshot.requested_capture_buffer_frames =
             normalize_capture_buffer_frames(&device_id, snapshot.requested_capture_buffer_frames)?;
         snapshot.capture_buffer_frames = None;
-        snapshot.input_sample_format = sample_format.to_string();
+        // A recovery-only i32 -> i24 migration is not committed to the
+        // snapshot until an exact i24 stream has actually opened. All ordinary
+        // activations retain the existing early bootstrap behavior.
+        if input_sample_format_recovery.is_none() {
+            snapshot.input_sample_format = sample_format.to_string();
+            snapshot.audio_format.input_channels = input_channels;
+        }
         snapshot.audio_format.encoding = output_encoding.name().to_string();
-        snapshot.audio_format.input_channels = input_channels;
 
         let storage_kind = MasterStorageKind::from_snapshot(&snapshot)?;
         let master_path = session_dir.join(&snapshot.master_audio);
@@ -2791,11 +2941,13 @@ impl Engine {
         } else {
             None
         };
-        begin_capture_provenance(
-            &mut snapshot,
-            previous_capture_source,
-            expected_existing_frames,
-        )?;
+        if input_sample_format_recovery.is_none() {
+            begin_capture_provenance(
+                &mut snapshot,
+                previous_capture_source.clone(),
+                expected_existing_frames,
+            )?;
+        }
 
         // A recoverable projection must exist before writer/stream resources
         // are assembled. The authoritative activation event is committed
@@ -2830,6 +2982,7 @@ impl Engine {
             inserted_silence_frames: Arc::new(AtomicU64::new(
                 snapshot.input_discontinuity_silence_samples,
             )),
+            activation_discontinuities: snapshot.input_discontinuity_count,
         };
         let storage_status = Arc::new(AtomicU32::new(match storage_report.status {
             StorageStatus::Healthy => 0,
@@ -3046,6 +3199,8 @@ impl Engine {
             let exclusive_open = session.snapshot.capture_share_mode.is_exclusive();
             let share_mode = ShareMode::from(session.snapshot.capture_share_mode);
             let sample_rate = session.snapshot.audio_format.sample_rate;
+            let i24_left_aligned_in_i32 =
+                capture_backend_uses_left_aligned_i24_container(&session.snapshot.capture_backend);
             let mut last_error: Option<anyhow::Error> = None;
             let mut opened = None;
             for supported in candidates {
@@ -3063,6 +3218,7 @@ impl Engine {
                     &device,
                     &config,
                     supported.sample_format(),
+                    i24_left_aligned_in_i32,
                     input_channel_index,
                     session.writer_tx.clone(),
                     Arc::clone(&session.captured),
@@ -3116,30 +3272,73 @@ impl Engine {
             }
             match opened {
                 Some((stream, input_channels, sample_format, actual_buffer_frames)) => {
-                    session.snapshot.audio_format.input_channels = input_channels;
-                    session.snapshot.input_sample_format = sample_format.to_string();
-                    session.snapshot.capture_buffer_frames = actual_buffer_frames;
-                    let opened_source = capture_span_from_snapshot(
-                        &session.snapshot,
-                        expected_existing_frames,
-                        expected_existing_frames,
-                    );
-                    let pending_source =
-                        session.snapshot.capture_provenance.last_mut().context(
-                            "missing pending capture provenance during stream activation",
-                        )?;
-                    if pending_source.start_sample != expected_existing_frames
-                        || pending_source.end_sample != expected_existing_frames
-                    {
-                        return Err(self.finish_activation_failure(
-                            session,
-                            "update_capture_provenance",
-                            anyhow!(
-                                "pending capture provenance boundary changed before stream open"
-                            ),
-                        ));
+                    if let Some(recovery) = input_sample_format_recovery.as_ref() {
+                        if sample_format != SampleFormat::I24
+                            || input_channels != recovery.input_channels
+                        {
+                            return Err(self.finish_activation_failure(
+                                session,
+                                "validate_recovery_capture_format",
+                                anyhow!(
+                                    "受限 ASIO 恢复开流结果与已验证的 i24/{}ch 配置不一致",
+                                    recovery.input_channels
+                                ),
+                            ));
+                        }
+                        // Build the migrated projection on a clone. If
+                        // provenance validation fails, activation cleanup will
+                        // persist the untouched i32 snapshot and a later retry
+                        // can make the same explicit decision again.
+                        let mut migrated_snapshot = session.snapshot.clone();
+                        migrated_snapshot.audio_format.input_channels = input_channels;
+                        migrated_snapshot.input_sample_format = sample_format.to_string();
+                        migrated_snapshot.capture_buffer_frames = actual_buffer_frames;
+                        if let Err(error) = begin_capture_provenance(
+                            &mut migrated_snapshot,
+                            previous_capture_source.clone(),
+                            expected_existing_frames,
+                        ) {
+                            return Err(self.finish_activation_failure(
+                                session,
+                                "migrate_capture_provenance",
+                                error.context("记录旧 ASIO i32 到 i24 的恢复边界"),
+                            ));
+                        }
+                        migrated_snapshot
+                            .input_sample_format_recovery_audits
+                            .push(recovery.audit(
+                                &device_name,
+                                &device_id,
+                                expected_existing_frames,
+                            ));
+                        session.snapshot = migrated_snapshot;
+                        recovery_warnings.push(recovery.warning(&device_name));
+                    } else {
+                        session.snapshot.audio_format.input_channels = input_channels;
+                        session.snapshot.input_sample_format = sample_format.to_string();
+                        session.snapshot.capture_buffer_frames = actual_buffer_frames;
+                        let opened_source = capture_span_from_snapshot(
+                            &session.snapshot,
+                            expected_existing_frames,
+                            expected_existing_frames,
+                        );
+                        let pending_source =
+                            session.snapshot.capture_provenance.last_mut().context(
+                                "missing pending capture provenance during stream activation",
+                            )?;
+                        if pending_source.start_sample != expected_existing_frames
+                            || pending_source.end_sample != expected_existing_frames
+                        {
+                            return Err(self.finish_activation_failure(
+                                session,
+                                "update_capture_provenance",
+                                anyhow!(
+                                    "pending capture provenance boundary changed before stream open"
+                                ),
+                            ));
+                        }
+                        *pending_source = opened_source;
                     }
-                    *pending_source = opened_source;
                     session.stream = Some(stream);
                 }
                 None => {
@@ -3396,6 +3595,9 @@ impl Engine {
                 "device_name": device_name,
                 "device_id": device_id,
                 "input_sample_format": sample_format.to_string(),
+                "input_sample_format_recovery": input_sample_format_recovery.as_ref().and_then(|_| {
+                    session.snapshot.input_sample_format_recovery_audits.last()
+                }),
                 "capture_share_mode": session.snapshot.capture_share_mode,
                 "capture_backend": session.snapshot.capture_backend,
                 "requested_capture_buffer_frames": session.snapshot.requested_capture_buffer_frames,
@@ -3673,6 +3875,9 @@ impl Engine {
                 .inserted_silence_frames
                 .load(Ordering::Acquire),
             overflow_samples_at_start: session.overflow.load(Ordering::Acquire),
+            input_discontinuity_count_at_completion: None,
+            input_discontinuity_silence_samples_at_completion: None,
+            overflow_samples_at_completion: None,
             metrics: None,
             warning_codes: Vec::new(),
         };
@@ -3757,19 +3962,18 @@ impl Engine {
             0,
             duration_samples,
         )?;
-        let input_discontinuity_count = session
-            .capture_recovery
-            .discontinuities
-            .load(Ordering::Acquire)
-            .saturating_sub(audition.input_discontinuity_count_at_start);
-        let input_discontinuity_silence_samples = session
+        let completion_epoch = session.input_continuity_epoch();
+        let completion_silence_samples = session
             .capture_recovery
             .inserted_silence_frames
-            .load(Ordering::Acquire)
+            .load(Ordering::Acquire);
+        let input_discontinuity_count = completion_epoch
+            .input_discontinuity_count
+            .saturating_sub(audition.input_discontinuity_count_at_start);
+        let input_discontinuity_silence_samples = completion_silence_samples
             .saturating_sub(audition.input_discontinuity_silence_samples_at_start);
-        let overflow_samples = session
-            .overflow
-            .load(Ordering::Acquire)
+        let overflow_samples = completion_epoch
+            .overflow_samples
             .saturating_sub(audition.overflow_samples_at_start);
         let warning_codes = input_audition_warning_codes(
             duration_samples,
@@ -3777,6 +3981,7 @@ impl Engine {
             peak,
             rms,
             input_discontinuity_count,
+            input_discontinuity_silence_samples,
             overflow_samples,
         );
         let metrics = InputAuditionMetrics {
@@ -3799,6 +4004,11 @@ impl Engine {
         audition.end_sample = Some(end_sample);
         audition.captured_samples = duration_samples;
         audition.completed_at = Some(Utc::now().to_rfc3339());
+        audition.input_discontinuity_count_at_completion =
+            Some(completion_epoch.input_discontinuity_count);
+        audition.input_discontinuity_silence_samples_at_completion =
+            Some(completion_silence_samples);
+        audition.overflow_samples_at_completion = Some(completion_epoch.overflow_samples);
         audition.metrics = Some(metrics.clone());
         audition.warning_codes = warning_codes.clone();
         session.snapshot.input_audition = Some(audition.clone());
@@ -3811,6 +4021,9 @@ impl Engine {
                 "end_sample": end_sample,
                 "required_samples": audition.required_samples,
                 "capture_fingerprint": audition.capture_fingerprint,
+                "input_discontinuity_count_at_completion": audition.input_discontinuity_count_at_completion,
+                "input_discontinuity_silence_samples_at_completion": audition.input_discontinuity_silence_samples_at_completion,
+                "overflow_samples_at_completion": audition.overflow_samples_at_completion,
                 "metrics": metrics,
                 "warning_codes": warning_codes,
             }),
@@ -3848,6 +4061,14 @@ impl Engine {
         }
         if audition.status != InputAuditionStatus::Ready {
             bail!("只有完整且无采集警告的 10 秒输入试听可以确认");
+        }
+        let current_fingerprint = input_audition_capture_fingerprint(&session.snapshot)?;
+        if audition.capture_fingerprint != current_fingerprint {
+            bail!("输入设备参数已变化，请重新进行输入试听");
+        }
+        let completion_epoch = RecordingSession::audition_completion_epoch(&audition)?;
+        if session.input_continuity_epoch() != completion_epoch {
+            bail!("输入试听完成后又出现了采集不连续或溢出，请重新试听");
         }
         audition.status = InputAuditionStatus::Confirmed;
         let confirmed_at = Utc::now().to_rfc3339();
@@ -3963,12 +4184,20 @@ impl Engine {
                 .inserted_silence_frames
                 .load(Ordering::Acquire),
             overflow_samples_at_start: session.overflow.load(Ordering::Acquire),
+            input_discontinuity_count_at_completion: None,
+            input_discontinuity_silence_samples_at_completion: None,
+            overflow_samples_at_completion: None,
             metrics: None,
             warning_codes: Vec::new(),
         });
         if session.snapshot.input_audition.is_none() && check_id.is_some() {
             bail!("当前没有可与 check_id 匹配的输入试听");
         }
+        let completion_epoch = session.input_continuity_epoch();
+        let completion_silence_samples = session
+            .capture_recovery
+            .inserted_silence_frames
+            .load(Ordering::Acquire);
         audition.status = InputAuditionStatus::Skipped;
         audition.capture_fingerprint = capture_fingerprint.clone();
         audition.configuration = input_audition_configuration(&session.snapshot);
@@ -3982,6 +4211,11 @@ impl Engine {
         audition.source_check_id = Some(audition.check_id.clone());
         audition.source_decided_at = Some(now);
         audition.source_capture_fingerprint = Some(audition.capture_fingerprint.clone());
+        audition.input_discontinuity_count_at_completion =
+            Some(completion_epoch.input_discontinuity_count);
+        audition.input_discontinuity_silence_samples_at_completion =
+            Some(completion_silence_samples);
+        audition.overflow_samples_at_completion = Some(completion_epoch.overflow_samples);
         session.snapshot.input_audition = Some(audition.clone());
         session.persist(
             "input_audition_skipped",
@@ -3992,6 +4226,9 @@ impl Engine {
                 "end_sample": audition.end_sample,
                 "skipped_at": audition.skipped_at,
                 "decision_source": audition.decision_source,
+                "input_discontinuity_count_at_completion": audition.input_discontinuity_count_at_completion,
+                "input_discontinuity_silence_samples_at_completion": audition.input_discontinuity_silence_samples_at_completion,
+                "overflow_samples_at_completion": audition.overflow_samples_at_completion,
             }),
         )?;
         let persisted = session
@@ -4103,7 +4340,22 @@ impl Engine {
         if source_capture_fingerprint != capture_fingerprint {
             bail!("缓存的输入试听决定不属于当前采集配置，请重新试听");
         }
+        let activation_epoch = InputContinuityEpoch {
+            input_discontinuity_count: session.capture_recovery.activation_discontinuities,
+            overflow_samples: 0,
+        };
+        let adoption_epoch = session.input_continuity_epoch();
+        if adoption_epoch != activation_epoch {
+            bail!("当前采集运行时在缓存采用前已出现输入不连续或溢出，请重新试听");
+        }
         let captured = session.checkpoint()?;
+        if session.input_continuity_epoch() != adoption_epoch {
+            bail!("缓存采用过程中出现输入不连续或溢出，请重新试听");
+        }
+        let adoption_silence_samples = session
+            .capture_recovery
+            .inserted_silence_frames
+            .load(Ordering::Acquire);
         let now = Utc::now().to_rfc3339();
         let required_samples =
             input_audition_required_samples(session.snapshot.audio_format.sample_rate)?;
@@ -4138,6 +4390,9 @@ impl Engine {
                 .inserted_silence_frames
                 .load(Ordering::Acquire),
             overflow_samples_at_start: session.overflow.load(Ordering::Acquire),
+            input_discontinuity_count_at_completion: Some(adoption_epoch.input_discontinuity_count),
+            input_discontinuity_silence_samples_at_completion: Some(adoption_silence_samples),
+            overflow_samples_at_completion: Some(adoption_epoch.overflow_samples),
             metrics: None,
             warning_codes: Vec::new(),
         };
@@ -4154,6 +4409,9 @@ impl Engine {
                 "source_capture_fingerprint": audition.source_capture_fingerprint,
                 "start_sample": audition.start_sample,
                 "end_sample": audition.end_sample,
+                "input_discontinuity_count_at_completion": audition.input_discontinuity_count_at_completion,
+                "input_discontinuity_silence_samples_at_completion": audition.input_discontinuity_silence_samples_at_completion,
+                "overflow_samples_at_completion": audition.overflow_samples_at_completion,
             }),
         )?;
         let persisted = session
@@ -4332,7 +4590,17 @@ impl Engine {
         if session.active_attempt.is_some() {
             bail!("an attempt is already recording");
         }
-        session.ensure_input_audition_decision()?;
+        // Carry the exact audition decision epoch into the active take. Never
+        // reload these counters after validation: a callback discontinuity in
+        // the start-command window must either invalidate the start or become
+        // visible when this attempt is stopped, never become its new baseline.
+        let attempt_continuity_epoch = session.ensure_input_audition_decision()?;
+        let attempt_discontinuity_silence_baseline = session
+            .snapshot
+            .input_audition
+            .as_ref()
+            .and_then(|audition| audition.input_discontinuity_silence_samples_at_completion)
+            .context("输入试听缺少完成时的补偿静音计数，请重新试听")?;
         let item = session
             .snapshot
             .items
@@ -4357,20 +4625,14 @@ impl Engine {
         session.head_silence.set_enforce(enforce_silence);
         let recording_started_sample = session.arm_attempt_analysis()?;
         let start_sample = recording_started_sample;
-        session.active_attempt = Some(ActiveAttempt {
-            item_id: item_id.to_string(),
-            attempt_id: attempt_id.clone(),
+        session.active_attempt = Some(ActiveAttempt::from_input_continuity_epoch(
+            item_id.to_string(),
+            attempt_id.clone(),
             start_sample,
             recording_started_sample,
-            input_discontinuity_count_at_start: session
-                .capture_recovery
-                .discontinuities
-                .load(Ordering::Acquire),
-            input_discontinuity_silence_samples_at_start: session
-                .capture_recovery
-                .inserted_silence_frames
-                .load(Ordering::Acquire),
-        });
+            attempt_continuity_epoch,
+            attempt_discontinuity_silence_baseline,
+        ));
         session.persist(
             "attempt_started",
             json!({
@@ -4583,19 +4845,23 @@ impl Engine {
             }
             bail!("attempt contains no audio samples");
         }
-        let observed_discontinuity = session
+        let input_discontinuity_count_at_end = session
             .capture_recovery
             .discontinuities
-            .load(Ordering::Acquire)
-            > active.input_discontinuity_count_at_start;
-        // A driver discontinuity is direct evidence that this take may contain
-        // a click/pop even when packet positions do not let us estimate missing
-        // frames. Never allow such a take into delivery silently.
-        let recovered_discontinuity = session
+            .load(Ordering::Acquire);
+        let input_discontinuity_silence_samples_at_end = session
             .capture_recovery
             .inserted_silence_frames
-            .load(Ordering::Acquire)
-            > active.input_discontinuity_silence_samples_at_start;
+            .load(Ordering::Acquire);
+        let (observed_discontinuity, recovered_discontinuity) = attempt_input_discontinuity_state(
+            &active,
+            input_discontinuity_count_at_end,
+            input_discontinuity_silence_samples_at_end,
+        );
+        // A driver discontinuity or recovered gap is direct evidence that this
+        // take may contain a click/pop. Never allow such a take into delivery
+        // silently, even if the two telemetry atomics were observed between
+        // their callback updates.
         let quality_issues = if observed_discontinuity {
             vec![AttemptQualityIssue {
                 code: "input_discontinuity".to_string(),
@@ -4627,6 +4893,13 @@ impl Engine {
                 "recorded".to_string()
             },
             created_at: Utc::now().to_rfc3339(),
+            input_continuity: Some(AttemptInputContinuityEvidence {
+                input_discontinuity_count_at_start: active.input_discontinuity_count_at_start,
+                input_discontinuity_count_at_end,
+                input_discontinuity_silence_samples_at_start: active
+                    .input_discontinuity_silence_samples_at_start,
+                input_discontinuity_silence_samples_at_end,
+            }),
             quality_issues,
         };
         let item = session
@@ -4706,6 +4979,11 @@ impl Engine {
         if !attempt_is_delivery_safe(&live_snapshot, &selected)? {
             bail!("异常中断的录音不能被确认或交付");
         }
+        ensure_attempt_has_proven_clean_input_continuity(
+            &live_snapshot,
+            &live_snapshot.items[item_index],
+            &selected,
+        )?;
         let is_current_accepted = selected.status == "accepted"
             && session.snapshot.items[item_index]
                 .selected_attempt_id
@@ -5452,6 +5730,7 @@ impl Engine {
             Some(ExportArtifact::FullTrack) => json!({
                 "committed_samples": snapshot.committed_samples,
                 "capture_provenance": snapshot.capture_provenance,
+                "input_sample_format_recovery_audits": snapshot.input_sample_format_recovery_audits,
             }),
             _ => json!({
                 "journal_seq": snapshot.journal_seq,
@@ -5746,6 +6025,7 @@ impl Engine {
                 "forced_without_tail_silence": attempt.forced_without_tail_silence,
                 "tail_silence_samples": attempt.tail_silence_samples,
                 "required_tail_silence_samples": attempt.required_tail_silence_samples,
+                "input_continuity": attempt.input_continuity,
                 "sha256": slice_sha256,
             }));
         }
@@ -5776,6 +6056,7 @@ impl Engine {
             "requested_capture_buffer_frames": snapshot.requested_capture_buffer_frames,
             "capture_buffer_frames": snapshot.capture_buffer_frames,
             "capture_provenance": snapshot.capture_provenance,
+            "input_sample_format_recovery_audits": snapshot.input_sample_format_recovery_audits,
             "audio_format": snapshot.audio_format,
             "storage_layout_version": snapshot.storage_layout_version,
             "segment_frames": snapshot.segment_frames,
@@ -6423,6 +6704,43 @@ fn attempt_is_delivery_safe(snapshot: &SessionSnapshot, attempt: &Attempt) -> Re
         && attempt_range_has_provenance(snapshot, attempt))
 }
 
+/// A task-level discontinuity counter cannot identify which historical take
+/// was affected. New takes therefore persist the absolute counter values at
+/// both boundaries. Legacy takes remain deliverable while the task has no
+/// discontinuity evidence; once either cumulative counter is non-zero, a cut
+/// is safe only when its own complete epoch proves no change during the take.
+fn attempt_has_proven_clean_input_continuity(
+    snapshot: &SessionSnapshot,
+    attempt: &Attempt,
+) -> bool {
+    let task_has_discontinuity_evidence =
+        snapshot.input_discontinuity_count > 0 || snapshot.input_discontinuity_silence_samples > 0;
+    let Some(evidence) = attempt.input_continuity.as_ref() else {
+        return !task_has_discontinuity_evidence;
+    };
+    evidence.input_discontinuity_count_at_start == evidence.input_discontinuity_count_at_end
+        && evidence.input_discontinuity_silence_samples_at_start
+            == evidence.input_discontinuity_silence_samples_at_end
+        && evidence.input_discontinuity_count_at_end <= snapshot.input_discontinuity_count
+        && evidence.input_discontinuity_silence_samples_at_end
+            <= snapshot.input_discontinuity_silence_samples
+}
+
+fn ensure_attempt_has_proven_clean_input_continuity(
+    snapshot: &SessionSnapshot,
+    item: &ItemState,
+    attempt: &Attempt,
+) -> Result<()> {
+    if !attempt_has_proven_clean_input_continuity(snapshot, attempt) {
+        bail!(
+            "条目 {} 的录音 {} 缺少可验证的输入连续性边界，不能确认或导出句子切片；可先预览，或导出原始整轨与时间戳 JSON 人工检查。",
+            item.id,
+            attempt.attempt_id
+        );
+    }
+    Ok(())
+}
+
 fn attempt_sample_order_is_valid(attempt: &Attempt) -> bool {
     attempt.recording_started_sample <= attempt.start_sample
         && attempt.recording_started_sample <= attempt.end_sample
@@ -6594,6 +6912,7 @@ fn reconcile_capture_provenance_after_recovery(
 fn input_audition_configuration(snapshot: &SessionSnapshot) -> InputAuditionConfiguration {
     InputAuditionConfiguration {
         device_name: snapshot.device_name.clone(),
+        device_id: snapshot.device_id.clone(),
         capture_backend: snapshot.capture_backend.clone(),
         sample_rate: snapshot.audio_format.sample_rate,
         bit_depth: snapshot.audio_format.bit_depth,
@@ -6671,6 +6990,7 @@ fn input_audition_warning_codes(
     peak: f32,
     rms: f32,
     discontinuities: u64,
+    inserted_silence_samples: u64,
     overflow_samples: u64,
 ) -> Vec<String> {
     let mut warning_codes = Vec::<String>::new();
@@ -6680,7 +7000,7 @@ fn input_audition_warning_codes(
     if peak >= 0.999 {
         warning_codes.push("clipping".to_string());
     }
-    if discontinuities > 0 {
+    if discontinuities > 0 || inserted_silence_samples > 0 {
         warning_codes.push("input_discontinuity".to_string());
     }
     if overflow_samples > 0 {
@@ -6806,6 +7126,7 @@ fn session_summary_value(snapshot: &SessionSnapshot) -> Value {
         "requested_capture_buffer_frames": snapshot.requested_capture_buffer_frames,
         "capture_buffer_frames": snapshot.capture_buffer_frames,
         "capture_provenance": snapshot.capture_provenance,
+        "input_sample_format_recovery_audits": snapshot.input_sample_format_recovery_audits,
         "audio_format": snapshot.audio_format,
         "storage_layout_version": snapshot.storage_layout_version,
         "segment_frames": snapshot.segment_frames,
@@ -6856,6 +7177,7 @@ fn validate_snapshot_for_export(snapshot: &SessionSnapshot) -> Result<()> {
             .iter()
             .find(|attempt| attempt.attempt_id == selected_id)
             .with_context(|| format!("条目 {} 的当前使用录音不存在，无法导出切片。", item.id))?;
+        ensure_attempt_has_proven_clean_input_continuity(snapshot, item, attempt)?;
         let outside_durable_audio = attempt.end_sample <= attempt.start_sample
             || attempt.start_sample > snapshot.committed_samples
             || attempt.recording_started_sample > snapshot.committed_samples
@@ -6908,6 +7230,7 @@ fn validate_snapshot_for_artifact(
             .iter()
             .find(|attempt| attempt.attempt_id == selected_id)
             .with_context(|| format!("条目 {} 的当前使用录音不存在，无法导出切片。", item.id))?;
+        ensure_attempt_has_proven_clean_input_continuity(snapshot, item, attempt)?;
         if matches!(attempt.status.as_str(), "interrupted" | "needs_rerecord")
             || attempt.end_sample <= attempt.start_sample
             || attempt.end_sample > snapshot.committed_samples
@@ -6973,6 +7296,7 @@ fn validate_snapshot_for_cut_scope(snapshot: &SessionSnapshot, scope: ExportScop
             if selected.status != "accepted" || !attempt_is_delivery_safe(snapshot, selected)? {
                 bail!("条目 {} 的当前使用录音不可安全交付", item.id);
             }
+            ensure_attempt_has_proven_clean_input_continuity(snapshot, item, selected)?;
             if item
                 .attempts
                 .iter()
@@ -7781,6 +8105,7 @@ fn recover_interrupted_attempts(
             required_tail_silence_samples: 0,
             status: "interrupted".to_string(),
             created_at: active.created_at,
+            input_continuity: None,
             quality_issues: Vec::new(),
         });
         warnings.push(format!(
@@ -7839,6 +8164,7 @@ fn mark_active_attempt_interrupted(
         required_tail_silence_samples: 0,
         status: "interrupted".to_string(),
         created_at: Utc::now().to_rfc3339(),
+        input_continuity: None,
         quality_issues: Vec::new(),
     };
     item.attempts.push(attempt.clone());
@@ -8114,6 +8440,7 @@ impl RecordingSession {
             required_tail_silence_samples: self.required_silence_samples(),
             status: "needs_rerecord".to_string(),
             created_at: Utc::now().to_rfc3339(),
+            input_continuity: None,
             quality_issues: vec![issue],
         };
         let item = self
@@ -8365,6 +8692,27 @@ impl RecordingSession {
         snapshot
     }
 
+    fn input_continuity_epoch(&self) -> InputContinuityEpoch {
+        InputContinuityEpoch {
+            input_discontinuity_count: self
+                .capture_recovery
+                .discontinuities
+                .load(Ordering::Acquire),
+            overflow_samples: self.overflow.load(Ordering::Acquire),
+        }
+    }
+
+    fn audition_completion_epoch(audition: &InputAudition) -> Result<InputContinuityEpoch> {
+        Ok(InputContinuityEpoch {
+            input_discontinuity_count: audition
+                .input_discontinuity_count_at_completion
+                .context("输入试听缺少完成时的不连续计数，请重新试听")?,
+            overflow_samples: audition
+                .overflow_samples_at_completion
+                .context("输入试听缺少完成时的溢出计数，请重新试听")?,
+        })
+    }
+
     fn arm_input_audition_decision(&mut self, audition: &InputAudition) -> Result<()> {
         if !matches!(
             audition.status,
@@ -8379,20 +8727,20 @@ impl RecordingSession {
         if audition.capture_fingerprint != capture_fingerprint {
             bail!("采集配置已变化，需要重新进行输入试听");
         }
+        let completion_epoch = Self::audition_completion_epoch(audition)?;
+        if self.input_continuity_epoch() != completion_epoch {
+            bail!("输入试听完成后又出现了采集不连续或溢出，请重新试听");
+        }
         self.input_audition_decision = Some(InputAuditionRuntimeDecision {
             check_id: audition.check_id.clone(),
             status: audition.status,
             capture_fingerprint,
-            input_discontinuity_count: self
-                .capture_recovery
-                .discontinuities
-                .load(Ordering::Acquire),
-            overflow_samples: self.overflow.load(Ordering::Acquire),
+            completion_epoch,
         });
         Ok(())
     }
 
-    fn ensure_input_audition_decision(&self) -> Result<()> {
+    fn ensure_input_audition_decision(&self) -> Result<InputContinuityEpoch> {
         if self.faulted.load(Ordering::Acquire) || self.overflow.load(Ordering::Acquire) > 0 {
             bail!("音频采集已发生故障或数据溢出，请安全结束并重新试听");
         }
@@ -8412,21 +8760,18 @@ impl RecordingSession {
             .as_ref()
             .context("当前音频引擎尚未获得有效输入试听决定，请重新试听")?;
         let capture_fingerprint = input_audition_capture_fingerprint(&self.snapshot)?;
-        let discontinuity_count = self
-            .capture_recovery
-            .discontinuities
-            .load(Ordering::Acquire);
-        let overflow_samples = self.overflow.load(Ordering::Acquire);
+        let completion_epoch = Self::audition_completion_epoch(audition)?;
+        let current_epoch = self.input_continuity_epoch();
         if decision.check_id != audition.check_id
             || decision.status != audition.status
             || decision.capture_fingerprint != capture_fingerprint
             || audition.capture_fingerprint != capture_fingerprint
-            || decision.input_discontinuity_count != discontinuity_count
-            || decision.overflow_samples != overflow_samples
+            || decision.completion_epoch != completion_epoch
+            || completion_epoch != current_epoch
         {
             bail!("输入试听决定已因采集配置、故障或输入不连续而失效，请重新试听");
         }
-        Ok(())
+        Ok(completion_epoch)
     }
 
     fn ensure_metadata_mutation_allowed(&self) -> Result<()> {
@@ -10097,6 +10442,122 @@ fn catalog_sample_formats(catalog: &InputFormatCatalog) -> Vec<String> {
     formats
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacyAsioI24RecoveryPlan {
+    sample_rate: u32,
+    input_channels: u16,
+    input_channel: u16,
+    original_selection_error: String,
+}
+
+impl LegacyAsioI24RecoveryPlan {
+    fn warning(&self, device_name: &str) -> String {
+        format!(
+            "恢复旧 ASIO 任务时，设备 {device_name} 不再提供快照记录的精确 i32 配置；已在相同 {} Hz、{} 通道下显式迁移为 i24。旧母轨区间仍保留 i32 来源，新追加区间从恢复边界起记录为 i24。原始选择错误：{}",
+            self.sample_rate, self.input_channels, self.original_selection_error
+        )
+    }
+
+    fn audit(
+        &self,
+        device_name: &str,
+        device_id: &str,
+        boundary_sample: u64,
+    ) -> InputSampleFormatRecoveryAudit {
+        InputSampleFormatRecoveryAudit {
+            at: Utc::now().to_rfc3339(),
+            reason_code: "legacy_asio_aligned_24_i32_to_i24".to_string(),
+            device_name: device_name.to_string(),
+            device_id: device_id.to_string(),
+            capture_backend: "asio".to_string(),
+            from_sample_format: "i32".to_string(),
+            to_sample_format: "i24".to_string(),
+            sample_rate: self.sample_rate,
+            input_channels: self.input_channels,
+            input_channel: self.input_channel,
+            boundary_sample,
+            original_selection_error: self.original_selection_error.clone(),
+        }
+    }
+}
+
+fn legacy_asio_i24_recovery_is_eligible(
+    snapshot: &SessionSnapshot,
+    append: bool,
+    resolved_device_id: &str,
+    requested_sample_format: Option<SampleFormat>,
+) -> bool {
+    append
+        // `create_session` and reset both produce a pristine stopped task that
+        // is activated through the resume command. Do not let that routing
+        // detail turn a newly-created explicit i32 request into a legacy
+        // migration; the task must contain evidence of an earlier activation.
+        && !is_pristine_bootstrap(snapshot)
+        && requested_sample_format == Some(SampleFormat::I32)
+        && snapshot.capture_backend.trim().eq_ignore_ascii_case("asio")
+        && is_asio_device_id(&snapshot.device_id)
+        && is_asio_device_id(resolved_device_id)
+}
+
+fn select_config_candidates_with_legacy_asio_i24_recovery<F>(
+    snapshot: &SessionSnapshot,
+    append: bool,
+    resolved_device_id: &str,
+    requested_sample_format: Option<SampleFormat>,
+    mut select: F,
+) -> Result<(
+    Vec<SupportedStreamConfig>,
+    Option<LegacyAsioI24RecoveryPlan>,
+)>
+where
+    F: FnMut(Option<SampleFormat>) -> Result<Vec<SupportedStreamConfig>>,
+{
+    let original_error = match select(requested_sample_format) {
+        Ok(candidates) => return Ok((candidates, None)),
+        Err(error) => error,
+    };
+    if !legacy_asio_i24_recovery_is_eligible(
+        snapshot,
+        append,
+        resolved_device_id,
+        requested_sample_format,
+    ) {
+        return Err(original_error);
+    }
+
+    let original_selection_error = format!("{original_error:#}");
+    let expected_channels = snapshot.audio_format.input_channels;
+    let fallback = select(Some(SampleFormat::I24)).map_err(|fallback_error| {
+        anyhow!(
+            "旧 ASIO 任务的精确 i32 配置不可用，且受限 i24 恢复配置也不可用。i32：{original_selection_error}；i24：{fallback_error:#}"
+        )
+    })?;
+    let candidates = fallback
+        .into_iter()
+        .filter(|candidate| {
+            candidate.sample_format() == SampleFormat::I24
+                && candidate.sample_rate() == snapshot.audio_format.sample_rate
+                && candidate.channels() == expected_channels
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        bail!(
+            "旧 ASIO 任务的精确 i32 配置不可用；驱动虽提供 i24，但没有相同 {} Hz、{} 通道的精确恢复配置。不会改用其他采样率或通道数。原始选择错误：{original_selection_error}",
+            snapshot.audio_format.sample_rate,
+            expected_channels,
+        );
+    }
+    Ok((
+        candidates,
+        Some(LegacyAsioI24RecoveryPlan {
+            sample_rate: snapshot.audio_format.sample_rate,
+            input_channels: expected_channels,
+            input_channel: snapshot.audio_format.input_channel,
+            original_selection_error,
+        }),
+    ))
+}
+
 fn select_config_candidates(
     device: &Device,
     sample_rate: u32,
@@ -10235,6 +10696,7 @@ fn build_stream(
     device: &Device,
     config: &StreamConfig,
     format: SampleFormat,
+    i24_left_aligned_in_i32: bool,
     input_channel_index: usize,
     writer: Sender<WriterMessage>,
     captured: Arc<AtomicU64>,
@@ -10332,7 +10794,7 @@ fn build_stream(
             queue.clone(),
             waveform.clone(),
             silence.clone(),
-            i24_to_f32,
+            i24_to_f32_converter(i24_left_aligned_in_i32),
         ),
         SampleFormat::I32 => build_typed_stream::<i32>(
             device,
@@ -10417,7 +10879,7 @@ fn build_stream(
             queue.clone(),
             waveform.clone(),
             silence.clone(),
-            u24_to_f32,
+            u24_to_f32_converter(i24_left_aligned_in_i32),
         ),
         SampleFormat::U32 => build_typed_stream::<u32>(
             device,
@@ -10628,16 +11090,44 @@ fn normalize_u24_raw(raw: i32, left_aligned_in_i32: bool) -> f32 {
     (value as f32 - 8_388_608.0) / 8_388_608.0
 }
 
-fn i24_to_f32(sample: I24) -> f32 {
-    // WASAPI exposes 24 valid PCM bits left-aligned in a 32-bit container.
-    // CPAL 0.18.1 casts that container directly to its i32-backed I24 wrapper,
-    // so Windows needs an arithmetic shift before normalization. Other CPAL
-    // backends provide the wrapper's normal signed 24-bit logical value.
-    normalize_i24_raw(sample.inner(), cfg!(target_os = "windows"))
+fn capture_backend_uses_left_aligned_i24_container(capture_backend: &str) -> bool {
+    // WASAPI exposes 24 valid PCM bits left-aligned in a 32-bit container and
+    // CPAL casts that container directly to its i32-backed I24/U24 wrapper.
+    // ASIO now normalizes aligned hardware samples into logical I24 before the
+    // callback; target OS alone therefore cannot identify the representation.
+    capture_backend.trim().eq_ignore_ascii_case("wasapi")
 }
 
-fn u24_to_f32(sample: U24) -> f32 {
-    normalize_u24_raw(sample.inner(), cfg!(target_os = "windows"))
+fn logical_i24_to_f32(sample: I24) -> f32 {
+    normalize_i24_raw(sample.inner(), false)
+}
+
+fn left_aligned_i24_to_f32(sample: I24) -> f32 {
+    normalize_i24_raw(sample.inner(), true)
+}
+
+fn i24_to_f32_converter(left_aligned_in_i32: bool) -> fn(I24) -> f32 {
+    if left_aligned_in_i32 {
+        left_aligned_i24_to_f32
+    } else {
+        logical_i24_to_f32
+    }
+}
+
+fn logical_u24_to_f32(sample: U24) -> f32 {
+    normalize_u24_raw(sample.inner(), false)
+}
+
+fn left_aligned_u24_to_f32(sample: U24) -> f32 {
+    normalize_u24_raw(sample.inner(), true)
+}
+
+fn u24_to_f32_converter(left_aligned_in_i32: bool) -> fn(U24) -> f32 {
+    if left_aligned_in_i32 {
+        left_aligned_u24_to_f32
+    } else {
+        logical_u24_to_f32
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12281,6 +12771,11 @@ mod tests {
     fn arm_test_input_audition(session: &mut RecordingSession) {
         let now = "2026-09-01T00:00:00Z".to_string();
         let captured = session.captured.load(Ordering::Acquire);
+        let completion_epoch = session.input_continuity_epoch();
+        let completion_silence_samples = session
+            .capture_recovery
+            .inserted_silence_frames
+            .load(Ordering::Acquire);
         let fingerprint = input_audition_capture_fingerprint(&session.snapshot).unwrap();
         let audition = InputAudition {
             status: InputAuditionStatus::Skipped,
@@ -12305,6 +12800,11 @@ mod tests {
             input_discontinuity_count_at_start: 0,
             input_discontinuity_silence_samples_at_start: 0,
             overflow_samples_at_start: 0,
+            input_discontinuity_count_at_completion: Some(
+                completion_epoch.input_discontinuity_count,
+            ),
+            input_discontinuity_silence_samples_at_completion: Some(completion_silence_samples),
+            overflow_samples_at_completion: Some(completion_epoch.overflow_samples),
             metrics: None,
             warning_codes: Vec::new(),
         };
@@ -12653,6 +13153,38 @@ mod tests {
                 .is_none()
         );
         assert!(production_backend_block_reason("USB Microphone", "wasapi:endpoint").is_none());
+    }
+
+    #[test]
+    fn only_native_asio_endpoints_are_production_recommended() {
+        assert!(is_production_recommended_asio(
+            "Focusrite USB ASIO",
+            "asio:Focusrite USB ASIO"
+        ));
+        assert!(is_production_recommended_asio(
+            "RME Fireface USB",
+            "asio:RME Fireface USB"
+        ));
+        for (name, id) in [
+            ("ASIO4ALL v2", "asio:ASIO4ALL v2"),
+            (
+                "Generic Low Latency ASIO Driver",
+                "asio:Generic Low Latency ASIO Driver",
+            ),
+            ("Realtek ASIO", "asio:Realtek ASIO"),
+            ("Voicemeeter Virtual ASIO", "asio:Voicemeeter Virtual ASIO"),
+            ("FL Studio ASIO", "asio:FL Studio ASIO"),
+            ("FlexASIO", "asio:FlexASIO"),
+        ] {
+            assert!(
+                !is_production_recommended_asio(name, id),
+                "wrapper endpoint {name} must remain selectable but not production-recommended"
+            );
+        }
+        assert!(!is_production_recommended_asio(
+            "Focusrite USB Audio",
+            "wasapi:focusrite-wdm"
+        ));
     }
 
     #[test]
@@ -13033,6 +13565,7 @@ mod tests {
             requested_capture_buffer_frames: None,
             capture_buffer_frames: None,
             capture_provenance: Vec::new(),
+            input_sample_format_recovery_audits: Vec::new(),
             audio_format: AudioFormat {
                 sample_rate: 48_000,
                 bit_depth: 24,
@@ -13084,8 +13617,21 @@ mod tests {
             required_tail_silence_samples: 0,
             status: status.to_string(),
             created_at: "2026-08-11T00:00:00Z".to_string(),
+            input_continuity: None,
             quality_issues: Vec::new(),
         }
+    }
+
+    fn clean_input_continuity(
+        discontinuity_count: u64,
+        inserted_silence_samples: u64,
+    ) -> Option<AttemptInputContinuityEvidence> {
+        Some(AttemptInputContinuityEvidence {
+            input_discontinuity_count_at_start: discontinuity_count,
+            input_discontinuity_count_at_end: discontinuity_count,
+            input_discontinuity_silence_samples_at_start: inserted_silence_samples,
+            input_discontinuity_silence_samples_at_end: inserted_silence_samples,
+        })
     }
 
     fn select_safe_first_attempt(snapshot: &mut SessionSnapshot, end_sample: u64) {
@@ -13393,6 +13939,161 @@ mod tests {
         session
     }
 
+    #[test]
+    fn audition_confirmation_rejects_count_before_recovery_telemetry_arrives() {
+        let root = test_root("audition-confirmation-finish-boundary");
+        let mut session = metadata_test_session(&root);
+        arm_test_input_audition(&mut session);
+        let audition = session.snapshot.input_audition.as_mut().unwrap();
+        audition.status = InputAuditionStatus::Ready;
+        audition.skipped_at = None;
+        audition.decision_source = None;
+        audition.source_check_id = None;
+        audition.source_decided_at = None;
+        audition.source_capture_fingerprint = None;
+        session.input_audition_decision = None;
+        session
+            .capture_recovery
+            .discontinuities
+            .store(1, Ordering::Release);
+        // The driver callback publishes this authority counter before the
+        // optional recovered-silence total. Confirmation must fail during
+        // that deliberately torn observation window as well.
+
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+        let error = engine
+            .confirm_input_audition("test-input-audition-skip")
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("试听完成后又出现了采集不连续"),
+            "{error:#}"
+        );
+        assert_eq!(
+            engine
+                .session
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .input_audition
+                .as_ref()
+                .unwrap()
+                .status,
+            InputAuditionStatus::Ready
+        );
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cached_audition_adoption_rejects_a_gap_since_runtime_activation() {
+        let root = test_root("cached-audition-activation-boundary");
+        let session = metadata_test_session(&root);
+        let fingerprint = input_audition_capture_fingerprint(&session.snapshot).unwrap();
+        session
+            .capture_recovery
+            .discontinuities
+            .store(1, Ordering::Release);
+        session
+            .capture_recovery
+            .inserted_silence_frames
+            .store(256, Ordering::Release);
+
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+        let error = engine
+            .adopt_cached_input_audition(AdoptCachedInputAuditionPayload {
+                status: InputAuditionStatus::Confirmed,
+                source_check_id: "cached-check".to_string(),
+                source_decided_at: "2026-09-01T00:00:00Z".to_string(),
+                capture_fingerprint: fingerprint,
+            })
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("缓存采用前已出现输入不连续"),
+            "{error:#}"
+        );
+        assert!(
+            engine
+                .session
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .input_audition
+                .is_none()
+        );
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn attempt_baseline_keeps_the_validated_audition_epoch_across_start_window() {
+        let root = test_root("attempt-audition-epoch-bridge");
+        let mut session = metadata_test_session(&root);
+        arm_test_input_audition(&mut session);
+        let validated_epoch = session.ensure_input_audition_decision().unwrap();
+
+        // Deterministically model a callback gap after authorization was
+        // validated but before the active-attempt object is installed.
+        session
+            .capture_recovery
+            .discontinuities
+            .store(1, Ordering::Release);
+        session
+            .capture_recovery
+            .inserted_silence_frames
+            .store(480, Ordering::Release);
+        let active = ActiveAttempt::from_input_continuity_epoch(
+            "001".to_string(),
+            "001-a1".to_string(),
+            10,
+            10,
+            validated_epoch,
+            0,
+        );
+
+        assert_eq!(active.input_discontinuity_count_at_start, 0);
+        assert_eq!(active.input_discontinuity_silence_samples_at_start, 0);
+        assert!(
+            session
+                .capture_recovery
+                .discontinuities
+                .load(Ordering::Acquire)
+                > active.input_discontinuity_count_at_start
+        );
+        assert!(
+            session
+                .capture_recovery
+                .inserted_silence_frames
+                .load(Ordering::Acquire)
+                > active.input_discontinuity_silence_samples_at_start
+        );
+        assert_eq!(
+            attempt_input_discontinuity_state(
+                &active,
+                session
+                    .capture_recovery
+                    .discontinuities
+                    .load(Ordering::Acquire),
+                session
+                    .capture_recovery
+                    .inserted_silence_frames
+                    .load(Ordering::Acquire),
+            ),
+            (true, true)
+        );
+        drop(session);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovered_only_audition_telemetry_is_an_input_discontinuity_warning() {
+        assert_eq!(
+            input_audition_warning_codes(480_000, 480_000, 0.5, 0.1, 0, 480, 0),
+            vec!["input_discontinuity"]
+        );
+    }
+
     fn assert_delivery_mutations_reject_capture_fault(
         fixture_name: &str,
         faulted: bool,
@@ -13415,6 +14116,7 @@ mod tests {
             required_tail_silence_samples: 5,
             status: "recorded".to_string(),
             created_at: "2026-08-11T00:00:00Z".to_string(),
+            input_continuity: None,
             quality_issues: Vec::new(),
         };
         session.snapshot.items[0].status = "review".to_string();
@@ -13505,6 +14207,45 @@ mod tests {
         assert_eq!(item.attempts[2].status, "rejected_by_operator");
         assert!(engine.accept_attempt("001", "001-a2").is_err());
 
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn accept_attempt_rejects_a_legacy_take_after_any_task_discontinuity() {
+        let root = test_root("accept-rejects-missing-continuity-evidence");
+        let mut session = prepare_metadata_test_session(&root);
+        session.snapshot.items[0].status = "review".to_string();
+        session.snapshot.items[0].attempts = vec![test_attempt("001-a1", 0, 10, "recorded")];
+        session.snapshot.captured_samples = 10;
+        session.snapshot.committed_samples = 10;
+        cover_committed_test_audio(&mut session.snapshot);
+        session.captured.store(10, Ordering::Release);
+        session.committed.store(10, Ordering::Release);
+        session
+            .capture_recovery
+            .discontinuities
+            .store(1, Ordering::Release);
+        let snapshot_before = serde_json::to_value(&session.snapshot).unwrap();
+        let journal_before = std::fs::read(root.join("metadata/events.jsonl")).unwrap();
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+
+        let error = engine.accept_attempt("001", "001-a1").unwrap_err();
+
+        assert!(format!("{error:#}").contains("输入连续性边界"), "{error:#}");
+        let session = engine.session.as_ref().unwrap();
+        assert_eq!(
+            serde_json::to_value(&session.snapshot).unwrap(),
+            snapshot_before
+        );
+        assert_eq!(
+            std::fs::read(root.join("metadata/events.jsonl")).unwrap(),
+            journal_before
+        );
+        assert_eq!(session.snapshot.items[0].status, "review");
+        assert_eq!(session.snapshot.items[0].attempts[0].status, "recorded");
+        assert!(session.snapshot.items[0].selected_attempt_id.is_none());
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -14163,6 +14904,7 @@ mod tests {
             required_tail_silence_samples: 5,
             status: "accepted".to_string(),
             created_at: "2026-08-11T00:00:00Z".to_string(),
+            input_continuity: clean_input_continuity(0, 0),
             quality_issues: Vec::new(),
         });
         session.head_silence = HeadSilenceMonitor::new(20);
@@ -14430,8 +15172,36 @@ mod tests {
         assert_eq!(stopped["recovered_discontinuity"], false);
         assert_eq!(stopped["attempt"]["status"], "needs_rerecord");
         assert_eq!(
+            stopped["attempt"]["input_continuity"]["input_discontinuity_count_at_start"],
+            0
+        );
+        assert_eq!(
+            stopped["attempt"]["input_continuity"]["input_discontinuity_count_at_end"],
+            1
+        );
+        assert_eq!(
+            stopped["attempt"]["input_continuity"]["input_discontinuity_silence_samples_at_start"],
+            0
+        );
+        assert_eq!(
+            stopped["attempt"]["input_continuity"]["input_discontinuity_silence_samples_at_end"],
+            0
+        );
+        assert_eq!(
             stopped["attempt"]["quality_issues"][0]["code"],
             "input_discontinuity"
+        );
+        let persisted: SessionSnapshot = serde_json::from_slice(
+            &std::fs::read(root.join("metadata/items.snapshot.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted.items[0].attempts[0]
+                .input_continuity
+                .as_ref()
+                .unwrap()
+                .input_discontinuity_count_at_end,
+            1
         );
         assert!(engine.accept_attempt("001", "001-a1").is_err());
         assert_eq!(
@@ -14474,6 +15244,7 @@ mod tests {
             required_tail_silence_samples: 5,
             status: "accepted".to_string(),
             created_at: "2026-08-11T00:00:00Z".to_string(),
+            input_continuity: clean_input_continuity(0, 0),
             quality_issues: Vec::new(),
         });
         session
@@ -14562,15 +15333,14 @@ mod tests {
     }
 
     #[test]
-    fn recovered_discontinuity_without_a_previous_version_requires_rerecord() {
-        let root = test_root("recovered-discontinuity-requires-rerecord");
+    fn recovered_silence_without_driver_counter_still_requires_rerecord() {
+        let root = test_root("recovered-only-discontinuity-requires-rerecord");
         let mut session = prepare_metadata_test_session(&root);
         session.snapshot.audio_format.sample_rate = 100;
         session.snapshot.silence_duration_ms = 200;
-        session
-            .capture_recovery
-            .discontinuities
-            .store(1, Ordering::Release);
+        // Model a recovered-only observation explicitly. Production publishes
+        // the discontinuity authority first, but this impossible/torn state
+        // must still fail closed if it is ever observed or restored.
         session
             .capture_recovery
             .inserted_silence_frames
@@ -14615,7 +15385,29 @@ mod tests {
 
         let stopped = engine.stop_attempt(false, true, false).unwrap();
 
+        assert_eq!(stopped["observed_discontinuity"], true);
+        assert_eq!(stopped["recovered_discontinuity"], true);
         assert_eq!(stopped["attempt"]["status"], "needs_rerecord");
+        assert_eq!(
+            stopped["attempt"]["input_continuity"]["input_discontinuity_count_at_start"],
+            0
+        );
+        assert_eq!(
+            stopped["attempt"]["input_continuity"]["input_discontinuity_count_at_end"],
+            0
+        );
+        assert_eq!(
+            stopped["attempt"]["input_continuity"]["input_discontinuity_silence_samples_at_start"],
+            0
+        );
+        assert_eq!(
+            stopped["attempt"]["input_continuity"]["input_discontinuity_silence_samples_at_end"],
+            1
+        );
+        assert_eq!(
+            stopped["attempt"]["quality_issues"][0]["code"],
+            "input_discontinuity"
+        );
         assert_eq!(stopped["auto_selected"], false);
         let session = engine.session.as_ref().unwrap();
         assert_eq!(session.snapshot.items[0].status, "review");
@@ -15026,6 +15818,13 @@ mod tests {
 
     #[test]
     fn cpal_i24_normalization_handles_logical_and_wasapi_container_values() {
+        assert!(capture_backend_uses_left_aligned_i24_container("wasapi"));
+        assert!(capture_backend_uses_left_aligned_i24_container("WASAPI"));
+        assert!(!capture_backend_uses_left_aligned_i24_container("asio"));
+        assert!(!capture_backend_uses_left_aligned_i24_container(
+            "coreaudio"
+        ));
+
         assert_eq!(normalize_i24_raw(-8_388_608, false), -1.0);
         assert_eq!(normalize_i24_raw(0, false), 0.0);
         assert_eq!(
@@ -15042,6 +15841,105 @@ mod tests {
         assert_eq!(normalize_u24_raw(0x8000_0000u32 as i32, true), 0.0);
         assert_eq!(normalize_u24_raw(0x4000_0000, true), -0.5);
         assert_eq!(normalize_u24_raw(8_388_608, false), 0.0);
+    }
+
+    #[test]
+    fn asio_logical_i24_and_other_logical_u24_reach_engine_without_a_second_shift() {
+        // The vendored ASIO aligned-24 adapter emits these logical I24 values
+        // before invoking the engine callback. Feed that exact boundary type
+        // through the engine's channel-selection conversion path.
+        let asio_i24 = [
+            I24::new(-8_388_608).unwrap(),
+            I24::new(-256).unwrap(),
+            I24::new(0).unwrap(),
+            I24::new(256).unwrap(),
+            I24::new(8_388_607).unwrap(),
+        ];
+        let expected = vec![
+            -1.0,
+            -256.0 / 8_388_608.0,
+            0.0,
+            256.0 / 8_388_608.0,
+            8_388_607.0 / 8_388_608.0,
+        ];
+        assert_eq!(
+            convert_frames(
+                &asio_i24,
+                1,
+                0,
+                i24_to_f32_converter(capture_backend_uses_left_aligned_i24_container("asio")),
+            )
+            .unwrap(),
+            expected
+        );
+
+        let logical_u24 = [
+            U24::new(0).unwrap(),
+            U24::new(8_388_352).unwrap(),
+            U24::new(8_388_608).unwrap(),
+            U24::new(8_388_864).unwrap(),
+            U24::new(16_777_215).unwrap(),
+        ];
+        assert_eq!(
+            convert_frames(
+                &logical_u24,
+                1,
+                0,
+                u24_to_f32_converter(capture_backend_uses_left_aligned_i24_container("coreaudio")),
+            )
+            .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn wasapi_left_aligned_i24_and_u24_keep_full_scale_zero_and_small_signals() {
+        // WASAPI's zero-copy callback view places the raw 32-bit container in
+        // CPAL's i32-backed wrappers. `new_unchecked` deliberately models that
+        // backend boundary, including values outside the wrappers' logical
+        // 24-bit constructor range.
+        let wasapi_i24 = [
+            I24::new_unchecked(i32::MIN),
+            I24::new_unchecked(-65_536),
+            I24::new_unchecked(0),
+            I24::new_unchecked(65_536),
+            I24::new_unchecked(0x7fff_ff00),
+        ];
+        let expected = vec![
+            -1.0,
+            -256.0 / 8_388_608.0,
+            0.0,
+            256.0 / 8_388_608.0,
+            8_388_607.0 / 8_388_608.0,
+        ];
+        assert_eq!(
+            convert_frames(
+                &wasapi_i24,
+                1,
+                0,
+                i24_to_f32_converter(capture_backend_uses_left_aligned_i24_container("wasapi")),
+            )
+            .unwrap(),
+            expected
+        );
+
+        let wasapi_u24 = [
+            U24::new_unchecked(0),
+            U24::new_unchecked(0x7fff_0000),
+            U24::new_unchecked(0x8000_0000u32 as i32),
+            U24::new_unchecked(0x8001_0000u32 as i32),
+            U24::new_unchecked(0xffff_ff00u32 as i32),
+        ];
+        assert_eq!(
+            convert_frames(
+                &wasapi_u24,
+                1,
+                0,
+                u24_to_f32_converter(capture_backend_uses_left_aligned_i24_container("wasapi")),
+            )
+            .unwrap(),
+            expected
+        );
     }
 
     #[test]
@@ -17083,6 +17981,7 @@ mod tests {
             required_tail_silence_samples: 0,
             status: "interrupted".to_string(),
             created_at: "2026-08-11T00:00:00Z".to_string(),
+            input_continuity: None,
             quality_issues: Vec::new(),
         });
         assert!(validate_snapshot_for_export(&snapshot).is_err());
@@ -17125,6 +18024,70 @@ mod tests {
     }
 
     #[test]
+    fn sentence_delivery_fails_closed_when_a_legacy_take_has_no_continuity_epoch() {
+        let mut snapshot = test_snapshot();
+        snapshot.status = "stopped".to_string();
+        snapshot.captured_samples = 10;
+        snapshot.committed_samples = 10;
+        select_safe_first_attempt(&mut snapshot, 10);
+        snapshot.input_discontinuity_count = 330;
+
+        let attempt = &snapshot.items[0].attempts[0];
+        assert!(attempt.input_continuity.is_none());
+        assert!(!attempt_has_proven_clean_input_continuity(
+            &snapshot, attempt
+        ));
+        assert!(usable_preview_attempt(&snapshot, "001", "001-a1").is_ok());
+        assert!(validate_snapshot_for_export(&snapshot).is_err());
+        assert!(validate_snapshot_for_artifact(&snapshot, Some(ExportArtifact::CutsZip)).is_err());
+        assert!(validate_snapshot_for_cut_scope(&snapshot, ExportScope::ConfirmedOnly).is_err());
+        assert!(validate_snapshot_for_cut_scope(&snapshot, ExportScope::CompleteTask).is_err());
+        validate_snapshot_for_artifact(&snapshot, Some(ExportArtifact::FullTrack)).unwrap();
+        validate_snapshot_for_artifact(&snapshot, Some(ExportArtifact::TimestampsJson)).unwrap();
+
+        let encoded = serde_json::to_value(&snapshot).unwrap();
+        assert!(
+            encoded["items"][0]["attempts"][0]
+                .get("input_continuity")
+                .is_none()
+        );
+        let restored: SessionSnapshot = serde_json::from_value(encoded).unwrap();
+        assert!(restored.items[0].attempts[0].input_continuity.is_none());
+    }
+
+    #[test]
+    fn complete_continuity_epochs_allow_faults_outside_a_clean_take() {
+        let mut snapshot = test_snapshot();
+        snapshot.status = "stopped".to_string();
+        snapshot.captured_samples = 10;
+        snapshot.committed_samples = 10;
+        snapshot.input_discontinuity_count = 330;
+        snapshot.input_discontinuity_silence_samples = 480;
+        select_safe_first_attempt(&mut snapshot, 10);
+
+        // A new retake started after the last known fault and remained in the
+        // same epoch for its entire duration.
+        snapshot.items[0].attempts[0].input_continuity = clean_input_continuity(330, 480);
+        validate_snapshot_for_export(&snapshot).unwrap();
+        validate_snapshot_for_artifact(&snapshot, Some(ExportArtifact::CutsZip)).unwrap();
+        validate_snapshot_for_cut_scope(&snapshot, ExportScope::ConfirmedOnly).unwrap();
+        validate_snapshot_for_cut_scope(&snapshot, ExportScope::CompleteTask).unwrap();
+
+        // A historical take with a complete earlier epoch also remains safe
+        // when the task-level fault happened only after that take ended.
+        snapshot.items[0].attempts[0].input_continuity = clean_input_continuity(329, 0);
+        validate_snapshot_for_cut_scope(&snapshot, ExportScope::CompleteTask).unwrap();
+
+        snapshot.items[0].attempts[0].input_continuity = Some(AttemptInputContinuityEvidence {
+            input_discontinuity_count_at_start: 329,
+            input_discontinuity_count_at_end: 330,
+            input_discontinuity_silence_samples_at_start: 0,
+            input_discontinuity_silence_samples_at_end: 480,
+        });
+        assert!(validate_snapshot_for_cut_scope(&snapshot, ExportScope::CompleteTask).is_err());
+    }
+
+    #[test]
     fn offline_preview_enforces_the_complete_head_silence_contract() {
         let mut snapshot = test_snapshot();
         snapshot.status = "stopped".to_string();
@@ -17147,6 +18110,7 @@ mod tests {
             required_tail_silence_samples: 100,
             status: "accepted".to_string(),
             created_at: "2026-08-27T00:00:00Z".to_string(),
+            input_continuity: None,
             quality_issues: Vec::new(),
         }];
 
@@ -17233,6 +18197,7 @@ mod tests {
             required_tail_silence_samples: 48_000,
             status: "accepted".to_string(),
             created_at: "2026-08-18T06:28:39Z".to_string(),
+            input_continuity: None,
             quality_issues: Vec::new(),
         });
         snapshot.items.push(ItemState {
@@ -17254,6 +18219,7 @@ mod tests {
                 required_tail_silence_samples: 48_000,
                 status: "accepted".to_string(),
                 created_at: "2026-08-18T06:29:35Z".to_string(),
+                input_continuity: None,
                 quality_issues: Vec::new(),
             }],
             selected_attempt_id: Some("0003-a1".to_string()),
@@ -17293,6 +18259,7 @@ mod tests {
             required_tail_silence_samples: 48_000,
             status: "accepted".to_string(),
             created_at: "2026-08-20T10:50:00Z".to_string(),
+            input_continuity: None,
             quality_issues: Vec::new(),
         });
 
@@ -17438,6 +18405,7 @@ mod tests {
             required_tail_silence_samples: 0,
             status: "accepted".to_string(),
             created_at: "2026-08-10T12:00:00Z".to_string(),
+            input_continuity: None,
             quality_issues: Vec::new(),
         }];
         write_snapshot_file(&root.join("metadata/items.snapshot.json"), &snapshot);
@@ -17542,6 +18510,7 @@ mod tests {
                 required_tail_silence_samples: 0,
                 status: "accepted".to_string(),
                 created_at: "2026-08-11T00:00:00Z".to_string(),
+                input_continuity: None,
                 quality_issues: Vec::new(),
             },
             Attempt {
@@ -17558,6 +18527,7 @@ mod tests {
                 required_tail_silence_samples: 0,
                 status: "recorded".to_string(),
                 created_at: "2026-08-11T00:01:00Z".to_string(),
+                input_continuity: None,
                 quality_issues: Vec::new(),
             },
             Attempt {
@@ -17574,6 +18544,7 @@ mod tests {
                 required_tail_silence_samples: 0,
                 status: "needs_rerecord".to_string(),
                 created_at: "2026-08-11T00:02:00Z".to_string(),
+                input_continuity: None,
                 quality_issues: Vec::new(),
             },
         ];
@@ -17655,6 +18626,54 @@ mod tests {
     }
 
     #[test]
+    fn offline_selection_rejects_missing_continuity_evidence_without_blocking_preview() {
+        let root = test_root("offline-select-missing-continuity-evidence");
+        for directory in ["audio", "metadata", "script", "preview", "export"] {
+            std::fs::create_dir_all(root.join(directory)).unwrap();
+        }
+        let mut writer =
+            RecoverableWav::create(&root.join(LEGACY_MASTER_AUDIO), 48_000, 1, 24).unwrap();
+        writer.write_samples(&[0.1, 0.2, 0.3, 0.4]).unwrap();
+        writer.finalize().unwrap();
+        let mut snapshot = test_snapshot();
+        snapshot.status = "stopped".to_string();
+        snapshot.journal_seq = 1;
+        snapshot.captured_samples = 4;
+        snapshot.committed_samples = 4;
+        snapshot.input_discontinuity_count = 1;
+        cover_committed_test_audio(&mut snapshot);
+        snapshot.items[0].status = "review".to_string();
+        snapshot.items[0].attempts = vec![test_attempt("001-a1", 0, 4, "recorded")];
+        write_journal(&root, &[sequenced_event("session_stopped", &snapshot)]);
+        write_snapshot_file(&root.join("metadata/items.snapshot.json"), &snapshot);
+
+        let engine = Engine::new(Emitter::new());
+        let preview = engine
+            .preview_session_waveform_expected(&root, "resume-test", "001", "001-a1")
+            .unwrap();
+        assert!(!preview["bins"].as_array().unwrap().is_empty());
+        let journal_before = std::fs::read(root.join("metadata/events.jsonl")).unwrap();
+
+        let error = engine
+            .select_session_attempt_expected(&root, "resume-test", "001", "001-a1", 1)
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("输入连续性边界"), "{error:#}");
+        assert_eq!(
+            std::fs::read(root.join("metadata/events.jsonl")).unwrap(),
+            journal_before
+        );
+        let persisted: SessionSnapshot = serde_json::from_slice(
+            &std::fs::read(root.join("metadata/items.snapshot.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted.items[0].status, "review");
+        assert_eq!(persisted.items[0].attempts[0].status, "recorded");
+        assert!(persisted.items[0].selected_attempt_id.is_none());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn preview_session_waveform_returns_bins_for_a_usable_attempt() {
         let root = test_root("preview-session-waveform");
         for directory in ["audio", "metadata", "script", "preview"] {
@@ -17686,6 +18705,7 @@ mod tests {
             required_tail_silence_samples: 0,
             status: "accepted".to_string(),
             created_at: "2026-08-11T00:00:00Z".to_string(),
+            input_continuity: None,
             quality_issues: Vec::new(),
         }];
         write_journal(&root, &[sequenced_event("session_stopped", &snapshot)]);
@@ -17722,7 +18742,26 @@ mod tests {
         stopped.status = "stopped".to_string();
         stopped.captured_samples = 4;
         stopped.committed_samples = 4;
+        stopped.input_sample_format_recovery_audits = vec![InputSampleFormatRecoveryAudit {
+            at: "2026-09-01T00:00:00Z".to_string(),
+            reason_code: "legacy_asio_aligned_24_i32_to_i24".to_string(),
+            device_name: "Focusrite USB ASIO".to_string(),
+            device_id: "asio:Focusrite USB ASIO".to_string(),
+            capture_backend: "asio".to_string(),
+            from_sample_format: "i32".to_string(),
+            to_sample_format: "i24".to_string(),
+            sample_rate: 48_000,
+            input_channels: 2,
+            input_channel: 1,
+            boundary_sample: 4,
+            original_selection_error: "driver no longer reports exact i32".to_string(),
+        }];
+        let expected_recovery_audits =
+            serde_json::to_value(&stopped.input_sample_format_recovery_audits).unwrap();
         select_safe_first_attempt(&mut stopped, 4);
+        stopped.items[0].attempts[0].input_continuity = clean_input_continuity(0, 0);
+        let expected_input_continuity =
+            serde_json::to_value(&stopped.items[0].attempts[0].input_continuity).unwrap();
         stopped.items.push(ItemState {
             id: "002".to_string(),
             text: "明确跳过".to_string(),
@@ -17733,7 +18772,21 @@ mod tests {
         });
         write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
         write_snapshot_file(&root.join("metadata/items.snapshot.json"), &stopped);
+        atomic_json(&root.join("session.json"), &session_summary_value(&stopped)).unwrap();
+        let session_summary: Value =
+            serde_json::from_slice(&std::fs::read(root.join("session.json")).unwrap()).unwrap();
+        assert_eq!(
+            session_summary["input_sample_format_recovery_audits"],
+            expected_recovery_audits
+        );
         let engine = Engine::new(Emitter::new());
+        let inspected = engine
+            .inspect_session_expected(&root, "resume-test")
+            .unwrap();
+        assert_eq!(
+            inspected["snapshot"]["input_sample_format_recovery_audits"],
+            expected_recovery_audits
+        );
 
         let full_track = engine
             .export_session_artifact_expected(&root, "resume-test", ExportArtifact::FullTrack)
@@ -17746,6 +18799,14 @@ mod tests {
         assert!(root.join("export/status-full-track.json").is_file());
         assert!(!root.join("export/timestamps.json").exists());
         assert!(!root.join("export/cuts.zip").exists());
+        let full_track_status: Value = serde_json::from_slice(
+            &std::fs::read(root.join("export/status-full-track.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            full_track_status["source"]["input_sample_format_recovery_audits"],
+            expected_recovery_audits
+        );
 
         let timestamps = engine
             .export_session_artifact_expected(&root, "resume-test", ExportArtifact::TimestampsJson)
@@ -17757,6 +18818,17 @@ mod tests {
         assert!(root.join("export/timestamps.json").is_file());
         assert!(root.join("export/status-timestamps-json.json").is_file());
         assert!(!root.join("export/cuts.zip").exists());
+        let timestamps_metadata: Value =
+            serde_json::from_slice(&std::fs::read(root.join("export/timestamps.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            timestamps_metadata["input_sample_format_recovery_audits"],
+            expected_recovery_audits
+        );
+        assert_eq!(
+            timestamps_metadata["items"][0]["attempts"][0]["input_continuity"],
+            expected_input_continuity
+        );
 
         let cuts = engine
             .export_session_artifact_with_options_expected(
@@ -17774,6 +18846,13 @@ mod tests {
             sha256_file(&root.join("export/cuts.zip")).unwrap()
         );
         assert!(root.join("export/cuts-manifest.json").is_file());
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(root.join("export/cuts-manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            manifest["included"][0]["input_continuity"],
+            expected_input_continuity
+        );
         let status: Value = serde_json::from_slice(
             &std::fs::read(root.join("export/status-cuts-zip.json")).unwrap(),
         )
@@ -18179,6 +19258,7 @@ mod tests {
             required_tail_silence_samples: 10,
             status: "accepted".to_string(),
             created_at: "2026-08-11T00:00:00Z".to_string(),
+            input_continuity: None,
             quality_issues: Vec::new(),
         });
         write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
@@ -18263,6 +19343,7 @@ mod tests {
             required_tail_silence_samples: 10,
             status: "accepted".to_string(),
             created_at: "2026-08-11T00:00:00Z".to_string(),
+            input_continuity: None,
             quality_issues: Vec::new(),
         });
         write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
@@ -18315,6 +19396,7 @@ mod tests {
             required_tail_silence_samples: 2,
             status: "accepted".to_string(),
             created_at: "2026-08-20T00:00:00Z".to_string(),
+            input_continuity: None,
             quality_issues: Vec::new(),
         });
         write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
@@ -18344,6 +19426,7 @@ mod tests {
         object.remove("app_version");
         object.remove("engine_version");
         object.remove("input_audition");
+        object.remove("input_sample_format_recovery_audits");
         object
             .get_mut("audio_format")
             .unwrap()
@@ -18355,10 +19438,11 @@ mod tests {
         assert_eq!(snapshot.engine_version, "unknown");
         assert_eq!(snapshot.audio_format.bit_depth, 24);
         assert!(snapshot.input_audition.is_none());
+        assert!(snapshot.input_sample_format_recovery_audits.is_empty());
     }
 
     #[test]
-    fn input_audition_fingerprint_excludes_raw_endpoint_but_tracks_capture_parameters() {
+    fn input_audition_fingerprint_includes_endpoint_identity_and_capture_parameters() {
         let mut snapshot = test_snapshot();
         snapshot.device_name = "Focusrite USB ASIO".to_string();
         snapshot.device_id = "asio:raw-endpoint-at-usb-port-a".to_string();
@@ -18367,18 +19451,15 @@ mod tests {
         snapshot.capture_buffer_frames = Some(512);
         let first = input_audition_capture_fingerprint(&snapshot).unwrap();
         let encoded = serde_json::to_value(input_audition_configuration(&snapshot)).unwrap();
-        assert!(encoded.get("device_id").is_none());
-        assert!(
-            !serde_json::to_string(&encoded)
-                .unwrap()
-                .contains("raw-endpoint-at-usb-port-a")
-        );
+        assert_eq!(encoded["device_id"], "asio:raw-endpoint-at-usb-port-a");
 
         snapshot.device_id = "asio:raw-endpoint-at-usb-port-b".to_string();
-        assert_eq!(
+        assert_ne!(
             input_audition_capture_fingerprint(&snapshot).unwrap(),
-            first
+            first,
+            "same-named physical endpoints must not share an audition decision"
         );
+        snapshot.device_id = "asio:raw-endpoint-at-usb-port-a".to_string();
         snapshot.capture_buffer_frames = Some(256);
         assert_ne!(
             input_audition_capture_fingerprint(&snapshot).unwrap(),
@@ -18387,6 +19468,7 @@ mod tests {
 
         snapshot.capture_backend = "wasapi".to_string();
         snapshot.capture_buffer_frames = Some(512);
+        snapshot.device_id = "wasapi:stable-endpoint-a".to_string();
         snapshot.device_name = "Microphone (2- USB Audio Device)".to_string();
         let usb_port_two = input_audition_capture_fingerprint(&snapshot).unwrap();
         snapshot.device_name = "Microphone (3- USB Audio Device)".to_string();
@@ -18413,6 +19495,23 @@ mod tests {
             usb_port_two,
             "different product names must never share an audition fingerprint"
         );
+
+        snapshot.device_name = "Microphone (USB Audio Device)".to_string();
+        snapshot.device_id = "wasapi:stable-endpoint-b".to_string();
+        assert_ne!(
+            input_audition_capture_fingerprint(&snapshot).unwrap(),
+            usb_port_two,
+            "different endpoint identities must not collide even when labels match"
+        );
+
+        let mut legacy_configuration = encoded;
+        legacy_configuration
+            .as_object_mut()
+            .unwrap()
+            .remove("device_id");
+        let decoded: InputAuditionConfiguration =
+            serde_json::from_value(legacy_configuration).unwrap();
+        assert!(decoded.device_id.is_empty());
     }
 
     #[test]
@@ -18441,6 +19540,9 @@ mod tests {
             input_discontinuity_count_at_start: 0,
             input_discontinuity_silence_samples_at_start: 0,
             overflow_samples_at_start: 0,
+            input_discontinuity_count_at_completion: Some(0),
+            input_discontinuity_silence_samples_at_completion: Some(0),
+            overflow_samples_at_completion: Some(0),
             metrics: Some(InputAuditionMetrics {
                 duration_samples: 480_000,
                 duration_seconds: 10.0,
@@ -18625,6 +19727,201 @@ mod tests {
         );
         assert!(parse_requested_input_sample_format("").unwrap().is_none());
         assert!(parse_requested_input_sample_format("pcm24").is_err());
+    }
+
+    #[test]
+    fn legacy_asio_i32_recovery_prefers_real_i32_and_falls_back_only_to_exact_i24() {
+        let mut snapshot = test_snapshot();
+        snapshot.capture_backend = "asio".to_string();
+        snapshot.device_id = "asio:Focusrite USB ASIO".to_string();
+        snapshot.device_name = "Focusrite USB ASIO".to_string();
+        snapshot.journal_seq = 1;
+        snapshot.input_sample_format = "i32".to_string();
+        snapshot.audio_format.sample_rate = 48_000;
+        snapshot.audio_format.input_channels = 2;
+        snapshot.audio_format.input_channel = 1;
+
+        let i32_config = SupportedStreamConfig::new(
+            2,
+            48_000,
+            cpal::SupportedBufferSize::Unknown,
+            SampleFormat::I32,
+        );
+        let mut preferred_calls = Vec::new();
+        let (preferred, migration) = select_config_candidates_with_legacy_asio_i24_recovery(
+            &snapshot,
+            true,
+            "asio:Focusrite USB ASIO",
+            Some(SampleFormat::I32),
+            |format| {
+                preferred_calls.push(format);
+                Ok(vec![i32_config])
+            },
+        )
+        .unwrap();
+        assert_eq!(preferred_calls, vec![Some(SampleFormat::I32)]);
+        assert_eq!(preferred, vec![i32_config]);
+        assert!(migration.is_none(), "a real i32 path must always win");
+
+        let one_channel_i24 = SupportedStreamConfig::new(
+            1,
+            48_000,
+            cpal::SupportedBufferSize::Unknown,
+            SampleFormat::I24,
+        );
+        let exact_i24 = SupportedStreamConfig::new(
+            2,
+            48_000,
+            cpal::SupportedBufferSize::Unknown,
+            SampleFormat::I24,
+        );
+        let wrong_rate_i24 = SupportedStreamConfig::new(
+            2,
+            44_100,
+            cpal::SupportedBufferSize::Unknown,
+            SampleFormat::I24,
+        );
+        let mut fallback_calls = Vec::new();
+        let (fallback, migration) = select_config_candidates_with_legacy_asio_i24_recovery(
+            &snapshot,
+            true,
+            "asio:Focusrite USB ASIO",
+            Some(SampleFormat::I32),
+            |format| {
+                fallback_calls.push(format);
+                match format {
+                    Some(SampleFormat::I32) => bail!("driver no longer reports exact i32"),
+                    Some(SampleFormat::I24) => Ok(vec![one_channel_i24, wrong_rate_i24, exact_i24]),
+                    other => panic!("unexpected selection request {other:?}"),
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fallback_calls,
+            vec![Some(SampleFormat::I32), Some(SampleFormat::I24)]
+        );
+        assert_eq!(fallback, vec![exact_i24]);
+        let migration = migration.unwrap();
+        assert_eq!(migration.sample_rate, 48_000);
+        assert_eq!(migration.input_channels, 2);
+        assert!(
+            migration
+                .original_selection_error
+                .contains("no longer reports exact i32")
+        );
+
+        snapshot.committed_samples = 96_000;
+        snapshot.captured_samples = 96_000;
+        let previous_source = capture_span_from_snapshot(&snapshot, 0, 0);
+        snapshot.input_sample_format = "i24".to_string();
+        begin_capture_provenance(&mut snapshot, previous_source, 96_000).unwrap();
+        let audit = migration.audit("Focusrite USB ASIO", "asio:Focusrite USB ASIO", 96_000);
+        snapshot
+            .input_sample_format_recovery_audits
+            .push(audit.clone());
+        assert_eq!(snapshot.capture_provenance.len(), 2);
+        assert_eq!(snapshot.capture_provenance[0].start_sample, 0);
+        assert_eq!(snapshot.capture_provenance[0].end_sample, 96_000);
+        assert_eq!(snapshot.capture_provenance[0].input_sample_format, "i32");
+        assert_eq!(snapshot.capture_provenance[1].start_sample, 96_000);
+        assert_eq!(snapshot.capture_provenance[1].end_sample, 96_000);
+        assert_eq!(snapshot.capture_provenance[1].input_sample_format, "i24");
+        assert_eq!(audit.boundary_sample, 96_000);
+        assert_eq!(audit.reason_code, "legacy_asio_aligned_24_i32_to_i24");
+        assert!(
+            migration
+                .warning("Focusrite USB ASIO")
+                .contains("显式迁移为 i24")
+        );
+    }
+
+    #[test]
+    fn legacy_asio_i24_recovery_never_applies_to_new_or_non_asio_tasks() {
+        let mut snapshot = test_snapshot();
+        snapshot.capture_backend = "asio".to_string();
+        snapshot.device_id = "asio:Focusrite USB ASIO".to_string();
+        snapshot.input_sample_format = "i32".to_string();
+        snapshot.audio_format.input_channels = 2;
+        let mut calls = Vec::new();
+        let error = select_config_candidates_with_legacy_asio_i24_recovery(
+            &snapshot,
+            false,
+            "asio:Focusrite USB ASIO",
+            Some(SampleFormat::I32),
+            |format| {
+                calls.push(format);
+                bail!("exact i32 unavailable")
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls, vec![Some(SampleFormat::I32)]);
+        assert!(format!("{error:#}").contains("exact i32 unavailable"));
+
+        assert!(!legacy_asio_i24_recovery_is_eligible(
+            &snapshot,
+            false,
+            "asio:Focusrite USB ASIO",
+            Some(SampleFormat::I32)
+        ));
+        assert!(is_pristine_bootstrap(&snapshot));
+        assert!(!legacy_asio_i24_recovery_is_eligible(
+            &snapshot,
+            true,
+            "asio:Focusrite USB ASIO",
+            Some(SampleFormat::I32)
+        ));
+        snapshot.journal_seq = 1;
+        let mut non_asio_snapshot = snapshot.clone();
+        non_asio_snapshot.capture_backend = "wasapi".to_string();
+        assert!(!legacy_asio_i24_recovery_is_eligible(
+            &non_asio_snapshot,
+            true,
+            "asio:Focusrite USB ASIO",
+            Some(SampleFormat::I32)
+        ));
+        non_asio_snapshot.capture_backend = "asio".to_string();
+        non_asio_snapshot.device_id = "wasapi:focusrite-wdm".to_string();
+        assert!(!legacy_asio_i24_recovery_is_eligible(
+            &non_asio_snapshot,
+            true,
+            "asio:Focusrite USB ASIO",
+            Some(SampleFormat::I32)
+        ));
+        assert!(!legacy_asio_i24_recovery_is_eligible(
+            &snapshot,
+            true,
+            "wasapi:focusrite-wdm",
+            Some(SampleFormat::I32)
+        ));
+    }
+
+    #[test]
+    fn legacy_asio_i24_recovery_rejects_channel_changes() {
+        let mut snapshot = test_snapshot();
+        snapshot.capture_backend = "asio".to_string();
+        snapshot.device_id = "asio:Focusrite USB ASIO".to_string();
+        snapshot.input_sample_format = "i32".to_string();
+        snapshot.audio_format.input_channels = 2;
+        snapshot.journal_seq = 1;
+        let error = select_config_candidates_with_legacy_asio_i24_recovery(
+            &snapshot,
+            true,
+            "asio:Focusrite USB ASIO",
+            Some(SampleFormat::I32),
+            |format| match format {
+                Some(SampleFormat::I32) => bail!("exact i32 unavailable"),
+                Some(SampleFormat::I24) => Ok(vec![SupportedStreamConfig::new(
+                    4,
+                    48_000,
+                    cpal::SupportedBufferSize::Unknown,
+                    SampleFormat::I24,
+                )]),
+                other => panic!("unexpected selection request {other:?}"),
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("没有相同 48000 Hz、2 通道"));
     }
 
     #[test]

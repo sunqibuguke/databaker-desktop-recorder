@@ -63,6 +63,9 @@
         "windows_release",
         "device_id",
         "device_name",
+        "capture_backend",
+        "capture_buffer_frames",
+        "noise_threshold_dbfs",
         "driver_version",
         "usb_port",
         "serial",
@@ -91,6 +94,25 @@
         "device_name": {
           "type": "string",
           "minLength": 1
+        },
+        "capture_backend": {
+          "enum": [
+            "asio",
+            "wasapi"
+          ]
+        },
+        "capture_buffer_frames": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 16,
+          "maximum": 16384
+        },
+        "noise_threshold_dbfs": {
+          "type": "number",
+          "minimum": -96,
+          "maximum": -40
         },
         "driver_version": {
           "type": "string",
@@ -144,7 +166,34 @@
             }
           }
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "capture_backend": {
+                "const": "asio"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "capture_buffer_frames": {
+                "type": "integer",
+                "minimum": 16,
+                "maximum": 16384
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "capture_buffer_frames": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
     },
     "required_runs": {
       "type": "array",

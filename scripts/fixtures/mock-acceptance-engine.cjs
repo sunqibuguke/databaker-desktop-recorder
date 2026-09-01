@@ -11,11 +11,14 @@ let stopped = false;
 let faulted = false;
 let sessionSequence = 0;
 let postFaultInventoryCalls = 0;
+let inputAudition = null;
+let activeAttempt = null;
+let capturedOffsetFrames = 0;
 const replugScenario = process.env.DATABAKER_ACCEPTANCE_MOCK_REPLUG ?? null;
 const mockUnplugAfterMs = Number(process.env.DATABAKER_ACCEPTANCE_MOCK_UNPLUG_AFTER_MS ?? 3_250);
 
 function mockDevice(id = 'mock:usb-interface', name = 'Mock USB Audio Interface') {
-  return {
+  const device = {
     id,
     name,
     is_default: true,
@@ -26,6 +29,13 @@ function mockDevice(id = 'mock:usb-interface', name = 'Mock USB Audio Interface'
       { min_sample_rate: 48_000, max_sample_rate: 48_000, channels: 2, sample_format: 'f32', share_mode: 'shared' },
     ],
   };
+  if (process.env.DATABAKER_ACCEPTANCE_MOCK_MISSING_BACKEND !== '1') {
+    device.backend = 'asio';
+  }
+  if (process.env.DATABAKER_ACCEPTANCE_MOCK_MISSING_REQUESTED_BUFFER !== '1') {
+    device.recommended_buffer_frames = 512;
+  }
+  return device;
 }
 
 function mockInventory() {
@@ -193,7 +203,7 @@ function sealInterruptedSession(directory) {
 function updateAudio() {
   if (!snapshot || stopped || faulted) return;
   const elapsed = Math.max(0, (Date.now() - startedAt) / 1_000);
-  const frames = Math.floor(elapsed * snapshot.audio_format.sample_rate);
+  const frames = capturedOffsetFrames + Math.floor(elapsed * snapshot.audio_format.sample_rate);
   snapshot.captured_samples = frames;
   snapshot.committed_samples = frames;
   snapshot.updated_at = new Date().toISOString();
@@ -268,6 +278,8 @@ createInterface({ input: process.stdin }).on('line', (line) => {
         captured_samples: 0,
         committed_samples: 0,
         overflow_samples: 0,
+        input_discontinuity_count: 0,
+        input_discontinuity_silence_samples: 0,
         started_at: now,
         updated_at: now,
         noise_check: null,
@@ -275,6 +287,24 @@ createInterface({ input: process.stdin }).on('line', (line) => {
         silence_threshold_dbfs: payload.silence_threshold_dbfs,
         items: payload.items.map((item) => ({ ...item, status: 'pending', attempts: [], selected_attempt_id: null })),
       };
+      if (process.env.DATABAKER_ACCEPTANCE_MOCK_MISSING_OVERFLOW === '1') {
+        delete snapshot.overflow_samples;
+      }
+      if (process.env.DATABAKER_ACCEPTANCE_MOCK_MISSING_BACKEND !== '1') {
+        snapshot.capture_backend = 'asio';
+      }
+      if (payload.capture_buffer_frames !== undefined) {
+        snapshot.requested_capture_buffer_frames = payload.capture_buffer_frames;
+      }
+      if (
+        payload.capture_buffer_frames !== undefined &&
+        process.env.DATABAKER_ACCEPTANCE_MOCK_MISSING_ACTUAL_BUFFER !== '1'
+      ) {
+        snapshot.capture_buffer_frames = payload.capture_buffer_frames;
+      }
+      inputAudition = null;
+      activeAttempt = null;
+      capturedOffsetFrames = 0;
       startedAt = Date.now();
       stopped = false;
       faulted = false;
@@ -288,8 +318,12 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       break;
     }
     case 'check_noise': {
+      if (process.env.DATABAKER_ACCEPTANCE_MOCK_NOISE_ERROR === '1') {
+        error(requestId, 'mock ambient noise measurement failed');
+        break;
+      }
       const result = {
-        passed: true,
+        passed: process.env.DATABAKER_ACCEPTANCE_MOCK_NOISE_FAILED !== '1',
         threshold_dbfs: command.payload.threshold_dbfs,
         average_dbfs: -70,
         maximum_dbfs: -65,
@@ -301,25 +335,183 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       response(requestId, result);
       break;
     }
+    case 'begin_input_audition': {
+      updateAudio();
+      const requiredSamples = process.env.DATABAKER_ACCEPTANCE_MOCK_SHORT_AUDITION === '1'
+        ? 1
+        : snapshot.audio_format.sample_rate * 10;
+      inputAudition = {
+        status: 'recording',
+        check_id: 'mock-input-audition-1',
+        start_sample: snapshot.captured_samples,
+        required_samples: requiredSamples,
+        captured_samples: 0,
+        warning_codes: [],
+      };
+      snapshot.input_audition = inputAudition;
+      if (requiredSamples > 1) {
+        // Keep integration tests fast while preserving the production protocol
+        // contract: the next get_state observes a complete 10-second range and
+        // later monitor deltas and fault timing still use the real wall clock.
+        capturedOffsetFrames += requiredSamples;
+      }
+      response(requestId, {
+        check_id: inputAudition.check_id,
+        required_samples: inputAudition.required_samples,
+        captured_samples: 0,
+        input_audition: inputAudition,
+        snapshot,
+      });
+      break;
+    }
+    case 'finish_input_audition': {
+      updateAudio();
+      if (!inputAudition || command.payload.check_id !== inputAudition.check_id) {
+        error(requestId, 'mock input audition is not active');
+        break;
+      }
+      inputAudition = {
+        ...inputAudition,
+        status: 'ready',
+        captured_samples: inputAudition.required_samples,
+        end_sample: inputAudition.start_sample + inputAudition.required_samples,
+        warning_codes: [],
+        metrics: {
+          duration_samples: inputAudition.required_samples,
+          duration_seconds: inputAudition.required_samples / snapshot.audio_format.sample_rate,
+          input_discontinuity_count: 0,
+          input_discontinuity_silence_samples:
+            process.env.DATABAKER_ACCEPTANCE_MOCK_AUDITION_DISCONTINUITY_SILENCE === '1' ? 128 : 0,
+          overflow_samples: 0,
+          warning_codes: [],
+        },
+      };
+      snapshot.input_audition = inputAudition;
+      response(requestId, { input_audition: inputAudition, snapshot });
+      break;
+    }
+    case 'confirm_input_audition': {
+      if (!inputAudition || inputAudition.status !== 'ready' || command.payload.check_id !== inputAudition.check_id) {
+        error(requestId, 'mock input audition cannot be confirmed');
+        break;
+      }
+      inputAudition = { ...inputAudition, status: 'confirmed' };
+      snapshot.input_audition = inputAudition;
+      response(requestId, { input_audition: inputAudition, snapshot });
+      break;
+    }
+    case 'start_attempt': {
+      updateAudio();
+      if (inputAudition?.status !== 'confirmed') {
+        error(requestId, 'mock input audition decision required');
+        break;
+      }
+      const item = snapshot.items.find((candidate) => candidate.id === command.payload.item_id);
+      if (!item) {
+        error(requestId, `unknown mock item ${command.payload.item_id}`);
+        break;
+      }
+      activeAttempt = {
+        item_id: item.id,
+        attempt_id: `${item.id}-a${item.attempts.length + 1}`,
+        start_sample: snapshot.captured_samples,
+      };
+      response(requestId, {
+        attempt_id: activeAttempt.attempt_id,
+        start_sample: activeAttempt.start_sample,
+        recording_started_sample: activeAttempt.start_sample,
+      });
+      break;
+    }
+    case 'stop_attempt': {
+      updateAudio();
+      if (!activeAttempt) {
+        error(requestId, 'no mock attempt is recording');
+        break;
+      }
+      const observedDiscontinuity = process.env.DATABAKER_ACCEPTANCE_MOCK_DISCONTINUITY === '1';
+      if (observedDiscontinuity) {
+        snapshot.input_discontinuity_count = 1;
+        snapshot.input_discontinuity_silence_samples = 128;
+      }
+      const item = snapshot.items.find((candidate) => candidate.id === activeAttempt.item_id);
+      const attemptStatus = faulted
+        ? 'interrupted'
+        : observedDiscontinuity
+          ? 'needs_rerecord'
+          : 'recorded';
+      const attempt = {
+        attempt_id: activeAttempt.attempt_id,
+        start_sample: activeAttempt.start_sample,
+        recording_started_sample: activeAttempt.start_sample,
+        head_silence_armed_sample: activeAttempt.start_sample,
+        head_silence_passed_sample: activeAttempt.start_sample,
+        required_head_silence_samples: 0,
+        content_started_sample: activeAttempt.start_sample,
+        end_sample: Math.max(activeAttempt.start_sample + 1, snapshot.captured_samples),
+        forced_without_tail_silence: false,
+        tail_silence_samples: snapshot.audio_format.sample_rate,
+        required_tail_silence_samples: snapshot.audio_format.sample_rate,
+        status: attemptStatus,
+        quality_issues: observedDiscontinuity
+          ? [{ code: 'input_discontinuity' }]
+          : faulted
+            ? [{ code: 'capture_fault' }]
+            : [],
+        created_at: new Date().toISOString(),
+      };
+      item.status = 'review';
+      item.attempts.push(attempt);
+      item.selected_attempt_id = null;
+      activeAttempt = null;
+      response(requestId, {
+        item_id: item.id,
+        attempt,
+        forced: true,
+        auto_selected: false,
+        observed_discontinuity: observedDiscontinuity,
+        recovered_discontinuity: observedDiscontinuity,
+      });
+      break;
+    }
+    case 'accept_attempt': {
+      const item = snapshot.items.find((candidate) => candidate.id === command.payload.item_id);
+      const attempt = item?.attempts.find((candidate) => candidate.attempt_id === command.payload.attempt_id);
+      if (!attempt || attempt.status !== 'recorded') {
+        error(requestId, 'mock attempt is not delivery safe');
+        break;
+      }
+      attempt.status = 'accepted';
+      item.status = 'accepted';
+      item.selected_attempt_id = attempt.attempt_id;
+      response(requestId, { item_id: item.id, attempt_id: attempt.attempt_id });
+      break;
+    }
     case 'get_state':
       updateAudio();
+      const meterPayload = {
+        captured_samples: snapshot.captured_samples,
+        committed_samples: snapshot.committed_samples,
+        overflow_samples: 0,
+        input_discontinuity_count: snapshot.input_discontinuity_count,
+        input_discontinuity_silence_samples: snapshot.input_discontinuity_silence_samples,
+        faulted,
+        fault_kind: faulted ? 'device_unavailable' : '',
+        fault_reason: faulted ? 'mock input device became unavailable' : '',
+        storage_status: 'healthy',
+        storage_safe_remaining_seconds: 100_000,
+        peak: 0.25,
+        rms: 0.1,
+        silence_samples: 0,
+        waveform: [],
+      };
+      if (process.env.DATABAKER_ACCEPTANCE_MOCK_MISSING_OVERFLOW === '1') {
+        delete meterPayload.overflow_samples;
+      }
       emit({
         protocol_version: 1,
         event: 'meter',
-        payload: {
-          captured_samples: snapshot.captured_samples,
-          committed_samples: snapshot.committed_samples,
-          overflow_samples: 0,
-          faulted,
-          fault_kind: faulted ? 'device_unavailable' : '',
-          fault_reason: faulted ? 'mock input device became unavailable' : '',
-          storage_status: 'healthy',
-          storage_safe_remaining_seconds: 100_000,
-          peak: 0.25,
-          rms: 0.1,
-          silence_samples: 0,
-          waveform: [],
-        },
+        payload: meterPayload,
       });
       response(requestId, { snapshot, session_dir: sessionDirectory, active_attempt: null });
       break;
@@ -334,7 +526,10 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       if (replugScenario === 'second-tail-loss' && sessionSequence === 2) {
         snapshot.captured_samples += snapshot.audio_format.sample_rate;
       }
-      if (process.env.DATABAKER_ACCEPTANCE_MOCK_EXPORT_ACCEPTED_ITEM === '1') {
+      if (
+        process.env.DATABAKER_ACCEPTANCE_MOCK_EXPORT_ACCEPTED_ITEM === '1' &&
+        snapshot.items[0].attempts.length === 0
+      ) {
         const item = snapshot.items[0];
         const endSample = Math.max(2, Math.min(snapshot.committed_samples, snapshot.audio_format.sample_rate));
         const attempt = {

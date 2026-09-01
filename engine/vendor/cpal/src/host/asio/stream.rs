@@ -59,6 +59,124 @@ enum StreamState {
     Starting = 0,
     Paused = 1,
     Playing = 2,
+    Invalidated = 3,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CallbackStamp {
+    buffer_index: i32,
+    system_time: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CallbackContinuityResult {
+    Process,
+    Duplicate,
+    Discontinuity(&'static str),
+}
+
+#[derive(Default)]
+struct CallbackContinuity {
+    // asio-sys 0.3 keeps ASIOTimeInfo::samplePosition inside its private callback
+    // bridge and exposes only buffer_index/system_time here. Use both exposed signals;
+    // exact frame-position continuity will require an asio-sys API extension.
+    last: Option<CallbackStamp>,
+}
+
+impl CallbackContinuity {
+    fn reset(&mut self) {
+        self.last = None;
+    }
+
+    fn observe(
+        &mut self,
+        buffer_index: i32,
+        system_time: u64,
+        buffer_frames: usize,
+        sample_rate: SampleRate,
+    ) -> CallbackContinuityResult {
+        if !matches!(buffer_index, 0 | 1) {
+            return CallbackContinuityResult::Discontinuity(
+                "driver returned an invalid double-buffer index",
+            );
+        }
+
+        // A zero timestamp (or an unusable configuration) cannot establish timing
+        // continuity. Keep suppressing exact duplicate buffer indices, but reset the
+        // timing baseline rather than manufacturing a gap from invalid timing data.
+        let current_time =
+            (system_time != 0 && buffer_frames != 0 && sample_rate != 0).then_some(system_time);
+        let current = CallbackStamp {
+            buffer_index,
+            system_time: current_time,
+        };
+        let Some(previous) = self.last else {
+            self.last = Some(current);
+            return CallbackContinuityResult::Process;
+        };
+
+        let Some(current_time) = current.system_time else {
+            self.last = Some(current);
+            return if buffer_index == previous.buffer_index {
+                CallbackContinuityResult::Duplicate
+            } else {
+                CallbackContinuityResult::Process
+            };
+        };
+        let Some(previous_time) = previous.system_time else {
+            self.last = Some(current);
+            return if buffer_index == previous.buffer_index {
+                CallbackContinuityResult::Duplicate
+            } else {
+                CallbackContinuityResult::Process
+            };
+        };
+
+        let elapsed = if current_time >= previous_time {
+            current_time - previous_time
+        } else if previous_time >= TIMEGETIME_WRAP_NS.saturating_sub(1_000_000_000)
+            && current_time <= 1_000_000_000
+        {
+            current_time + TIMEGETIME_WRAP_NS - previous_time
+        } else {
+            return CallbackContinuityResult::Discontinuity("ASIO system time moved backwards");
+        };
+
+        let expected_period_ns = ((buffer_frames as u128 * 1_000_000_000u128) / sample_rate as u128)
+            .min(u64::MAX as u128) as u64;
+        // ASIO system time is commonly derived from timeGetTime(), whose resolution is
+        // only one millisecond. Add both a fixed two-millisecond allowance and 25% of a
+        // period before deciding that a whole callback went missing.
+        let tolerance_ns = 2_000_000u64.max(expected_period_ns / 4);
+
+        if buffer_index == previous.buffer_index {
+            let one_missed_callback_threshold = expected_period_ns
+                .saturating_mul(3)
+                .saturating_div(2)
+                .saturating_add(tolerance_ns);
+            if elapsed > one_missed_callback_threshold {
+                return CallbackContinuityResult::Discontinuity(
+                    "ASIO double-buffer index did not alternate",
+                );
+            }
+            // Some drivers issue the same callback more than once for a single buffer
+            // period. Do not advance the timing baseline for those duplicates.
+            return CallbackContinuityResult::Duplicate;
+        }
+
+        let multiple_missed_callbacks_threshold = expected_period_ns
+            .saturating_mul(5)
+            .saturating_div(2)
+            .saturating_add(tolerance_ns);
+        if elapsed > multiple_missed_callbacks_threshold {
+            return CallbackContinuityResult::Discontinuity(
+                "ASIO callback timing skipped multiple buffer periods",
+            );
+        }
+
+        self.last = Some(current);
+        CallbackContinuityResult::Process
+    }
 }
 
 #[inline]
@@ -71,11 +189,32 @@ fn normalize_aligned_asio_i32(sample: i32, little_endian: bool, valid_bits: u32)
     native.wrapping_shl(32 - valid_bits)
 }
 
+#[inline]
+fn aligned_asio_i32_to_i16(sample: i32, little_endian: bool) -> i16 {
+    (normalize_aligned_asio_i32(sample, little_endian, 16) >> 16) as i16
+}
+
+#[inline]
+fn aligned_asio_i32_to_i24(sample: i32, little_endian: bool) -> I24 {
+    I24::new(normalize_aligned_asio_i32(sample, little_endian, 24) >> 8)
+        .expect("normalized ASIO sample must fit in i24")
+}
+
+fn buffer_size_change_error(value: i32) -> Error {
+    let detail = if value > 0 {
+        format!("ASIO driver requested buffer size {value}; the stream must be rebuilt")
+    } else {
+        "ASIO driver requested a buffer-size change; the stream must be rebuilt".to_owned()
+    };
+    Error::with_message(ErrorKind::StreamInvalidated, detail)
+}
+
 impl StreamState {
     fn load(atom: &AtomicU8, order: Ordering) -> Self {
         match atom.load(order) {
             1 => Self::Paused,
             2 => Self::Playing,
+            3 => Self::Invalidated,
             _ => Self::Starting,
         }
     }
@@ -87,11 +226,19 @@ impl StreamState {
 
 pub struct Stream {
     state: Arc<AtomicU8>,
+    continuity_epoch: Arc<AtomicU64>,
     driver: Arc<sys::Driver>,
     asio_streams: Arc<Mutex<sys::AsioStreams>>,
     callback_id: sys::BufferCallbackId,
     driver_event_callback_id: sys::DriverEventCallbackId,
+    event_timer_join: Option<std::thread::JoinHandle<()>>,
     time_base: Arc<TimeBase>,
+}
+
+struct AsioEventCallbackRegistration {
+    callback_id: sys::DriverEventCallbackId,
+    terminal_error_tx: mpsc::Sender<Error>,
+    timer_join: std::thread::JoinHandle<()>,
 }
 
 // Compile-time assertion that Stream is Send and Sync
@@ -108,13 +255,72 @@ impl Stream {
     }
 
     pub fn play(&self) -> Result<(), Error> {
-        StreamState::Playing.store(&self.state, Ordering::Release);
-        Ok(())
+        loop {
+            match StreamState::load(&self.state, Ordering::Acquire) {
+                StreamState::Playing => return Ok(()),
+                StreamState::Invalidated => {
+                    return Err(Error::with_message(
+                        ErrorKind::StreamInvalidated,
+                        "ASIO stream must be rebuilt before it can be played again",
+                    ));
+                }
+                StreamState::Paused => {
+                    self.continuity_epoch.fetch_add(1, Ordering::Release);
+                    if self
+                        .state
+                        .compare_exchange(
+                            StreamState::Paused as u8,
+                            StreamState::Playing as u8,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return Ok(());
+                    }
+                }
+                StreamState::Starting => {
+                    return Err(Error::with_message(
+                        ErrorKind::BackendError,
+                        "ASIO stream is still starting",
+                    ));
+                }
+            }
+        }
     }
 
     pub fn pause(&self) -> Result<(), Error> {
-        StreamState::Paused.store(&self.state, Ordering::Release);
-        Ok(())
+        loop {
+            match StreamState::load(&self.state, Ordering::Acquire) {
+                StreamState::Paused => return Ok(()),
+                StreamState::Invalidated => {
+                    return Err(Error::with_message(
+                        ErrorKind::StreamInvalidated,
+                        "ASIO stream must be rebuilt before it can be paused",
+                    ));
+                }
+                StreamState::Playing => {
+                    if self
+                        .state
+                        .compare_exchange(
+                            StreamState::Playing as u8,
+                            StreamState::Paused as u8,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return Ok(());
+                    }
+                }
+                StreamState::Starting => {
+                    return Err(Error::with_message(
+                        ErrorKind::BackendError,
+                        "ASIO stream is still starting",
+                    ));
+                }
+            }
+        }
     }
 
     pub fn buffer_size(&self) -> Result<FrameCount, Error> {
@@ -160,8 +366,8 @@ impl Device {
         let stream_type = driver.input_data_type().map_err(build_stream_err)?;
 
         // Ensure that the desired sample type is supported.
-        let expected_sample_format =
-            super::device::convert_input_data_type(&stream_type).ok_or_else(|| {
+        let expected_sample_format = super::device::convert_input_data_type(&stream_type)
+            .ok_or_else(|| {
                 Error::with_message(
                     ErrorKind::UnsupportedConfig,
                     "Input sample format is not supported",
@@ -195,7 +401,12 @@ impl Device {
         ));
 
         let state = Arc::new(AtomicU8::new(StreamState::Starting as u8));
-        let driver_event_callback_id = self
+        let continuity_epoch = Arc::new(AtomicU64::new(0));
+        let AsioEventCallbackRegistration {
+            callback_id: driver_event_callback_id,
+            terminal_error_tx: continuity_error_tx,
+            timer_join: event_timer_join,
+        } = self
             .add_event_callback(
                 &driver,
                 error_callback,
@@ -211,9 +422,10 @@ impl Device {
             })?;
 
         let state_cb = Arc::clone(&state);
+        let continuity_epoch_cb = Arc::clone(&continuity_epoch);
         let asio_streams = self.asio_streams.clone();
-        let mut current_buffer_size = buffer_size as i32;
-        let mut last_buffer_index: i32 = -1;
+        let mut continuity = CallbackContinuity::default();
+        let mut observed_continuity_epoch = u64::MAX;
 
         let time_base = Arc::new(TimeBase::default());
         let time_base_cb = Arc::clone(&time_base);
@@ -226,13 +438,32 @@ impl Device {
                 return;
             }
 
-            // Guard against non-conformant drivers (e.g. Focusrite USB ASIO, ReaRoute) that
-            // fire the buffer callback multiple times per buffer cycle with the same buffer
-            // index.
-            if callback_info.buffer_index == last_buffer_index {
-                return;
+            let current_epoch = continuity_epoch_cb.load(Ordering::Acquire);
+            if current_epoch != observed_continuity_epoch {
+                continuity.reset();
+                observed_continuity_epoch = current_epoch;
             }
-            last_buffer_index = callback_info.buffer_index;
+            match continuity.observe(
+                callback_info.buffer_index,
+                callback_info.system_time,
+                buffer_size,
+                config.sample_rate,
+            ) {
+                CallbackContinuityResult::Process => {}
+                CallbackContinuityResult::Duplicate => return,
+                CallbackContinuityResult::Discontinuity(reason) => {
+                    StreamState::Invalidated.store(&state_cb, Ordering::Release);
+                    let _ = continuity_error_tx.send(Error::with_message(
+                        ErrorKind::StreamInvalidated,
+                        format!(
+                            "ASIO input callback continuity was lost: {reason} \
+                             (buffer index {}, system time {} ns)",
+                            callback_info.buffer_index, callback_info.system_time
+                        ),
+                    ));
+                    return;
+                }
+            }
 
             // There is 0% chance of lock contention the host only locks when recreating streams.
             let stream_lock = asio_streams.lock().unwrap();
@@ -240,18 +471,6 @@ impl Device {
                 Some(ref asio_stream) => asio_stream,
                 None => return,
             };
-
-            // Resize the buffer only when the driver issues a buffer size change request.
-            // In normal operation this branch is never taken.
-            if asio_stream.buffer_size != current_buffer_size {
-                current_buffer_size = asio_stream.buffer_size;
-                interleaved.resize(
-                    current_buffer_size as usize
-                        * num_channels as usize
-                        * sample_format.sample_size(),
-                    0,
-                );
-            }
 
             let hardware_input_latency = hardware_input_latency.load(Ordering::Relaxed) as usize;
 
@@ -289,6 +508,46 @@ impl Device {
                 }
 
                 // 2. Deliver the interleaved buffer to the callback.
+                apply_input_callback_to_data::<A, _>(
+                    data_callback,
+                    interleaved,
+                    callback_instant,
+                    sample_rate,
+                    format,
+                    hardware_latency_frames,
+                );
+            }
+
+            /// Read an ASIO 32-bit container and expose the actual representable CPAL
+            /// integer format, rather than claiming that padding bits are valid audio bits.
+            #[allow(clippy::too_many_arguments)]
+            unsafe fn process_aligned_i32_input_callback<A, D, F>(
+                data_callback: &mut D,
+                interleaved: &mut [u8],
+                asio_stream: &sys::AsioStream,
+                asio_info: &sys::CallbackInfo,
+                sample_rate: SampleRate,
+                format: SampleFormat,
+                convert: F,
+                hardware_latency_frames: usize,
+                callback_instant: StreamInstant,
+            ) where
+                A: Copy,
+                D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
+                F: Fn(i32) -> A,
+            {
+                let interleaved: &mut [A] = cast_slice_mut(interleaved);
+                let n_frames = asio_stream.buffer_size as usize;
+                let n_channels = interleaved.len() / n_frames;
+                let buffer_index = asio_info.buffer_index as usize;
+                for ch_ix in 0..n_channels {
+                    let asio_channel =
+                        asio_channel_slice::<i32>(asio_stream, buffer_index, ch_ix, None);
+                    for (frame, s_asio) in interleaved.chunks_mut(n_channels).zip(asio_channel) {
+                        frame[ch_ix] = convert(*s_asio);
+                    }
+                }
+
                 apply_input_callback_to_data::<A, _>(
                     data_callback,
                     interleaved,
@@ -380,118 +639,58 @@ impl Device {
                         callback_instant,
                     );
                 }
-                (
-                    &sys::AsioSampleType::ASIOSTInt32LSB16,
-                    SampleFormat::I32,
-                ) => process_input_callback::<i32, _, _>(
-                    &mut data_callback,
-                    &mut interleaved,
-                    asio_stream,
-                    callback_info,
-                    config.sample_rate,
-                    SampleFormat::I32,
-                    |sample| normalize_aligned_asio_i32(sample, true, 16),
-                    hardware_input_latency,
-                    callback_instant,
-                ),
-                (
-                    &sys::AsioSampleType::ASIOSTInt32LSB18,
-                    SampleFormat::I32,
-                ) => process_input_callback::<i32, _, _>(
-                    &mut data_callback,
-                    &mut interleaved,
-                    asio_stream,
-                    callback_info,
-                    config.sample_rate,
-                    SampleFormat::I32,
-                    |sample| normalize_aligned_asio_i32(sample, true, 18),
-                    hardware_input_latency,
-                    callback_instant,
-                ),
-                (
-                    &sys::AsioSampleType::ASIOSTInt32LSB20,
-                    SampleFormat::I32,
-                ) => process_input_callback::<i32, _, _>(
-                    &mut data_callback,
-                    &mut interleaved,
-                    asio_stream,
-                    callback_info,
-                    config.sample_rate,
-                    SampleFormat::I32,
-                    |sample| normalize_aligned_asio_i32(sample, true, 20),
-                    hardware_input_latency,
-                    callback_instant,
-                ),
-                (
-                    &sys::AsioSampleType::ASIOSTInt32LSB24,
-                    SampleFormat::I32,
-                ) => process_input_callback::<i32, _, _>(
-                    &mut data_callback,
-                    &mut interleaved,
-                    asio_stream,
-                    callback_info,
-                    config.sample_rate,
-                    SampleFormat::I32,
-                    |sample| normalize_aligned_asio_i32(sample, true, 24),
-                    hardware_input_latency,
-                    callback_instant,
-                ),
-                (
-                    &sys::AsioSampleType::ASIOSTInt32MSB16,
-                    SampleFormat::I32,
-                ) => process_input_callback::<i32, _, _>(
-                    &mut data_callback,
-                    &mut interleaved,
-                    asio_stream,
-                    callback_info,
-                    config.sample_rate,
-                    SampleFormat::I32,
-                    |sample| normalize_aligned_asio_i32(sample, false, 16),
-                    hardware_input_latency,
-                    callback_instant,
-                ),
-                (
-                    &sys::AsioSampleType::ASIOSTInt32MSB18,
-                    SampleFormat::I32,
-                ) => process_input_callback::<i32, _, _>(
-                    &mut data_callback,
-                    &mut interleaved,
-                    asio_stream,
-                    callback_info,
-                    config.sample_rate,
-                    SampleFormat::I32,
-                    |sample| normalize_aligned_asio_i32(sample, false, 18),
-                    hardware_input_latency,
-                    callback_instant,
-                ),
-                (
-                    &sys::AsioSampleType::ASIOSTInt32MSB20,
-                    SampleFormat::I32,
-                ) => process_input_callback::<i32, _, _>(
-                    &mut data_callback,
-                    &mut interleaved,
-                    asio_stream,
-                    callback_info,
-                    config.sample_rate,
-                    SampleFormat::I32,
-                    |sample| normalize_aligned_asio_i32(sample, false, 20),
-                    hardware_input_latency,
-                    callback_instant,
-                ),
-                (
-                    &sys::AsioSampleType::ASIOSTInt32MSB24,
-                    SampleFormat::I32,
-                ) => process_input_callback::<i32, _, _>(
-                    &mut data_callback,
-                    &mut interleaved,
-                    asio_stream,
-                    callback_info,
-                    config.sample_rate,
-                    SampleFormat::I32,
-                    |sample| normalize_aligned_asio_i32(sample, false, 24),
-                    hardware_input_latency,
-                    callback_instant,
-                ),
+                (&sys::AsioSampleType::ASIOSTInt32LSB16, SampleFormat::I16) => {
+                    process_aligned_i32_input_callback::<i16, _, _>(
+                        &mut data_callback,
+                        &mut interleaved,
+                        asio_stream,
+                        callback_info,
+                        config.sample_rate,
+                        SampleFormat::I16,
+                        |sample| aligned_asio_i32_to_i16(sample, true),
+                        hardware_input_latency,
+                        callback_instant,
+                    )
+                }
+                (&sys::AsioSampleType::ASIOSTInt32LSB24, SampleFormat::I24) => {
+                    process_aligned_i32_input_callback::<I24, _, _>(
+                        &mut data_callback,
+                        &mut interleaved,
+                        asio_stream,
+                        callback_info,
+                        config.sample_rate,
+                        SampleFormat::I24,
+                        |sample| aligned_asio_i32_to_i24(sample, true),
+                        hardware_input_latency,
+                        callback_instant,
+                    )
+                }
+                (&sys::AsioSampleType::ASIOSTInt32MSB16, SampleFormat::I16) => {
+                    process_aligned_i32_input_callback::<i16, _, _>(
+                        &mut data_callback,
+                        &mut interleaved,
+                        asio_stream,
+                        callback_info,
+                        config.sample_rate,
+                        SampleFormat::I16,
+                        |sample| aligned_asio_i32_to_i16(sample, false),
+                        hardware_input_latency,
+                        callback_instant,
+                    )
+                }
+                (&sys::AsioSampleType::ASIOSTInt32MSB24, SampleFormat::I24) => {
+                    process_aligned_i32_input_callback::<I24, _, _>(
+                        &mut data_callback,
+                        &mut interleaved,
+                        asio_stream,
+                        callback_info,
+                        config.sample_rate,
+                        SampleFormat::I24,
+                        |sample| aligned_asio_i32_to_i24(sample, false),
+                        hardware_input_latency,
+                        callback_instant,
+                    )
+                }
 
                 (&sys::AsioSampleType::ASIOSTFloat64LSB, SampleFormat::F64) => {
                     process_input_callback::<u64, _, _>(
@@ -559,19 +758,41 @@ impl Device {
         if let Err(e) = driver.start() {
             driver.remove_event_callback(driver_event_callback_id);
             driver.remove_callback(callback_id);
+            join_asio_event_timer(event_timer_join);
             if let Ok(mut streams) = asio_streams.lock() {
                 streams.input = None;
             }
             return Err(build_stream_err(e));
         }
 
-        StreamState::Paused.store(&state, Ordering::Release);
+        if state
+            .compare_exchange(
+                StreamState::Starting as u8,
+                StreamState::Paused as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            driver.remove_event_callback(driver_event_callback_id);
+            driver.remove_callback(callback_id);
+            join_asio_event_timer(event_timer_join);
+            if let Ok(mut streams) = asio_streams.lock() {
+                streams.input = None;
+            }
+            return Err(Error::with_message(
+                ErrorKind::StreamInvalidated,
+                "ASIO stream configuration changed while the input stream was starting",
+            ));
+        }
         Ok(Stream {
             state,
+            continuity_epoch,
             driver,
             asio_streams,
             callback_id,
             driver_event_callback_id,
+            event_timer_join: Some(event_timer_join),
             time_base: Arc::clone(&time_base),
         })
     }
@@ -641,7 +862,12 @@ impl Device {
         ));
 
         let state = Arc::new(AtomicU8::new(StreamState::Starting as u8));
-        let driver_event_callback_id = self
+        let continuity_epoch = Arc::new(AtomicU64::new(0));
+        let AsioEventCallbackRegistration {
+            callback_id: driver_event_callback_id,
+            terminal_error_tx: continuity_error_tx,
+            timer_join: event_timer_join,
+        } = self
             .add_event_callback(
                 &driver,
                 error_callback,
@@ -657,9 +883,10 @@ impl Device {
             })?;
 
         let state_cb = Arc::clone(&state);
+        let continuity_epoch_cb = Arc::clone(&continuity_epoch);
         let asio_streams = self.asio_streams.clone();
-        let mut current_buffer_size = buffer_size as i32;
-        let mut last_buffer_index: i32 = -1;
+        let mut continuity = CallbackContinuity::default();
+        let mut observed_continuity_epoch = u64::MAX;
 
         let time_base = Arc::new(TimeBase::default());
         let time_base_cb = Arc::clone(&time_base);
@@ -670,13 +897,32 @@ impl Device {
                 return;
             }
 
-            // Guard against non-conformant drivers (e.g. Focusrite USB ASIO, ReaRoute) that
-            // fire the buffer callback multiple times per buffer cycle with the same buffer
-            // index.
-            if callback_info.buffer_index == last_buffer_index {
-                return;
+            let current_epoch = continuity_epoch_cb.load(Ordering::Acquire);
+            if current_epoch != observed_continuity_epoch {
+                continuity.reset();
+                observed_continuity_epoch = current_epoch;
             }
-            last_buffer_index = callback_info.buffer_index;
+            match continuity.observe(
+                callback_info.buffer_index,
+                callback_info.system_time,
+                buffer_size,
+                config.sample_rate,
+            ) {
+                CallbackContinuityResult::Process => {}
+                CallbackContinuityResult::Duplicate => return,
+                CallbackContinuityResult::Discontinuity(reason) => {
+                    StreamState::Invalidated.store(&state_cb, Ordering::Release);
+                    let _ = continuity_error_tx.send(Error::with_message(
+                        ErrorKind::StreamInvalidated,
+                        format!(
+                            "ASIO output callback continuity was lost: {reason} \
+                             (buffer index {}, system time {} ns)",
+                            callback_info.buffer_index, callback_info.system_time
+                        ),
+                    ));
+                    return;
+                }
+            }
 
             // There is 0% chance of lock contention the host only locks when recreating streams.
             let mut stream_lock = asio_streams.lock().unwrap();
@@ -684,18 +930,6 @@ impl Device {
                 Some(ref mut asio_stream) => asio_stream,
                 None => return,
             };
-
-            // Resize the buffer only when the driver issues a buffer size change request.
-            // In normal operation this branch is never taken.
-            if asio_stream.buffer_size != current_buffer_size {
-                current_buffer_size = asio_stream.buffer_size;
-                interleaved.resize(
-                    current_buffer_size as usize
-                        * num_channels as usize
-                        * sample_format.sample_size(),
-                    0,
-                );
-            }
 
             let hardware_output_latency = hardware_output_latency.load(Ordering::Relaxed) as usize;
 
@@ -942,19 +1176,41 @@ impl Device {
         if let Err(e) = driver.start() {
             driver.remove_event_callback(driver_event_callback_id);
             driver.remove_callback(callback_id);
+            join_asio_event_timer(event_timer_join);
             if let Ok(mut streams) = asio_streams.lock() {
                 streams.output = None;
             }
             return Err(build_stream_err(e));
         }
 
-        StreamState::Paused.store(&state, Ordering::Release);
+        if state
+            .compare_exchange(
+                StreamState::Starting as u8,
+                StreamState::Paused as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            driver.remove_event_callback(driver_event_callback_id);
+            driver.remove_callback(callback_id);
+            join_asio_event_timer(event_timer_join);
+            if let Ok(mut streams) = asio_streams.lock() {
+                streams.output = None;
+            }
+            return Err(Error::with_message(
+                ErrorKind::StreamInvalidated,
+                "ASIO stream configuration changed while the output stream was starting",
+            ));
+        }
         Ok(Stream {
             state,
+            continuity_epoch,
             driver,
             asio_streams,
             callback_id,
             driver_event_callback_id,
+            event_timer_join: Some(event_timer_join),
             time_base: Arc::clone(&time_base),
         })
     }
@@ -1052,7 +1308,7 @@ impl Device {
         hardware_latency: Arc<AtomicU32>,
         is_input: bool,
         state: Arc<AtomicU8>,
-    ) -> Result<sys::DriverEventCallbackId, Error>
+    ) -> Result<AsioEventCallbackRegistration, Error>
     where
         E: FnMut(Error) + Send + 'static,
     {
@@ -1065,40 +1321,16 @@ impl Device {
             }
         };
         let driver_for_latency = driver.clone();
-        let asio_streams_for_event = self.asio_streams.clone();
 
         // Debounce timer: wait for ASIO_EVENT_DEBOUNCE of silence after the most recent event
-        // before delivering to the user. Exits when `timer_tx` is dropped, which happens when the
-        // event callback closure is removed during stream teardown.
+        // before delivering to the user. Stream teardown removes both ASIO callbacks, drops every
+        // sender, flushes any pending terminal error, and joins this worker.
         let (timer_tx, timer_rx) = mpsc::channel::<Error>();
         let error_cb_for_timer = Arc::clone(&error_callback_shared);
-        std::thread::Builder::new()
+        let event_timer_join = std::thread::Builder::new()
             .name("cpal-asio-event-timer".into())
             .spawn(move || {
-                let mut pending: Option<Error> = None;
-                loop {
-                    // Use recv() when idle (no timeout needed) so we don't spin.
-                    let result = if pending.is_some() {
-                        timer_rx.recv_timeout(ASIO_EVENT_DEBOUNCE)
-                    } else {
-                        timer_rx
-                            .recv()
-                            .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
-                    };
-                    match result {
-                        Ok(err) => {
-                            // New event; restart the grace window.
-                            pending = Some(err);
-                        }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            // Grace period elapsed with no new events: now deliver.
-                            if let Some(err) = pending.take() {
-                                emit_error(&error_cb_for_timer, err);
-                            }
-                        }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                    }
-                }
+                run_asio_event_debounce(timer_rx, ASIO_EVENT_DEBOUNCE, error_cb_for_timer)
             })
             .map_err(|e| {
                 Error::with_message(
@@ -1107,24 +1339,28 @@ impl Device {
                 )
             })?;
 
-        Ok(driver.add_event_callback(move |event| {
+        let continuity_error_tx = timer_tx.clone();
+        let callback_id = driver.add_event_callback(move |event| {
             match event {
                 sys::AsioDriverEvent::Message {
                     selector: msg,
                     value,
                 } => match msg {
                     sys::AsioMessageSelectors::kAsioSelectorSupported => {
-                        // Signal which selectors this stream opts into.
+                        // Dynamic buffer resizing requires disposing and recreating the ASIO
+                        // buffers, which cannot be done from the driver's event callback. Do not
+                        // advertise support for it; an unsolicited request is handled below by
+                        // invalidating the stream and requiring a full rebuild.
                         matches!(
                             sys::AsioMessageSelectors::from_i64(value as i64),
-                            Some(sys::AsioMessageSelectors::kAsioBufferSizeChange)
-                                | Some(sys::AsioMessageSelectors::kAsioOverload)
+                            Some(sys::AsioMessageSelectors::kAsioOverload)
                         )
                     }
                     sys::AsioMessageSelectors::kAsioResetRequest => {
                         // Guard on Starting: some USB ASIO drivers (ASIO4ALL, Focusrite, etc.)
                         // fire spurious reset/resync requests during driver.start().
                         if StreamState::load(&state, Ordering::Acquire) != StreamState::Starting {
+                            StreamState::Invalidated.store(&state, Ordering::Release);
                             let _ = timer_tx.send(Error::with_message(
                                 ErrorKind::StreamInvalidated,
                                 "Stream reset was requested by the ASIO driver",
@@ -1137,6 +1373,7 @@ impl Device {
                         // means the driver needs a full stop/reinit/start. It is *not* a simple
                         // xrun notification.
                         if StreamState::load(&state, Ordering::Acquire) != StreamState::Starting {
+                            StreamState::Invalidated.store(&state, Ordering::Release);
                             let _ = timer_tx.send(Error::with_message(
                                 ErrorKind::StreamInvalidated,
                                 "Stream resynchronization was requested by the ASIO driver",
@@ -1163,20 +1400,13 @@ impl Device {
                         false
                     }
                     sys::AsioMessageSelectors::kAsioBufferSizeChange => {
-                        if value > 0 {
-                            let mut streams = asio_streams_for_event
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner());
-                            let stream = if is_input {
-                                streams.input.as_mut()
-                            } else {
-                                streams.output.as_mut()
-                            };
-                            if let Some(s) = stream {
-                                s.buffer_size = value;
-                            }
-                        }
-                        true
+                        // ASIO buffer pointers are valid only for the size passed to
+                        // ASIOCreateBuffers. Mutating AsioStream::buffer_size here would make the
+                        // next callback construct slices beyond those allocations. Stop delivery
+                        // immediately and require the owner to dispose/recreate the whole stream.
+                        StreamState::Invalidated.store(&state, Ordering::Release);
+                        let _ = timer_tx.send(buffer_size_change_error(value));
+                        false
                     }
                     _ => false,
                 },
@@ -1191,6 +1421,7 @@ impl Device {
                     if should_notify
                         && StreamState::load(&state, Ordering::Acquire) != StreamState::Starting
                     {
+                        StreamState::Invalidated.store(&state, Ordering::Release);
                         let _ = timer_tx.send(Error::with_message(
                             ErrorKind::StreamInvalidated,
                             format!("Sample rate changed to {new_rate} Hz by the ASIO driver"),
@@ -1199,7 +1430,12 @@ impl Device {
                     false
                 }
             }
-        }))
+        });
+        Ok(AsioEventCallbackRegistration {
+            callback_id,
+            terminal_error_tx: continuity_error_tx,
+            timer_join: event_timer_join,
+        })
     }
 }
 
@@ -1208,6 +1444,65 @@ impl Drop for Stream {
         self.driver.remove_callback(self.callback_id);
         self.driver
             .remove_event_callback(self.driver_event_callback_id);
+        // Removing both callbacks drops every sender. Join the worker so a
+        // terminal error already queued during the debounce window is delivered
+        // before stream teardown can be reported as clean.
+        if let Some(join) = self.event_timer_join.take() {
+            join_asio_event_timer(join);
+        }
+    }
+}
+
+fn join_asio_event_timer(join: std::thread::JoinHandle<()>) {
+    // A user error callback is allowed to trigger arbitrary ownership changes,
+    // including dropping its own Stream through shared application state. The
+    // callback runs on this timer worker, so joining that same thread would
+    // deadlock (or panic on platforms that detect self-join). In that one case
+    // the pending error is already being delivered; detaching lets the worker
+    // return normally after the callback finishes.
+    if join.thread().id() != std::thread::current().id() {
+        let _ = join.join();
+    }
+}
+
+fn run_asio_event_debounce<E>(
+    receiver: mpsc::Receiver<Error>,
+    debounce: Duration,
+    error_callback: Arc<Mutex<E>>,
+) where
+    E: FnMut(Error) + Send + 'static,
+{
+    let mut pending: Option<Error> = None;
+    loop {
+        // Use recv() when idle (no timeout needed) so we don't spin.
+        let result = if pending.is_some() {
+            receiver.recv_timeout(debounce)
+        } else {
+            receiver
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        };
+        match result {
+            Ok(err) => {
+                // A later event supersedes the diagnostic detail, but the
+                // invalidated state remains latched from the first one.
+                pending = Some(err);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(err) = pending.take() {
+                    emit_error(&error_callback, err);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // Stream teardown removes both ASIO callbacks and therefore all
+                // senders. Do not let that normal lifecycle edge erase an
+                // invalidation that arrived less than one debounce interval ago.
+                if let Some(err) = pending.take() {
+                    emit_error(&error_callback, err);
+                }
+                return;
+            }
+        }
     }
 }
 
@@ -1573,18 +1868,212 @@ unsafe fn apply_input_callback_to_data<A, D>(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_aligned_asio_i32;
+    use super::{
+        aligned_asio_i32_to_i16, aligned_asio_i32_to_i24, buffer_size_change_error,
+        join_asio_event_timer, normalize_aligned_asio_i32, run_asio_event_debounce,
+        CallbackContinuity, CallbackContinuityResult, Error, ErrorKind, TIMEGETIME_WRAP_NS,
+    };
+    use std::{
+        sync::{mpsc, Arc, Mutex},
+        time::Duration,
+    };
+
+    const BUFFER_FRAMES: usize = 512;
+    const SAMPLE_RATE: u32 = 48_000;
+    const PERIOD_NS: u64 = 10_666_666;
 
     #[test]
     fn aligned_integer_samples_use_the_full_i32_scale() {
-        assert_eq!(normalize_aligned_asio_i32(0x007f_ffff, true, 24), 0x7fff_ff00);
+        assert_eq!(
+            normalize_aligned_asio_i32(0x007f_ffff, true, 24),
+            0x7fff_ff00
+        );
         assert_eq!(normalize_aligned_asio_i32(0x0080_0000, true, 24), i32::MIN);
-        assert_eq!(normalize_aligned_asio_i32(0x0000_7fff, true, 16), 0x7fff_0000);
+        assert_eq!(
+            normalize_aligned_asio_i32(0x0000_7fff, true, 16),
+            0x7fff_0000
+        );
 
         let big_endian_positive = i32::from_ne_bytes([0x00, 0x7f, 0xff, 0xff]);
         assert_eq!(
             normalize_aligned_asio_i32(big_endian_positive, false, 24),
             0x7fff_ff00
+        );
+
+        assert_eq!(aligned_asio_i32_to_i16(0x0000_7fff, true), i16::MAX);
+        assert_eq!(aligned_asio_i32_to_i16(0x0000_8000, true), i16::MIN);
+        assert_eq!(
+            aligned_asio_i32_to_i24(0x007f_ffff, true).inner(),
+            0x007f_ffff
+        );
+        assert_eq!(
+            aligned_asio_i32_to_i24(0x0080_0000, true).inner(),
+            -0x0080_0000
+        );
+    }
+
+    #[test]
+    fn buffer_size_changes_require_stream_rebuild() {
+        let error = buffer_size_change_error(1024);
+        assert_eq!(error.kind(), ErrorKind::StreamInvalidated);
+        assert!(error.message().unwrap().contains("1024"));
+        assert!(error.message().unwrap().contains("rebuilt"));
+    }
+
+    #[test]
+    fn pending_terminal_error_is_delivered_once_when_stream_tears_down_before_debounce() {
+        let (sender, receiver) = mpsc::channel();
+        let delivered = Arc::new(Mutex::new(Vec::<(ErrorKind, String)>::new()));
+        let delivered_for_callback = Arc::clone(&delivered);
+        let error_callback = Arc::new(Mutex::new(move |error: Error| {
+            delivered_for_callback.lock().unwrap().push((
+                error.kind(),
+                error.message().unwrap_or_default().to_string(),
+            ));
+        }));
+        let worker = std::thread::spawn(move || {
+            run_asio_event_debounce(receiver, Duration::from_secs(60), error_callback)
+        });
+
+        sender
+            .send(Error::with_message(
+                ErrorKind::StreamInvalidated,
+                "terminal ASIO invalidation",
+            ))
+            .unwrap();
+        // Dropping the final sender models Stream::drop removing both ASIO
+        // callbacks before the normal 500 ms debounce expires.
+        drop(sender);
+        worker.join().unwrap();
+
+        let delivered = delivered.lock().unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].0, ErrorKind::StreamInvalidated);
+        assert_eq!(delivered[0].1, "terminal ASIO invalidation");
+    }
+
+    #[test]
+    fn event_callback_can_drop_its_own_stream_without_self_joining() {
+        let (handle_sender, handle_receiver) = mpsc::channel();
+        let (finished_sender, finished_receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let own_handle = handle_receiver.recv().unwrap();
+            join_asio_event_timer(own_handle);
+            finished_sender.send(()).unwrap();
+        });
+        handle_sender.send(worker).unwrap();
+
+        finished_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("self-owned event timer handle must be detached instead of joined");
+    }
+
+    #[test]
+    fn callback_continuity_accepts_normal_timing_and_suppresses_driver_duplicates() {
+        let mut continuity = CallbackContinuity::default();
+        let start = 1_000_000_000;
+        assert_eq!(
+            continuity.observe(0, start, BUFFER_FRAMES, SAMPLE_RATE),
+            CallbackContinuityResult::Process
+        );
+        assert_eq!(
+            continuity.observe(0, start, BUFFER_FRAMES, SAMPLE_RATE),
+            CallbackContinuityResult::Duplicate
+        );
+        assert_eq!(
+            continuity.observe(1, start + PERIOD_NS, BUFFER_FRAMES, SAMPLE_RATE),
+            CallbackContinuityResult::Process
+        );
+        assert_eq!(
+            continuity.observe(0, start + PERIOD_NS * 2, BUFFER_FRAMES, SAMPLE_RATE),
+            CallbackContinuityResult::Process
+        );
+    }
+
+    #[test]
+    fn callback_continuity_fails_closed_when_one_or_more_callbacks_are_missing() {
+        let start = 1_000_000_000;
+        let mut invalid_index = CallbackContinuity::default();
+        assert_eq!(
+            invalid_index.observe(2, start, BUFFER_FRAMES, SAMPLE_RATE),
+            CallbackContinuityResult::Discontinuity(
+                "driver returned an invalid double-buffer index"
+            )
+        );
+
+        let mut one_missing = CallbackContinuity::default();
+        assert_eq!(
+            one_missing.observe(0, start, BUFFER_FRAMES, SAMPLE_RATE),
+            CallbackContinuityResult::Process
+        );
+        assert_eq!(
+            one_missing.observe(0, start + PERIOD_NS * 2, BUFFER_FRAMES, SAMPLE_RATE),
+            CallbackContinuityResult::Discontinuity("ASIO double-buffer index did not alternate")
+        );
+
+        let mut two_missing = CallbackContinuity::default();
+        assert_eq!(
+            two_missing.observe(0, start, BUFFER_FRAMES, SAMPLE_RATE),
+            CallbackContinuityResult::Process
+        );
+        assert_eq!(
+            two_missing.observe(1, start + PERIOD_NS * 3, BUFFER_FRAMES, SAMPLE_RATE),
+            CallbackContinuityResult::Discontinuity(
+                "ASIO callback timing skipped multiple buffer periods"
+            )
+        );
+    }
+
+    #[test]
+    fn callback_continuity_rejects_backwards_time_but_accepts_timer_wrap() {
+        let mut backwards = CallbackContinuity::default();
+        assert_eq!(
+            backwards.observe(0, 2_000_000_000, BUFFER_FRAMES, SAMPLE_RATE),
+            CallbackContinuityResult::Process
+        );
+        assert_eq!(
+            backwards.observe(1, 1_000_000_000, BUFFER_FRAMES, SAMPLE_RATE),
+            CallbackContinuityResult::Discontinuity("ASIO system time moved backwards")
+        );
+
+        let mut wrapping = CallbackContinuity::default();
+        let before_wrap = TIMEGETIME_WRAP_NS - PERIOD_NS / 2;
+        assert_eq!(
+            wrapping.observe(0, before_wrap, BUFFER_FRAMES, SAMPLE_RATE),
+            CallbackContinuityResult::Process
+        );
+        assert_eq!(
+            wrapping.observe(1, PERIOD_NS / 2, BUFFER_FRAMES, SAMPLE_RATE),
+            CallbackContinuityResult::Process
+        );
+    }
+
+    #[test]
+    fn callback_continuity_resets_timing_when_driver_timestamp_is_unavailable() {
+        let mut continuity = CallbackContinuity::default();
+        assert_eq!(
+            continuity.observe(0, 0, BUFFER_FRAMES, SAMPLE_RATE),
+            CallbackContinuityResult::Process
+        );
+        assert_eq!(
+            continuity.observe(0, 0, BUFFER_FRAMES, SAMPLE_RATE),
+            CallbackContinuityResult::Duplicate
+        );
+        assert_eq!(
+            continuity.observe(1, 0, BUFFER_FRAMES, SAMPLE_RATE),
+            CallbackContinuityResult::Process
+        );
+        assert_eq!(
+            continuity.observe(0, 1_000_000_000, BUFFER_FRAMES, SAMPLE_RATE),
+            CallbackContinuityResult::Process
+        );
+
+        // pause/play increments the stream epoch and calls this reset before the next
+        // callback, so an intentional long pause cannot be misclassified as a gap.
+        continuity.reset();
+        assert_eq!(
+            continuity.observe(0, 60_000_000_000, BUFFER_FRAMES, SAMPLE_RATE),
+            CallbackContinuityResult::Process
         );
     }
 }

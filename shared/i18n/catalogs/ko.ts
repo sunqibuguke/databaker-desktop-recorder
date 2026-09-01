@@ -211,6 +211,8 @@ const ko: MessageTree = {
     dataSafetyTitle: '데이터 안전 알림',
   },
   activationError: {
+    accessDeniedTitle: 'Windows가 입력 장치 접근을 거부했습니다',
+    accessDeniedBody: '설정 → 개인 정보 및 보안 → 마이크에서 마이크 접근, 앱의 마이크 접근, 데스크톱 앱의 마이크 접근을 모두 켜세요. 조직에서 관리하는 설정이면 관리자에게 허용을 요청한 뒤 다시 시도하세요. 수집 모드를 바꾸거나 녹음을 다시 만들 필요는 없습니다.',
     exclusiveTitle: '독점 모드로 사운드 카드를 열 수 없습니다',
     exclusiveBody: 'Windows가 독점 수집을 거부했습니다. 다른 프로그램이 장치를 쓰거나 샘플레이트/비트 깊이가 드라이버와 맞지 않을 수 있습니다. 공유 모드로 자동 전환하지 않습니다.',
     busyTitle: '사운드 카드를 다른 프로그램이 사용 중입니다',
@@ -228,6 +230,8 @@ const ko: MessageTree = {
     recreateAndEnter: '다시 만들고 녹음 시작',
     backToSetup: '전체 설정으로 돌아가기',
     openEditor: '수집 설정 변경',
+    openAccessHelp: '해결 방법 보기',
+    retryCapture: '수집 다시 시도',
     editSettingsNotice: '녹음 설정으로 돌아왔습니다. 모드나 형식을 바꾼 뒤 작업을 다시 만드세요.',
     recreatedNotice: '새 수집 설정으로 작업을 만들었습니다.',
     detail: '자세한 원인',

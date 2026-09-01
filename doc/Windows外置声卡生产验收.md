@@ -125,11 +125,17 @@ $device = "<inventory 返回的完整设备 ID>"
 
 默认 `--share-mode exclusive`。独占开流失败时报告应可复现（设备占用、不支持的采样率/位深/通道），再显式用 `--share-mode shared` 做对照，不得把共享会话标成独占。
 
-执行噪声检测的前 3 秒保持安静，之后持续朗读或播放稳定测试音。如果是多输入声卡，对生产会使用的每一个 `--channel` 分别执行。完整生产资格必须在 44.1/48/96 kHz 下各重复 16/24/32-bit 矩阵；单次项目验证不能代替该资格矩阵。
+执行噪声检测的前 3 秒保持安静，之后持续朗读或播放稳定测试音。生产资格计划必须通过 `target.noise_threshold_dbfs` 固定阈值，取值只能在 `-96` 至 `-40` dBFS；每个采集 run 的 `--noise-threshold-dbfs` 必须与计划值精确一致，且不得高于 `-40 dBFS`。工具随后会完成 10 秒输入试听；有效试听区间必须恰好覆盖 `sample_rate * 10` 个样本，少一个或多一个样本都不得作为生产证据。之后工具对 `QA-001` 真实执行 `start_attempt` → `stop_attempt` → `accept_attempt`；需要导出时，这个已确认 attempt 必须真实出现在单句交付中。如果是多输入声卡，对生产会使用的每一个 `--channel` 分别执行。完整生产资格必须在 44.1/48/96 kHz 下各重复 16/24/32-bit 矩阵；单次项目验证不能代替该资格矩阵。
+
+`--skip-noise-check` 只允许用于开发排障。噪声检测缺失、命令报错、`passed=false` 或使用该跳过参数都会使正常/故障验收 FAIL；生产 `power-cut` 也不会生成 armed 证据。只有显式的 `--test-only-power-cut` 可在回归中跳过，其证据固定不具备生产资格。
 
 强制通过标准：
 
-- 请求设备 ID、开流模式、采样率、输入通道和交付位深与会话快照一致。
+- 请求设备 ID、开流模式、采样率、输入通道和交付位深与会话快照一致。生产资格 run 还必须通过 `--expected-capture-backend asio --expected-capture-buffer-frames 512`（或计划中的其他独立期望值）声明预期；期望、选择、请求和实际后端必须均非空且一致。
+- ASIO 的计划期望缓冲区、CLI 期望、设备推荐、验收请求、快照请求和驱动实际缓冲区必须都是正整数且完全一致；任一字段缺失或全部自洽成错误值不得通过。
+- 环境噪声检测已执行且 `passed=true`；报告中的阈值、CLI `--noise-threshold-dbfs` 与资格计划 `target.noise_threshold_dbfs` 完全一致，且阈值不高于 `-40 dBFS`。10 秒输入试听无警告并已确认，`required_samples` 和实际试听区间都必须等于 `sample_rate * 10`。
+- 最终 `input_discontinuity_count=0` 且 `input_discontinuity_silence_samples=0`，字段缺失也是 FAIL。
+- 验收句完成开始、停止和确认；已确认 attempt 与最终 selected attempt 一致，需要导出时必须进入单句交付而非 skipped。
 - 引擎记录非空 `input_sample_format` 与 `capture_share_mode`，且通过 `minimum_input_format_bits` 有效数字精度门槛（整数按位宽，`f32=24`、`f64=53`；显式选择 24/32-bit 交付时不接受 `i16/u16`）。
 - `captured` / `committed` 单调，最大提交延迟 ≤ 15 秒，无 overflow/fault marker。
 - 所有分段 WAV 为请求采样率、请求位深、Mono；物理帧数等于最终 `committed_samples`。
@@ -316,10 +322,10 @@ $reports = Join-Path $qaRoot "reports-phase-1"
 生产 `power-cut` 模式会强制 `--trigger-delay-seconds >= 3600`；未显式给出时，默认是录制 3600 秒后进入达标检查、最长等待 3900 秒。到达墙钟时间并不会立即提示断电；工具还会确认：
 
 - `committed_samples >= sample_rate * 3600`，即至少 1 小时的样本已进入持久化水位。
-- 样本水位和分段文件仍在增长，会话无 fault/overflow，磁盘读取正常。
+- 样本水位和分段文件仍在增长，会话无 fault，armed 行的 `overflow_samples` 明确存在且等于 `0`，磁盘读取正常。
 - `captured - committed` 不超过 `--max-tail-loss-seconds`（默认 15 秒，覆盖约 10 秒 checkpoint、回调缓冲和少量调度抖动；允许配置到 30 秒，不能更高）。
 
-全部达标后，工具才会生成随机 nonce，将同一份 `armed` 证据同步写入 phase-1 报告目录和 `<session>\metadata\power-cut.acceptance.json`，对重命名后的最终证据文件再次执行 flush，并强制落盘 telemetry，然后鸣笛并打印断电提示。提示出现后：
+全部达标后，工具才会生成随机 nonce，并把 `overflow_samples=0` 连同 armed 样本水位写入证据，将同一份 `armed` 证据同步写入 phase-1 报告目录和 `<session>\metadata\power-cut.acceptance.json`，对重命名后的最终证据文件再次执行 flush，并强制落盘 telemetry，然后鸣笛并打印断电提示。phase-2 与资格汇总必须在 phase-1 报告、独立 `power-cut-evidence.json`、会话内证据和 armed telemetry 行之间交叉验证该零溢出值；任一处缺失、非零或不一致都不得通过。提示出现后：
 
 1. 确认终端中的 `captured` / `committed` 和文件字节仍在增长。
 2. 直接切断整台测试机电源，不点击应用的停止或退出。
@@ -341,7 +347,7 @@ $phase1Report = Get-ChildItem (Join-Path $qaRoot "reports-phase-1") -Filter "acc
 .\run-windows-audio-acceptance.cmd --mode recover --session-dir $session --phase1-report $phase1Report --output $reports --yes
 ```
 
-`--phase1-report` 也可以指向 phase-1 目录中的独立 `power-cut-evidence.json`，不能直接指向会话内那一份证据。`recover` 在启动引擎、更改 WAV 或写入恢复元数据之前，会先只读校验两份证据逐字段一致、session/device/format 身份、恢复前 `recording/stopping` 状态、1 小时 committed 水位、phase-1/phase-2 验收脚本与 `recorder-engine.exe` 的 SHA-256 完全一致，以及同一 hostname/platform/architecture 上的系统启动时间已晚于 armed 时间。因此仅强杀录音进程、没有重启 Windows，或换用另一个构建来恢复，都不能通过该门禁。用于无硬件测试的 boot 注入只在显式 `--test-only-power-cut` 分类下生效，设置 `NODE_ENV=test` 不能伪造生产恢复的新 boot。
+`--phase1-report` 也可以指向 phase-1 目录中的独立 `power-cut-evidence.json`，不能直接指向会话内那一份证据。`recover` 在启动引擎、更改 WAV 或写入恢复元数据之前，会先只读校验两份证据逐字段一致、session/device/format 身份、恢复前 `recording/stopping` 状态、1 小时 committed 水位、armed `overflow_samples=0` 与 telemetry 一致、phase-1/phase-2 验收脚本与 `recorder-engine.exe` 的 SHA-256 完全一致，以及同一 hostname/platform/architecture 上的系统启动时间已晚于 armed 时间。因此仅强杀录音进程、没有重启 Windows，或换用另一个构建来恢复，都不能通过该门禁。用于无硬件测试的 boot 注入只在显式 `--test-only-power-cut` 分类下生效，设置 `NODE_ENV=test` 不能伪造生产恢复的新 boot。
 
 预检通过后，`recover` 才会启动包内同一个 `recorder-engine.exe`，调用 `seal_interrupted_session`，修复最后一段的不完整帧和落后头部，再从磁盘重新读取全部证据。只有以下项目全部成立才返回 `PASS` / 退出码 `0`：
 
@@ -374,7 +380,7 @@ $phase1Report = Get-ChildItem (Join-Path $qaRoot "reports-phase-1") -Filter "acc
 ```powershell
 $qualification = "DB-WIN-RELEASE-DEVICE-001"
 $installerSha256 = "<SHA256SUMS.txt 中的 64 位哈希>"
-.\run-windows-audio-acceptance.cmd --mode short --device-id $device --sample-rate 48000 --bit-depth 24 --channel 1 --seconds 30 --qualification-id $qualification --qualification-run-id short-48000-24-ch1 --installer-sha256 $installerSha256
+.\run-windows-audio-acceptance.cmd --mode short --device-id $device --expected-capture-backend asio --expected-capture-buffer-frames 512 --sample-rate 48000 --bit-depth 24 --channel 1 --seconds 30 --qualification-id $qualification --qualification-run-id short-48000-24-ch1 --installer-sha256 $installerSha256
 ```
 
 所有 run 完成后，将计划、安装包、各 run 目录和 power-cut 会话放在同一归档根下，执行：
@@ -392,7 +398,7 @@ $installerSha256 = "<SHA256SUMS.txt 中的 64 位哈希>"
 
 真正断电后，phase-1 原始报告保持 `overall=INCOMPLETE`、`completed_at=null`、`power_cut.phase=armed`，这是预期状态，不要人工改成 `PASS`。该 run 目录必须整体归档，至少包含 `acceptance-report.json`、`power-cut-evidence.json`、`telemetry.jsonl`、`protocol.jsonl`和 `engine-stderr.log`，并保留会话内的 `metadata/power-cut.acceptance.json`。
 
-聚合器会 fail-closed 核对上述原始报告、独立证据、会话证据和 phase-2 内嵌证据；还会从 telemetry/protocol 复核 armed 水位、引擎启动与成功 `start_session`，严格比对 qualification/run、安装包、验收工具、引擎、主机、设备和音频格式。原始报告缺失、出现重复或任一字段不一致，均为 `NOT_QUALIFIED`。通过后，phase-1 的报告、日志和证据也必须进入 `qualification-evidence.sha256`。
+聚合器会 fail-closed 核对上述原始报告、独立证据、会话证据和 phase-2 内嵌证据；还会从 telemetry/protocol 复核 armed 水位与 `overflow_samples=0`、引擎启动与成功 `start_session`，严格比对 qualification/run、安装包、验收工具、引擎、主机、设备和音频格式。对采集 run，它不信任报告自报的 `overall=PASS`，还会独立复核资格计划中的 `noise_threshold_dbfs` 与 CLI/噪声结果精确一致且不高于 `-40 dBFS`、`capture_backend` / `capture_buffer_frames` 期望、快照实际值、discontinuity 计数、恰好 `sample_rate * 10` 样本的输入试听、attempt 生命周期和导出归属。原始报告缺失、出现重复或任一字段不一致，均为 `NOT_QUALIFIED`。通过后，phase-1 的报告、日志和证据也必须进入 `qualification-evidence.sha256`。
 
 资格计划在运行时使用 Ajv 2020 严格验证：多余字段、用字符串写数字等情况会在生成报告前被拒绝，不会被自动删除或转型。安装包内的 launcher 直接使用 `app.asar` 中的 Ajv，客户机无需另装 Node.js。
 
