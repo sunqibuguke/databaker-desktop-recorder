@@ -178,9 +178,6 @@ async function skipInputAuditionIfPrompted(page: Page): Promise<void> {
   if (await waitForInputAuditionGate(page) === 'decided') return;
 
   await page.getByTestId('input-audition-skip').click();
-  const confirmation = page.getByTestId('input-audition-skip-confirm');
-  await expect(confirmation).toBeVisible();
-  await confirmation.click();
   await expect(dialog).toBeHidden();
 }
 
@@ -193,7 +190,7 @@ async function confirmInputAudition(page: Page): Promise<void> {
   await feedPaced(page, 480_000, 'speech');
   const audio = page.getByTestId('input-audition-audio');
   await expect(audio).toBeVisible({ timeout: 15_000 });
-  await audio.evaluate((node) => node.dispatchEvent(new Event('ended')));
+  await expect(page.getByTestId('input-audition-confirm')).toBeEnabled();
   await page.getByTestId('input-audition-confirm').click();
   await expect(dialog).toBeHidden();
 }
@@ -378,11 +375,10 @@ test('real Electron confirms a ten-second input audition without creating a sent
     await expect(audio).toBeVisible({ timeout: 15_000 });
     expectNoSentenceAttempt(await readEngineState(page));
 
-    // CI does not have to expose an audible output endpoint. Dispatching the
-    // media completion event exercises the dialog's explicit "listened to the
-    // end" gate while the captured WAV itself still comes from the real
-    // system-test engine and synthetic PCM bridge.
-    await audio.evaluate((node) => node.dispatchEvent(new Event('ended')));
+    // Confirmation is intentionally available as soon as playback is ready;
+    // operators may keep listening, but the workflow no longer blocks on an
+    // audible output endpoint or a media-ended event.
+    await expect(page.getByTestId('input-audition-confirm')).toBeEnabled();
     await page.getByTestId('input-audition-confirm').click();
     await expect(dialog).toBeHidden();
 
@@ -437,14 +433,6 @@ test('real Electron retries and explicitly skips input audition without shortcut
     await page.getByTestId('main-transport').click();
     await expect(dialog).toBeVisible();
     await page.getByTestId('input-audition-skip').click();
-    await page.getByTestId('input-audition-skip-cancel').click();
-    await expect(dialog).toBeVisible();
-    const returnedToAudition = await readEngineState(page);
-    expect(returnedToAudition.snapshot.input_audition ?? null).toBeNull();
-    expectNoSentenceAttempt(returnedToAudition);
-
-    await page.getByTestId('input-audition-skip').click();
-    await page.getByTestId('input-audition-skip-confirm').click();
     await expect(dialog).toBeHidden();
     const skipped = await readEngineState(page);
     expect(skipped.snapshot.input_audition?.status).toBe('skipped');
@@ -462,8 +450,6 @@ test('real Electron scopes audition reuse to one launch and one capture configur
     const dialog = () => page.getByTestId('input-audition-dialog');
     const explicitlySkip = async () => {
       await page.getByTestId('input-audition-skip').click();
-      await expect(page.getByTestId('input-audition-skip-confirm')).toBeVisible();
-      await page.getByTestId('input-audition-skip-confirm').click();
       await expect(dialog()).toBeHidden();
     };
     const pauseToHome = async () => {
