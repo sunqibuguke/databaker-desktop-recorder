@@ -251,6 +251,7 @@ optional = true
 
 [target.'cfg(target_os = "windows")'.dependencies.asio-sys]
 version = "0.3.0"
+path = "asio-sys"
 optional = true
 
 [target.'cfg(target_os = "windows")'.dependencies.audio_thread_priority]

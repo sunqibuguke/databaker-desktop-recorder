@@ -48,13 +48,20 @@ jobs:
         run: npm ci
 
       - name: Check Rust formatting
-        run: node scripts/run-cargo.cjs fmt --manifest-path engine/Cargo.toml --package recorder-engine -- --check
+        shell: pwsh
+        run: |
+          node scripts/run-cargo.cjs fmt --manifest-path engine/Cargo.toml --package recorder-engine -- --check
+          cargo fmt --manifest-path engine/vendor/cpal/Cargo.toml -- --check
+          cargo fmt --manifest-path engine/vendor/cpal/asio-sys/Cargo.toml -- --check
 
       - name: Run strict Rust lints
         run: node scripts/run-cargo.cjs clippy --manifest-path engine/Cargo.toml --all-targets --all-features -- -D warnings
 
       - name: Run vendored CPAL Windows audio patch tests
         run: cargo test --manifest-path engine/vendor/cpal/Cargo.toml --lib --features asio
+
+      - name: Run vendored ASIO callback metadata tests
+        run: cargo test --manifest-path engine/vendor/cpal/asio-sys/Cargo.toml --lib
 
       - name: Run tests including deterministic engine kill recovery
         run: npm test

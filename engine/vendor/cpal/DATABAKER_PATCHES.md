@@ -57,11 +57,32 @@ The Windows build also enables CPAL's ASIO host. DataBaker extends its input
 sample mapping for the ASIO 32-bit container formats with 16/18/20/24 valid
 bits. Those formats are normalized to full-scale `i32` before CPAL hands the
 samples to the recorder, preventing a supported professional driver from being
-hidden during enumeration or recorded at the wrong digital level. The existing
-ASIO duplicate-buffer callback guard remains active for non-conformant drivers,
-including Focusrite USB ASIO.
+hidden during enumeration or recorded at the wrong digital level.
+
+DataBaker also vendors `asio-sys` 0.3.0 so its callback metadata includes the
+driver's `ASIOTimeInfo` validity flags and 64-bit `samplePosition`. A valid
+sample position is the authoritative continuity clock: one complete buffer is
+accepted, an exact callback replay is suppressed, confirmed forward gaps emit
+terminal `ErrorKind::Xrun`, and backwards or partial-buffer movement invalidates
+the stream. The ASIO `systemTime` remains useful for callback timestamps but is
+not proof that PCM was lost. In particular, a Focusrite system timestamp moving
+backwards no longer stops otherwise sample-continuous capture, and the CPAL
+stream clock clamps such a rollback instead of interpreting it as a 49.7-day
+`timeGetTime` wrap. Invalid time-info fields are zeroed at the FFI boundary and
+never used for continuity decisions. A callback without a valid sample position
+invalidates a DataBaker ASIO stream because continuity cannot otherwise be
+proven; it is not silently downgraded to buffer-index/timestamp heuristics.
+All terminal ASIO continuity faults, overloads, and runtime configuration
+changes are queued to a non-driver worker for immediate delivery. The worker
+preserves the first FIFO root cause, invokes the error callback once, and then
+discards duplicate driver chatter. This removes the former 500 ms health-report
+lag and keeps DataBaker's blocking fail-closed handler off ASIO callback threads.
+Latency-change notifications never query the driver from its callback: startup
+latency is refreshed after `ASIOStart` returns, while a runtime change requires a
+safe stream rebuild.
 
 Remove this vendor only after a released CPAL version containing both upstream
 fixes, equivalent silent-packet handling, equivalent explicit-endpoint
-disconnect notification, and the aligned ASIO integer input support has been
-adopted, and the Windows hardware fault suite passes again.
+disconnect notification, the aligned ASIO integer input support, and equivalent
+valid-`samplePosition` ASIO continuity handling has been adopted, and the
+Windows hardware fault suite passes again.

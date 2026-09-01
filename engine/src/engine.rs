@@ -4447,6 +4447,19 @@ impl Engine {
     }
 
     pub fn check_noise(&mut self, payload: NoiseCheckPayload) -> Result<Value> {
+        self.check_noise_with_hooks(payload, |_, interval| thread::sleep(interval), || {})
+    }
+
+    fn check_noise_with_hooks<WaitForSample, BeforeResultCommit>(
+        &mut self,
+        payload: NoiseCheckPayload,
+        mut wait_for_sample: WaitForSample,
+        mut before_result_commit: BeforeResultCommit,
+    ) -> Result<Value>
+    where
+        WaitForSample: FnMut(usize, Duration),
+        BeforeResultCommit: FnMut(),
+    {
         const SAMPLE_COUNT: usize = 15;
         const SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
         if !payload.threshold_dbfs.is_finite() || !(-96.0..=-6.0).contains(&payload.threshold_dbfs)
@@ -4459,10 +4472,15 @@ impl Engine {
         if session.active_attempt.is_some() {
             bail!("cannot check ambient noise while an attempt is recording");
         }
-        if session.faulted.load(Ordering::Acquire) {
-            bail!("音频写盘异常，请结束并恢复当前录制");
-        }
-        session.snapshot.noise_threshold_dbfs = Some(payload.threshold_dbfs);
+        // The counter is absolute and monotonic for the whole capture runtime.
+        // Snapshot it before the initial health gate so a discontinuity racing
+        // with noise-check startup cannot be silently absorbed. A clean check
+        // requires both this startup value and every later value to remain zero.
+        let discontinuity_baseline = session
+            .capture_recovery
+            .discontinuities
+            .load(Ordering::Acquire);
+        ensure_noise_check_capture_healthy(session, discontinuity_baseline)?;
         let rms = Arc::clone(&session.rms);
         let peak = Arc::clone(&session.peak);
         let mut samples = Vec::with_capacity(SAMPLE_COUNT);
@@ -4475,9 +4493,13 @@ impl Engine {
             }),
         );
         for index in 0..SAMPLE_COUNT {
-            thread::sleep(SAMPLE_INTERVAL);
+            wait_for_sample(index + 1, SAMPLE_INTERVAL);
             let rms_value = f32::from_bits(rms.load(Ordering::Relaxed));
             let peak_value = f32::from_bits(peak.load(Ordering::Relaxed));
+            // Capture health changes are published asynchronously by the
+            // backend. Never turn a frozen or discontinuous meter value into
+            // an additional valid noise sample.
+            ensure_noise_check_capture_healthy(session, discontinuity_baseline)?;
             let rms_dbfs = linear_to_dbfs(rms_value);
             samples.push(rms_dbfs);
             emitter.event(
@@ -4513,6 +4535,12 @@ impl Engine {
             fail_reason,
             bandwidth_ratio_db: bandwidth.ratio_db,
         };
+        before_result_commit();
+        // Close the final sample-to-commit window as well. A fault, overflow,
+        // or discontinuity after the last meter sample invalidates the whole
+        // check; it must not be persisted or reported as successful.
+        ensure_noise_check_capture_healthy(session, discontinuity_baseline)?;
+        session.snapshot.noise_threshold_dbfs = Some(payload.threshold_dbfs);
         session.snapshot.noise_check = Some(result.clone());
         session.persist("noise_check_completed", json!(&result))?;
         emitter.event("noise_check_completed", json!(&result));
@@ -11470,6 +11498,36 @@ fn waveform_bins(samples: &[f32]) -> Vec<[f32; 2]> {
         .collect()
 }
 
+fn ensure_noise_check_capture_healthy(
+    session: &RecordingSession,
+    discontinuity_baseline: u64,
+) -> Result<()> {
+    if session.faulted.load(Ordering::Acquire) {
+        bail!("环境噪声检测期间音频采集发生故障，检测结果已作废；请结束录制并保留已落盘母轨。");
+    }
+    let overflow_samples = session.overflow.load(Ordering::Acquire);
+    if overflow_samples > 0 {
+        bail!(
+            "环境噪声检测期间音频采集发生数据溢出（{overflow_samples} 帧），检测结果已作废；请结束录制并保留已落盘母轨。"
+        );
+    }
+    if discontinuity_baseline != 0 {
+        bail!(
+            "环境噪声检测开始前当前音频采集已出现不连续（计数 {discontinuity_baseline}），检测结果已作废；请重新检查声卡与驱动后重试。"
+        );
+    }
+    let current_discontinuities = session
+        .capture_recovery
+        .discontinuities
+        .load(Ordering::Acquire);
+    if current_discontinuities != 0 {
+        bail!(
+            "环境噪声检测期间音频输入出现不连续（计数从 0 增至 {current_discontinuities}），检测结果已作废；请重新检查声卡与驱动后重试。"
+        );
+    }
+    Ok(())
+}
+
 fn linear_to_dbfs(value: f32) -> f32 {
     if value <= 0.000_015_85 {
         -96.0
@@ -13937,6 +13995,266 @@ mod tests {
         let mut session = metadata_test_session(root);
         session.snapshot = snapshot;
         session
+    }
+
+    fn assert_failed_noise_check_was_not_persisted(
+        engine: &Engine,
+        root: &Path,
+        journal_before: &[u8],
+        snapshot_before: &[u8],
+    ) {
+        let session = engine.session.as_ref().unwrap();
+        assert!(session.snapshot.noise_check.is_none());
+        assert_eq!(session.snapshot.noise_threshold_dbfs, Some(-42.0));
+        assert_eq!(session.snapshot.journal_seq, 1);
+        assert_eq!(
+            std::fs::read(root.join("metadata/events.jsonl")).unwrap(),
+            journal_before
+        );
+        assert_eq!(
+            std::fs::read(root.join("metadata/items.snapshot.json")).unwrap(),
+            snapshot_before
+        );
+    }
+
+    #[test]
+    fn noise_check_fails_when_capture_faults_mid_check_without_persisting_a_result() {
+        let root = test_root("noise-check-capture-fault");
+        let session = prepare_metadata_test_session(&root);
+        session.rms.store(0.003f32.to_bits(), Ordering::Release);
+        session.peak.store(0.01f32.to_bits(), Ordering::Release);
+        let faulted = Arc::clone(&session.faulted);
+        let journal_before = std::fs::read(root.join("metadata/events.jsonl")).unwrap();
+        let snapshot_before = std::fs::read(root.join("metadata/items.snapshot.json")).unwrap();
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+        let mut waited_samples = 0usize;
+
+        let error = engine
+            .check_noise_with_hooks(
+                NoiseCheckPayload {
+                    threshold_dbfs: -41.0,
+                },
+                |sample_index, _| {
+                    waited_samples += 1;
+                    // One valid sample, then the asynchronous input stream
+                    // faults before the second meter value is read.
+                    if sample_index == 2 {
+                        faulted.store(true, Ordering::Release);
+                    }
+                },
+                || {},
+            )
+            .unwrap_err();
+
+        assert_eq!(waited_samples, 2);
+        assert!(
+            format!("{error:#}").contains("环境噪声检测期间音频采集发生故障"),
+            "{error:#}"
+        );
+        assert_failed_noise_check_was_not_persisted(
+            &engine,
+            &root,
+            &journal_before,
+            &snapshot_before,
+        );
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn noise_check_fails_when_capture_overflows_mid_check_without_persisting_a_result() {
+        let root = test_root("noise-check-capture-overflow");
+        let session = prepare_metadata_test_session(&root);
+        let overflow = Arc::clone(&session.overflow);
+        let journal_before = std::fs::read(root.join("metadata/events.jsonl")).unwrap();
+        let snapshot_before = std::fs::read(root.join("metadata/items.snapshot.json")).unwrap();
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+        let mut waited_samples = 0usize;
+
+        let error = engine
+            .check_noise_with_hooks(
+                NoiseCheckPayload {
+                    threshold_dbfs: -41.0,
+                },
+                |sample_index, _| {
+                    waited_samples += 1;
+                    if sample_index == 3 {
+                        overflow.store(256, Ordering::Release);
+                    }
+                },
+                || {},
+            )
+            .unwrap_err();
+
+        assert_eq!(waited_samples, 3);
+        assert!(
+            format!("{error:#}").contains("数据溢出（256 帧）"),
+            "{error:#}"
+        );
+        assert_failed_noise_check_was_not_persisted(
+            &engine,
+            &root,
+            &journal_before,
+            &snapshot_before,
+        );
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn noise_check_rejects_an_existing_input_discontinuity_before_sampling() {
+        let root = test_root("noise-check-existing-input-discontinuity");
+        let session = prepare_metadata_test_session(&root);
+        session
+            .capture_recovery
+            .discontinuities
+            .store(1, Ordering::Release);
+        let journal_before = std::fs::read(root.join("metadata/events.jsonl")).unwrap();
+        let snapshot_before = std::fs::read(root.join("metadata/items.snapshot.json")).unwrap();
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+        let mut waited_samples = 0usize;
+
+        let error = engine
+            .check_noise_with_hooks(
+                NoiseCheckPayload {
+                    threshold_dbfs: -41.0,
+                },
+                |_, _| waited_samples += 1,
+                || {},
+            )
+            .unwrap_err();
+
+        assert_eq!(waited_samples, 0);
+        assert!(
+            format!("{error:#}").contains("检测开始前当前音频采集已出现不连续（计数 1）"),
+            "{error:#}"
+        );
+        assert_failed_noise_check_was_not_persisted(
+            &engine,
+            &root,
+            &journal_before,
+            &snapshot_before,
+        );
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn noise_check_fails_when_input_discontinuity_increases_mid_check() {
+        let root = test_root("noise-check-input-discontinuity");
+        let session = prepare_metadata_test_session(&root);
+        let discontinuities = Arc::clone(&session.capture_recovery.discontinuities);
+        let journal_before = std::fs::read(root.join("metadata/events.jsonl")).unwrap();
+        let snapshot_before = std::fs::read(root.join("metadata/items.snapshot.json")).unwrap();
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+        let mut waited_samples = 0usize;
+
+        let error = engine
+            .check_noise_with_hooks(
+                NoiseCheckPayload {
+                    threshold_dbfs: -41.0,
+                },
+                |sample_index, _| {
+                    waited_samples += 1;
+                    if sample_index == 2 {
+                        discontinuities.store(1, Ordering::Release);
+                    }
+                },
+                || {},
+            )
+            .unwrap_err();
+
+        assert_eq!(waited_samples, 2);
+        assert!(
+            format!("{error:#}").contains("音频输入出现不连续（计数从 0 增至 1）"),
+            "{error:#}"
+        );
+        assert_failed_noise_check_was_not_persisted(
+            &engine,
+            &root,
+            &journal_before,
+            &snapshot_before,
+        );
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn noise_check_rechecks_capture_health_immediately_before_persisting() {
+        let root = test_root("noise-check-final-capture-fault");
+        let session = prepare_metadata_test_session(&root);
+        session.rms.store(0.003f32.to_bits(), Ordering::Release);
+        session.peak.store(0.01f32.to_bits(), Ordering::Release);
+        let faulted = Arc::clone(&session.faulted);
+        let journal_before = std::fs::read(root.join("metadata/events.jsonl")).unwrap();
+        let snapshot_before = std::fs::read(root.join("metadata/items.snapshot.json")).unwrap();
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+        let mut waited_samples = 0usize;
+
+        let error = engine
+            .check_noise_with_hooks(
+                NoiseCheckPayload {
+                    threshold_dbfs: -41.0,
+                },
+                |_, _| waited_samples += 1,
+                || faulted.store(true, Ordering::Release),
+            )
+            .unwrap_err();
+
+        assert_eq!(waited_samples, 15);
+        assert!(
+            format!("{error:#}").contains("环境噪声检测期间音频采集发生故障"),
+            "{error:#}"
+        );
+        assert_failed_noise_check_was_not_persisted(
+            &engine,
+            &root,
+            &journal_before,
+            &snapshot_before,
+        );
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn noise_check_rechecks_discontinuity_immediately_before_persisting() {
+        let root = test_root("noise-check-final-input-discontinuity");
+        let session = prepare_metadata_test_session(&root);
+        let discontinuities = Arc::clone(&session.capture_recovery.discontinuities);
+        let journal_before = std::fs::read(root.join("metadata/events.jsonl")).unwrap();
+        let snapshot_before = std::fs::read(root.join("metadata/items.snapshot.json")).unwrap();
+        let mut engine = Engine::new(Emitter::new());
+        engine.session = Some(session);
+        let mut waited_samples = 0usize;
+
+        let error = engine
+            .check_noise_with_hooks(
+                NoiseCheckPayload {
+                    threshold_dbfs: -41.0,
+                },
+                |_, _| waited_samples += 1,
+                || discontinuities.store(1, Ordering::Release),
+            )
+            .unwrap_err();
+
+        assert_eq!(waited_samples, 15);
+        assert!(
+            format!("{error:#}").contains("音频输入出现不连续（计数从 0 增至 1）"),
+            "{error:#}"
+        );
+        assert_failed_noise_check_was_not_persisted(
+            &engine,
+            &root,
+            &journal_before,
+            &snapshot_before,
+        );
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
