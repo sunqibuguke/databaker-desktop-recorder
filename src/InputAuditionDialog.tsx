@@ -100,7 +100,6 @@ export function InputAuditionDialog({
   const [finishResult, setFinishResult] = useState<InputAuditionFinishResult | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [listenedToEnd, setListenedToEnd] = useState(false);
-  const [skipConfirmationOpen, setSkipConfirmationOpen] = useState(false);
   const [error, setError] = useState('');
   const [clockMs, setClockMs] = useState(Date.now());
   const blocking = beginPending
@@ -210,13 +209,11 @@ export function InputAuditionDialog({
       dialogRef.current?.focus();
       return;
     }
-    const initial = (listenedToEnd
-      ? dialogRef.current?.querySelector<HTMLElement>('[data-dialog-default]:not([disabled])')
-      : null)
+    const initial = dialogRef.current?.querySelector<HTMLElement>('[data-dialog-default]:not([disabled])')
       ?? dialogRef.current?.querySelector<HTMLElement>('[data-dialog-initial]:not([disabled])')
       ?? dialogRef.current?.querySelector<HTMLElement>(FOCUSABLE);
     initial?.focus();
-  }, [listenedToEnd, phase, skipConfirmationOpen]);
+  }, [phase]);
 
   useEffect(() => {
     if (!audioUrl) autoPlaybackUrlRef.current = null;
@@ -290,7 +287,6 @@ export function InputAuditionDialog({
     replaceAudioUrl(null);
     setFinishResult(null);
     setListenedToEnd(false);
-    setSkipConfirmationOpen(false);
     setError('');
     try {
       const result = await window.recorder.beginInputAudition();
@@ -308,7 +304,6 @@ export function InputAuditionDialog({
         replaceAudioUrl(null);
         setAudition(null);
         setFinishResult(null);
-        setSkipConfirmationOpen(false);
         if (cancelAfterBeginNotifyParentRef.current) onCancelRef.current();
         else setPhase('idle');
         return;
@@ -347,7 +342,6 @@ export function InputAuditionDialog({
       replaceAudioUrl(null);
       setAudition(null);
       setFinishResult(null);
-      setSkipConfirmationOpen(false);
       if (notifyParent) onCancelRef.current();
       else await begin();
     } catch (caught) {
@@ -360,7 +354,6 @@ export function InputAuditionDialog({
   const skip = useCallback(async () => {
     const operation = ++operationRef.current;
     setPhase('skipping');
-    setSkipConfirmationOpen(false);
     setError('');
     try {
       const checkId = cancellableCheckId(audition);
@@ -391,14 +384,9 @@ export function InputAuditionDialog({
     }
   }, [audition, t]);
 
-  const requestSkip = useCallback(() => {
-    if (blocking || beginPendingRef.current) return;
-    setSkipConfirmationOpen(true);
-  }, [blocking]);
-
   const confirm = useCallback(async () => {
     const checkId = operationCheckId(audition);
-    if (!checkId || !listenedToEnd || phase !== 'ready') return;
+    if (!checkId || phase !== 'ready') return;
     const operation = ++operationRef.current;
     setPhase('confirming');
     setError('');
@@ -421,7 +409,7 @@ export function InputAuditionDialog({
       setError(inputAuditionErrorMessage(caught));
       setPhase('error');
     }
-  }, [audition, listenedToEnd, phase, t]);
+  }, [audition, phase, t]);
 
   const onDialogKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     // The audition overlay owns every key. In particular R/P/S/Space must not
@@ -430,10 +418,6 @@ export function InputAuditionDialog({
     if (event.key === 'Escape') {
       event.preventDefault();
       if (phase === 'checking-cache') return;
-      if (skipConfirmationOpen) {
-        setSkipConfirmationOpen(false);
-        return;
-      }
       if (phase !== 'confirming' && phase !== 'skipping' && phase !== 'cancelling') {
         void cancelCurrent(true);
       }
@@ -554,27 +538,20 @@ export function InputAuditionDialog({
         <strong>{t('inputAudition.warningTitle')}</strong>
         <span>{t('inputAudition.warningCodes', { codes: warningCodeCopy.join('、') })}</span>
       </div> : null}
-      {skipConfirmationOpen ? <div className="dialog-warning danger" role="alert" data-testid="input-audition-skip-confirmation">
-        <strong>{t('inputAudition.skipConfirmTitle')}</strong>
-        <span>{t('inputAudition.skipConfirmBody')}</span>
-      </div> : null}
       {error ? <div className="dialog-warning danger" role="alert">
         <strong>{t('inputAudition.errorTitle')}</strong>
         <span>{error}</span>
       </div> : null}
       <footer>
-        {skipConfirmationOpen ? <>
-          <button data-dialog-initial data-testid="input-audition-skip-cancel" className="button" type="button" onClick={() => setSkipConfirmationOpen(false)}>{t('inputAudition.skipConfirmCancel')}</button>
-          <button data-testid="input-audition-skip-confirm" className="button danger-button" type="button" onClick={() => void skip()}>{t('inputAudition.skipConfirmAction')}</button>
-        </> : phase === 'checking-cache' ? <>
+        {phase === 'checking-cache' ? <>
           <button data-dialog-initial className="button" type="button" disabled>{t('common.checking')}</button>
         </> : phase === 'idle' ? <>
-          <button data-testid="input-audition-skip" className="button" type="button" onClick={requestSkip}>{t('inputAudition.skip')}</button>
+          <button data-testid="input-audition-skip" className="button" type="button" onClick={() => void skip()}>{t('inputAudition.skip')}</button>
           <button data-dialog-initial data-testid="input-audition-start" className="button primary" type="button" onClick={() => void begin()} disabled={beginPending} aria-busy={beginPending}>
             <Icon name="record" size={14} />{t('inputAudition.start')}
           </button>
         </> : phase === 'ready' ? <>
-          <button data-testid="input-audition-skip" className="button" type="button" onClick={requestSkip}>{t('inputAudition.skip')}</button>
+          <button data-testid="input-audition-skip" className="button" type="button" onClick={() => void skip()}>{t('inputAudition.skip')}</button>
           <button data-dialog-initial data-testid="input-audition-retry" className="button" type="button" onClick={() => void cancelCurrent(false)}>{t('inputAudition.retry')}</button>
           <button
             data-dialog-default
@@ -582,10 +559,9 @@ export function InputAuditionDialog({
             className="button primary"
             type="button"
             onClick={() => void confirm()}
-            disabled={!listenedToEnd}
           ><Icon name="check" size={14} />{t('inputAudition.confirm')}</button>
         </> : phase === 'warning' || phase === 'error' ? <>
-          <button data-testid="input-audition-skip" className="button" type="button" onClick={requestSkip} disabled={blocking}>{t('inputAudition.skip')}</button>
+          <button data-testid="input-audition-skip" className="button" type="button" onClick={() => void skip()} disabled={blocking}>{t('inputAudition.skip')}</button>
           <button data-dialog-initial data-testid="input-audition-retry" className="button primary" type="button" onClick={() => void cancelCurrent(false)} disabled={blocking}>
             <Icon name="retake" size={14} />{t('inputAudition.retry')}
           </button>
@@ -593,7 +569,7 @@ export function InputAuditionDialog({
           <button data-dialog-initial className="button" type="button" onClick={() => void cancelCurrent(true)} disabled={phase === 'cancelling'}>
             {t('inputAudition.cancel')}
           </button>
-          <button data-testid="input-audition-skip" className="button" type="button" onClick={requestSkip} disabled={blocking}>
+          <button data-testid="input-audition-skip" className="button" type="button" onClick={() => void skip()} disabled={blocking}>
             {t('inputAudition.skip')}
           </button>
         </>}

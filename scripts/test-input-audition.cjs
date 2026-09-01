@@ -434,8 +434,14 @@ async function main() {
       < dialogSource.indexOf('await window.recorder.beginInputAudition()'),
     'the begin-pending guard must be armed before invoking the engine',
   );
-  assert.match(dialogSource, /listenedToEnd[\s\S]*?\[data-dialog-default\]:not\(\[disabled\]\)/,
-    'completed playback must move default focus to the enabled confirmation action');
+  assert.match(dialogSource, /const initial = dialogRef\.current\?\.querySelector<HTMLElement>\('\[data-dialog-default\]:not\(\[disabled\]\)'\)/,
+    'the ready dialog must focus its immediately enabled confirmation action');
+  assert.doesNotMatch(dialogSource, /disabled=\{!listenedToEnd\}/,
+    'confirmation must not require complete playback');
+  assert.doesNotMatch(dialogSource, /skipConfirmationOpen|input-audition-skip-confirmation/,
+    'skip must not open a second confirmation step');
+  assert.match(dialogSource, /data-testid="input-audition-skip"[\s\S]*?onClick=\{\(\) => void skip\(\)\}/,
+    'skip actions must resolve directly');
   assert.match(dialogSource, /force \|\| unresolvedAtOpen[\s\S]*?getInputAuditionDecision/,
     'an unresolved engine audition must bypass cache adoption');
   const forcedOpen = recorderSource.slice(

@@ -19,9 +19,11 @@ pub enum WavEncoding {
 impl WavEncoding {
     pub fn for_bit_depth(bit_depth: u16) -> Result<Self> {
         match bit_depth {
-            16 | 24 => Ok(Self::Pcm),
+            8 | 16 | 24 => Ok(Self::Pcm),
             32 => Ok(Self::Float),
-            _ => bail!("bit depth must be one of 16-bit PCM, 24-bit PCM, or 32-bit Float"),
+            _ => {
+                bail!("bit depth must be one of 8-bit PCM, 16-bit PCM, 24-bit PCM, or 32-bit Float")
+            }
         }
     }
 
@@ -61,6 +63,11 @@ pub(crate) fn decode_encoded_mono_samples(bytes: &[u8], bit_depth: u16) -> Resul
     }
     let mut samples = Vec::with_capacity(bytes.len() / sample_bytes);
     match bit_depth {
+        8 => {
+            for byte in bytes {
+                samples.push((f32::from(*byte) - 128.0) / 128.0);
+            }
+        }
         16 => {
             for chunk in bytes.as_chunks::<2>().0 {
                 let value = i16::from_le_bytes([chunk[0], chunk[1]]);
@@ -79,7 +86,7 @@ pub(crate) fn decode_encoded_mono_samples(bytes: &[u8], bit_depth: u16) -> Resul
                 samples.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
             }
         }
-        _ => bail!("bit depth must be one of 16-bit PCM, 24-bit PCM, or 32-bit Float"),
+        _ => bail!("bit depth must be one of 8-bit PCM, 16-bit PCM, 24-bit PCM, or 32-bit Float"),
     }
     Ok(samples)
 }
@@ -678,6 +685,11 @@ impl RecoverableWav {
         let mut encoded = Vec::with_capacity(samples.len() * bytes_per_sample);
         for sample in samples {
             match (self.encoding, self.bit_depth) {
+                (WavEncoding::Pcm, 8) => {
+                    let sample = sample.clamp(-1.0, 1.0);
+                    let value = (sample * 128.0 + 128.0).round().clamp(0.0, 255.0) as u8;
+                    encoded.push(value);
+                }
                 (WavEncoding::Pcm, 16) => {
                     let sample = sample.clamp(-1.0, 1.0);
                     let value = (sample * 32_768.0)
@@ -1263,9 +1275,12 @@ mod tests {
 
     #[test]
     fn writes_and_slices_every_supported_bit_depth() {
-        for (bit_depth, header_len, bytes_per_sample, format_code) in
-            [(16, 44, 2, 1u16), (24, 44, 3, 1u16), (32, 56, 4, 3u16)]
-        {
+        for (bit_depth, header_len, bytes_per_sample, format_code) in [
+            (8, 44, 1, 1u16),
+            (16, 44, 2, 1u16),
+            (24, 44, 3, 1u16),
+            (32, 56, 4, 3u16),
+        ] {
             let root = test_root(&bit_depth.to_string());
             let source = root.join("source.wav");
             let slice = root.join("slice.wav");
@@ -1307,7 +1322,7 @@ mod tests {
 
     #[test]
     fn recoverable_writer_rejects_non_finite_samples_before_writing_any_payload() {
-        for bit_depth in [16, 24, 32] {
+        for bit_depth in [8, 16, 24, 32] {
             for (name, invalid) in [
                 ("nan", f32::NAN),
                 ("positive-infinity", f32::INFINITY),
@@ -1454,7 +1469,7 @@ mod tests {
 
     #[test]
     fn reopens_and_appends_without_changing_existing_audio() {
-        for bit_depth in [16, 24, 32] {
+        for bit_depth in [8, 16, 24, 32] {
             let root = test_root(&format!("append-{bit_depth}"));
             let path = root.join("append.wav");
             let initial = [-0.75, -0.25, 0.25];
@@ -1501,7 +1516,7 @@ mod tests {
 
     #[test]
     fn recovers_audio_synced_before_its_header_checkpoint() {
-        for bit_depth in [16, 24, 32] {
+        for bit_depth in [8, 16, 24, 32] {
             let root = test_root(&format!("append-power-loss-{bit_depth}"));
             let path = root.join("source.wav");
             let mut writer = RecoverableWav::create(&path, 48_000, 1, bit_depth).unwrap();
@@ -1523,7 +1538,7 @@ mod tests {
 
     #[test]
     fn repairs_a_stale_header_from_complete_physical_frames() {
-        for bit_depth in [16, 24, 32] {
+        for bit_depth in [8, 16, 24, 32] {
             let root = test_root(&format!("append-stale-header-{bit_depth}"));
             let path = root.join("source.wav");
             let mut writer = RecoverableWav::create(&path, 48_000, 1, bit_depth).unwrap();
@@ -1545,7 +1560,7 @@ mod tests {
 
     #[test]
     fn truncates_an_incomplete_tail_to_the_last_complete_frame() {
-        for bit_depth in [16, 24, 32] {
+        for bit_depth in [8, 16, 24, 32] {
             let root = test_root(&format!("append-torn-tail-{bit_depth}"));
             let path = root.join("source.wav");
             let mut writer = RecoverableWav::create(&path, 48_000, 1, bit_depth).unwrap();
@@ -1570,7 +1585,7 @@ mod tests {
 
     #[test]
     fn checkpoint_discards_an_unaccepted_tail_even_when_it_contains_complete_frames() {
-        for bit_depth in [16, 24, 32] {
+        for bit_depth in [8, 16, 24, 32] {
             let root = test_root(&format!("checkpoint-unaccepted-tail-{bit_depth}"));
             let path = root.join("source.wav");
             let mut writer = RecoverableWav::create(&path, 48_000, 1, bit_depth).unwrap();
@@ -1595,7 +1610,7 @@ mod tests {
 
     #[test]
     fn repairs_a_header_that_is_ahead_of_physical_audio() {
-        for bit_depth in [16, 24, 32] {
+        for bit_depth in [8, 16, 24, 32] {
             let root = test_root(&format!("append-header-ahead-{bit_depth}"));
             let path = root.join("source.wav");
             let mut writer = RecoverableWav::create(&path, 48_000, 1, bit_depth).unwrap();
@@ -1630,7 +1645,7 @@ mod tests {
 
     #[test]
     fn rejects_a_block_before_crossing_the_riff_limit() {
-        for bit_depth in [16, 24, 32] {
+        for bit_depth in [8, 16, 24, 32] {
             let root = test_root(&format!("limit-{bit_depth}"));
             let path = root.join("limit.wav");
             let mut writer = RecoverableWav::create(&path, 48_000, 1, bit_depth).unwrap();
@@ -1657,7 +1672,7 @@ mod tests {
 
     #[test]
     fn auto_export_uses_riff_at_the_boundary_and_rf64_immediately_above_it() {
-        for bit_depth in [16, 24, 32] {
+        for bit_depth in [8, 16, 24, 32] {
             let encoding = WavEncoding::for_bit_depth(bit_depth).unwrap();
             let frame_bytes = u64::from(bytes_per_sample(bit_depth).unwrap());
             let maximum_data_bytes = u64::from(u32::MAX) - (encoding.header_len() - 8);
@@ -1752,10 +1767,12 @@ mod tests {
 
     #[test]
     fn export_writer_keeps_small_files_as_reader_compatible_riff() {
-        for bit_depth in [16, 24, 32] {
+        for bit_depth in [8, 16, 24, 32] {
             let root = test_root(&format!("small-export-{bit_depth}"));
             let path = root.join("small.wav");
-            let frames = 3u64;
+            // Keep the payload word-aligned so opening this finished export as
+            // an appendable recording cannot mistake a RIFF pad byte for audio.
+            let frames = 4u64;
             let data = vec![0u8; usize::try_from(frames * u64::from(bit_depth / 8)).unwrap()];
             let mut writer = WavExportWriter::create_new(
                 &path,
@@ -1818,7 +1835,7 @@ mod tests {
 
     #[test]
     fn export_writer_streams_rf64_payload_after_the_ds64_header() {
-        for bit_depth in [16, 24, 32] {
+        for bit_depth in [8, 16, 24, 32] {
             let root = test_root(&format!("forced-rf64-export-{bit_depth}"));
             let path = root.join("large-layout.wav");
             let frames = 3u64;

@@ -163,6 +163,8 @@ function testArgs() {
 
   const sixteenBit = parseArgs(['--mode', 'short', '--bit-depth', '16']);
   assert.equal(sixteenBit.minimumInputFormatBits, 16);
+  const eightBit = parseArgs(['--mode', 'short', '--bit-depth', '8']);
+  assert.equal(eightBit.minimumInputFormatBits, 8);
   const explicitMinimum = parseArgs([
     '--mode',
     'short',
@@ -181,7 +183,7 @@ function testArgs() {
   assert.equal(soak.pollSeconds, 5);
   assert.equal(soak.export, false);
   assert.throws(() => parseArgs(['--mode', 'soak', '--hours', '1']), /2–8/);
-  assert.throws(() => parseArgs(['--mode', 'short', '--bit-depth', '20']), /16、24/);
+  assert.throws(() => parseArgs(['--mode', 'short', '--bit-depth', '20']), /8、16、24/);
   assert.throws(() => parseArgs(['--mode', 'disk-full']), /confirm-dedicated-volume/);
   const replug = parseArgs(['--mode', 'replug', '--seconds', '5']);
   assert.equal(replug.mode, 'replug');
@@ -458,7 +460,7 @@ function testEngineExitChecks() {
 function testWavInspection() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'databaker-audio-acceptance-test-'));
   try {
-    for (const bitDepth of [16, 24, 32]) {
+    for (const bitDepth of [8, 16, 24, 32]) {
       const wavPath = path.join(root, `${bitDepth}.wav`);
       fs.writeFileSync(wavPath, makeWav(48_000, bitDepth, 480));
       const wav = inspectWav(wavPath);

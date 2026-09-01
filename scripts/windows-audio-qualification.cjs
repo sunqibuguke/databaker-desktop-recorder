@@ -38,7 +38,7 @@ const Ajv2020 = loadAjv2020();
 
 const QUALIFICATION_PROFILE = 'databaker-windows-v1';
 const REQUIRED_SAMPLE_RATES = Object.freeze([44_100, 48_000, 96_000]);
-const REQUIRED_BIT_DEPTHS = Object.freeze([16, 24, 32]);
+const REQUIRED_BIT_DEPTHS = Object.freeze([8, 16, 24, 32]);
 const IMPLEMENTED_ACCEPTANCE_MODES = new Set([
   'inventory',
   'short',
@@ -1433,7 +1433,7 @@ function inputSampleFormatBits(format) {
 
 function actualSnapshotMatchesRequirement(snapshot, requirement, plan) {
   const bitDepth = Number(requirement?.bit_depth);
-  const minimumInputBits = bitDepth === 16 ? 16 : 24;
+  const minimumInputBits = bitDepth === 8 ? 8 : bitDepth === 16 ? 16 : 24;
   const expectedBackend = String(plan?.target?.capture_backend ?? '').trim().toLowerCase();
   const expectedBuffer = plan?.target?.capture_buffer_frames;
   return Boolean(snapshot) &&
@@ -1944,7 +1944,8 @@ function validateReport(entry, requirement, plan, reportsRoot) {
         })),
       },
     );
-    const requiredInputBits = Number(requirement.bit_depth) === 16 ? 16 : 24;
+    const requiredBitDepth = Number(requirement.bit_depth);
+    const requiredInputBits = requiredBitDepth === 8 ? 8 : requiredBitDepth === 16 ? 16 : 24;
     add(
       'input-sample-format-evidence',
       Number.isSafeInteger(report.options?.minimumInputFormatBits) &&

@@ -37,6 +37,15 @@
       "mode": "inventory"
     },
     {
+      "id": "short-44100-8-ch1",
+      "mode": "short",
+      "sample_rate": 44100,
+      "bit_depth": 8,
+      "channel": 1,
+      "min_seconds": 30,
+      "export": true
+    },
+    {
       "id": "short-44100-16-ch1",
       "mode": "short",
       "sample_rate": 44100,
@@ -64,6 +73,15 @@
       "export": true
     },
     {
+      "id": "short-48000-8-ch1",
+      "mode": "short",
+      "sample_rate": 48000,
+      "bit_depth": 8,
+      "channel": 1,
+      "min_seconds": 30,
+      "export": true
+    },
+    {
       "id": "short-48000-16-ch1",
       "mode": "short",
       "sample_rate": 48000,
@@ -86,6 +104,15 @@
       "mode": "short",
       "sample_rate": 48000,
       "bit_depth": 32,
+      "channel": 1,
+      "min_seconds": 30,
+      "export": true
+    },
+    {
+      "id": "short-96000-8-ch1",
+      "mode": "short",
+      "sample_rate": 96000,
+      "bit_depth": 8,
       "channel": 1,
       "min_seconds": 30,
       "export": true

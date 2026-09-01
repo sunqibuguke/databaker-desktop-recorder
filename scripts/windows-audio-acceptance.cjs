@@ -25,7 +25,7 @@ const MODES = new Set([
 const DEVICE_UNPLUG_MODES = new Set(['unplug', 'replug']);
 const FAULT_MODES = new Set(['unplug', 'replug', 'disk-full']);
 const CAPTURE_MODES = new Set(['short', 'soak', 'unplug', 'replug', 'disk-full', 'power-cut']);
-const BIT_DEPTHS = new Set([16, 24, 32]);
+const BIT_DEPTHS = new Set([8, 16, 24, 32]);
 const PRODUCTION_POWER_CUT_SECONDS = 3_600;
 const DEFAULT_POWER_CUT_MAXIMUM_SECONDS = 3_900;
 const DEFAULT_MAX_TAIL_LOSS_SECONDS = 15;
@@ -96,7 +96,7 @@ function usage() {
   --device-id <id>               list_devices 返回的稳定设备 ID
   --device-index <n>             界面打印的 1-based 设备序号
   --sample-rate <hz>             默认 48000
-  --bit-depth <16|24|32>         交付 WAV 位深，默认 16
+  --bit-depth <8|16|24|32>       交付 WAV 位深，默认 16
   --share-mode <exclusive|shared> 开流模式，默认 exclusive（绕过 Windows 混音器）
   --expected-capture-backend <asio|wasapi> 独立指定本轮应使用的录音后端；生产资格 run 必填
   --expected-capture-buffer-frames <n> 独立指定 ASIO 缓冲区；ASIO 默认 512
@@ -381,7 +381,7 @@ function parseArgs(argv) {
     );
   }
   if (options.mode === 'disk-full') validateDiskFullTarget(options.output);
-  if (!BIT_DEPTHS.has(options.bitDepth)) throw new Error('--bit-depth 必须是 16、24 或 32');
+  if (!BIT_DEPTHS.has(options.bitDepth)) throw new Error('--bit-depth 必须是 8、16、24 或 32');
   if (options.shareMode !== 'exclusive' && options.shareMode !== 'shared') {
     throw new Error('--share-mode 必须是 exclusive 或 shared');
   }
@@ -417,7 +417,7 @@ function parseArgs(argv) {
   if (options.minimumInputFormatBits === null) {
     // 32-bit Float 交付通常来自 24-bit ADC。这里只拒绝明显低于
     // 24-bit 有效数字精度的输入，不把数字表示精度误当成 ADC ENOB 证明。
-    options.minimumInputFormatBits = options.bitDepth === 16 ? 16 : 24;
+    options.minimumInputFormatBits = options.bitDepth === 8 ? 8 : options.bitDepth === 16 ? 16 : 24;
   }
   if (![8, 16, 24, 32, 53, 64].includes(options.minimumInputFormatBits)) {
     throw new Error('--minimum-input-format-bits 必须是 8、16、24、32、53 或 64');
@@ -1237,7 +1237,7 @@ function inspectWav(filePath) {
     formatErrors.push(`byte_rate=${format.byte_rate}，期望 ${expectedByteRate}`);
   }
   const supportedEncoding =
-    (format.format_code === 1 && (format.bits_per_sample === 16 || format.bits_per_sample === 24)) ||
+    (format.format_code === 1 && (format.bits_per_sample === 8 || format.bits_per_sample === 16 || format.bits_per_sample === 24)) ||
     (format.format_code === 3 && format.bits_per_sample === 32);
   if (!supportedEncoding) {
     formatErrors.push(`不支持的 format_code/bit_depth: ${format.format_code}/${format.bits_per_sample}`);

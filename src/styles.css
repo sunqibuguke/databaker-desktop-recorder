@@ -524,10 +524,15 @@ input[type="range"]:focus-visible::-moz-range-thumb { box-shadow: 0 0 0 2px var(
 .setup-advanced[open] { padding-bottom: 8px; }
 .setup-advanced[open] > summary { margin-bottom: 6px; padding-bottom: 8px; border-bottom: 1px solid var(--line-soft); }
 .setup-advanced .automation-rules { margin: 0; padding: 0; border: 0; }
-.setup-essential-audio { align-items: end; }
-.setup-rhythm { min-width: 0; display: grid; gap: 6px; color: var(--label); font-size: var(--text-xs); }
-.setup-rhythm > div { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
-.setup-rhythm button { min-height: 29px; border: 1px solid var(--line-control); color: var(--muted); background: var(--input); font-size: var(--text-xs); }
+.setup-essential-audio { align-items: start; }
+.setup-essential-audio .field > small { margin-top: 4px; color: var(--quiet); font-size: var(--text-xs); line-height: 1.4; }
+.setup-rhythm { grid-column: 1 / -1; min-width: 0; padding: 9px 10px; border: 1px solid var(--line-soft); background: var(--library-header); color: var(--label); font-size: var(--text-xs); }
+.setup-rhythm > div { display: grid; gap: 8px; }
+.setup-rhythm > div > span strong, .setup-rhythm > div > span small { display: block; }
+.setup-rhythm > div > span strong { color: var(--text-soft); font-weight: 600; }
+.setup-rhythm > div > span small { margin-top: 3px; }
+.setup-rhythm [role="group"] { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; }
+.setup-rhythm button { min-width: 0; min-height: 31px; padding-inline: 10px; border: 1px solid var(--line-control); color: var(--muted); background: var(--input); font-size: var(--text-xs); white-space: nowrap; }
 .setup-rhythm button.active { border-color: var(--accent-deep-line); color: var(--accent-tint); background: var(--accent-well); }
 .setup-rhythm small { color: var(--quiet); line-height: 1.4; }
 .setup-advanced-grid { grid-column: auto; margin: 10px 0 12px; padding-bottom: 12px; border-bottom: 1px solid var(--line-soft); }

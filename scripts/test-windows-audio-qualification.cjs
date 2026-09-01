@@ -243,7 +243,7 @@ function writeSessionFixture(directory, snapshot, { faulted = false, exportConta
 function buildRequiredRuns() {
   const runs = [{ id: 'inventory', mode: 'inventory' }];
   for (const sampleRate of [44_100, 48_000, 96_000]) {
-    for (const bitDepth of [16, 24, 32]) {
+    for (const bitDepth of [8, 16, 24, 32]) {
       runs.push({
         id: `short-${sampleRate}-${bitDepth}-ch1`,
         mode: 'short',
@@ -932,7 +932,7 @@ function createFixture() {
         bitDepth: requirement.bit_depth ?? 24,
         channel: requirement.channel ?? 1,
         shareMode: 'exclusive',
-        minimumInputFormatBits: requirement.bit_depth === 16 ? 16 : 24,
+        minimumInputFormatBits: requirement.bit_depth === 8 ? 8 : requirement.bit_depth === 16 ? 16 : 24,
         seconds: requirement.min_seconds ?? 30,
         hours: requirement.min_hours ?? 2,
         export: requirement.export ?? false,

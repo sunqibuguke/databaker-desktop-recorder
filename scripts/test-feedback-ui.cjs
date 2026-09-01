@@ -37,12 +37,16 @@ assert.match(recorder, /testIdPrefix="rule"/);
 assert.match(recorder, /saveSessionAutomationRules\(sessionDir, next\)/);
 assert.match(recorder, /saveWorkstationAutomationRules\(next\)/);
 assert.doesNotMatch(recorder, /saveAutomationRules/);
-assert.match(recorder, /const bitDepth = DEFAULT_DELIVERY_BIT_DEPTH/);
-assert.match(recorder, /const nextBitDepth = DEFAULT_DELIVERY_BIT_DEPTH/);
+assert.match(recorder, /useState<DeliveryBitDepth>\(DEFAULT_DELIVERY_BIT_DEPTH\)/);
+assert.match(recorder, /const nextBitDepth = bitDepth/);
+assert.match(recorder, /data-testid="delivery-bit-depth"/);
+assert.match(recorder, /DELIVERY_BIT_DEPTHS\.map/);
+assert.doesNotMatch(recorder, /data-testid="capture-sample-format"/,
+  '普通任务设置不应暴露驱动输入格式');
 assert.match(recorder, /bit_depth: nextBitDepth,[\s\S]*?input_sample_format: nextSampleFormat/,
   'new task delivery depth and native driver input format must be sent independently');
 assert.doesNotMatch(recorder, /deliveryBitDepthForCaptureFormat\(nextSampleFormat\)/,
-  'the selected ASIO/WASAPI input representation must not change PCM16 delivery');
+  'the selected ASIO/WASAPI input representation must not change the chosen delivery depth');
 const detectionPanel = recorder.slice(
   recorder.indexOf("monitorPanelTab === 'detection'"),
   recorder.indexOf("monitorPanelTab === 'settings'"),

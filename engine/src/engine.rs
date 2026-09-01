@@ -10369,6 +10369,7 @@ fn input_representation_bits(format: SampleFormat) -> Option<u16> {
 
 fn minimum_input_representation_bits(output_bit_depth: u16) -> Result<u16> {
     match output_bit_depth {
+        8 => Ok(8),
         16 => Ok(16),
         // A 32-bit float delivery file can preserve headroom and processing
         // precision, but commodity drivers normally expose f32 (24 bits of
@@ -16047,6 +16048,7 @@ mod tests {
     #[test]
     fn delivery_depth_requires_an_honest_driver_representation() {
         assert_eq!(minimum_input_representation_bits(16).unwrap(), 16);
+        assert_eq!(minimum_input_representation_bits(8).unwrap(), 8);
         assert_eq!(minimum_input_representation_bits(24).unwrap(), 24);
         assert_eq!(minimum_input_representation_bits(32).unwrap(), 24);
         assert!(minimum_input_representation_bits(20).is_err());

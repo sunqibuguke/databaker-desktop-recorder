@@ -153,8 +153,8 @@ pub fn audio_bytes_per_second(sample_rate: u32, channels: u16, bit_depth: u16) -
     if channels == 0 {
         bail!("channel count must be greater than zero");
     }
-    if !matches!(bit_depth, 16 | 24 | 32) {
-        bail!("bit depth must be one of 16, 24, or 32 bits");
+    if !matches!(bit_depth, 8 | 16 | 24 | 32) {
+        bail!("bit depth must be one of 8, 16, 24, or 32 bits");
     }
     u64::from(sample_rate)
         .checked_mul(u64::from(channels))

@@ -361,6 +361,7 @@ async function main() {
   }, [sharedOnlyDevice]).device, null,
   'an explicit missing endpoint id must not fall back to a same-named stale device');
   assert.equal(captureFormatsSupportBitDepth(['I16'], 16), true);
+  assert.equal(captureFormatsSupportBitDepth(['I16'], 8), true);
   assert.equal(
     captureFormatsSupportBitDepth(['I16'], 24),
     false,
@@ -376,9 +377,9 @@ async function main() {
   assert.equal(normalizeCaptureSampleFormat('I24'), 'i24');
   assert.equal(normalizeCaptureSampleFormat('pcm24'), null);
   assert.equal(captureSampleFormatFromBitDepth(16), 'i16');
+  assert.equal(captureSampleFormatFromBitDepth(8), 'i16');
   assert.equal(captureSampleFormatFromBitDepth(32), 'f32');
-  assert.equal(DEFAULT_DELIVERY_BIT_DEPTH, 16,
-    'new tasks keep PCM16 delivery independently from the selected driver input format');
+  assert.equal(DEFAULT_DELIVERY_BIT_DEPTH, 16, 'new tasks default to PCM16 delivery');
   assert.equal(preferredCaptureSampleFormat(['f32', 'i16']), 'f32');
   assert.equal(preferredCaptureSampleFormat(['i16', 'i24']), 'i24');
   assert.equal(classifyInputDevice({ name: 'Analogue 1 + 2 (2- Focusrite USB Audio)' }), 'production');

@@ -1,5 +1,5 @@
 import { t } from '../shared/i18n/index.ts';
-import type { AudioDevice, CaptureShareMode, DeviceStreamConfiguration } from './types';
+import type { AudioDevice, CaptureShareMode, DeliveryBitDepth, DeviceStreamConfiguration } from './types';
 
 /**
  * Mirrors the recorder engine's input representation precision policy.
@@ -96,6 +96,7 @@ export function inputSampleFormatRepresentationBits(format: string): number | nu
 }
 
 export function minimumInputRepresentationBits(outputBitDepth: number): number | null {
+  if (outputBitDepth === 8) return 8;
   if (outputBitDepth === 16) return 16;
   if (outputBitDepth === 24 || outputBitDepth === 32) return 24;
   return null;
@@ -116,8 +117,16 @@ export function captureFormatsSupportBitDepth(
 export const CAPTURE_SAMPLE_FORMATS = ['i16', 'i24', 'i32', 'f32'] as const;
 export type CaptureSampleFormat = (typeof CAPTURE_SAMPLE_FORMATS)[number];
 
-/** New recording tasks always deliver mono PCM16, regardless of driver input. */
+/** New recording tasks default to mono PCM16; the operator may select another delivery depth. */
 export const DEFAULT_DELIVERY_BIT_DEPTH = 16 as const;
+export const DELIVERY_BIT_DEPTHS: readonly DeliveryBitDepth[] = [8, 16, 24, 32];
+
+export function deliveryBitDepthLabel(bitDepth: DeliveryBitDepth): string {
+  if (bitDepth === 8) return t('setup.bit8');
+  if (bitDepth === 16) return t('setup.bit16');
+  if (bitDepth === 24) return t('setup.bit24');
+  return t('setup.bit32');
+}
 
 const PREFERRED_CAPTURE_SAMPLE_FORMATS: readonly CaptureSampleFormat[] = ['i24', 'f32', 'i32', 'i16'];
 
@@ -177,6 +186,7 @@ export function normalizeCaptureSampleFormat(value: unknown): CaptureSampleForma
 }
 
 export function captureSampleFormatFromBitDepth(bitDepth: number): CaptureSampleFormat {
+  if (bitDepth === 8) return 'i16';
   if (bitDepth === 16) return 'i16';
   if (bitDepth === 32) return 'f32';
   return 'i24';

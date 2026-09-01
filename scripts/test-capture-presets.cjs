@@ -75,6 +75,10 @@ async function main() {
     '预设必须保留独立的 PCM16 交付位深');
   assert.equal(decoupledPreset.inputSampleFormat, 'f32',
     '预设必须同时保留驱动实际 F32 输入格式');
+  const pcm8Preset = await repository.save({ ...draft, name: 'PCM8 delivery', bitDepth: 8 });
+  const savedPcm8 = pcm8Preset.presets.find((preset) => preset.name === 'PCM8 delivery');
+  assert.equal(savedPcm8.bitDepth, 8, '预设必须保留 8-bit PCM 交付位深');
+  assert.equal(savedPcm8.inputSampleFormat, 'i16', '8-bit 交付默认使用至少 16-bit 驱动输入');
   const sharedPreset = await repository.save({ ...draft, name: 'Shared mixer', captureShareMode: 'shared' });
   assert.equal(sharedPreset.presets.find((preset) => preset.name === 'Shared mixer').captureShareMode, 'shared');
   const manyChannelDevice = await repository.save({ ...draft, name: 'Dante 128', inputChannel: 128 });

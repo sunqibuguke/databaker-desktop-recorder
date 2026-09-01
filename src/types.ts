@@ -287,13 +287,15 @@ export type CapturePreset = {
   deviceId: string;
   deviceName: string;
   sampleRate: number;
-  bitDepth: 16 | 24 | 32;
+  bitDepth: DeliveryBitDepth;
   inputSampleFormat?: 'i16' | 'i24' | 'i32' | 'f32';
   inputChannel: number;
   captureShareMode?: CaptureShareMode;
   silenceDurationMs: number;
   silenceThresholdDbfs: number;
 };
+
+export type DeliveryBitDepth = 8 | 16 | 24 | 32;
 
 export type CapturePresetDraft = Omit<CapturePreset, 'id'> & { id?: string };
 

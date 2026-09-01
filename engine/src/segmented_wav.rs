@@ -73,6 +73,14 @@ struct WavLayout {
 impl WavLayout {
     fn for_bit_depth(bit_depth: u16) -> Result<Self> {
         match bit_depth {
+            8 => Ok(Self {
+                header_len: 44,
+                sample_bytes: 1,
+                format_code: 1,
+                data_marker: 36,
+                data_size_offset: 40,
+                fact_frame_offset: None,
+            }),
             16 => Ok(Self {
                 header_len: 44,
                 sample_bytes: 2,
@@ -97,7 +105,9 @@ impl WavLayout {
                 data_size_offset: 52,
                 fact_frame_offset: Some(44),
             }),
-            _ => bail!("bit depth must be one of 16-bit PCM, 24-bit PCM, or 32-bit Float"),
+            _ => {
+                bail!("bit depth must be one of 8-bit PCM, 16-bit PCM, 24-bit PCM, or 32-bit Float")
+            }
         }
     }
 
@@ -853,9 +863,9 @@ fn segment_descriptor_temp_path(segment_path: &Path) -> Result<PathBuf> {
 
 fn segment_encoding_name(bit_depth: u16) -> Result<&'static str> {
     match bit_depth {
-        16 | 24 => Ok("pcm"),
+        8 | 16 | 24 => Ok("pcm"),
         32 => Ok("float"),
-        _ => bail!("bit depth must be one of 16-bit PCM, 24-bit PCM, or 32-bit Float"),
+        _ => bail!("bit depth must be one of 8-bit PCM, 16-bit PCM, 24-bit PCM, or 32-bit Float"),
     }
 }
 
@@ -1589,7 +1599,7 @@ mod tests {
 
     #[test]
     fn rolls_and_exports_continuous_audio_at_every_bit_depth() {
-        for bit_depth in [16, 24, 32] {
+        for bit_depth in [8, 16, 24, 32] {
             let root = test_root(&format!("roll-{bit_depth}"));
             let segment_dir = root.join("segments");
             let mut writer = SegmentedWav::create(&segment_dir, 48_000, 1, bit_depth, 3).unwrap();
@@ -1654,7 +1664,7 @@ mod tests {
 
     #[test]
     fn exports_the_locked_active_segment_and_restores_its_append_cursor() {
-        for bit_depth in [16, 24, 32] {
+        for bit_depth in [8, 16, 24, 32] {
             let root = test_root(&format!("active-export-{bit_depth}"));
             let segment_dir = root.join("segments");
             let destination = root.join("preview.wav");
@@ -1712,7 +1722,7 @@ mod tests {
 
     #[test]
     fn resumes_across_segment_boundaries_at_every_bit_depth() {
-        for bit_depth in [16, 24, 32] {
+        for bit_depth in [8, 16, 24, 32] {
             let root = test_root(&format!("resume-{bit_depth}"));
             let mut writer = SegmentedWav::create(&root, 48_000, 1, bit_depth, 3).unwrap();
             writer.write_samples(&[0.1; 5]).unwrap();
@@ -1751,7 +1761,7 @@ mod tests {
 
     #[test]
     fn repairs_only_the_torn_active_tail_at_every_bit_depth() {
-        for bit_depth in [16, 24, 32] {
+        for bit_depth in [8, 16, 24, 32] {
             let root = test_root(&format!("tail-{bit_depth}"));
             let mut writer = SegmentedWav::create(&root, 48_000, 1, bit_depth, 5).unwrap();
             writer.write_samples(&[0.1; 3]).unwrap();
@@ -1796,7 +1806,7 @@ mod tests {
 
     #[test]
     fn rebuilds_torn_active_headers_from_the_immutable_descriptor_at_every_bit_depth() {
-        for bit_depth in [16, 24, 32] {
+        for bit_depth in [8, 16, 24, 32] {
             let layout = WavLayout::for_bit_depth(bit_depth).unwrap();
             let cases = [
                 ("riff", 0usize, 4usize),
@@ -1860,7 +1870,7 @@ mod tests {
 
     #[test]
     fn refuses_torn_or_arbitrary_active_files_without_a_trusted_descriptor() {
-        for bit_depth in [16, 24, 32] {
+        for bit_depth in [8, 16, 24, 32] {
             let root = test_root(&format!("missing-descriptor-{bit_depth}"));
             let mut writer = SegmentedWav::create(&root, 48_000, 1, bit_depth, 5).unwrap();
             writer.write_samples(&[0.1, -0.2, 0.3]).unwrap();
@@ -1983,7 +1993,7 @@ mod tests {
 
     #[test]
     fn never_rebuilds_a_torn_closed_segment_even_when_its_descriptor_is_valid() {
-        for bit_depth in [16, 24, 32] {
+        for bit_depth in [8, 16, 24, 32] {
             let root = test_root(&format!("closed-torn-header-{bit_depth}"));
             let mut writer = SegmentedWav::create(&root, 48_000, 1, bit_depth, 2).unwrap();
             writer.write_samples(&[0.1; 3]).unwrap();
