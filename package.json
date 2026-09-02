@@ -104,6 +104,14 @@
       {
         "from": "doc/Windows外置声卡资格计划.example.json",
         "to": "acceptance/Windows外置声卡资格计划.example.json"
+      },
+      {
+        "from": "doc/手册/标贝音频采集_使用手册.pdf",
+        "to": "manuals/标贝音频采集_使用手册.pdf"
+      },
+      {
+        "from": "output/pdf/标贝音频采集_详细操作手册_2026-09-01.pdf",
+        "to": "manuals/标贝音频采集_详细操作手册.pdf"
       }
     ],
     "mac": {

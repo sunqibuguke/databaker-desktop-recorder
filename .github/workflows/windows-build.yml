@@ -89,8 +89,10 @@ jobs:
           $qualificationExample = Join-Path $resources "acceptance/Windows外置声卡资格计划.example.json"
           $acceptanceDoc = Join-Path $resources "acceptance/Windows外置声卡生产验收.md"
           $pilotReleaseNotes = Join-Path $resources "acceptance/受控试运行说明.md"
+          $userManual = Join-Path $resources "manuals/标贝音频采集_使用手册.pdf"
+          $detailedManual = Join-Path $resources "manuals/标贝音频采集_详细操作手册.pdf"
           $engine = Join-Path $resources "bin/recorder-engine.exe"
-          foreach ($required in @($acceptance, $launcher, $cmdLauncher, $qualification, $qualificationLauncher, $qualificationPowerShell, $qualificationSchema, $qualificationExample, $acceptanceDoc, $pilotReleaseNotes, $engine)) {
+          foreach ($required in @($acceptance, $launcher, $cmdLauncher, $qualification, $qualificationLauncher, $qualificationPowerShell, $qualificationSchema, $qualificationExample, $acceptanceDoc, $pilotReleaseNotes, $userManual, $detailedManual, $engine)) {
             if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
               throw "Packaged acceptance resource is missing: $required"
             }
@@ -163,8 +165,10 @@ jobs:
           $installedQualification = Join-Path $installRoot "resources/acceptance/run-windows-audio-qualification.cmd"
           $installedQualificationExample = Join-Path $installRoot "resources/acceptance/Windows外置声卡资格计划.example.json"
           $installedPilotReleaseNotes = Join-Path $installRoot "resources/acceptance/受控试运行说明.md"
+          $installedUserManual = Join-Path $installRoot "resources/manuals/标贝音频采集_使用手册.pdf"
+          $installedDetailedManual = Join-Path $installRoot "resources/manuals/标贝音频采集_详细操作手册.pdf"
           $installedEngine = Join-Path $installRoot "resources/bin/recorder-engine.exe"
-          foreach ($required in @($installedLauncher, $installedQualification, $installedQualificationExample, $installedPilotReleaseNotes, $installedEngine)) {
+          foreach ($required in @($installedLauncher, $installedQualification, $installedQualificationExample, $installedPilotReleaseNotes, $installedUserManual, $installedDetailedManual, $installedEngine)) {
             if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
               throw "Installed production payload is missing: $required"
             }
