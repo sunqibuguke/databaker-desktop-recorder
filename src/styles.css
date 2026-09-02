@@ -947,6 +947,11 @@ input[type="range"]:focus-visible::-moz-range-thumb { box-shadow: 0 0 0 2px var(
 .export-result-meta code { display: block; overflow: hidden; color: var(--text-soft); font: var(--text-xs) var(--mono); white-space: nowrap; text-overflow: ellipsis; }
 .studio-dialog > footer { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 7px; padding: 10px 12px; border-top: 1px solid var(--line); background: var(--panel); border-radius: 0 0 var(--radius-panel) var(--radius-panel); }
 .input-audition-dialog { width: min(620px, calc(100vw - 32px)); max-height: calc(100vh - 32px); max-height: calc(100dvh - 32px); display: grid; grid-template-rows: auto auto auto auto auto auto minmax(0, auto) auto; overflow: auto; overscroll-behavior: contain; }
+.input-audition-dialog > header > div { min-width: 0; flex: 1; }
+.input-audition-dialog-close { width: 28px; height: 28px; flex: none; display: grid; place-items: center; padding: 0; border: 1px solid transparent; border-radius: 2px; color: var(--muted); background: transparent; }
+.input-audition-dialog-close:hover:not(:disabled) { border-color: var(--line-control); color: var(--text-soft); background: var(--control); }
+.input-audition-dialog-close:focus-visible { border-color: var(--accent-deep-line); outline: none; }
+.input-audition-dialog-close:disabled { opacity: .35; cursor: not-allowed; }
 .input-audition-summary dd { max-width: 170px; overflow: hidden; font-size: var(--text-sm); text-overflow: ellipsis; white-space: nowrap; }
 .input-audition-progress-block { display: grid; gap: 8px; }
 .input-audition-progress-block strong { color: var(--text-soft); font-weight: 600; }

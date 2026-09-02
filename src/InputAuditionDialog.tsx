@@ -209,6 +209,13 @@ export function InputAuditionDialog({
       dialogRef.current?.focus();
       return;
     }
+    // Do not focus the consequential skip action while the operator is
+    // speaking. The dialog still owns keyboard events and Tab enters its
+    // controls normally.
+    if (phase === 'recording') {
+      dialogRef.current?.focus();
+      return;
+    }
     const initial = dialogRef.current?.querySelector<HTMLElement>('[data-dialog-default]:not([disabled])')
       ?? dialogRef.current?.querySelector<HTMLElement>('[data-dialog-initial]:not([disabled])')
       ?? dialogRef.current?.querySelector<HTMLElement>(FOCUSABLE);
@@ -484,6 +491,18 @@ export function InputAuditionDialog({
           <h2 id="input-audition-title">{t('inputAudition.title')}</h2>
           <small>{t('inputAudition.duration', { seconds: 10 })}</small>
         </div>
+        <button
+          data-testid="input-audition-close"
+          className="input-audition-dialog-close"
+          type="button"
+          aria-label={t('inputAudition.cancel')}
+          title={t('inputAudition.cancel')}
+          onClick={() => void cancelCurrent(true)}
+          disabled={phase === 'checking-cache'
+            || phase === 'confirming'
+            || phase === 'skipping'
+            || phase === 'cancelling'}
+        ><Icon name="close" size={15} /></button>
       </header>
       <p id="input-audition-description">{phase === 'recording'
         ? t('inputAudition.recordingBody', { seconds: remainingSeconds })
@@ -565,11 +584,12 @@ export function InputAuditionDialog({
           <button data-dialog-initial data-testid="input-audition-retry" className="button primary" type="button" onClick={() => void cancelCurrent(false)} disabled={blocking}>
             <Icon name="retake" size={14} />{t('inputAudition.retry')}
           </button>
-        </> : <>
-          <button data-dialog-initial className="button" type="button" onClick={() => void cancelCurrent(true)} disabled={phase === 'cancelling'}>
-            {t('inputAudition.cancel')}
+        </> : phase === 'recording' ? <>
+          <button data-testid="input-audition-skip" className="button" type="button" onClick={() => void skip()}>
+            <Icon name="skip" size={14} />{t('inputAudition.skipRecording')}
           </button>
-          <button data-testid="input-audition-skip" className="button" type="button" onClick={() => void skip()} disabled={blocking}>
+        </> : <>
+          <button data-testid="input-audition-skip" className="button" type="button" disabled>
             {t('inputAudition.skip')}
           </button>
         </>}

@@ -26,6 +26,7 @@ const zhCN = {
   warningCodeNotConfirmed: '未完成人工确认',
   errorTitle: '输入试听未完成',
   skip: '跳过试听',
+  skipRecording: '结束并跳过试听',
   start: '开始 10 秒试听',
   retry: '重新录制',
   confirm: '声音正常，开始录制',
@@ -54,7 +55,7 @@ const en = {
   warningBody: 'This audition has a capture warning and cannot be marked as listened. Record it again, or explicitly skip it to continue.',
   invalidResult: 'The capture engine returned an incomplete input-audition result', preparing: 'Preparing playback…', remaining: '{seconds} seconds remaining', progress: 'Input audition recording progress', playbackCompleted: 'Playback completed. You can confirm or record again.', listenBeforeConfirm: 'Playback is running. You can confirm now or keep listening.', durationLabel: 'Actual duration', warningTitle: 'This audition needs attention', warningCodes: 'Reason: {codes}',
   warningCodeDigitalSilence: 'digital silence', warningCodeClipping: 'audible clipping', warningCodeDiscontinuity: 'input discontinuity', warningCodeOverflow: 'capture queue overflow', warningCodeTooShort: 'recording too short', warningCodeNotConfirmed: 'not confirmed by the operator',
-  errorTitle: 'Input audition not completed', skip: 'Skip audition', start: 'Start 10-second audition', retry: 'Record again', confirm: 'Sound is normal, start recording', cancel: 'Cancel audition',
+  errorTitle: 'Input audition not completed', skip: 'Skip audition', skipRecording: 'Stop and skip audition', start: 'Start 10-second audition', retry: 'Record again', confirm: 'Sound is normal, start recording', cancel: 'Cancel audition',
   skipConfirmTitle: 'Skip the input audition?', skipConfirmBody: 'You can continue, but the task will be recorded as skipped, never as listened or passed.', skipConfirmCancel: 'Back to audition', skipConfirmAction: 'Confirm skip',
   statusLabel: 'Input audition', statusConfirmed: 'Listened', statusSkipped: 'Skipped', statusPending: 'Pending', pendingCue: 'Complete the input audition first', open: 'Open input audition', recheck: 'Audition input again', confirmedNotice: 'Input audition completed. Formal recording can begin.', skippedNotice: 'Input audition explicitly skipped; it will not be shown as listened.', cancelledNotice: 'Input audition cancelled. Complete or explicitly skip it before formal recording.',
 } as const;

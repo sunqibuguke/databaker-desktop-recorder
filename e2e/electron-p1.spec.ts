@@ -404,6 +404,15 @@ test('real Electron retries and explicitly skips input audition without shortcut
     await page.getByTestId('recording-workspace').waitFor();
     const dialog = page.getByTestId('input-audition-dialog');
     await expect(dialog).toBeVisible();
+
+    // The exceptional close action remains discoverable outside the footer.
+    // It cancels the current gate without recording a skipped decision.
+    await page.getByTestId('input-audition-close').click();
+    await expect(dialog).toBeHidden();
+    expect((await readEngineState(page)).snapshot.input_audition?.status).not.toBe('skipped');
+    await page.getByTestId('main-transport').click();
+    await expect(dialog).toBeVisible();
+
     await page.getByTestId('input-audition-start').click();
     await feedPaced(page, 480_000, 'speech');
     await expect(page.getByTestId('input-audition-audio')).toBeVisible({ timeout: 15_000 });
@@ -426,13 +435,14 @@ test('real Electron retries and explicitly skips input audition without shortcut
     await expect(page.getByTestId('main-transport')).toHaveText(transportBefore);
     expectNoSentenceAttempt(await readEngineState(page));
 
-    // A recording-phase audition must be cancelled before it can be skipped;
-    // reopen the still-blocked gate and then exercise the explicit decision.
-    await dialog.getByRole('button', { name: '取消试听' }).click();
-    await expect(dialog).toBeHidden();
-    await page.getByTestId('main-transport').click();
-    await expect(dialog).toBeVisible();
-    await page.getByTestId('input-audition-skip').click();
+    // Recording keeps one visible footer action: it atomically stops the test
+    // capture and records the explicit skipped decision.
+    const recordingFooterButtons = dialog.locator('footer button');
+    await expect(recordingFooterButtons).toHaveCount(1);
+    const recordingSkip = page.getByTestId('input-audition-skip');
+    await expect(recordingSkip).toHaveText('结束并跳过试听');
+    await expect(recordingSkip).toBeEnabled();
+    await recordingSkip.click();
     await expect(dialog).toBeHidden();
     const skipped = await readEngineState(page);
     expect(skipped.snapshot.input_audition?.status).toBe('skipped');

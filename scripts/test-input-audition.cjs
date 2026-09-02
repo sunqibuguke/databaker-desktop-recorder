@@ -442,6 +442,18 @@ async function main() {
     'skip must not open a second confirmation step');
   assert.match(dialogSource, /data-testid="input-audition-skip"[\s\S]*?onClick=\{\(\) => void skip\(\)\}/,
     'skip actions must resolve directly');
+  assert.match(dialogSource, /phase === 'recording'[\s\S]*?inputAudition\.skipRecording/,
+    'recording phase must expose a dedicated stop-and-skip action');
+  assert.doesNotMatch(
+    dialogSource.slice(
+      dialogSource.indexOf(": phase === 'recording' ? <>"),
+      dialogSource.indexOf('</> : <>', dialogSource.indexOf(": phase === 'recording' ? <>")),
+    ),
+    /inputAudition\.cancel|disabled=\{blocking\}/,
+    'recording footer must contain no cancel action and must not disable skip via the generic blocking state',
+  );
+  assert.match(dialogSource, /data-testid="input-audition-close"[\s\S]*?cancelCurrent\(true\)/,
+    'the exceptional cancel path must remain available from the dialog header');
   assert.match(dialogSource, /force \|\| unresolvedAtOpen[\s\S]*?getInputAuditionDecision/,
     'an unresolved engine audition must bypass cache adoption');
   const forcedOpen = recorderSource.slice(
