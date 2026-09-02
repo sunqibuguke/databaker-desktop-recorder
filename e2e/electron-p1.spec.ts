@@ -352,6 +352,52 @@ function expectNoSentenceAttempt(state: E2eEngineState): void {
   }
 }
 
+test('real Electron keeps task setup actions visible on a laptop viewport', async () => {
+  let harness: Harness | null = null;
+  try {
+    harness = await launchHarness();
+    const { page } = harness;
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await importScript(page, [
+      '第一条客户交付文本',
+      '第二条客户交付文本',
+      '第三条客户交付文本',
+    ].join('\n'), '客户交付文本.txt');
+
+    const scrollRegion = page.locator('.setup-form-scroll');
+    const footer = page.getByTestId('setup-readiness');
+    const initialFooter = await footer.boundingBox();
+    const scrollMetrics = await scrollRegion.evaluate((node) => ({
+      clientHeight: node.clientHeight,
+      scrollHeight: node.scrollHeight,
+    }));
+    expect(scrollMetrics.scrollHeight).toBeGreaterThan(scrollMetrics.clientHeight);
+    expect(initialFooter).not.toBeNull();
+    expect((initialFooter?.y ?? Infinity) + (initialFooter?.height ?? Infinity)).toBeLessThanOrEqual(768);
+
+    const picker = await page.locator('.script-picker').boundingBox();
+    const inlinePreview = await page.getByTestId('open-script-preview').boundingBox();
+    expect(picker).not.toBeNull();
+    expect(inlinePreview).not.toBeNull();
+    expect(inlinePreview?.width ?? Infinity).toBeLessThan((picker?.width ?? 0) * .5);
+
+    const captureParameters = page.getByTestId('setup-technical-settings');
+    await expect(captureParameters).toContainText('采集模式');
+    await expect(captureParameters).toContainText('输入通道');
+    await expect(captureParameters).toContainText('采样率');
+    await expect(captureParameters).toContainText('输出位深');
+    await expect(page.getByTestId('setup-detection-advanced')).not.toContainText('采样率');
+    await expect(page.getByTestId('setup-detection-advanced')).not.toContainText('采集模式');
+
+    await scrollRegion.evaluate((node) => { node.scrollTop = node.scrollHeight; });
+    const scrolledFooter = await footer.boundingBox();
+    expect(scrolledFooter).not.toBeNull();
+    expect(Math.abs((scrolledFooter?.y ?? 0) - (initialFooter?.y ?? 0))).toBeLessThanOrEqual(1);
+  } finally {
+    await closeHarness(harness);
+  }
+});
+
 test('real Electron confirms a ten-second input audition without creating a sentence attempt', async () => {
   let harness: Harness | null = null;
   try {

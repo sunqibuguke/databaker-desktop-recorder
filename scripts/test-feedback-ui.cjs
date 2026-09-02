@@ -170,6 +170,29 @@ assert.match(recorder, /data-testid="setup-essential-audio"/);
 assert.match(recorder, /data-testid="setup-technical-settings"/);
 assert.match(recorder, /setupReadinessIssues\(\{/);
 assert.match(recorder, /data-testid="setup-readiness"/);
+assert.match(recorder, /className="setup-form-scroll"/);
+assert.match(recorder, /className=\{`script-preview-inline/);
+const setupCaptureParameters = recorder.slice(
+  recorder.indexOf('className="setup-capture-parameters"'),
+  recorder.indexOf('className="setup-rhythm"'),
+);
+assert.match(setupCaptureParameters, /setup\.shareMode/,
+  '采集模式应与输入通道、采样率和交付位深归在采集参数区');
+assert.match(setupCaptureParameters, /setup\.sampleRate/,
+  '采样率应属于采集参数，不应藏在检测策略中');
+const setupDetectionPolicy = recorder.slice(
+  recorder.indexOf('data-testid="setup-detection-advanced"'),
+  recorder.indexOf('className=\{`hardware-line'),
+);
+assert.doesNotMatch(setupDetectionPolicy, /setup\.shareMode/,
+  '检测策略不应混入采集模式');
+assert.doesNotMatch(setupDetectionPolicy, /setup\.sampleRate/,
+  '检测策略不应混入采样率');
+assert.match(css, /\.document-canvas\s*\{[^}]*grid-template-rows:\s*minmax\(0, 1fr\) auto[^}]*overflow:\s*hidden/,
+  '任务表单和底部操作区应分成独立网格行');
+assert.match(css, /\.setup-form-scroll\s*\{[^}]*overflow:\s*auto/,
+  '只有任务表单内容应滚动');
+assert.match(css, /\.script-preview-inline/);
 assert.match(css, /\.setup-rhythm/);
 assert.match(css, /\.issue-resolution/);
 assert.match(css, /\.retake-ab-review/);
