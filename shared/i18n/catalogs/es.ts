@@ -4,6 +4,10 @@ import { inputAuditionCopy } from './input-audition.ts';
 
 const es: MessageTree = {
   speech: {
+    "lowReason": "El RMS de voz de {value} dBFS está por debajo del mínimo de esta toma: {limit} dBFS",
+    "highReason": "El PEAK de voz de {value} dBFS supera el máximo de esta toma: {limit} dBFS",
+    "liveLowReason": "Hubo un nivel bajo sostenido durante la toma (mínimo RMS: {limit} dBFS)",
+    "liveHighReason": "Se superó el máximo PEAK de {limit} dBFS durante la toma",
     "silenceDuration": "Silencio actual: {seconds} s",
     "adjustSilence": "Ajustar duración del silencio",
     "title": "Comprobaciones de voz y frases cortas",

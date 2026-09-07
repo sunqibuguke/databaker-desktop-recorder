@@ -3,6 +3,10 @@ import { inputAuditionCopy } from './input-audition.ts';
 
 const zhCN = {
   speech: {
+    "lowReason": "人声 RMS {value} dBFS 低于本次下限 {limit} dBFS",
+    "highReason": "人声 PEAK {value} dBFS 超过本次上限 {limit} dBFS",
+    "liveLowReason": "录制中曾持续偏小（本次 RMS 下限 {limit} dBFS）",
+    "liveHighReason": "录制中曾超限（本次 PEAK 上限 {limit} dBFS）",
     "silenceDuration": "当前静音时长：{seconds} 秒",
     "adjustSilence": "调整静音时长",
     "title": "人声检查与短句录制",

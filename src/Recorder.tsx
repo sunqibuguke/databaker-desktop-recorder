@@ -1,5 +1,5 @@
 import { RecordingPolicyFields } from './RecordingPolicyFields';
-import { DEFAULT_RECORDING_POLICY, validRecordingPolicy, speechQualityWarning, type RecordingPolicy, type StoppedAttempt, type AutomaticStopEvent } from './recording-policy';
+import { DEFAULT_RECORDING_POLICY, validRecordingPolicy, speechQualityWarning, speechQualityWarningDetail, type RecordingPolicy, type StoppedAttempt, type AutomaticStopEvent } from './recording-policy';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { HomeHeader, Icon, StudioChrome, StudioStatus, type EngineStatus, type Phase } from './studio-chrome';
 import {
@@ -1611,6 +1611,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   });
   const speechResult = recording ? meter.speech_quality : reviewAttempt?.speech_quality;
   const speechWarning = speechQualityWarning(speechResult, recording);
+  const speechWarningDetail = speechQualityWarningDetail(speechResult);
   const readerCueLabel = t(`readerCue.${readerCueKey(cue)}`);
   const prompterState = useMemo<PrompterState>(() => ({
     sessionName: snapshot?.session_id ?? sessionName,
@@ -5393,11 +5394,19 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
               </div>
             </header>
             <div className="workspace-status-slot">
-          {(activationFailure || captureFault || discontinuityToast || qualityWarning || speechWarning || vadHealth !== 'healthy') && <div className="workspace-toasts" aria-live="polite">
+          {(activationFailure || captureFault || discontinuityToast || qualityWarning || speechWarning || (!recording && speechResult) || vadHealth !== 'healthy') && <div className="workspace-toasts" aria-live="polite">
             {activationFailure && !captureActive && <div className="session-noise-banner failed" role="alert" data-testid="activation-failure-banner"><Icon name="stop" size={16} /><div><strong>{activationErrorCopy(activationFailure.kind).title}</strong><span>{activationErrorCopy(activationFailure.kind).body}</span></div><button className="button" onClick={() => setActivationFailureOpen(true)} disabled={Boolean(busy)}>{activationFailure.kind === 'input_access_denied' ? t('activationError.openAccessHelp') : t('activationError.openEditor')}</button></div>}
             {captureFault && <div className="capture-fault-banner" role="alert"><Icon name="stop" size={16} /><div><strong>{captureFaultCopy.title}</strong><span>{captureFaultCopy.detail}{snapshot?.device_name ? ` ${t('issues.currentDevice', { name: snapshot.device_name })}` : ' '}{t('issues.stopThenFinish')}</span></div></div>}
             {discontinuityToast && !captureFault && <div className="input-quality-banner workspace-toast" data-testid="discontinuity-toast" role="status"><Icon name="meter" size={16} /><div><strong>{t('discontinuity.bannerTitle')}</strong><span>{discontinuityToast}. {t('discontinuity.bannerHint')}</span></div></div>}
-            {speechWarning && <div className="speech-quality-banner" role="status">{speechWarning}</div>}
+            {recording && speechWarning && <div className="speech-quality-banner" role="status"><Icon name="warning" size={15} />{speechWarning}</div>}
+            {!recording && speechResult && <div className={`speech-review${speechWarning ? ' has-warning' : ''}`} data-testid="speech-quality-result" role="status">
+              <div className="speech-review-heading">
+                {speechWarning && <><Icon name="warning" size={15} /><strong>{speechWarning}</strong></>}
+                <span className="speech-review-metrics">{speechResult.speech_samples ? t('speech.metrics', { rms: speechResult.rms_dbfs?.toFixed(1) ?? '—', peak: speechResult.peak_dbfs?.toFixed(1) ?? '—' }) : t('speech.unmeasured')}</span>
+                {speechResult.retained_by_operator_at && <span className="speech-review-retained">{t('speech.retained')}</span>}
+              </div>
+              {speechWarningDetail && <div className="speech-review-reason" title={speechWarningDetail}>{speechWarningDetail}</div>}
+            </div>}
             {qualityWarning && <div className="input-quality-banner" role="alert"><Icon name="meter" size={16} /><div><strong>{t('quality.bannerTitle')}</strong><span>{qualityWarning}. {t('quality.bannerHint')}</span></div></div>}
             {vadHealth !== 'healthy' && <div className={`vad-health-banner ${vadHealth}`} role={vadHealth === 'lagging' ? 'status' : 'alert'} data-testid="vad-health-banner"><Icon name="meter" size={16} /><div><strong>{t(`p1.vadHealth.${vadHealth}`)}</strong><span>{vadHealth === 'lagging' ? t('p1.vadLagDetail', { backlog: vadBacklogMs, capacity: vadCapacityMs }) : t('p1.vadFaultDetail')}</span></div></div>}
           </div>}
@@ -5419,11 +5428,6 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
               <small>{captureFault ? captureFaultCopy.detail : entryBlocksAttempt ? (inputAuditionBlocksAttempt || inputAuditionOpen ? t('inputAudition.introBody') : deviceWarningOpen ? t('deviceWarning.warning') : noiseCheckMessage) : workflowComplete ? t('recorder.exportLater') : <>{currentItem?.id}</>}</small>
             </div>
           </section>
-          {!recording && speechResult && <div className="speech-review" data-testid="speech-quality-result">
-            <span>{speechResult.speech_samples ? t('speech.metrics', { rms: speechResult.rms_dbfs?.toFixed(1) ?? '—', peak: speechResult.peak_dbfs?.toFixed(1) ?? '—' }) : t('speech.unmeasured')}</span>
-            {speechWarning && <span>{t('speech.recordedWarning')}</span>}
-            {speechResult.retained_by_operator_at && <span>{t('speech.retained')}</span>}
-          </div>}
           <section className="signal-monitor"><header><div><strong>{t('recorder.waveform')}</strong>{captureActive || shouldUseRecordedSilencePair(recording, reviewAttempt) ? <SilencePairReadout pair={silencePair} /> : null}</div><div>{captureActive ? <><span>RMS <b>{db(meter.rms)}</b></span><span>PEAK <b className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</b></span></> : <span>{reviewAttempt ? formatDuration(reviewAttempt.end_sample - reviewAttempt.start_sample, sampleRateForDisplay) : t('recorder.noTakeWaveform')}</span>}</div></header><div className="signal-scope"><WebGLWaveform key={showReviewWaveform ? `${sessionDir}:${reviewAttempt?.attempt_id}` : `${sessionDir}:${waveformGeneration}`} mode={showReviewWaveform ? 'review' : 'live'} bins={showReviewWaveform ? reviewWaveformBins : (meter.waveform ?? [])} capturedSamples={meter.captured_samples} waveformEndSample={meter.waveform_end_sample} recording={waveformTakeIsActive(recording && !captureFault, hasSpoken)} takeStartSample={recording && !captureFault ? liveTakeStartSample : undefined} takeEndSample={recording && !captureFault ? liveTakeEndSample : undefined} sampleRate={sampleRateForDisplay} />{captureActive ? <LiveSilenceHint liveMs={displayedLiveSilenceMs} requiredMs={effectiveSilenceDurationMs} /> : null}<div className="scope-scale"><span>−1.0</span><span>−0.5</span><span>0</span><span>+0.5</span><span>+1.0</span></div></div><div className="horizontal-meter"><i className="meter-rms" style={{ width: `${rmsPercent}%` }} /><i className="meter-peak" style={{ left: `${peakPercent}%` }} /></div></section>
           <section className="transport-panel">
             <div className="transport-review">

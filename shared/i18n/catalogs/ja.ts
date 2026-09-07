@@ -4,6 +4,10 @@ import { inputAuditionCopy } from './input-audition.ts';
 
 const ja: MessageTree = {
   speech: {
+    "lowReason": "音声 RMS {value} dBFS は今回の下限 {limit} dBFS 未満です",
+    "highReason": "音声 PEAK {value} dBFS は今回の上限 {limit} dBFS を超えています",
+    "liveLowReason": "録音中に低音量が持続しました（RMS 下限 {limit} dBFS）",
+    "liveHighReason": "録音中に PEAK 上限 {limit} dBFS を超えました",
     "silenceDuration": "現在の無音時間：{seconds} 秒",
     "adjustSilence": "無音時間を調整",
     "title": "音声チェックと短文録音",

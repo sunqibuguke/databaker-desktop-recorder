@@ -4,6 +4,10 @@ import { inputAuditionCopy } from './input-audition.ts';
 
 const th: MessageTree = {
   speech: {
+    "lowReason": "RMS เสียงพูด {value} dBFS ต่ำกว่าขีดจำกัดล่างของเทคนี้ที่ {limit} dBFS",
+    "highReason": "PEAK เสียงพูด {value} dBFS เกินขีดจำกัดบนของเทคนี้ที่ {limit} dBFS",
+    "liveLowReason": "ระหว่างบันทึกเสียงเบาต่อเนื่อง (RMS ขั้นต่ำ {limit} dBFS)",
+    "liveHighReason": "ระหว่างบันทึก PEAK เกิน {limit} dBFS",
     "silenceDuration": "ระยะเงียบปัจจุบัน: {seconds} วินาที",
     "adjustSilence": "ปรับระยะเงียบ",
     "title": "ตรวจสอบเสียงพูดและบันทึกประโยคสั้น",

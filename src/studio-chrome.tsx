@@ -3,11 +3,12 @@ import { useI18n } from './i18n';
 
 export type Phase = 'home' | 'setup' | 'running';
 export type EngineStatus = 'connecting' | 'ready' | 'offline';
-export type IconName = 'check' | 'chevron-left' | 'chevron-right' | 'close' | 'copy' | 'export' | 'file' | 'folder' | 'history' | 'home' | 'headphones' | 'log' | 'meter' | 'microphone' | 'more' | 'pause' | 'play' | 'plus' | 'record' | 'refresh' | 'retake' | 'settings' | 'skip' | 'sliders' | 'stop' | 'trash';
+export type IconName = 'check' | 'chevron-left' | 'chevron-right' | 'close' | 'copy' | 'export' | 'file' | 'folder' | 'history' | 'home' | 'headphones' | 'log' | 'meter' | 'microphone' | 'more' | 'pause' | 'play' | 'plus' | 'record' | 'refresh' | 'retake' | 'settings' | 'skip' | 'sliders' | 'stop' | 'trash' | 'warning';
 
 export function Icon({ name, size = 16 }: { name: IconName; size?: number }) {
   const common = { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.7, strokeLinecap: 'round' as const, strokeLinejoin: 'round' as const, 'aria-hidden': true };
   switch (name) {
+    case 'warning': return <svg {...common}><path d="M12 3 2 21h20L12 3Z" /><path d="M12 9v5m0 3v.1" /></svg>;
     case 'check': return <svg {...common}><path d="m5 12 4 4L19 6" /></svg>;
     case 'close': return <svg {...common}><path d="M6 6l12 12M18 6 6 18" /></svg>;
     case 'chevron-left': return <svg {...common}><path d="m15 18-6-6 6-6" /></svg>;

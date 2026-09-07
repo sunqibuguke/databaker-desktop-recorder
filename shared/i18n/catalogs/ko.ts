@@ -4,6 +4,10 @@ import { inputAuditionCopy } from './input-audition.ts';
 
 const ko: MessageTree = {
   speech: {
+    "lowReason": "음성 RMS {value} dBFS가 이번 녹음의 하한 {limit} dBFS보다 낮습니다",
+    "highReason": "음성 PEAK {value} dBFS가 이번 녹음의 상한 {limit} dBFS를 초과합니다",
+    "liveLowReason": "녹음 중 낮은 음량이 지속되었습니다(RMS 하한 {limit} dBFS)",
+    "liveHighReason": "녹음 중 PEAK 상한 {limit} dBFS를 초과했습니다",
     "silenceDuration": "현재 무음 시간: {seconds}초",
     "adjustSilence": "무음 시간 조정",
     "title": "음성 검사 및 짧은 문장 녹음",

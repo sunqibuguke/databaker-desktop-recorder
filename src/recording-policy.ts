@@ -27,3 +27,22 @@ export function speechQualityWarning(quality: SpeechQuality | null | undefined, 
   const codes = [...new Set([...(live ? [] : quality.warnings), ...quality.live_warnings])];
   return codes.map((code) => code === 'speech_low' ? t('speech.low') : code === 'speech_high' ? t('speech.high') : '').filter(Boolean).join(' · ');
 }
+
+// Explain saved warning codes using the policy captured for this take, never the
+// task's current settings. Live-only warnings must not imply the final RMS failed.
+export function speechQualityWarningDetail(quality: SpeechQuality | null | undefined): string {
+  if (!quality) return '';
+  const parts: string[] = [];
+  const value = (dbfs: number) => String(Number(dbfs.toFixed(3)));
+  if (quality.warnings.includes('speech_low') && quality.rms_dbfs !== null) {
+    parts.push(t('speech.lowReason', { value: value(quality.rms_dbfs), limit: value(quality.policy.rms_min_dbfs) }));
+  } else if (quality.live_warnings.includes('speech_low')) {
+    parts.push(t('speech.liveLowReason', { limit: value(quality.policy.rms_min_dbfs) }));
+  }
+  if (quality.warnings.includes('speech_high') && quality.peak_dbfs !== null) {
+    parts.push(t('speech.highReason', { value: value(quality.peak_dbfs), limit: value(quality.policy.peak_max_dbfs) }));
+  } else if (quality.live_warnings.includes('speech_high')) {
+    parts.push(t('speech.liveHighReason', { limit: value(quality.policy.peak_max_dbfs) }));
+  }
+  return parts.join(' · ');
+}

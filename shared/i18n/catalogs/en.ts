@@ -4,6 +4,10 @@ import { inputAuditionCopy } from './input-audition.ts';
 
 const en: MessageTree = {
   speech: {
+    "lowReason": "Speech RMS {value} dBFS is below this take’s minimum of {limit} dBFS",
+    "highReason": "Speech PEAK {value} dBFS exceeds this take’s maximum of {limit} dBFS",
+    "liveLowReason": "Sustained low level during recording (RMS minimum {limit} dBFS)",
+    "liveHighReason": "Peak exceeded {limit} dBFS during recording",
     "silenceDuration": "Current silence duration: {seconds} s",
     "adjustSilence": "Adjust silence duration",
     "title": "Speech checks and short recordings",

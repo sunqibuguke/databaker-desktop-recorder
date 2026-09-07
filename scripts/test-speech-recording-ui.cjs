@@ -72,12 +72,22 @@ async function main() {
         };
       });
     }
+    const geometry = () => page.evaluate(() => Object.fromEntries(['.script-monitor', '.prompt-surface', '.signal-monitor', '.transport-panel'].map((selector) => {
+      const { x, y, width, height } = document.querySelector(selector).getBoundingClientRect();
+      return [selector, { x, y, width, height }];
+    })));
+    const beforeRecording = await geometry();
     await page.getByTestId('main-transport').click();
-    await expect(page.locator('.speech-quality-banner')).toHaveText('声音偏小', { timeout: 10_000 });
+    await expect(page.locator('.speech-quality-banner, .speech-review.has-warning')).toContainText('声音偏小', { timeout: 10_000 });
     assert.equal(await page.evaluate(() => window.__speechPrompter.qualityWarning), '声音偏小');
     await expect(page.getByTestId('main-transport')).toContainText('确认保留并录下一句', { timeout: 10_000 });
     const state = () => page.evaluate(() => window.recorder.request('get_state'));
     const first = await state();
+    assert.deepEqual(await geometry(), beforeRecording, 'ending a take must not move or resize the script, waveform or controls');
+    await expect(page.getByTestId('speech-quality-result')).toContainText('声音偏小');
+    await expect(page.getByTestId('speech-quality-result')).toContainText('低于本次下限 -10 dBFS');
+    await expect(page.locator('.speech-quality-banner')).toHaveCount(0);
+    assert.equal(await page.locator('.editor-canvas > .speech-review').count(), 0, 'results cannot create an implicit grid row');
     if (process.env.DATABAKER_TEST_DELAY_START_REPLY === '1') {
       assert.equal(await page.evaluate(() => window.__autoBeforeStartReply), true);
     }
@@ -89,7 +99,7 @@ async function main() {
     for (const viewport of [{ width: 1080, height: 700 }, { width: 1366, height: 768 }, { width: 1920, height: 1080 }]) {
       await page.setViewportSize(viewport);
       const overlap = await page.evaluate(() => {
-        const warning = document.querySelector('.speech-quality-banner').getBoundingClientRect();
+        const warning = document.querySelector('.speech-review').getBoundingClientRect();
         return [...document.querySelectorAll('button, input')].filter((element) => {
           const r = element.getBoundingClientRect();
           return r.width && r.height && r.x < warning.right && r.right > warning.x && r.y < warning.bottom && r.bottom > warning.y;
@@ -104,6 +114,7 @@ async function main() {
     await expect(page.getByLabel('短句自动结束', { exact: true })).toBeChecked();
     await page.getByTestId('main-transport').click();
     const second = await state();
+    await expect(page.getByTestId('speech-quality-result')).toHaveCount(0);
     assert.equal(second.active_attempt.item_id, '002');
     assert.ok(second.snapshot.items[0].attempts[0].speech_quality.retained_by_operator_at);
     assert.equal(second.snapshot.items[0].attempts[0].end_sample, boundary);
@@ -112,6 +123,8 @@ async function main() {
     await page.getByRole('button', { name: '保存录制设置', exact: true }).click();
     await expect(page.getByTestId('speech-quality-result')).toBeVisible({ timeout: 10_000 });
     const finished = await state();
+    await expect(page.getByTestId('speech-quality-result')).toContainText('低于本次下限 -10 dBFS');
+    await expect(page.getByTestId('speech-quality-result')).not.toContainText('本次下限 -30');
     assert.equal(finished.snapshot.recording_policy.auto_end, false);
     assert.equal(finished.snapshot.items[1].attempts[0].recording_policy.auto_end, true);
     assert.equal(finished.snapshot.items[1].attempts[0].speech_quality.policy.rms_min_dbfs, -10);
