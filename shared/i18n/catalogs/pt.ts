@@ -3,6 +3,31 @@ import { p1Copy } from './p1.ts';
 import { inputAuditionCopy } from './input-audition.ts';
 
 const pt: MessageTree = {
+  speech: {
+    "silenceDuration": "Silêncio atual: {seconds} s",
+    "adjustSilence": "Ajustar duração do silêncio",
+    "title": "Verificação de voz e frases curtas",
+    "amplitude": "Verificar o nível da voz",
+    "rmsMin": "RMS mínimo da voz (dBFS)",
+    "peakMax": "PEAK máximo da voz (dBFS)",
+    "reference": "−30 / −3 dBFS são valores de referência, não critérios de aceitação.",
+    "autoEnd": "Finalizar frases curtas automaticamente",
+    "autoHint": "Finaliza após o silêncio configurado e aguarda confirmação. Repetições sem pausa suficiente podem ser incluídas; o conteúdo não é reconhecido.",
+    "nextTake": "As alterações valem para a próxima tomada. Os resultados anteriores são preservados.",
+    "save": "Salvar ajustes de gravação",
+    "saved": "Ajustes salvos para a próxima tomada",
+    "invalid": "Insira de −96 a 0 dBFS; o RMS mínimo deve ser inferior ao PEAK máximo.",
+    "low": "Voz muito baixa",
+    "high": "Voz muito alta",
+    "autoStopped": "A tomada terminou automaticamente. Ouça, confirme ou grave novamente.",
+    "retain": "Manter com aviso e continuar",
+    "retainOnly": "Manter esta tomada com aviso",
+    "recordedWarning": "Esta tomada tem avisos de nível. Ouça, grave novamente ou confirme que deseja mantê-la.",
+    "retained": "O operador confirmou a manutenção",
+    "metrics": "RMS da voz {rms} dBFS · PEAK {peak} dBFS",
+    "unmeasured": "Nenhum resultado de nível de voz disponível",
+    "autoFailed": "Falha ao finalizar automaticamente: {message}"
+  },
   common: {
     confirm: 'Confirmar',
     cancel: 'Cancelar',
@@ -73,6 +98,11 @@ const pt: MessageTree = {
     manualDefault: 'Pausar após cada frase',
   },
   license: {
+    titleState: "Não foi possível verificar o estado local da licença",
+    errorState: "Verifique o armazenamento seguro do sistema ou peça ao administrador para restaurar os registros originais. Reinserir o código não remove registros danificados nem erros de relógio.",
+    "sealing": "Finalizando a gravação com segurança",
+    "sealingDetail": "A licença não é mais válida. A ativação aparecerá após salvar e encerrar a gravação.",
+    "retrySeal": "Tentar encerrar novamente",
     title: 'O software não está licenciado',
     titleExpired: 'A licença expirou',
     titleWrongMachine: 'A licença não é deste computador',

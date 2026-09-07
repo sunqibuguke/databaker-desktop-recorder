@@ -1,0 +1,66 @@
+
+> databaker-desktop-recorder@0.2.0 test:e2e:electron
+> npm run build:e2e:electron && playwright test --config playwright.electron.config.ts
+
+
+> databaker-desktop-recorder@0.2.0 build:e2e:electron
+> cross-env DATABAKER_SENTRY_PLUGIN_DISABLED=1 npm run build:renderer && npm run build:electron && npm run build:engine:system-test
+
+
+> databaker-desktop-recorder@0.2.0 build:renderer
+> vite build
+
+[sentry-vite-plugin] Info: Using environment variables configured in ".env.sentry-build-plugin".
+(!) Your Vite config uses features that are unsupported by `configLoader: 'native'`, which is planned to become the default in a future major version of Vite:
+  - `__dirname` (vite.config.mts:9:31). Use `import.meta.dirname` instead
+Set `VITE_CONFIG_NATIVE_IGNORE_WARNING=true` to suppress this warning.
+vite v8.2.1 building client environment for production...
+[2K
+transforming...✓ 408 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                                       0.54 kB │ gzip:   0.36 kB
+dist/assets/databaker-recorder-logo-CqVIRKS_.png    374.72 kB
+dist/assets/index-yVE4o6RJ.css                      125.58 kB │ gzip:  22.49 kB
+dist/assets/index-Dcm_YobK.js                     1,023.76 kB │ gzip: 299.46 kB │ map: 2,800.50 kB
+
+✓ built in 362ms
+[plugin builtin:vite-reporter]
+(!) Some chunks are larger than 500 kB after minification. Consider:
+- Using dynamic import() to code-split the application
+- Use build.rolldownOptions.output.codeSplitting to improve chunking: https://rolldown.rs/reference/OutputOptions.codeSplitting
+- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.
+
+> databaker-desktop-recorder@0.2.0 build:electron
+> tsc -p electron/tsconfig.json
+
+
+> databaker-desktop-recorder@0.2.0 build:engine:system-test
+> cross-env CARGO_TARGET_DIR=engine/target/system-test node scripts/run-cargo.cjs build --manifest-path engine/Cargo.toml --features system-test
+
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.14s
+
+Running 18 tests using 1 worker
+
+(node:21943) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+  ✓   1 e2e/electron-p1.spec.ts:356:5 › real Electron keeps task setup actions visible on a laptop viewport (1.2s)
+  ✓   2 e2e/electron-p1.spec.ts:402:5 › real Electron confirms a ten-second input audition without creating a sentence attempt (15.2s)
+  ✓   3 e2e/electron-p1.spec.ts:440:5 › real Electron retries and explicitly skips input audition without shortcut or attempt bleed (15.6s)
+  ✓   4 e2e/electron-p1.spec.ts:502:5 › real Electron scopes audition reuse to one launch and one capture configuration (13.7s)
+  ✓   5 e2e/electron-p1.spec.ts:628:5 › real Electron uses default VAD for a complete first-take confirmation flow (6.0s)
+  ✓   6 e2e/electron-p1.spec.ts:662:5 › real Electron preserves first-take rhythm across a label boundary (16.3s)
+  ✓   7 e2e/electron-p1.spec.ts:717:5 › real Electron keeps the selected take and continues handled retakes with Space without auto-recording (10.0s)
+  ✓   8 e2e/electron-p1.spec.ts:798:5 › real Electron restores local item context and an undecided take without ghost recording (7.9s)
+  ✓   9 e2e/electron-p1.spec.ts:839:5 › real Electron separates current-task recording settings from new-task defaults (9.4s)
+  ✓  10 e2e/electron-p1.spec.ts:907:5 › real Electron derives confirmed-only and complete-task export gates from task state (5.6s)
+  ✓  11 e2e/electron-p1.spec.ts:966:5 › real Electron filters and locates current-task issues without starting a recording (6.7s)
+  ✓  12 e2e/electron-p1.spec.ts:1032:5 › real Electron closes the issue queue and exposes one explicit path to delivery (5.5s)
+  ✓  13 e2e/electron-p1.spec.ts:1069:5 › real Electron home warning action opens export review instead of restoring an old panel (5.7s)
+  ✓  14 e2e/electron-p1.spec.ts:1112:5 › real Electron rejects a stale offline attempt switch without changing the selected version (7.4s)
+  ✓  15 e2e/electron-p1.spec.ts:1194:5 › real Electron exports cuts, verifies the external copy, writes a receipt, and reverifies after restart (18.4s)
+  ✓  16 e2e/electron-p1.spec.ts:1352:5 › real Electron keeps 320 long-label items reachable at target resolutions and Windows 125% scaling (6.0s)
+  ✓  17 e2e/electron-p1.spec.ts:1472:5 › real Electron keeps 1000-item navigation visible and bounded (7.0s)
+  ✓  18 e2e/electron-p1.spec.ts:1495:5 › real Electron short utterance stops at a fixed boundary and requires explicit warning retention (6.5s)
+
+  18 passed (2.7m)

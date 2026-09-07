@@ -1,0 +1,8 @@
+test engine::tests::automatic_discontinuity_retake_keeps_previous_and_cannot_be_retained ... ok
+test speech_quality::tests::equality_is_allowed_and_gaps_reset_low_timer ... ok
+test speech_quality::tests::short_voice_and_silence_do_not_dilute_levels ... ok
+test speech_quality::tests::sustained_low_and_peak_are_remembered_after_recovery ... ok
+test speech_quality::tests::metrics_match_the_written_pcm_for_every_delivery_depth ... ok
+test engine::tests::short_take_policy_freezes_audio_and_persists_operator_retention ... ok
+test result: ok. 274 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 13.89s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

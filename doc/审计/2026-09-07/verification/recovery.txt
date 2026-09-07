@@ -1,0 +1,6 @@
+
+> databaker-desktop-recorder@0.2.0 test:crash-recovery
+> node scripts/run-cargo.cjs build --manifest-path engine/Cargo.toml && node scripts/test-crash-recovery.cjs
+
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s
+crash recovery black-box passed: killed=333 frames, header-ahead=211 frames

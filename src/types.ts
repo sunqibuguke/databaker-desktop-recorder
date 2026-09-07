@@ -1,3 +1,4 @@
+import type { RecordingPolicy, SpeechQuality } from './recording-policy';
 export type LicenseReason =
   | 'unlicensed'
   | 'malformed'
@@ -6,9 +7,13 @@ export type LicenseReason =
   | 'wrong_machine'
   | 'expired'
   | 'clock_rollback'
-  | 'fingerprint_unavailable';
+  | 'fingerprint_unavailable'
+  | 'state_invalid';
 
 export type LicenseStatus = {
+  transitionRevision?: number;
+  captureStopPending?: boolean;
+  captureStopError?: string;
   state: 'valid' | 'invalid';
   reason: LicenseReason | null;
   machineCode: string;
@@ -50,6 +55,9 @@ export type AttemptInputContinuityEvidence = {
 };
 
 export type Attempt = {
+  recording_policy?: RecordingPolicy;
+  speech_quality?: SpeechQuality | null;
+  end_reason?: string;
   attempt_id: string;
   start_sample: number;
   recording_started_sample: number;
@@ -103,6 +111,7 @@ export type CaptureProvenanceSpan = {
 };
 
 export type SessionSnapshot = {
+  recording_policy?: RecordingPolicy;
   schema_version: number;
   /** Application build that created or most recently wrote this task. */
   app_version?: string;
@@ -311,6 +320,7 @@ export type CapturePresetLoadResult = {
 };
 
 export type Meter = {
+  speech_quality?: SpeechQuality | null;
   captured_samples: number;
   committed_samples: number;
   overflow_samples: number;
@@ -442,6 +452,7 @@ export type ScriptLabelTransition = {
 };
 
 export type PrompterState = {
+  licenseInvalid?: boolean;
   sessionName: string;
   sequence: number;
   total: number;

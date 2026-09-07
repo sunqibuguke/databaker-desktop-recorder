@@ -1,3 +1,4 @@
+import { DEFAULT_RECORDING_POLICY, validRecordingPolicy, type RecordingPolicy, type SpeechQuality, type StoppedAttempt } from './recording-policy';
 import type { DebugLogDraft, DebugLogEntry, DebugLogSnapshot } from './debug-log';
 import { formatDebugLogText } from './debug-log';
 import {
@@ -56,6 +57,9 @@ export function installDevRecorderMock() {
 
   let snapshot: SessionSnapshot | null = null;
   let activeAttempt: MockActiveAttempt | null = null;
+  let takePolicy: RecordingPolicy = { ...DEFAULT_RECORDING_POLICY };
+  let autoEndBoundary = 0;
+  let takeQuality: SpeechQuality | null = null;
   let capturedSamples = 0;
   let previousCapturedSamples = 0;
   let waveformSampleCursor = 0;
@@ -343,7 +347,7 @@ export function installDevRecorderMock() {
     };
   }
 
-  function emitMeter() {
+  function emitMeter(allowAuto = true) {
     capturedSamples = Math.max(capturedSamples, Math.floor((performance.now() - recordingStartedAt) / 1_000 * mockSampleRate));
     const committedSamples = Math.max(snapshot?.committed_samples ?? 0, capturedSamples - 2_400);
     if (snapshot) {
@@ -423,11 +427,27 @@ export function installDevRecorderMock() {
     const speaking = Boolean(activeAttempt?.content_started_sample)
       && capturedSamples < (activeAttempt?.content_started_sample ?? 0) + mockSpeechSamples;
     const pulse = speaking ? .1 + Math.abs(Math.sin(capturedSamples / 35_000)) * .22 : .0025;
-    if (speaking) {
+    if (speaking && !autoEndBoundary) {
       silenceSamples = 0;
       lastSignalSample = capturedSamples;
     } else {
       silenceSamples += newSamples;
+    }
+    if (speaking && !autoEndBoundary && takeQuality) {
+      takeQuality.speech_samples += newSamples;
+      takeQuality.rms_dbfs = -20;
+      takeQuality.peak_dbfs = -9;
+      takeQuality.warnings = [ ...(takePolicy.rms_min_dbfs > -20 ? ['speech_low'] : []), ...(takePolicy.peak_max_dbfs < -9 ? ['speech_high'] : []) ];
+      takeQuality.live_warnings = takeQuality.warnings;
+    }
+    if (activeAttempt && takePolicy.auto_end && firstAttemptSignalSample && lastSignalSample && !speaking && !autoEndBoundary
+      && capturedSamples >= lastSignalSample + activeAttempt.required_head_silence_samples) {
+      autoEndBoundary = lastSignalSample + activeAttempt.required_head_silence_samples;
+      if (allowAuto) {
+        const sessionId = snapshot?.session_id;
+        void request<StoppedAttempt>('stop_attempt', { attempt_id: activeAttempt.attempt_id, automatic: true, enforce_silence: enforceSilence })
+          .then((result) => emitEvent('attempt_auto_stopped', { session_id: sessionId, result }));
+      }
     }
     const waveformBinCount = Math.floor((capturedSamples - waveformSampleCursor) / 64);
     const waveformStartSample = waveformSampleCursor;
@@ -447,6 +467,7 @@ export function installDevRecorderMock() {
       input_discontinuity_silence_samples: inputDiscontinuitySilenceSamples,
       storage_status: 'healthy',
       storage_safe_remaining_seconds: 12 * 60 * 60,
+      speech_quality: takeQuality,
       peak: pulse,
       rms: pulse * .42,
       silence_samples: silenceSamples,
@@ -460,7 +481,7 @@ export function installDevRecorderMock() {
       head_silence_passed_sample: activeAttempt?.head_silence_passed_sample ?? 0,
       content_started_sample: activeAttempt?.content_started_sample ?? 0,
       silence_threshold_dbfs: snapshot?.silence_threshold_dbfs ?? -42,
-      silence_duration_ms: snapshot?.silence_duration_ms ?? 1_000,
+      silence_duration_ms: activeAttempt && takePolicy.auto_end ? activeAttempt.required_head_silence_samples / mockSampleRate * 1_000 : snapshot?.silence_duration_ms ?? 1_000,
       silence_detector: snapshot?.silence_detector ?? 'vad',
       waveform,
       waveform_end_sample: waveformSampleCursor,
@@ -503,6 +524,7 @@ export function installDevRecorderMock() {
       if (!requestedDevice) throw new Error('未找到指定的录音设备');
       const now = new Date().toISOString();
       snapshot = {
+        recording_policy: { ...DEFAULT_RECORDING_POLICY, ...(data.recording_policy as Partial<RecordingPolicy>) },
         schema_version: 1,
         journal_seq: 1,
         session_id: String(data.session_id),
@@ -882,6 +904,19 @@ export function installDevRecorderMock() {
       emitEvent('noise_check_completed', result);
       return result as T;
     }
+    if (command === 'set_session_recording_policy') {
+      if (data.expected_journal_seq !== snapshot.journal_seq || data.expected_session_id !== snapshot.session_id) throw new Error('任务已变更');
+      if (!validRecordingPolicy(data.recording_policy as RecordingPolicy)) throw new Error('人声幅值设置无效');
+      snapshot.recording_policy = { ...(data.recording_policy as RecordingPolicy) };
+      snapshot.journal_seq += 1;
+      return { snapshot: snapshotCopy() } as T;
+    }
+    if (command === 'set_recording_policy') {
+      if (!validRecordingPolicy(data as RecordingPolicy)) throw new Error('人声幅值设置无效');
+      snapshot.recording_policy = { ...data } as RecordingPolicy;
+      snapshot.journal_seq += 1;
+      return { snapshot: snapshotCopy(), applies_from: 'next_attempt' } as T;
+    }
     if (command === 'set_silence_settings') {
       const thresholdDbfs = Number(data.threshold_dbfs);
       const silenceDurationMs = Number(data.silence_duration_ms);
@@ -890,6 +925,12 @@ export function installDevRecorderMock() {
       }
       if (!Number.isSafeInteger(silenceDurationMs) || silenceDurationMs < 200 || silenceDurationMs > 5_000) {
         throw new Error('静音时长必须在 0.2 到 5 秒之间');
+      }
+      if (activeAttempt && takePolicy.auto_end) {
+        snapshot.silence_threshold_dbfs = thresholdDbfs;
+        snapshot.silence_duration_ms = silenceDurationMs;
+        return { threshold_dbfs: thresholdDbfs, silence_duration_ms: silenceDurationMs,
+          silence_detector: snapshot.silence_detector, reset_kind: 'next_attempt', snapshot: snapshotCopy() } as T;
       }
       const phase = activeAttempt?.head_silence_phase ?? 'idle';
       let resetKind = 'idle';
@@ -930,6 +971,10 @@ export function installDevRecorderMock() {
     if (command === 'start_attempt') {
       if (!captureActive || snapshot.status !== 'recording') throw new Error('当前任务未进入采集状态');
       if (activeAttempt) throw new Error('已有录音正在进行');
+      takePolicy = { ...DEFAULT_RECORDING_POLICY, ...snapshot.recording_policy };
+      autoEndBoundary = 0;
+      takeQuality = takePolicy.amplitude_enabled ? { policy: { ...takePolicy }, speech_samples: 0,
+        rms_dbfs: null, peak_dbfs: null, warnings: [], live_warnings: [], retained_by_operator_at: null } : null;
       enforceSilence = data.enforce_silence === true;
       const required = mockSampleRate * snapshot.silence_duration_ms / 1_000;
       const item = snapshot.items.find((candidate) => candidate.id === data.item_id);
@@ -952,27 +997,35 @@ export function installDevRecorderMock() {
       return { ...activeAttempt } as T;
     }
     if (command === 'stop_attempt') {
+      if (data.attempt_id && data.attempt_id !== activeAttempt?.attempt_id) {
+        for (const item of snapshot.items) {
+          const attempt = item.attempts.find((a) => a.attempt_id === data.attempt_id);
+          if (attempt) return { item_id: item.id, attempt, already_stopped: true } as T;
+        }
+        throw new Error('录制版本已变化');
+      }
       if (!activeAttempt) throw new Error('当前没有正在进行的录音');
       // Sample at the command boundary instead of waiting for the 100 ms
       // telemetry timer. Rust freezes this captured boundary and waits for the
       // writer checkpoint before sealing the attempt.
-      emitMeter();
+      if (!data.automatic) emitMeter(false);
       const discardEmpty = data.discard_empty !== false;
       if (!firstAttemptSignalSample && discardEmpty) {
         const itemId = activeAttempt.item_id;
         activeAttempt = null;
         return { item_id: itemId, attempt: null, discarded: true, forced: true } as T;
       }
-      const requiredSilence = mockSampleRate * snapshot.silence_duration_ms / 1_000;
+      const requiredSilence = takePolicy.auto_end ? activeAttempt.required_head_silence_samples : mockSampleRate * snapshot.silence_duration_ms / 1_000;
       const forcedWithoutTailSilence = silenceSamples < requiredSilence;
       if (data.force !== true && firstAttemptSignalSample && forcedWithoutTailSilence) {
         throw new Error('尾静音未满，不能结束本句');
       }
       completedAttemptCount += 1;
       const recoveredDiscontinuity = activeAttempt.discontinuity_injected === true;
-      const committedBoundary = capturedSamples;
-      snapshot.captured_samples = committedBoundary;
-      snapshot.committed_samples = committedBoundary;
+      const committedBoundary = autoEndBoundary || capturedSamples;
+      snapshot.captured_samples = capturedSamples;
+      snapshot.committed_samples = Math.max(snapshot.committed_samples, committedBoundary);
+      if (snapshot.capture_provenance?.length) snapshot.capture_provenance[snapshot.capture_provenance.length - 1].end_sample = snapshot.committed_samples;
       const useVadTrim = snapshot.silence_detector === 'vad' && firstAttemptSignalSample > 0;
       const attemptStart = useVadTrim
         ? Math.max(
@@ -997,6 +1050,9 @@ export function installDevRecorderMock() {
         throw new Error('本次录音的 VAD 裁切边界无效');
       }
       const attempt: Attempt = {
+        recording_policy: { ...takePolicy },
+        speech_quality: takeQuality ? structuredClone(takeQuality) : null,
+        end_reason: autoEndBoundary ? 'auto_silence' : 'manual',
         attempt_id: activeAttempt.attempt_id,
         start_sample: attemptStart,
         recording_started_sample: activeAttempt.recording_started_sample,
@@ -1052,6 +1108,9 @@ export function installDevRecorderMock() {
       const isCurrentAccepted = selected.status === 'accepted' && item.selected_attempt_id === selectedId;
       if (selected.status !== 'recorded' && !isCurrentAccepted) {
         throw new Error('只能使用待确认录音或保留当前使用录音');
+      }
+      if (selected.speech_quality && (selected.speech_quality.warnings.length || selected.speech_quality.live_warnings.length)) {
+        selected.speech_quality.retained_by_operator_at = new Date().toISOString();
       }
       item.selected_attempt_id = selectedId;
       item.status = 'accepted';

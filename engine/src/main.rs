@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 mod attempt;
 mod bandwidth;
 mod capture_select;
@@ -6,6 +7,7 @@ mod engine;
 mod protocol;
 mod segmented_wav;
 mod session_lock;
+mod speech_quality;
 mod storage_guard;
 mod vad;
 mod wav;
@@ -58,6 +60,14 @@ struct OfflineSelectAttemptPayload {
     item_id: String,
     attempt_id: String,
     expected_journal_seq: u64,
+}
+
+#[derive(Deserialize)]
+struct OfflineRecordingPolicyPayload {
+    session_dir: String,
+    expected_session_id: String,
+    expected_journal_seq: u64,
+    recording_policy: speech_quality::RecordingPolicy,
 }
 
 #[derive(Deserialize)]
@@ -118,10 +128,39 @@ fn main() -> Result<()> {
             "arch": std::env::consts::ARCH,
         }),
     );
-    let stdin = io::stdin();
     let mut engine = Engine::new(emitter.clone());
     let mut terminal_shutdown_error = None::<String>;
-    for line in stdin.lock().lines() {
+    // Input and take completion share one owner of Engine. Capture/VAD only
+    // latch sample boundaries; persistence never runs on an audio callback.
+    let (input_tx, input_rx) = std::sync::mpsc::sync_channel(64);
+    std::thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            if input_tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut auto_retry_at = std::time::Instant::now();
+    let mut auto_error = None::<String>;
+    loop {
+        if std::time::Instant::now() >= auto_retry_at {
+            match engine.complete_auto_attempt() {
+                Ok(()) => auto_error = None,
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    if auto_error.as_ref() != Some(&message) {
+                        emitter.event("auto_attempt_error", json!({ "message": message }));
+                    }
+                    auto_error = Some(message);
+                    auto_retry_at = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                }
+            }
+        }
+        let line = match input_rx.recv_timeout(std::time::Duration::from_millis(20)) {
+            Ok(line) => line,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         let line = match line {
             Ok(line) if !line.trim().is_empty() => line,
             Ok(_) => continue,
@@ -342,6 +381,16 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
             let payload: SetSilenceSettingsPayload = parse(command.payload)?;
             engine.set_silence_settings(payload)
         }
+        "set_recording_policy" => engine.set_recording_policy(parse(command.payload)?),
+        "set_session_recording_policy" => {
+            let payload: OfflineRecordingPolicyPayload = parse(command.payload)?;
+            engine.set_session_recording_policy(
+                PathBuf::from(payload.session_dir).as_path(),
+                &payload.expected_session_id,
+                payload.expected_journal_seq,
+                payload.recording_policy,
+            )
+        }
         "start_attempt" => {
             let payload: ItemPayload = parse(command.payload)?;
             engine.start_attempt(&payload.item_id, payload.enforce_silence)
@@ -355,7 +404,8 @@ fn dispatch(engine: &mut Engine, command: CommandEnvelope) -> Result<Value> {
             } else {
                 parse(command.payload)?
             };
-            engine.stop_attempt(
+            engine.stop_attempt_identified(
+                payload.attempt_id.as_deref(),
                 payload.force,
                 payload.discard_empty,
                 payload.enforce_silence,
@@ -529,6 +579,7 @@ mod tests {
         writer.write_samples(&[0.25, -0.25]).unwrap();
         writer.finalize().unwrap();
         let snapshot = SessionSnapshot {
+            recording_policy: Default::default(),
             schema_version: 1,
             app_version: crate::engine::build_app_version(),
             engine_version: crate::engine::build_engine_version(),

@@ -39,7 +39,7 @@ declare global {
       defaultOutput(): Promise<DefaultOutputResult>;
       getLicenseStatus?(): Promise<LicenseStatus>;
       activateLicense?(ticket: string): Promise<LicenseStatus>;
-      listPendingLicenseSeals?(): Promise<{ recordings: PendingLicenseSeal[] }>;
+      listPendingLicenseSeals?(): Promise<{ recordings: PendingLicenseSeal[]; warning?: string }>;
       emergencySealRecording?(sessionDir: string, sessionId: string): Promise<unknown>;
       onLicenseChanged?(listener: (status: LicenseStatus) => void): () => void;
       getLocale?(): Promise<string>;

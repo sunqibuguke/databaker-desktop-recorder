@@ -1,0 +1,6 @@
+
+> databaker-desktop-recorder@0.2.0 test:engine-protocol
+> node scripts/run-cargo.cjs build --manifest-path engine/Cargo.toml && node scripts/smoke-engine.cjs
+
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s
+engine protocol smoke passed: /Users/lilk/projects/databaker/桌面音频采集/engine/target/debug/recorder-engine

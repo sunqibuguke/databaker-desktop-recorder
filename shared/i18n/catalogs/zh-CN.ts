@@ -2,6 +2,31 @@ import { p1Copy } from './p1.ts';
 import { inputAuditionCopy } from './input-audition.ts';
 
 const zhCN = {
+  speech: {
+    "silenceDuration": "当前静音时长：{seconds} 秒",
+    "adjustSilence": "调整静音时长",
+    "title": "人声检查与短句录制",
+    "amplitude": "人声幅值检查",
+    "rmsMin": "人声 RMS 下限（dBFS）",
+    "peakMax": "人声 PEAK 上限（dBFS）",
+    "reference": "−30 / −3 dBFS 为参考值，并非验收标准。",
+    "autoEnd": "短句自动结束",
+    "autoHint": "读完后静音达到任务设定时长，自动结束并等待确认。连续多读或停顿不足仍可能录入，本功能不判断内容。",
+    "nextTake": "保存后从下一次录制本句生效；历史检测结果保持原样。",
+    "save": "保存录制设置",
+    "saved": "设置已保存，从下一次录制本句生效",
+    "invalid": "请输入 −96～0 dBFS，且 RMS 下限小于 PEAK 上限。",
+    "low": "声音偏小",
+    "high": "声音过大",
+    "autoStopped": "本句已自动结束，请试听后确认或重录",
+    "retain": "确认保留并录下一句",
+    "retainOnly": "确认保留本句",
+    "recordedWarning": "本次录制出现幅值提醒，可试听、重录或确认保留。",
+    "retained": "采录人员已确认保留",
+    "metrics": "人声 RMS {rms} dBFS · PEAK {peak} dBFS",
+    "unmeasured": "没有可用的人声幅值结果",
+    "autoFailed": "自动结束未完成：{message}"
+  },
   common: {
     confirm: '确认',
     cancel: '取消',
@@ -72,6 +97,11 @@ const zhCN = {
     manualDefault: '默认逐句暂停',
   },
   license: {
+    titleState: "本地授权记录无法验证",
+    errorState: "请检查系统安全存储，或联系管理员恢复原授权记录。重新输入授权码不会清除损坏记录或时间异常。",
+    "sealing": "正在安全结束录制",
+    "sealingDetail": "授权已失效。录音封存完成后将显示授权页面。",
+    "retrySeal": "重试封存",
     title: '软件未授权',
     titleExpired: '授权已过期',
     titleWrongMachine: '授权不属于本机',

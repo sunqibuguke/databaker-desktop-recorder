@@ -10,7 +10,7 @@ const { spawnSync } = require('node:child_process');
 
 const scenario = process.argv[2];
 if (!scenario) {
-  for (const name of ['immediate-unsafe', 'late-unsafe', 'slow-safe', 'live-unsafe-retry']) {
+  for (const name of ['immediate-unsafe', 'late-unsafe', 'slow-safe', 'live-unsafe-retry', 'license-expiry', 'license-packaged']) {
     const result = spawnSync(process.execPath, [__filename, name], { encoding: 'utf8' });
     if (result.status !== 0) {
       process.stderr.write(result.stdout);
@@ -35,6 +35,10 @@ class FakeUnsafeStopError extends Error {
   }
 }
 
+let licenseValid = true;
+const licenseEvents = [];
+let releaseLicenseStop;
+const licenseStopGate = new Promise((resolve) => { releaseLicenseStop = resolve; });
 let releaseSlowStop;
 const slowStopGate = new Promise((resolve) => { releaseSlowStop = resolve; });
 
@@ -123,11 +127,21 @@ class FakeEngineClient extends EventEmitter {
   async request(command, payload) {
     this.commands.push({ command, payload });
     if (command === 'resume_session') {
+      this.captureActive = true;
       return {
         session_dir: payload.session_dir,
         snapshot: validSnapshot(path.basename(payload.session_dir)),
       };
     }
+    if (scenario === 'license-expiry' && command === 'stop_session') {
+      this.licenseStops = (this.licenseStops || 0) + 1;
+      if (this.licenseStops === 1) throw new Error('simulated disk failure');
+      await licenseStopGate;
+      this.captureActive = false;
+      const snapshot = validSnapshot('unsafe-live-session', 'stopped', 2);
+      return { snapshot };
+    }
+    if (scenario === 'license-expiry' && command === 'get_state_optional' && this.captureActive) return { active: true, session_dir: path.join(process.env.DATABAKER_DEFAULT_OUTPUT, 'unsafe-live-session'), snapshot: validSnapshot('unsafe-live-session') };
     if (command === 'seal_interrupted_session') {
       const snapshot = validSnapshot(path.basename(payload.session_dir), 'stopped', 2);
       await fs.writeFile(
@@ -156,7 +170,7 @@ class FakeEngineClient extends EventEmitter {
 
 class FakeWebContents extends EventEmitter {
   isDestroyed() { return false; }
-  send() {}
+  send(channel, payload) { if (channel === 'license:changed') licenseEvents.push(payload); }
 }
 
 class FakeBrowserWindow extends EventEmitter {
@@ -197,7 +211,7 @@ async function runScenario() {
   const root = await fs.realpath(lexicalRoot);
   const sessionId = 'unsafe-live-session';
   const sessionDir = path.join(root, sessionId);
-  if (scenario === 'live-unsafe-retry') {
+  if (scenario === 'live-unsafe-retry' || scenario === 'license-expiry') {
     await fs.mkdir(path.join(sessionDir, 'metadata'), { recursive: true });
     await fs.writeFile(
       path.join(sessionDir, 'session.json'),
@@ -211,6 +225,7 @@ async function runScenario() {
   process.env.DATABAKER_DEFAULT_OUTPUT = root;
   const appEvents = new Map();
   const handlers = new Map();
+  const ipcListeners = new Map();
   const dialogCalls = [];
   let quitCalls = 0;
   let internallyPreventedQuitCalls = 0;
@@ -218,7 +233,7 @@ async function runScenario() {
   let internallyPreventedSessionEndCalls = 0;
   const electronStub = {
     app: {
-      isPackaged: false,
+      isPackaged: scenario === 'license-packaged',
       requestSingleInstanceLock: () => true,
       whenReady: () => Promise.resolve(),
       on: (name, listener) => appEvents.set(name, listener),
@@ -258,7 +273,7 @@ async function runScenario() {
     },
     ipcMain: {
       handle: (name, listener) => handlers.set(name, listener),
-      on: () => undefined,
+      on: (name, listener) => ipcListeners.set(name, listener),
     },
     Menu: { buildFromTemplate: () => ({}) },
     nativeImage: { createFromDataURL: () => ({ setTemplateImage: () => undefined }) },
@@ -271,9 +286,18 @@ async function runScenario() {
     },
   };
 
+  if (scenario === 'license-expiry') delete process.env.DATABAKER_LICENSE_DISABLED;
+  if (scenario === 'license-packaged') { process.env.DATABAKER_LICENSE_DISABLED = '1'; process.resourcesPath = root; licenseValid = false; }
   const originalLoad = Module._load;
   Module._load = function loadWithStubs(request, parent, isMain) {
     if (request === 'electron') return electronStub;
+    if (scenario.startsWith('license-') && request === './license') {
+      const actual = originalLoad.call(this, request, parent, isMain);
+      return { ...actual, LicenseRepository: class {
+        async evaluate() { return licenseValid ? actual.disabledLicenseStatus('test-machine') : actual.emptyLicenseStatus('test-machine', 'expired'); }
+      } };
+    }
+    if (scenario.startsWith('license-') && request === './machine-fingerprint' && parent?.filename.endsWith(`${path.sep}dist-electron${path.sep}main.js`)) return { collectMachineFingerprint: async () => ({ machineCode: 'test-machine', componentHashes: [] }) };
     if (request === './engine-client' && parent?.filename.endsWith(`${path.sep}dist-electron${path.sep}main.js`)) {
       return {
         EngineClient: FakeEngineClient,
@@ -297,12 +321,39 @@ async function runScenario() {
       'main process startup',
     );
     const engine = globalThis.safeStopEngine;
-    if (scenario === 'live-unsafe-retry') {
+    if (scenario === 'live-unsafe-retry' || scenario === 'license-expiry') {
       const window = FakeBrowserWindow.instances[0];
       const event = { sender: window.webContents };
       const rows = (await handlers.get('recordings:list')({}, root)).recordings;
       assert.equal(rows.length, 1);
       await handlers.get('engine:request')(event, 'resume_session', { session_dir: sessionDir });
+    }
+    if (scenario.startsWith('license-')) {
+      const event = { sender: FakeBrowserWindow.instances[0].webContents };
+      if (scenario === 'license-packaged') {
+        assert.equal((await handlers.get('license:status')(event)).state, 'invalid', 'packaged main must ignore the disabled environment variable');
+        await assert.rejects(handlers.get('engine:request')(event, 'list_devices', {}), /LICENSE_REQUIRED/);
+        return;
+      }
+      await handlers.get('prompter:open')(event);
+      const readerEvent = { sender: FakeBrowserWindow.instances.at(-1).webContents };
+      ipcListeners.get('prompter:update')(event, { cue: 'recording', readerCueLabel: '请朗读' });
+      licenseValid = false;
+      assert.equal((await handlers.get('license:status')(event)).captureStopPending, true);
+      await waitFor(() => licenseEvents.some((status) => status.captureStopError), 'failed license seal warning');
+      assert.equal(licenseEvents.at(-1).captureStopPending, true);
+      assert.equal(handlers.get('prompter:get-state')(readerEvent).licenseInvalid, true);
+      ipcListeners.get('prompter:update')(event, { cue: 'recording', readerCueLabel: '请朗读' });
+      assert.equal(handlers.get('prompter:get-state')(readerEvent).licenseInvalid, true, 'late renderer updates cannot restore the reading cue after expiry');
+      await handlers.get('license:status')(event);
+      await waitFor(() => engine.licenseStops === 2, 'retry seal');
+      await assert.rejects(handlers.get('engine:request')(event, 'start_attempt', { item_id: '1' }), /LICENSE_REQUIRED/);
+      assert.equal(engine.licenseStops, 2, 'duplicate invalid IPC cannot duplicate a pending stop');
+      releaseLicenseStop();
+      await waitFor(() => licenseEvents.at(-1)?.captureStopPending === false, 'license gate after safe seal');
+      assert.equal(engine.captureActive, false);
+      assert.equal(quitCalls, 0, 'expiry safely stops recording without quitting');
+      return;
     }
     let prevented = false;
     appEvents.get('before-quit')({ preventDefault: () => { prevented = true; } });
@@ -386,7 +437,7 @@ async function runScenario() {
     assert.equal(quitCalls, 0, 'keeping the app open must not invoke app.quit');
     assert.equal(engine.running, true, 'the idle engine is restarted only after acknowledgement');
 
-    if (scenario === 'live-unsafe-retry') {
+    if (scenario === 'live-unsafe-retry' || scenario === 'license-expiry') {
       await new Promise((resolve) => setTimeout(resolve, 20));
       let retryPrevented = false;
       appEvents.get('before-quit')({ preventDefault: () => { retryPrevented = true; } });

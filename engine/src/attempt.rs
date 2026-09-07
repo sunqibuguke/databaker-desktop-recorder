@@ -1,4 +1,6 @@
+use crate::speech_quality::{RecordingPolicy, SpeechMeter};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 pub(crate) struct AnalysisWriteGuard<'a> {
@@ -40,6 +42,10 @@ pub(crate) const HEAD_SILENCE_SPEECH_STARTED: u32 = 3;
 
 #[derive(Clone)]
 pub(crate) struct HeadSilenceMonitor {
+    pub(crate) auto_end: Arc<AtomicBool>,
+    pub(crate) amplitude_enabled: Arc<AtomicBool>,
+    pub(crate) end_sample: Arc<AtomicU64>,
+    pub(crate) speech_meter: Arc<Mutex<SpeechMeter>>,
     pub(crate) phase: Arc<AtomicU32>,
     pub(crate) armed_sample: Arc<AtomicU64>,
     pub(crate) progress_samples: Arc<AtomicU64>,
@@ -51,6 +57,10 @@ pub(crate) struct HeadSilenceMonitor {
 impl HeadSilenceMonitor {
     pub(crate) fn new(required_samples: u64) -> Self {
         Self {
+            auto_end: Arc::new(AtomicBool::new(false)),
+            amplitude_enabled: Arc::new(AtomicBool::new(false)),
+            end_sample: Arc::new(AtomicU64::new(0)),
+            speech_meter: Arc::new(Mutex::new(SpeechMeter::default())),
             phase: Arc::new(AtomicU32::new(HEAD_SILENCE_IDLE)),
             armed_sample: Arc::new(AtomicU64::new(0)),
             progress_samples: Arc::new(AtomicU64::new(0)),
@@ -70,6 +80,7 @@ impl HeadSilenceMonitor {
 
     /// Must be called while holding the capture-analysis seqlock.
     pub(crate) fn arm(&self, armed_sample: u64) {
+        self.end_sample.store(0, Ordering::Release);
         self.phase.store(HEAD_SILENCE_IDLE, Ordering::Release);
         self.armed_sample.store(armed_sample, Ordering::Release);
         self.progress_samples.store(0, Ordering::Release);
@@ -83,6 +94,39 @@ impl HeadSilenceMonitor {
         self.armed_sample.store(0, Ordering::Release);
         self.progress_samples.store(0, Ordering::Release);
         self.passed_sample.store(0, Ordering::Release);
+    }
+
+    /// Called under the analysis writer guard before arming the next take.
+    pub(crate) fn configure(&self, policy: RecordingPolicy, rate: u32, depth: u16) {
+        self.auto_end.store(policy.auto_end, Ordering::Release);
+        self.amplitude_enabled
+            .store(policy.amplitude_enabled, Ordering::Release);
+        *self.speech_meter.lock().unwrap() = SpeechMeter::new(policy, rate, depth);
+    }
+
+    pub(crate) fn measure(&self, samples: &[f32], start: u64, speech: bool) {
+        if !self.amplitude_enabled.load(Ordering::Acquire)
+            || self.phase.load(Ordering::Acquire) == HEAD_SILENCE_IDLE
+            || self.end_sample.load(Ordering::Acquire) != 0
+        {
+            return;
+        }
+        let mut meter = self.speech_meter.lock().unwrap();
+        if !speech {
+            meter.silence();
+            return;
+        }
+        let armed = self.armed_sample.load(Ordering::Acquire);
+        if self.enforce.load(Ordering::Acquire)
+            && self.phase.load(Ordering::Acquire) == HEAD_SILENCE_WAITING
+        {
+            return;
+        }
+        for (offset, sample) in samples.iter().enumerate() {
+            if start + offset as u64 >= armed {
+                meter.push(*sample);
+            }
+        }
     }
 }
 
@@ -112,6 +156,10 @@ pub(crate) fn annotate_attempt_block(
     block_start: u64,
     block_end: u64,
 ) {
+    // Freeze the first eligible endpoint even if the command loop or UI is late.
+    if head_silence.end_sample.load(Ordering::Acquire) != 0 {
+        return;
+    }
     let armed_sample = head_silence.armed_sample.load(Ordering::Acquire);
     let mut phase = head_silence.phase.load(Ordering::Acquire);
 
@@ -173,5 +221,67 @@ pub(crate) fn annotate_attempt_block(
         head_silence
             .phase
             .store(HEAD_SILENCE_SPEECH_STARTED, Ordering::Release);
+    }
+    let last = last_signal_sample.load(Ordering::Acquire);
+    let end = last.saturating_add(head_silence.required_samples());
+    if head_silence.auto_end.load(Ordering::Acquire)
+        && !is_speech
+        && phase != HEAD_SILENCE_IDLE
+        && last > 0
+        && attempt_signal_start_sample.load(Ordering::Acquire) > 0
+        && block_end >= end
+    {
+        head_silence.end_sample.store(end, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod short_take_tests {
+    use super::*;
+    #[test]
+    fn first_eligible_boundary_stays_fixed_despite_more_speech() {
+        let h = HeadSilenceMonitor::new(200);
+        h.configure(
+            RecordingPolicy {
+                auto_end: true,
+                ..Default::default()
+            },
+            1_000,
+            16,
+        );
+        h.arm(10);
+        let silence = AtomicU64::new(0);
+        let last = AtomicU64::new(0);
+        let first = AtomicU64::new(0);
+        let feed = |speech, start, end| {
+            annotate_attempt_block(&h, &silence, &last, &first, speech, end - start, start, end)
+        };
+        feed(false, 10, 250);
+        assert_eq!(h.end_sample.load(Ordering::Acquire), 0); // no voice
+        feed(true, 250, 400);
+        feed(false, 400, 550);
+        assert_eq!(h.end_sample.load(Ordering::Acquire), 0);
+        feed(true, 550, 650);
+        feed(false, 650, 900);
+        assert_eq!(h.end_sample.load(Ordering::Acquire), 850);
+        feed(true, 900, 1_500);
+        assert_eq!(last.load(Ordering::Acquire), 650);
+        assert_eq!(h.end_sample.load(Ordering::Acquire), 850);
+        h.disarm();
+        h.arm(2_000);
+        assert_eq!(h.end_sample.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn legacy_manual_mode_keeps_accepting_speech() {
+        let h = HeadSilenceMonitor::new(200);
+        h.arm(10);
+        let silence = AtomicU64::new(0);
+        let last = AtomicU64::new(0);
+        let first = AtomicU64::new(0);
+        annotate_attempt_block(&h, &silence, &last, &first, true, 200, 10, 210);
+        annotate_attempt_block(&h, &silence, &last, &first, false, 1_000, 210, 1_210);
+        annotate_attempt_block(&h, &silence, &last, &first, true, 100, 1_210, 1_310);
+        assert_eq!(h.end_sample.load(Ordering::Acquire), 0);
+        assert_eq!(last.load(Ordering::Acquire), 1_310);
     }
 }

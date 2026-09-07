@@ -349,6 +349,7 @@ pub(crate) struct VadWorker {
     downsampler: Downsampler,
     frame: Vec<f32>,
     frame_capture: Vec<u64>,
+    original: std::collections::VecDeque<(u64, f32)>,
     last_block_end: u64,
     #[cfg(test)]
     fail_next_prediction: bool,
@@ -361,6 +362,7 @@ impl VadWorker {
             downsampler: Downsampler::new(sample_rate),
             frame: Vec::with_capacity(VAD_FRAME_SAMPLES),
             frame_capture: Vec::with_capacity(VAD_FRAME_SAMPLES),
+            original: std::collections::VecDeque::new(),
             last_block_end: 0,
             #[cfg(test)]
             fail_next_prediction: false,
@@ -370,6 +372,7 @@ impl VadWorker {
     fn reset(&mut self) {
         self.detector = earshot::Detector::default_boxed();
         self.downsampler.reset();
+        self.original.clear();
         self.frame.clear();
         self.frame_capture.clear();
         #[cfg(test)]
@@ -386,6 +389,14 @@ impl VadWorker {
         sink: &VadAnnotationSink,
     ) {
         self.last_block_end = block_end;
+        if sink.head_silence.amplitude_enabled.load(Ordering::Acquire) {
+            self.original.extend(
+                samples
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (block_start + i as u64, *v)),
+            );
+        }
         for (sample, capture) in self.downsampler.push(samples, block_start) {
             self.frame.push(sample);
             self.frame_capture.push(capture);
@@ -423,6 +434,7 @@ impl VadWorker {
                 // Rebuild the detector, but never classify the failed range as
                 // silence. The enclosing take is explicitly non-deliverable.
                 self.detector = earshot::Detector::default_boxed();
+                self.original.clear();
                 self.frame.clear();
                 self.frame_capture.clear();
                 return;
@@ -437,7 +449,14 @@ impl VadWorker {
                 .saturating_add(1)
                 .max(start.saturating_add(1))
         });
-        publish_classified_range(sink, is_speech, start, end);
+        let mut pcm = Vec::new();
+        while self.original.front().is_some_and(|(at, _)| *at < end) {
+            let (at, sample) = self.original.pop_front().unwrap();
+            if at >= start {
+                pcm.push(sample);
+            }
+        }
+        publish_classified_pcm(sink, is_speech, start, end, &pcm);
         self.frame.clear();
         self.frame_capture.clear();
     }
@@ -480,12 +499,19 @@ impl VadWorker {
     }
 }
 
-fn publish_classified_range(sink: &VadAnnotationSink, is_speech: bool, start: u64, end: u64) {
+fn publish_classified_pcm(
+    sink: &VadAnnotationSink,
+    is_speech: bool,
+    start: u64,
+    end: u64,
+    pcm: &[f32],
+) {
     if end <= start {
         return;
     }
     let frames = end - start;
     let analysis_write = begin_analysis_write(&sink.analysis_epoch);
+    sink.head_silence.measure(pcm, start, is_speech);
     annotate_attempt_block(
         &sink.head_silence,
         &sink.silence_samples,

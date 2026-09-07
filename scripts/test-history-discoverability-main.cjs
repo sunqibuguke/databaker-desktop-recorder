@@ -318,6 +318,19 @@ async function main() {
     assert.equal(rows.some((row) => row.session_id === 'unrelated-folder'), false,
       'ordinary folders in a broad selected root must not become fake tasks');
 
+    const ancientDir = path.join(selected, 'ancient-interrupted');
+    await fs.mkdir(path.join(ancientDir, 'metadata'), { recursive: true });
+    await writeJson(path.join(ancientDir, 'session.json'), { schema_version: 1, session_id: 'ancient-interrupted' });
+    await writeJson(path.join(ancientDir, 'metadata', 'items.snapshot.json'), { ...snapshot('ancient-interrupted'), status: 'recording' });
+    for (const file of [path.join(ancientDir, 'metadata', 'items.snapshot.json'), path.join(ancientDir, 'session.json'), path.join(ancientDir, 'metadata'), ancientDir]) await fs.utimes(file, oldTimestamp, oldTimestamp);
+    const firstPendingPage = await listRecordings(event, selected, { offset: 0, limit: 200 });
+    assert.equal(firstPendingPage.recordings.some((row) => row.session_id === 'ancient-interrupted'), false);
+    const preferenceBeforeScan = await fs.readFile(path.join(userData, 'output-root.json'));
+    const pending = await handlers.get('license:pending-seals')(event);
+    assert.ok(pending.recordings.some((row) => row.session_id === 'ancient-interrupted'), 'activation must discover interrupted tasks beyond the first 200');
+    assert.ok(pending.warning, 'damaged metadata is surfaced alongside readable tasks');
+    assert.deepEqual(await fs.readFile(path.join(userData, 'output-root.json')), preferenceBeforeScan, 'read-only scan cannot rewrite the volume binding');
+
     await handlers.get('shell:open-path')(event, validDir);
     await handlers.get('shell:open-path')(event, path.join(validDir, 'export'));
     assert.deepEqual(openedPaths, [validDir, path.join(validDir, 'export')],
@@ -504,6 +517,7 @@ async function main() {
       await handlers.get('app:default-output')(event),
       { outputRoot: environmentRoot },
     );
+    const persistedBeforeReplacement = await fs.readFile(preferencePath);
     await fs.rmdir(environmentRoot);
     await fs.mkdir(environmentRoot);
     await assert.rejects(
@@ -511,6 +525,8 @@ async function main() {
       /磁盘或目录身份已变化/,
       'a configured removable root must reject a same-path replacement after restart binding',
     );
+    await assert.rejects(handlers.get('license:pending-seals')(event), /磁盘或目录身份已变化/);
+    assert.deepEqual(await fs.readFile(preferencePath), persistedBeforeReplacement);
   } finally {
     if (previousDefault === undefined) delete process.env.DATABAKER_DEFAULT_OUTPUT;
     else process.env.DATABAKER_DEFAULT_OUTPUT = previousDefault;

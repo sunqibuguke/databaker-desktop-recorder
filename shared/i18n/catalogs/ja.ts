@@ -3,6 +3,31 @@ import { p1Copy } from './p1.ts';
 import { inputAuditionCopy } from './input-audition.ts';
 
 const ja: MessageTree = {
+  speech: {
+    "silenceDuration": "現在の無音時間：{seconds} 秒",
+    "adjustSilence": "無音時間を調整",
+    "title": "音声チェックと短文録音",
+    "amplitude": "音声レベルをチェック",
+    "rmsMin": "音声 RMS 下限（dBFS）",
+    "peakMax": "音声 PEAK 上限（dBFS）",
+    "reference": "−30 / −3 dBFS は参考値であり、合格基準ではありません。",
+    "autoEnd": "短文録音を自動終了",
+    "autoHint": "設定した無音時間に達すると終了し、確認を待ちます。十分な間がない繰り返しは含まれる場合があります。内容の認識は行いません。",
+    "nextTake": "保存した設定は次の録音から適用されます。過去の検出結果は保持されます。",
+    "save": "録音設定を保存",
+    "saved": "次の録音に適用する設定を保存しました",
+    "invalid": "−96～0 dBFS の範囲で、RMS 下限を PEAK 上限より低く設定してください。",
+    "low": "声が小さすぎます",
+    "high": "声が大きすぎます",
+    "autoStopped": "録音を自動終了しました。試聴して確認するか、録り直してください。",
+    "retain": "警告を承知で採用し次へ",
+    "retainOnly": "警告を承知でこの録音を採用",
+    "recordedWarning": "この録音には音声レベルの警告があります。試聴、録り直し、または採用を選べます。",
+    "retained": "担当者が採用を確認済み",
+    "metrics": "音声 RMS {rms} dBFS · PEAK {peak} dBFS",
+    "unmeasured": "音声レベルの結果がありません",
+    "autoFailed": "自動終了できませんでした：{message}"
+  },
   common: {
     confirm: '確認',
     cancel: 'キャンセル',
@@ -73,6 +98,11 @@ const ja: MessageTree = {
     manualDefault: '文ごとに一時停止',
   },
   license: {
+    titleState: "ローカル認証記録を検証できません",
+    errorState: "システムの安全なストレージを確認するか、管理者に元の認証記録の復元を依頼してください。認証コードを再入力しても破損や時刻の異常は解消されません。",
+    "sealing": "録音を安全に終了しています",
+    "sealingDetail": "ライセンスが無効です。録音の保存と終了後に認証画面を表示します。",
+    "retrySeal": "終了を再試行",
     title: 'ソフトウェアは未ライセンスです',
     titleExpired: 'ライセンスの期限が切れています',
     titleWrongMachine: 'このマシン向けのライセンスではありません',

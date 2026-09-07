@@ -3,6 +3,31 @@ import { p1Copy } from './p1.ts';
 import { inputAuditionCopy } from './input-audition.ts';
 
 const ko: MessageTree = {
+  speech: {
+    "silenceDuration": "현재 무음 시간: {seconds}초",
+    "adjustSilence": "무음 시간 조정",
+    "title": "음성 검사 및 짧은 문장 녹음",
+    "amplitude": "음성 레벨 검사",
+    "rmsMin": "음성 RMS 하한(dBFS)",
+    "peakMax": "음성 PEAK 상한(dBFS)",
+    "reference": "−30 / −3 dBFS는 참고값이며 합격 기준이 아닙니다.",
+    "autoEnd": "짧은 문장 자동 종료",
+    "autoHint": "설정한 무음 시간이 지나면 종료하고 확인을 기다립니다. 충분한 쉼 없이 반복하면 녹음에 포함될 수 있습니다. 발화 내용은 인식하지 않습니다.",
+    "nextTake": "저장한 설정은 다음 녹음부터 적용됩니다. 이전 검사 결과는 유지됩니다.",
+    "save": "녹음 설정 저장",
+    "saved": "다음 녹음에 적용할 설정을 저장했습니다",
+    "invalid": "−96~0 dBFS 범위에서 RMS 하한을 PEAK 상한보다 낮게 설정하세요.",
+    "low": "목소리가 너무 작음",
+    "high": "목소리가 너무 큼",
+    "autoStopped": "녹음이 자동 종료되었습니다. 들어본 후 확인하거나 다시 녹음하세요.",
+    "retain": "경고 확인 후 유지하고 다음으로",
+    "retainOnly": "경고 확인 후 이 녹음 유지",
+    "recordedWarning": "이 녹음에 레벨 경고가 있습니다. 들어보기, 재녹음 또는 유지 확인을 선택하세요.",
+    "retained": "담당자가 유지를 확인함",
+    "metrics": "음성 RMS {rms} dBFS · PEAK {peak} dBFS",
+    "unmeasured": "사용 가능한 음성 레벨 결과 없음",
+    "autoFailed": "자동 종료 실패: {message}"
+  },
   common: {
     confirm: '확인',
     cancel: '취소',
@@ -73,6 +98,11 @@ const ko: MessageTree = {
     manualDefault: '문장마다 일시 중지',
   },
   license: {
+    titleState: "로컬 라이선스 기록을 확인할 수 없습니다",
+    errorState: "시스템 보안 저장소를 확인하거나 관리자에게 원래 기록 복원을 요청하세요. 코드를 다시 입력해도 손상된 기록이나 시간 오류는 지워지지 않습니다.",
+    "sealing": "녹음을 안전하게 종료하는 중",
+    "sealingDetail": "라이선스가 유효하지 않습니다. 녹음 저장 및 종료 후 인증 화면이 표시됩니다.",
+    "retrySeal": "종료 재시도",
     title: '소프트웨어가 라이선스되지 않았습니다',
     titleExpired: '라이선스가 만료되었습니다',
     titleWrongMachine: '이 기기용 라이선스가 아닙니다',

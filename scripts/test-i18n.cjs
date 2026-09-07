@@ -140,6 +140,11 @@ async function main() {
   assert.equal(t('prompter.labelFontSizeSmaller'), '减小标签字号');
   assert.equal(t('prompter.labelFontSizeLarger'), '增大标签字号');
 
+  for (const locale of APP_LOCALES) {
+    setLocale(locale);
+    for (const key of ['license.sealing', 'license.sealingDetail', 'license.retrySeal', 'license.titleState', 'license.errorState', 'speech.silenceDuration', 'speech.adjustSilence']) assert.notEqual(t(key, { seconds: 1 }), key, `${locale}: missing ${key}`);
+  }
+  setLocale(DEFAULT_LOCALE);
   const chineseKeys = new Set(flattenKeys(catalogs['zh-CN']));
   for (const locale of APP_LOCALES) {
     if (locale === 'zh-CN') continue;

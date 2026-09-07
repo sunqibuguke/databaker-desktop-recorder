@@ -78,8 +78,8 @@ export function PrompterView() {
       document.removeEventListener('keydown', onKeyDown);
     };
   }, [settingsOpen]);
-  const cue = state?.cue ?? 'idle';
-  const readerLabel = state?.readerCueLabel || state?.cueLabel || t('prompter.waitTask');
+  const cue = state?.licenseInvalid ? 'fault' : state?.cue ?? 'idle';
+  const readerLabel = state?.licenseInvalid ? t('readerCue.halt') : state?.readerCueLabel || state?.cueLabel || t('prompter.waitTask');
   const qualityWarning = cue === 'fault' ? '' : state?.qualityWarning ?? '';
   const visibleLabelTransition = state?.labelTransition?.changed ? state.labelTransition : null;
   const copyLength = Array.from(state?.text ?? '').length;
@@ -108,7 +108,7 @@ export function PrompterView() {
         {readerLabel}
       </span>
     </header>
-    {qualityWarning && <div className="prompter-quality-warning" role="alert"><i />{qualityWarning}</div>}
+    <div className="prompter-status-slot">{qualityWarning && <div className="prompter-quality-warning" role="alert"><i />{qualityWarning}</div>}</div>
     <article className="prompter-content">
       <p ref={copyRef} className={`${copyDensity} ${cue === 'recording' ? 'live' : ''}`.trim()}>{state?.text || t('prompter.noText')}</p>
       {visibleLabelTransition && <div key={`transition:${state?.id ?? 'none'}:${state?.label ?? ''}`} className="prompter-label-transition" role="status" aria-live="polite" aria-atomic="true">

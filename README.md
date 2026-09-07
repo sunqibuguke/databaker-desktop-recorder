@@ -44,7 +44,7 @@ npm run dev
 
 macOS 只用于开发：`npm run dev` 会在点击「启用录音」后走 Electron `getUserMedia`，把系统麦克风 PCM 喂给引擎，用来看电平、环境检测和逐句流程。这不是 Windows 独占/共享采集。正式采集只打 Windows 包。若要临时回到 CoreAudio sidecar，启动前设 `DATABAKER_DEV_WEB_CAPTURE=0`。
 
-`npm run dev` 会跳过激活页和机器码采集，直接进入录制台。`npm run dev:unlocked` 与它相同。生产安装包不要设置 `DATABAKER_LICENSE_DISABLED`。
+`npm run dev` 会跳过激活页和机器码采集，直接进入录制台。`npm run dev:unlocked` 与它相同。生产安装包会忽略 `DATABAKER_LICENSE_DISABLED`，只有未打包的开发/测试环境可以跳过授权。
 
 ## 离线授权
 
@@ -74,7 +74,9 @@ npm run license:issue -- --machine A7K2-9M3P-Q4WX --days 365
 ./release/issuer/DataBaker-License-Issuer --clear-local
 ```
 
-窗口底部可以清空本机采集软件已激活的授权（`userData/license.json` 及其损坏备份）。请先退出采集软件。可用 `--license-file` 或 `DATABAKER_LICENSE_FILE` 指定文件。
+窗口底部可以清空本机采集软件已激活的授权（`userData/license.json` 及其损坏备份）。请先退出采集软件。可用 `--license-file` 或 `DATABAKER_LICENSE_FILE` 指定文件。清空授权不会清除受保护的时间记录。
+
+本地授权使用系统安全存储保护的密钥（`license.key`）和认证加密记录（`license.json`、`license.json.clock`）。旧授权首次升级只在签名机器码与本机一致时迁移；迁移后保留原有硬件变化容错。重新激活不能重置已记录的时间，系统安全存储不可用或记录损坏时不会放行。恢复授权备份时需保留这三个文件，并使用原系统用户环境。
 
 私钥默认放在 `tools/license-issuer/keys/license-2026a.pem`，不进 git，也不打进采集安装包。注册机打包会复制到程序旁并自动使用，窗口里不用选私钥，也不再要口令。
 
@@ -148,6 +150,23 @@ Windows 安装包会把验收工具、启动器和文档放在 `resources/accept
 ```
 
 当前代码已实现第一版的核心数据安全基线：分段母轨、物理 EOF 恢复、事件重放、会话独占锁、磁盘余量保护、故障数据禁止常规交付，以及 Renderer/引擎异常恢复。本版仅按《受控试运行说明》小范围使用；若后续升级为正式工位资格版本，仍需通过真实 Windows 声卡的长稳、断电、拔设备、磁盘写满和强杀故障注入门禁。
+
+### 切分另一台设备的 WAV
+
+逐句时间点在 `timestamps.json` 中；`status-full-track.json` 和
+`status-timestamps-json.json` 只是导出完成状态，不能用于切分。使用标准
+Python 3 将另一台设备录制的 PCM WAV 直接切成多个 WAV（不生成 ZIP）：
+
+```bash
+python scripts/cut_external_wav.py \
+  /path/to/external.wav \
+  /path/to/timestamps.json \
+  -o /path/to/external-cuts
+```
+
+默认假设两边的时间 0 对齐。如果外部设备比 DataBaker 早 2.35 秒开始，
+加 `--offset-seconds 2.35`。长录音如存在两台设备的时钟漂移，可再用
+`--time-scale` 校正。详细参数见 `python scripts/cut_external_wav.py --help`。
 
 ### 本地存储策略
 

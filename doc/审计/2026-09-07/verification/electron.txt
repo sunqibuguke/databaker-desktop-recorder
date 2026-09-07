@@ -1,0 +1,95 @@
+
+> databaker-desktop-recorder@0.2.0 test:electron:run
+> node scripts/test-sentry-sanitize.cjs && node --no-warnings scripts/test-meter-ipc-backpressure.cjs && node scripts/test-engine-event-preload.cjs && node scripts/test-meter-electron-main.cjs && node scripts/test-history-snapshot.cjs && node scripts/test-engine-client.cjs && node scripts/test-input-audition.cjs && node scripts/test-offline-seal-ipc.cjs && node scripts/test-safe-stop-main.cjs && node scripts/test-crash-before-quit-main.cjs && node scripts/test-export-lifecycle-ipc.cjs && node scripts/test-inspect-preview-ipc.cjs && node scripts/test-export-deliver.cjs && node scripts/test-engine-recovery-failure-main.cjs && node scripts/test-start-reconciliation-main.cjs && node scripts/test-attempt-reconciliation-main.cjs && node scripts/test-capture-fault-tray-main.cjs && node scripts/test-history-discoverability-main.cjs && node --no-warnings scripts/test-history-recovery-ui.cjs && node --no-warnings scripts/test-recording-workflow.cjs && node --no-warnings scripts/test-p1-workflow.cjs && node --no-warnings scripts/test-engine-error.cjs && node --no-warnings scripts/test-waveform-buffer.cjs && node --no-warnings scripts/test-silence-readout.cjs && node --no-warnings scripts/test-automation-rules.cjs && node --no-warnings scripts/test-latest-frame.cjs && node --no-warnings scripts/test-capture-fault-event.cjs && node scripts/test-capture-presets.cjs && node scripts/test-output-root-preference.cjs && node scripts/test-debug-log.cjs && node scripts/test-license.cjs && node scripts/test-license-transition.cjs && node --no-warnings scripts/test-i18n.cjs && node --no-warnings scripts/test-discontinuity-toast.cjs && node --no-warnings scripts/test-dev-web-capture.cjs && node scripts/test-exclusive-probe.cjs && node --no-warnings scripts/test-prompter-appearance.cjs && node --no-warnings scripts/test-prompter-cues.cjs && node scripts/test-typography.cjs && node scripts/test-colors.cjs && node --no-warnings scripts/test-preview-player.cjs && node --no-warnings scripts/test-script-parser.cjs && node scripts/test-feedback-ui.cjs
+
+Sentry sanitization tests passed
+(node:22502) ExperimentalWarning: Type Stripping is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:22502) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///Users/lilk/projects/databaker/%E6%A1%8C%E9%9D%A2%E9%9F%B3%E9%A2%91%E9%87%87%E9%9B%86/src/sentry-sanitize.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to /Users/lilk/projects/databaker/桌面音频采集/package.json.
+meter IPC backpressure tests passed
+engine event preload bridge tests passed
+录音面板异常，正在重建：Renderer 进程结束（crashed）
+main process meter IPC integration tests passed
+history snapshot recovery smoke passed
+engine client safe-stop tests passed
+(node:22515) ExperimentalWarning: Type Stripping is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:22515) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///Users/lilk/projects/databaker/%E6%A1%8C%E9%9D%A2%E9%9F%B3%E9%A2%91%E9%87%87%E9%9B%86/src/input-audition.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to /Users/lilk/projects/databaker/桌面音频采集/package.json.
+offline seal IPC safety tests passed
+main process unsafe-stop tests passed
+main process crash-before-quit seal tests passed
+开始安全退出（应用退出（导出已结束））
+main process export lifecycle tests passed
+inspect preview IPC tests passed
+(node:22555) ExperimentalWarning: Type Stripping is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:22555) [MODULE_TYPELESS_PACKAGE_JSON] Warning: Module type of file:///Users/lilk/projects/databaker/%E6%A1%8C%E9%9D%A2%E9%9F%B3%E9%A2%91%E9%87%87%E9%9B%86/electron/export-deliver.ts is not specified and it doesn't parse as CommonJS.
+Reparsing as ES module because module syntax was detected. This incurs a performance overhead.
+To eliminate this warning, add "type": "module" to /Users/lilk/projects/databaker/桌面音频采集/package.json.
+录音引擎第 1 次自动恢复失败： Error: mock device unavailable 1
+    at FakeEngineClient.start (/Users/lilk/projects/databaker/桌面音频采集/scripts/test-engine-recovery-failure-main.cjs:66:13)
+    at runEngineRecovery (/Users/lilk/projects/databaker/桌面音频采集/dist-electron/main.js:2767:26)
+    at runNextTicks (node:internal/process/task_queues:65:5)
+    at process.processTimers (node:internal/timers:540:9)
+    at async drainEngineRecoveryQueue (/Users/lilk/projects/databaker/桌面音频采集/dist-electron/main.js:2857:9)
+录音引擎第 2 次自动恢复失败： Error: mock device unavailable 2
+    at FakeEngineClient.start (/Users/lilk/projects/databaker/桌面音频采集/scripts/test-engine-recovery-failure-main.cjs:66:13)
+    at runEngineRecovery (/Users/lilk/projects/databaker/桌面音频采集/dist-electron/main.js:2767:26)
+    at async drainEngineRecoveryQueue (/Users/lilk/projects/databaker/桌面音频采集/dist-electron/main.js:2857:9)
+录音引擎第 3 次自动恢复失败： Error: mock device unavailable 3
+    at FakeEngineClient.start (/Users/lilk/projects/databaker/桌面音频采集/scripts/test-engine-recovery-failure-main.cjs:66:13)
+    at runEngineRecovery (/Users/lilk/projects/databaker/桌面音频采集/dist-electron/main.js:2767:26)
+    at async drainEngineRecoveryQueue (/Users/lilk/projects/databaker/桌面音频采集/dist-electron/main.js:2857:9)
+main process terminal engine recovery event test passed
+录音开始前引擎退出，未建立恢复任务：mock helper exit while resolveKnownSession is pending
+录音引擎第 1 次自动恢复失败： AuthorizedSessionBindingError: 录制任务目录在操作前被替换，请刷新任务后重试
+    at assertAuthorizedSessionUnchanged (/Users/lilk/projects/databaker/桌面音频采集/dist-electron/main.js:1119:15)
+    at async requestSessionWithReconciliation (/Users/lilk/projects/databaker/桌面音频采集/dist-electron/main.js:2523:9)
+    at async runEngineRecovery (/Users/lilk/projects/databaker/桌面音频采集/dist-electron/main.js:2769:27)
+    at async drainEngineRecoveryQueue (/Users/lilk/projects/databaker/桌面音频采集/dist-electron/main.js:2857:9)
+录音开始前引擎退出，未建立恢复任务：mock helper exit while microphone permission is pending
+录音状态不确定后无法完全停止引擎： FakeSafeStopTimeoutError: mock safe-stop timeout
+    at FakeEngineClient.stop (/Users/lilk/projects/databaker/桌面音频采集/scripts/test-start-reconciliation-main.cjs:99:13)
+    at failStartingSession (/Users/lilk/projects/databaker/桌面音频采集/dist-electron/main.js:3661:27)
+    at /Users/lilk/projects/databaker/桌面音频采集/dist-electron/main.js:4505:34
+    at async withDebugLoggedCommand (/Users/lilk/projects/databaker/桌面音频采集/dist-electron/main.js:3865:24)
+    at async waitForActual (node:assert:566:5)
+    at async Function.rejects (node:assert:687:25)
+    at async main (/Users/lilk/projects/databaker/桌面音频采集/scripts/test-start-reconciliation-main.cjs:627:5)
+main process start reconciliation stopping-state test passed
+main process attempt timeout reconciliation test passed
+录音引擎第 1 次自动恢复失败： FakeRequestError: mock first recovery resume failure
+    at FakeEngineClient.request (/Users/lilk/projects/databaker/桌面音频采集/scripts/test-capture-fault-tray-main.cjs:116:15)
+    at requestSessionWithReconciliation (/Users/lilk/projects/databaker/桌面音频采集/dist-electron/main.js:2534:37)
+    at async runEngineRecovery (/Users/lilk/projects/databaker/桌面音频采集/dist-electron/main.js:2769:27)
+    at async drainEngineRecoveryQueue (/Users/lilk/projects/databaker/桌面音频采集/dist-electron/main.js:2857:9)
+main process capture fault Tray latch test passed
+保存位置偏好无法读取，已保留为 output-root.json.corrupt-1788764786546-6ca3159e-0153-4d42-82b0-4bbb74a52ce8：Expected property name or '}' in JSON at position 1 (line 1 column 2)
+history discoverability and output-root restore tests passed
+history recovery UI policy tests passed
+recording workflow policy tests passed
+P1 workflow matrix and local context tests passed
+engine error sanitizer tests passed
+waveform buffer tests passed
+silence readout tests passed
+automation rules tests passed
+latest frame committer tests passed
+capture fault event tests passed
+capture preset repository tests passed
+output root preference tests passed
+debug log tests passed
+license tests passed
+license transition tests passed
+i18n catalog and locale preference tests passed
+discontinuity toast tests passed
+dev web capture helper tests passed
+exclusive probe inventory tests passed
+prompter appearance tests passed
+prompter cue tests passed
+typography tests passed
+color tests passed (96 tokens, 102 leftover uniques)
+feedback UI contract tests passed

@@ -42,6 +42,7 @@ async function launchHarness(existingRoot?: string): Promise<Harness> {
       ...process.env,
       NODE_ENV: 'test',
       DATABAKER_E2E: '1',
+      DATABAKER_DEV_WEB_CAPTURE: '0',
       DATABAKER_E2E_ENGINE_PATH: systemTestEngine,
       DATABAKER_E2E_USER_DATA: userData,
       DATABAKER_E2E_OUTPUT_DIR: output,
@@ -1485,6 +1486,60 @@ test('real Electron keeps 1000-item navigation visible and bounded', async () =>
     await enterCreatedRecording(page);
 
     for (const index of [0, 159, 499, 999]) await selectRowAndMeasure(page, index);
+  } finally {
+    await closeHarness(harness);
+  }
+});
+
+
+test('real Electron short utterance stops at a fixed boundary and requires explicit warning retention', async () => {
+  let harness: Harness | null = null;
+  try {
+    harness = await launchHarness();
+    const { page } = harness;
+    await importScript(page, '序号,正文,标签\n001,你好小贝,唤醒词\n002,你好小贝,唤醒词', 'short-utterance.csv');
+    await expect(page.getByLabel('人声幅值检查', { exact: true })).not.toBeChecked();
+    await expect(page.getByLabel('短句自动结束', { exact: true })).not.toBeChecked();
+    await page.getByLabel('人声幅值检查', { exact: true }).check();
+    await page.getByLabel('短句自动结束', { exact: true }).check();
+    await page.getByLabel('人声 RMS 下限（dBFS）', { exact: true }).fill('-1');
+    await page.getByLabel('人声 PEAK 上限（dBFS）', { exact: true }).fill('-0.5');
+    await enterCreatedRecording(page);
+    const transport = page.getByTestId('main-transport');
+    await transport.click();
+    await feedPaced(page, 72_000, 'silence');
+    expect((await readEngineState(page)).active_attempt?.item_id).toBe('001');
+    await feedPaced(page, 48_000, 'speech');
+    await expect(page.locator('.speech-quality-banner')).toContainText('声音偏小');
+    await feedPaced(page, 12_000, 'silence');
+    expect((await readEngineState(page)).active_attempt?.item_id).toBe('001');
+    await feedPaced(page, 24_000, 'speech');
+    await feedPaced(page, 72_000, 'silence');
+    await expect(transport).toContainText('确认保留并录下一句');
+    const firstState = await readEngineState(page);
+    const take = firstState.snapshot.items[0].attempts[0] as E2eAttempt & {
+      end_sample: number; end_reason: string; speech_quality: { retained_by_operator_at: string | null; warnings: string[] };
+    };
+    expect(firstState.active_attempt).toBeNull();
+    expect(firstState.snapshot.items[0].selected_attempt_id).toBeNull();
+    expect(firstState.snapshot.items[1].attempts).toHaveLength(0);
+    expect(take.end_reason).toBe('auto_silence');
+    expect(take.speech_quality.retained_by_operator_at).toBeNull();
+    expect(take.speech_quality.warnings).toContain('speech_low');
+    await feedPaced(page, 48_000, 'speech');
+    expect((await readEngineState(page)).snapshot.items[0].attempts[0]).toEqual(take);
+    await transport.click();
+    await expect.poll(async () => (await readEngineState(page)).active_attempt?.item_id).toBe('002');
+    await page.evaluate(async (attemptId) => {
+      await window.recorder.request('stop_attempt', { item_id: '001', attempt_id: attemptId, force: true, discard_empty: true, enforce_silence: false });
+    }, take.attempt_id);
+    const second = await readEngineState(page);
+    expect(second.active_attempt?.item_id).toBe('002');
+    const retained = second.snapshot.items[0].attempts[0] as typeof take;
+    expect(retained.speech_quality.retained_by_operator_at).toBeTruthy();
+    expect(retained.end_sample).toBe(take.end_sample);
+    const persisted = JSON.parse(await fs.readFile(path.join(second.session_dir, 'metadata/items.snapshot.json'), 'utf8'));
+    expect(persisted.items[0].attempts[0].speech_quality.retained_by_operator_at).toBe(retained.speech_quality.retained_by_operator_at);
   } finally {
     await closeHarness(harness);
   }

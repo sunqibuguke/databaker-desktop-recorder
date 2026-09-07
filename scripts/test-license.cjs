@@ -134,14 +134,21 @@ async function main() {
     storedComponentHashes: hashes,
     currentComponentHashes: [hashes[0], hashes[1], hashFingerprintComponent('x', 'y')],
   });
-  assert.equal('claims' in drifted, true, '2 of 3 component hashes must keep an already issued ticket valid');
+  assert.equal(drifted.reason, 'wrong_machine', 'unsigned hashes cannot authorize another machine');
 
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'databaker-license-'));
   const file = path.join(root, 'license.json');
+  const { SystemLicenseProtection } = require('../dist-electron/license-protection.js');
+  const systemStorage = (identity = 'test-system') => ({
+    isEncryptionAvailable: () => true,
+    encryptString: (value) => Buffer.from(identity + ':' + value),
+    decryptString: (value) => { const text = value.toString(); assert.ok(text.startsWith(identity + ':')); return text.slice(identity.length + 1); },
+  });
+  const protection = new SystemLicenseProtection(path.join(root, 'license.key'), systemStorage());
   let clock = now;
   try {
     const repository = new LicenseRepository(file, {
-      publicKeys,
+      publicKeys, protection,
       now: () => clock,
       createToken: () => 'token-1',
     });
@@ -161,6 +168,21 @@ async function main() {
     assert.equal(activated.licensee, '客户A-工位3');
     assert.equal(activated.daysRemaining, 365);
     assert.equal((await repository.evaluate(fingerprint)).state, 'valid');
+    const hardwareDrift = { componentHashes: [hashes[0], hashes[1], hashFingerprintComponent('x', 'y')] };
+    hardwareDrift.machineCode = encodeMachineCode(hardwareDrift.componentHashes);
+    assert.equal((await repository.evaluate(hardwareDrift)).state, 'valid', 'protected original binding retains hardware tolerance');
+    const restart = new LicenseRepository(file, { publicKeys, protection, now: () => clock });
+    assert.equal((await restart.evaluate(hardwareDrift)).state, 'valid');
+    const foreignProtection = new SystemLicenseProtection(path.join(root, 'license.key'), systemStorage('other-system'));
+    assert.equal((await new LicenseRepository(file, { publicKeys, protection: foreignProtection, now: () => clock }).evaluate(fingerprint)).reason, 'state_invalid');
+    const originalBytes = await fs.readFile(file);
+    const tampered = JSON.parse(originalBytes);
+    const body = Buffer.from(tampered.protectedData, 'base64'); body[body.length - 1] ^= 1;
+    tampered.protectedData = body.toString('base64');
+    await fs.writeFile(file, JSON.stringify(tampered));
+    assert.equal((await repository.evaluate(fingerprint)).reason, 'state_invalid');
+    assert.equal((await repository.activate(valid, fingerprint)).reason, 'state_invalid');
+    await fs.writeFile(file, originalBytes);
 
     const replacement = issue({ subject: '客户A-续期', jti: 'ticket-2', days: 10 });
     const renewed = await repository.activate(replacement, fingerprint);
@@ -178,6 +200,11 @@ async function main() {
     const rolled = await repository.evaluate(fingerprint);
     assert.equal(rolled.reason, 'clock_rollback');
 
+    assert.equal((await repository.activate(valid, fingerprint)).reason, 'clock_rollback', 'reactivation cannot reset the clock');
+    await fs.rm(file);
+    assert.equal((await repository.activate(valid, fingerprint)).reason, 'clock_rollback', 'deleting the license cannot reset the clock anchor');
+    clock = now + 11 * 86_400 * 1000;
+    assert.equal((await repository.activate(valid, fingerprint)).state, 'valid');
     const otherMachine = {
       machineCode: encodeMachineCode([hashFingerprintComponent('solo', 'only')]),
       componentHashes: [hashFingerprintComponent('solo', 'only')],
@@ -185,11 +212,23 @@ async function main() {
     assert.equal((await repository.activate(valid, otherMachine)).reason, 'wrong_machine');
 
     await fs.writeFile(file, '{broken', 'utf8');
-    const recovered = await repository.load();
-    assert.equal(recovered.license, null);
-    assert.match(recovered.warning, /已保留/);
+    await assert.rejects(repository.load());
+    assert.equal(await fs.readFile(file, 'utf8'), '{broken', 'do not erase evidence and allow a fresh activation after tampering');
+    assert.equal((await repository.activate(valid, fingerprint)).reason, 'state_invalid');
 
     assert.equal((await repository.evaluate({ machineCode: '', componentHashes: [] })).reason, 'fingerprint_unavailable');
+    const legacyFile = path.join(root, 'legacy.json');
+    const legacy = { schemaVersion: 1, ticket: valid, componentHashes: otherMachine.componentHashes, firstSeenAt: now / 1000, lastSeenAt: now / 1000 };
+    await fs.writeFile(legacyFile, JSON.stringify(legacy));
+    const migration = new LicenseRepository(legacyFile, { publicKeys, protection, now: () => now });
+    assert.equal((await migration.evaluate(otherMachine)).reason, 'wrong_machine');
+    assert.equal((await migration.evaluate(fingerprint)).state, 'valid');
+    assert.equal(JSON.parse(await fs.readFile(legacyFile, 'utf8')).schemaVersion, 2);
+    assert.deepEqual((await migration.load()).license.componentHashes, hashes, 'migrate fresh components, not unsigned stored hashes');
+    await fs.writeFile(legacyFile, JSON.stringify(legacy));
+    assert.equal((await migration.evaluate(fingerprint)).reason, 'state_invalid', 'reject plaintext downgrade after migration');
+    const noStorage = new LicenseRepository(path.join(root, 'unavailable.json'), { publicKeys, now: () => now });
+    assert.equal((await noStorage.activate(valid, fingerprint)).reason, 'state_invalid');
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
@@ -229,7 +268,9 @@ async function main() {
     'license expiry must not trap the operator in a live audition operation');
   assert.equal(isLicenseExemptEngineCommand('create_session'), false);
   assert.equal(isLicenseExemptEngineCommand('export_session'), false);
-  assert.equal(isLicenseCheckDisabled({ DATABAKER_LICENSE_DISABLED: '1' }), true);
+  assert.equal(isLicenseCheckDisabled({ DATABAKER_LICENSE_DISABLED: '1' }), false);
+  assert.equal(isLicenseCheckDisabled({ DATABAKER_LICENSE_DISABLED: '1' }, true), false);
+  assert.equal(isLicenseCheckDisabled({ DATABAKER_LICENSE_DISABLED: '1' }, false), true);
   assert.equal(isLicenseCheckDisabled({}), false);
 
   const required = new LicenseRequiredError('unlicensed');

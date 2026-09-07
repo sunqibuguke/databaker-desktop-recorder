@@ -1,3 +1,5 @@
+import { LicenseTransition } from './license-transition';
+import { SystemLicenseProtection } from './license-protection';
 import {
   flushSentry,
   isSentryEnabled,
@@ -26,6 +28,7 @@ import {
   Menu,
   nativeImage,
   screen,
+  safeStorage,
   session,
   shell,
   systemPreferences,
@@ -92,6 +95,7 @@ import {
   LicenseRepository,
   LicenseRequiredError,
   disabledLicenseStatus,
+  emptyLicenseStatus,
   isLicenseCheckDisabled,
   isLicenseExemptEngineCommand,
   type LicenseStatus,
@@ -381,6 +385,7 @@ const allowedCommands = new Set([
   'skip_input_audition',
   'cancel_input_audition',
   'set_silence_settings',
+  'set_recording_policy',
   'start_attempt',
   'stop_attempt',
   'accept_attempt',
@@ -390,6 +395,7 @@ const allowedCommands = new Set([
   'preview_session_waveform',
   'preview_attempt_waveform',
   'select_session_attempt',
+  'set_session_recording_policy',
   'get_state',
   'stop_session',
   'seal_interrupted_session',
@@ -425,6 +431,7 @@ const INSPECT_SESSION_COMMANDS = new Set([
   'render_session_attempt',
   'preview_session_waveform',
   'select_session_attempt',
+  'set_session_recording_policy',
 ]);
 
 // Inspect commands share one exclusive engine intent. The inspect workspace
@@ -844,9 +851,29 @@ function isFiniteNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
 }
 
+function isValidRecordingPolicy(value: unknown): boolean {
+  if (value === undefined) return true;
+  if (!isRecord(value)) return false;
+  return typeof value.amplitude_enabled === 'boolean' && typeof value.auto_end === 'boolean'
+    && isFiniteNumber(value.rms_min_dbfs) && isFiniteNumber(value.peak_max_dbfs)
+    && value.rms_min_dbfs >= -96 && value.peak_max_dbfs <= 0 && value.rms_min_dbfs < value.peak_max_dbfs;
+}
+function isValidSpeechQuality(value: unknown): boolean {
+  if (value === undefined || value === null) return true;
+  if (!isRecord(value) || !isRecord(value.policy) || !isValidRecordingPolicy(value.policy)) return false;
+  const codes = (v: unknown) => Array.isArray(v) && v.every((code) => code === 'speech_low' || code === 'speech_high');
+  return isNonNegativeSafeInteger(value.speech_samples)
+    && (value.rms_dbfs === null || isFiniteNumber(value.rms_dbfs))
+    && (value.peak_dbfs === null || isFiniteNumber(value.peak_dbfs))
+    && codes(value.warnings) && codes(value.live_warnings)
+    && (value.retained_by_operator_at === null || typeof value.retained_by_operator_at === 'string');
+}
+
 function isValidAttempt(value: unknown): value is Record<string, unknown> {
   if (!isRecord(value)) return false;
-  return typeof value.attempt_id === 'string'
+  return isValidRecordingPolicy(value.recording_policy) && isValidSpeechQuality(value.speech_quality)
+    && (value.end_reason === undefined || typeof value.end_reason === 'string')
+    && typeof value.attempt_id === 'string'
     && isNonNegativeSafeInteger(value.start_sample)
     && (value.recording_started_sample === undefined
       || isNonNegativeSafeInteger(value.recording_started_sample))
@@ -979,6 +1006,7 @@ function parseValidSnapshot(value: unknown): Record<string, unknown> | null {
     || typeof value.started_at !== 'string'
     || typeof value.updated_at !== 'string'
     || !isValidNoiseCheck(value.noise_check)
+    || !isValidRecordingPolicy(value.recording_policy)
     || (value.silence_duration_ms !== undefined
       && !isNonNegativeSafeInteger(value.silence_duration_ms))
     || (value.silence_threshold_dbfs !== undefined
@@ -2940,6 +2968,11 @@ async function requestAttemptWithReconciliation(
     throw new Error('结束录音的 enforce_silence 参数无效');
   }
   const itemId = payload.item_id;
+  if (command === 'stop_attempt' && payload.attempt_id !== undefined && payload.attempt_id !== null
+    && (typeof payload.attempt_id !== 'string' || payload.attempt_id.trim() === '')) {
+    throw new Error('结束录音的版本 ID 无效');
+  }
+  const expectedAttemptId = command === 'stop_attempt' && typeof payload.attempt_id === 'string' ? payload.attempt_id : null;
   const force = command === 'stop_attempt' && payload.force === true;
   const discardEmpty = command !== 'stop_attempt' || payload.discard_empty !== false;
   const enforceSilence = payload.enforce_silence === true;
@@ -2954,6 +2987,13 @@ async function requestAttemptWithReconciliation(
   ) as EngineOptionalState;
   assertCurrentEngineIntent(attemptIntent, ['active']);
   const before = inspectAttemptReconciliationState(beforeValue, expectedSessionDir, itemId);
+  if (expectedAttemptId && before.activeAttempt?.attempt_id !== expectedAttemptId) {
+    const completed = (before.item.attempts as Record<string, unknown>[]).find((attempt) => attempt.attempt_id === expectedAttemptId);
+    if (!completed) throw new Error('当前录制版本与要结束的版本不一致');
+    // An automatic stop can win before this query, or a delayed click can
+    // arrive while the next take is active. Never redirect it to that take.
+    return { item_id: itemId, attempt: completed, already_stopped: true };
+  }
   if (command === 'start_attempt' && before.activeAttempt !== null) {
     throw new Error('当前已有句子正在录制');
   }
@@ -2965,7 +3005,7 @@ async function requestAttemptWithReconciliation(
   // item_id is renderer/main-process reconciliation metadata.
   const enginePayload = command === 'start_attempt'
     ? { item_id: itemId, enforce_silence: enforceSilence }
-    : { force, discard_empty: discardEmpty, enforce_silence: enforceSilence };
+    : { force, discard_empty: discardEmpty, enforce_silence: enforceSilence, ...(expectedAttemptId ? { attempt_id: expectedAttemptId } : {}) };
   let requestError: unknown;
   try {
     const result = await engine.request(
@@ -4274,18 +4314,57 @@ function registerIpc(): void {
   );
   const licenseRepository = new LicenseRepository(
     path.join(app.getPath('userData'), 'license.json'),
+    { protection: new SystemLicenseProtection(path.join(app.getPath('userData'), 'license.key'), safeStorage) },
   );
   let cachedFingerprint: Promise<MachineFingerprint> | null = null;
   const machineFingerprint = (): Promise<MachineFingerprint> => {
     cachedFingerprint ??= collectMachineFingerprint();
     return cachedFingerprint;
   };
-  const readLicenseStatus = async (): Promise<LicenseStatus> => {
-    if (isLicenseCheckDisabled()) {
+  const evaluateLicenseStatus = async (): Promise<LicenseStatus> => {
+    if (isLicenseCheckDisabled(process.env, app.isPackaged)) {
       return disabledLicenseStatus('');
     }
-    return licenseRepository.evaluate(await machineFingerprint());
+    try { return await licenseRepository.evaluate(await machineFingerprint()); }
+    catch { return emptyLicenseStatus('', 'fingerprint_unavailable'); }
   };
+  let licenseAllowsPrompter = true;
+  const licenseTransition = new LicenseTransition(evaluateLicenseStatus, async () => {
+    if (isQuitting()) return false;
+    if (engineIntent.phase === 'active') await stopActiveSession();
+    else if (engineIntent.phase === 'stopping') await finishPendingEngineStop();
+    // Wait for an already authorized creation/export/recovery to settle; new
+    // licensed operations are rejected while the transition is pending.
+    if (engineIntent.phase === 'idle' && pendingCrashSeal) {
+      const obligation = pendingCrashSeal;
+      if (!obligation.expectedSessionId) throw new Error('无法确认中断任务身份，请检查录制目录后重试封存');
+      const intent = beginEngineIntent('sealing', obligation.sessionDir);
+      try {
+        const sealed = await executeAuthorizedOfflineSeal(intent, obligation.sessionDir, obligation.expectedSessionId);
+        assertCurrentEngineIntent(intent, ['sealing']);
+        rememberKnownSession(sealed.canonical, obligation.expectedSessionId);
+        clearCrashSealObligation(sealed.canonical);
+        transitionEngineIntent(intent, 'idle', null);
+      } catch (error) {
+        if (ownsEngineGeneration(intent)) transitionEngineIntent(intent, 'idle', null);
+        throw error;
+      }
+    }
+    return engineIntent.phase === 'idle' && !pendingCrashSeal;
+  }, (status) => {
+    licenseAllowsPrompter = status.state === 'valid';
+    if (!licenseAllowsPrompter) {
+      latestPrompterState = { ...(isRecord(latestPrompterState) ? latestPrompterState : {}), licenseInvalid: true, cue: 'fault', silenceProgress: 0, qualityWarning: '' };
+      try {
+        if (prompterWindow && !prompterWindow.isDestroyed() && !prompterWindow.webContents.isDestroyed()) prompterWindow.webContents.send('prompter:state', latestPrompterState);
+      } catch (error) { console.error('无法同步授权停止提示：', error); }
+    }
+    sendToMain('license:changed', status);
+  }, () => engineIntent.phase === 'idle' && !pendingCrashSeal);
+  const readLicenseStatus = () => licenseTransition.refresh();
+  const licenseRefreshTimer = setInterval(() => { void readLicenseStatus().catch(console.error); }, 30_000);
+  licenseRefreshTimer.unref();
+  app.on('will-quit', () => clearInterval(licenseRefreshTimer));
   const assertAppLicensed = async (): Promise<void> => {
     const status = await readLicenseStatus();
     if (status.state !== 'valid') throw new LicenseRequiredError(status.reason ?? 'unlicensed');
@@ -4414,27 +4493,38 @@ function registerIpc(): void {
   ipcMain.handle('license:activate', async (event, ticket: unknown) => {
     assertMainRenderer(event.sender);
     if (typeof ticket !== 'string') throw new LicenseRequiredError('malformed');
+    if (licenseTransition.pending) throw new Error('正在安全封存录制，请稍后重试');
     const fingerprint = await machineFingerprint();
     const status = await licenseRepository.activate(ticket, fingerprint);
     if (status.state !== 'valid') throw new LicenseRequiredError(status.reason ?? 'malformed');
-    sendToMain('license:changed', status);
-    return status;
+    return readLicenseStatus();
   });
   ipcMain.handle('license:pending-seals', async (event) => {
     assertMainRenderer(event.sender);
     const loaded = await outputRootPreference.load();
-    const root = loaded.preference?.outputRoot ?? defaultOutputRoot();
+    if (loaded.warning) throw new Error(loaded.warning);
+    if (!loaded.preference) return { recordings: [] };
+    const root = loaded.preference.outputRoot;
+    // Restore only the identity already authorized by the operator. Scanning
+    // must never bless a replacement disk or rewrite the saved binding.
+    allowedOutputRoots.add(root);
+    persistedOutputRoots.set(normalizedSessionDir(root), persistedOutputBinding(loaded.preference));
+    await resolveAuthorizedOutputRoot(root, false);
     try {
-      await bindAndRememberOutputRoot(path.resolve(root), false);
-    } catch {
-      return { recordings: [] };
-    }
-    try {
-      const page = await listRecordings(root, 0, HISTORY_PAGE_MAX_SIZE) as {
-        recordings?: Array<Record<string, unknown>>;
-      };
+      const rows = new Map<string, Record<string, unknown>>();
+      let offset = 0;
+      for (;;) {
+        const page = await listRecordings(root, offset, HISTORY_PAGE_MAX_SIZE) as {
+          recordings?: Array<Record<string, unknown>>; next_offset?: number | null;
+        };
+        for (const row of page.recordings ?? []) rows.set(String(row.session_dir), row);
+        if (page.next_offset === null || page.next_offset === undefined) break;
+        if (page.next_offset <= offset) throw new Error('待封存任务扫描未能继续，请刷新后重试');
+        offset = page.next_offset;
+      }
       return {
-        recordings: (page.recordings ?? [])
+        warning: [...rows.values()].some((row) => row.history_issue) ? '部分录制目录的元数据无法完整读取，请检查历史录制中的异常目录。可识别的待封存任务已列出。' : undefined,
+        recordings: [...rows.values()]
           .filter((row) => {
             const status = typeof row.status === 'string' ? row.status : '';
             const overflow = typeof row.overflow_samples === 'number' ? row.overflow_samples : 0;
@@ -4450,8 +4540,8 @@ function registerIpc(): void {
           }))
           .filter((row) => row.session_id && row.session_dir),
       };
-    } catch {
-      return { recordings: [] };
+    } catch (error) {
+      throw new Error(`无法完成待封存任务扫描：${error instanceof Error ? error.message : String(error)}`);
     }
   });
   ipcMain.handle('license:emergency-seal', async (event, payload: unknown) => {
@@ -5193,6 +5283,7 @@ function registerIpc(): void {
   });
   ipcMain.on('prompter:update', (event, state: unknown) => {
     if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) return;
+    if (!licenseAllowsPrompter) return;
     latestPrompterState = state;
     const window = prompterWindow;
     if (!window || window.isDestroyed() || window.webContents.isDestroyed()) return;

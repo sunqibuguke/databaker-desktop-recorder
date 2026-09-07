@@ -385,6 +385,13 @@ async function main() {
 
     engine.nextAttemptOutcome = 'timeout-start-success';
     await handlers.get('engine:request')(event, 'start_attempt', { item_id: '2' });
+    const callCount = engine.attemptCalls.length;
+    const lateStop = await handlers.get('engine:request')(event, 'stop_attempt', {
+      item_id: '1', attempt_id: '1-a1', force: true,
+    });
+    assert.equal(lateStop.already_stopped, true);
+    assert.equal(lateStop.attempt.attempt_id, '1-a1');
+    assert.equal(engine.attemptCalls.length, callCount, 'a late stop must not reach the newer active take');
     engine.nextAttemptOutcome = 'timeout-stop-discard';
     const discarded = await handlers.get('engine:request')(event, 'stop_attempt', {
       item_id: '2',

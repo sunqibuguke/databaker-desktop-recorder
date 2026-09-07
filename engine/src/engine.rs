@@ -191,6 +191,12 @@ pub struct ScriptItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Attempt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speech_quality: Option<crate::speech_quality::SpeechQuality>,
+    #[serde(default)]
+    pub recording_policy: crate::speech_quality::RecordingPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_reason: Option<String>,
     pub attempt_id: String,
     pub start_sample: u64,
     #[serde(default)]
@@ -424,6 +430,8 @@ pub struct InputAudition {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSnapshot {
+    #[serde(default)]
+    pub recording_policy: crate::speech_quality::RecordingPolicy,
     pub schema_version: u32,
     #[serde(default = "legacy_unknown_version")]
     pub app_version: String,
@@ -527,6 +535,8 @@ pub struct NoiseCheckResult {
 
 #[derive(Debug, Deserialize)]
 pub struct StartSessionPayload {
+    #[serde(default)]
+    pub recording_policy: crate::speech_quality::RecordingPolicy,
     pub session_dir: String,
     pub session_id: String,
     #[serde(default)]
@@ -765,6 +775,8 @@ fn default_true() -> bool {
 #[derive(Debug, Deserialize)]
 pub struct StopAttemptPayload {
     #[serde(default)]
+    pub attempt_id: Option<String>,
+    #[serde(default)]
     pub force: bool,
     #[serde(default = "default_true")]
     pub discard_empty: bool,
@@ -775,6 +787,7 @@ pub struct StopAttemptPayload {
 impl Default for StopAttemptPayload {
     fn default() -> Self {
         Self {
+            attempt_id: None,
             force: false,
             discard_empty: true,
             enforce_silence: false,
@@ -1217,8 +1230,11 @@ struct WriterQueueLease<'a> {
     enqueue_state: &'a AtomicU64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct CaptureAnalysisSnapshot {
+    auto_end_sample: u64,
+    speech_quality: Option<crate::speech_quality::SpeechQuality>,
+    recording_policy: crate::speech_quality::RecordingPolicy,
     boundary: u64,
     head_silence_phase: u32,
     head_silence_armed_sample: u64,
@@ -1661,6 +1677,7 @@ fn reserve_counter_range(counter: &AtomicU64, amount: u64) -> Option<(u64, u64)>
 
 #[derive(Debug)]
 struct InterruptedAttemptStart {
+    recording_policy: crate::speech_quality::RecordingPolicy,
     item_id: String,
     attempt_id: String,
     start_sample: u64,
@@ -1976,6 +1993,107 @@ pub struct Engine {
 }
 
 impl Engine {
+    pub fn set_recording_policy(
+        &mut self,
+        policy: crate::speech_quality::RecordingPolicy,
+    ) -> Result<Value> {
+        policy.validate()?;
+        let session = self.active_session_mut()?;
+        session.ensure_metadata_mutation_allowed()?;
+        session.snapshot.recording_policy = policy.clone();
+        session.persist(
+            "recording_policy_changed",
+            json!({ "recording_policy": policy }),
+        )?;
+        Ok(json!({ "snapshot": session.live_snapshot(), "applies_from": "next_attempt" }))
+    }
+
+    pub fn set_session_recording_policy(
+        &self,
+        session_dir: &Path,
+        expected_session_id: &str,
+        expected_journal_seq: u64,
+        policy: crate::speech_quality::RecordingPolicy,
+    ) -> Result<Value> {
+        policy.validate()?;
+        anyhow::ensure!(self.session.is_none(), "请使用当前录制任务设置");
+        validate_offline_session_tree(session_dir)?;
+        let _lock = SessionLock::acquire(session_dir, &Utc::now().to_rfc3339())?;
+        let mut journal = read_journal(session_dir)?;
+        let mut snapshot = load_recovery_snapshot_for_session(
+            session_dir,
+            &mut journal,
+            Some(expected_session_id.trim()),
+        )?;
+        anyhow::ensure!(snapshot.status == "stopped", "请先安全暂停或修复任务");
+        anyhow::ensure!(
+            snapshot.journal_seq == expected_journal_seq,
+            "任务已变更，请刷新后重试"
+        );
+        snapshot.recording_policy = policy.clone();
+        persist_offline_snapshot(
+            session_dir,
+            &mut snapshot,
+            "recording_policy_changed",
+            json!({ "recording_policy": policy }),
+        )?;
+        Ok(json!({ "snapshot": snapshot, "applies_from": "next_attempt" }))
+    }
+
+    pub fn complete_auto_attempt(&mut self) -> Result<()> {
+        let Some(session) = self.session.as_ref() else {
+            return Ok(());
+        };
+        if session.active_attempt.is_none()
+            || session.head_silence.end_sample.load(Ordering::Acquire) == 0
+        {
+            return Ok(());
+        }
+        let session_id = session.snapshot.session_id.clone();
+        let attempt_id = session.active_attempt.as_ref().unwrap().attempt_id.clone();
+        let result = self.stop_attempt(
+            false,
+            true,
+            session.head_silence.enforce.load(Ordering::Acquire),
+        )?;
+        self.emitter.event(
+            "attempt_auto_stopped",
+            json!({ "session_id": session_id, "attempt_id": attempt_id, "result": result }),
+        );
+        Ok(())
+    }
+
+    pub fn stop_attempt_identified(
+        &mut self,
+        attempt_id: Option<&str>,
+        force: bool,
+        discard_empty: bool,
+        enforce_silence: bool,
+    ) -> Result<Value> {
+        if let Some(id) = attempt_id {
+            let session = self.active_session_mut()?;
+            if session
+                .active_attempt
+                .as_ref()
+                .is_none_or(|active| active.attempt_id != id)
+            {
+                for item in &session.snapshot.items {
+                    if let Some(attempt) = item
+                        .attempts
+                        .iter()
+                        .find(|attempt| attempt.attempt_id == id)
+                    {
+                        return Ok(
+                            json!({ "item_id": item.id, "attempt": attempt, "already_stopped": true }),
+                        );
+                    }
+                }
+                bail!("录制版本已变化，请刷新录制状态");
+            }
+        }
+        self.stop_attempt(force, discard_empty, enforce_silence)
+    }
+
     pub fn new(emitter: Emitter) -> Self {
         Self {
             emitter,
@@ -2125,6 +2243,7 @@ impl Engine {
     }
 
     pub fn create_session(&self, payload: StartSessionPayload) -> Result<Value> {
+        payload.recording_policy.validate()?;
         require_explicit_input_device_id(payload.device_id.as_deref(), "创建录制任务")?;
         let (session_dir, mut snapshot) = self.prepare_new_session(payload, None)?;
         snapshot.status = "stopped".to_string();
@@ -2172,6 +2291,7 @@ impl Engine {
             storage_layout_v1_default_segment_frames(existing.audio_format.sample_rate)
         })?;
         let snapshot = SessionSnapshot {
+            recording_policy: existing.recording_policy.clone(),
             schema_version: 1,
             app_version: build_app_version(),
             engine_version: build_engine_version(),
@@ -2290,6 +2410,7 @@ impl Engine {
         payload: StartSessionPayload,
         segment_frames_override: Option<u64>,
     ) -> Result<(PathBuf, SessionSnapshot)> {
+        payload.recording_policy.validate()?;
         if self.session.is_some() {
             bail!("当前已有录制进行中");
         }
@@ -2347,6 +2468,7 @@ impl Engine {
         let requested_capture_buffer_frames =
             normalize_capture_buffer_frames(&device_id, payload.capture_buffer_frames)?;
         let snapshot = SessionSnapshot {
+            recording_policy: payload.recording_policy.clone(),
             schema_version: 1,
             app_version: build_app_version(),
             engine_version: build_engine_version(),
@@ -2683,6 +2805,12 @@ impl Engine {
         for attempt in &mut item.attempts {
             if attempt.attempt_id == attempt_id {
                 attempt.status = "accepted".to_string();
+                if let Some(quality) = attempt.speech_quality.as_mut()
+                    && quality.has_warning()
+                    && quality.retained_by_operator_at.is_none()
+                {
+                    quality.retained_by_operator_at = Some(Utc::now().to_rfc3339());
+                }
             } else if matches!(attempt.status.as_str(), "recorded" | "accepted") {
                 attempt.status = "rejected_by_operator".to_string();
             }
@@ -3498,6 +3626,7 @@ impl Engine {
                             );
                         last_fault_marker_attempt = Instant::now();
                     }
+                    let speech_quality = head_silence_thread.speech_meter.lock().unwrap().result();
                     emitter.event(
                         "meter",
                         json!({
@@ -3516,6 +3645,7 @@ impl Engine {
                             "storage_safe_remaining_seconds": storage_remaining_thread.load(Ordering::Acquire),
                             "peak": f32::from_bits(peak_thread.load(Ordering::Relaxed)),
                             "rms": f32::from_bits(rms_thread.load(Ordering::Relaxed)),
+                            "speech_quality": speech_quality,
                             "silence_samples": silence_samples_thread.load(Ordering::Acquire),
                             "digital_silence_samples": digital_silence_samples,
                             "digital_silence_suspected": digital_silence_suspected(
@@ -4561,7 +4691,9 @@ impl Engine {
             bail!("音频写盘异常，请结束并恢复当前录制");
         }
 
-        if let Some(enforce_silence) = payload.enforce_silence {
+        let deferred = session.active_attempt.is_some()
+            && session.head_silence.auto_end.load(Ordering::Acquire);
+        if !deferred && let Some(enforce_silence) = payload.enforce_silence {
             session.head_silence.set_enforce(enforce_silence);
         }
         if let Some(detector) = payload.silence_detector {
@@ -4580,8 +4712,14 @@ impl Engine {
                 .detector_kind
                 .store(detector.as_u32(), Ordering::Release);
         }
-        let (analysis_boundary, reset_kind) =
-            session.apply_silence_settings(payload.threshold_dbfs, payload.silence_duration_ms);
+        let (analysis_boundary, reset_kind) = if deferred {
+            (
+                session.analyzed_samples.load(Ordering::Acquire),
+                "next_attempt",
+            )
+        } else {
+            session.apply_silence_settings(payload.threshold_dbfs, payload.silence_duration_ms)
+        };
         session.snapshot.silence_threshold_dbfs = payload.threshold_dbfs;
         session.snapshot.silence_duration_ms = payload.silence_duration_ms;
         if session.active_attempt.is_none() {
@@ -4650,6 +4788,10 @@ impl Engine {
         // Clicking start arms a pending window. Room tone from before the
         // click does not count. Non-enforced takes still count elapsed time;
         // enforced takes require consecutive silence after the click.
+        session.apply_silence_settings(
+            session.snapshot.silence_threshold_dbfs,
+            session.snapshot.silence_duration_ms,
+        );
         session.head_silence.set_enforce(enforce_silence);
         let recording_started_sample = session.arm_attempt_analysis()?;
         let start_sample = recording_started_sample;
@@ -4673,6 +4815,7 @@ impl Engine {
                 // Legacy field retained for journal readers. At arm time no
                 // post-click silence has been accepted yet.
                 "pre_silence_samples": 0,
+                "recording_policy": session.head_silence.speech_meter.lock().unwrap().policy.clone(),
             }),
         )?;
         let phase = session.head_silence.phase.load(Ordering::Acquire);
@@ -4760,7 +4903,12 @@ impl Engine {
             }));
         }
         let analysis = session.wait_for_analysis_snapshot(requested_boundary)?;
-        let captured_boundary = analysis.boundary;
+        let locked_end = analysis.auto_end_sample;
+        let captured_boundary = if locked_end > 0 {
+            locked_end
+        } else {
+            analysis.boundary
+        };
         let observed_content_started_sample = analysis.content_started_sample;
         let content_started_sample = if observed_content_started_sample == 0
             || observed_content_started_sample > captured_boundary
@@ -4900,7 +5048,19 @@ impl Engine {
         } else {
             Vec::new()
         };
+        let speech_quality = analysis.speech_quality.clone();
+        let recording_policy = analysis.recording_policy.clone();
         let attempt = Attempt {
+            speech_quality,
+            recording_policy,
+            end_reason: Some(
+                if locked_end > 0 {
+                    "auto_silence"
+                } else {
+                    "manual"
+                }
+                .to_string(),
+            ),
             attempt_id: active.attempt_id.clone(),
             // Energy gating starts the clip where the required head pad
             // completed. AI VAD trims extra silence so each take keeps about
@@ -5024,6 +5184,12 @@ impl Engine {
         for attempt in &mut item.attempts {
             if attempt.attempt_id == attempt_id {
                 attempt.status = "accepted".to_string();
+                if let Some(quality) = attempt.speech_quality.as_mut()
+                    && quality.has_warning()
+                    && quality.retained_by_operator_at.is_none()
+                {
+                    quality.retained_by_operator_at = Some(Utc::now().to_rfc3339());
+                }
             } else if matches!(attempt.status.as_str(), "recorded" | "accepted") {
                 attempt.status = "rejected_by_operator".to_string();
             }
@@ -6054,6 +6220,9 @@ impl Engine {
                 "tail_silence_samples": attempt.tail_silence_samples,
                 "required_tail_silence_samples": attempt.required_tail_silence_samples,
                 "input_continuity": attempt.input_continuity,
+                "speech_quality": attempt.speech_quality,
+                "recording_policy": attempt.recording_policy,
+                "end_reason": attempt.end_reason,
                 "sha256": slice_sha256,
             }));
         }
@@ -7139,6 +7308,7 @@ fn input_audition_finish_value(
 
 fn session_summary_value(snapshot: &SessionSnapshot) -> Value {
     json!({
+        "recording_policy": snapshot.recording_policy,
         "schema_version": snapshot.schema_version,
         "app_version": snapshot.app_version,
         "engine_version": snapshot.engine_version,
@@ -7387,6 +7557,7 @@ fn validate_snapshot_for_cut_scope(snapshot: &SessionSnapshot, scope: ExportScop
 }
 
 fn validate_snapshot_identifiers(snapshot: &SessionSnapshot) -> Result<()> {
+    snapshot.recording_policy.validate()?;
     let mut item_ids = std::collections::HashSet::<&str>::new();
     for item in &snapshot.items {
         if item.id.trim().is_empty() || !item_ids.insert(item.id.as_str()) {
@@ -8034,6 +8205,12 @@ fn recover_interrupted_attempts(
                 open_attempts.insert(
                     attempt_id.to_string(),
                     InterruptedAttemptStart {
+                        recording_policy: payload
+                            .get("recording_policy")
+                            .cloned()
+                            .map(serde_json::from_value)
+                            .transpose()?
+                            .unwrap_or_default(),
                         item_id: item_id.to_string(),
                         attempt_id: attempt_id.to_string(),
                         start_sample: payload
@@ -8120,6 +8297,9 @@ fn recover_interrupted_attempts(
             .max(recording_started_sample)
             .min(durable_frames);
         item.attempts.push(Attempt {
+            speech_quality: None,
+            recording_policy: active.recording_policy.clone(),
+            end_reason: Some("interrupted".to_string()),
             attempt_id: active.attempt_id.clone(),
             start_sample,
             recording_started_sample,
@@ -8146,6 +8326,7 @@ fn recover_interrupted_attempts(
 
 fn mark_active_attempt_interrupted(
     snapshot: &mut SessionSnapshot,
+    recording_policy: crate::speech_quality::RecordingPolicy,
     active: &ActiveAttempt,
     durable_end: u64,
     head_silence_passed_sample: u64,
@@ -8179,6 +8360,9 @@ fn mark_active_attempt_interrupted(
         0
     };
     let attempt = Attempt {
+        speech_quality: None,
+        recording_policy,
+        end_reason: Some("interrupted".to_string()),
         attempt_id: active.attempt_id.clone(),
         start_sample: active.start_sample.min(durable_end),
         recording_started_sample: active.recording_started_sample.min(durable_end),
@@ -8201,6 +8385,9 @@ fn mark_active_attempt_interrupted(
 
 impl RecordingSession {
     fn required_silence_samples(&self) -> u64 {
+        if self.active_attempt.is_some() && self.head_silence.auto_end.load(Ordering::Acquire) {
+            return self.head_silence.required_samples();
+        }
         u64::from(self.snapshot.audio_format.sample_rate)
             .saturating_mul(u64::from(self.snapshot.silence_duration_ms))
             / 1_000
@@ -8222,6 +8409,11 @@ impl RecordingSession {
             .store(self.required_silence_samples(), Ordering::Release);
         self.attempt_signal_start_sample.store(0, Ordering::Release);
         self.last_signal_sample.store(0, Ordering::Release);
+        self.head_silence.configure(
+            self.snapshot.recording_policy.clone(),
+            self.snapshot.audio_format.sample_rate,
+            self.snapshot.audio_format.bit_depth,
+        );
         self.head_silence.arm(armed_sample);
         drop(analysis_write);
         Ok(armed_sample)
@@ -8444,6 +8636,15 @@ impl RecordingSession {
             detector_generation: Some(detector_generation),
         };
         let attempt = Attempt {
+            speech_quality: None,
+            recording_policy: self
+                .head_silence
+                .speech_meter
+                .lock()
+                .unwrap()
+                .policy
+                .clone(),
+            end_reason: Some("detector_failure".to_string()),
             attempt_id: active.attempt_id.clone(),
             start_sample: active.recording_started_sample.min(end_sample),
             recording_started_sample: active.recording_started_sample.min(end_sample),
@@ -8524,6 +8725,12 @@ impl RecordingSession {
     ) -> Result<Attempt> {
         let attempt = mark_active_attempt_interrupted(
             &mut self.snapshot,
+            self.head_silence
+                .speech_meter
+                .lock()
+                .unwrap()
+                .policy
+                .clone(),
             active,
             durable_end,
             head_silence_passed_sample,
@@ -8580,9 +8787,17 @@ impl RecordingSession {
                 self.head_silence.passed_sample.load(Ordering::Acquire);
             let content_started_sample = self.attempt_signal_start_sample.load(Ordering::Acquire);
             let last_signal_sample = self.last_signal_sample.load(Ordering::Acquire);
+            let (speech_quality, recording_policy) = {
+                let meter = self.head_silence.speech_meter.lock().unwrap();
+                (meter.result(), meter.policy.clone())
+            };
+            let auto_end_sample = self.head_silence.end_sample.load(Ordering::Acquire);
             let second_epoch = self.analysis_epoch.load(Ordering::Acquire);
             if first_epoch == second_epoch && second_epoch & 1 == 0 && analyzed >= requested {
                 return Ok(CaptureAnalysisSnapshot {
+                    auto_end_sample,
+                    speech_quality,
+                    recording_policy,
                     boundary: analyzed,
                     head_silence_phase,
                     head_silence_armed_sample,
@@ -9159,6 +9374,12 @@ impl RecordingSession {
         if let Some(active) = self.active_attempt.take()
             && let Err(error) = mark_active_attempt_interrupted(
                 &mut self.snapshot,
+                self.head_silence
+                    .speech_meter
+                    .lock()
+                    .unwrap()
+                    .policy
+                    .clone(),
                 &active,
                 committed,
                 self.head_silence.passed_sample.load(Ordering::Acquire),
@@ -9266,6 +9487,12 @@ impl RecordingSession {
         if let Some(active) = self.active_attempt.take() {
             let attempt = mark_active_attempt_interrupted(
                 &mut self.snapshot,
+                self.head_silence
+                    .speech_meter
+                    .lock()
+                    .unwrap()
+                    .policy
+                    .clone(),
                 &active,
                 committed,
                 self.head_silence.passed_sample.load(Ordering::Acquire),
@@ -11349,6 +11576,12 @@ fn publish_leased_block_with_preview(
     let waveform_packet = waveform_preview
         .as_deref_mut()
         .and_then(|preview| preview.prepare(block_start, &mono));
+    let quality_pcm = (!silence.analysis.uses_vad()
+        && silence
+            .head_silence
+            .amplitude_enabled
+            .load(Ordering::Acquire))
+    .then(|| mono.clone());
     if writer.try_send(WriterMessage::Samples(mono)).is_err() {
         queue.release(frames);
         if vad_reserved {
@@ -11453,6 +11686,13 @@ fn publish_leased_block_with_preview(
     if vad_reserved {
         // Detector selection changed between reservation and publication.
         silence.analysis.queue.release(frames);
+    }
+    if let Some(pcm) = quality_pcm.as_ref() {
+        silence.head_silence.measure(
+            pcm,
+            block_start,
+            energy_is_speech(&silence.threshold_bits, rms),
+        );
     }
     annotate_attempt_block(
         &silence.head_silence,
@@ -12496,6 +12736,180 @@ mod tests {
 
     #[cfg(feature = "system-test")]
     #[test]
+    fn short_take_policy_freezes_audio_and_persists_operator_retention() {
+        fn feed(engine: &mut Engine, frames: u64, seed: u64, pattern: SystemTestSignalPattern) {
+            let mut remaining = frames;
+            while remaining > 0 {
+                let count = remaining.min(4_800);
+                engine.system_test_feed(count, seed, 256, pattern).unwrap();
+                let session = engine.session.as_ref().unwrap();
+                let boundary = session.captured.load(Ordering::Acquire);
+                assert_eq!(
+                    session.flush_vad_analysis(boundary),
+                    VadFlushOutcome::Complete
+                );
+                remaining -= count;
+            }
+        }
+        for detector in ["energy", "vad"] {
+            let root = test_root(&format!("short-take-{detector}"));
+            std::fs::remove_dir_all(&root).unwrap();
+            let mut engine = Engine::new(Emitter::new());
+            let policy = crate::speech_quality::RecordingPolicy {
+                amplitude_enabled: true,
+                auto_end: true,
+                rms_min_dbfs: -1.0,
+                peak_max_dbfs: -0.5,
+            };
+            let payload: StartSessionPayload = serde_json::from_value(json!({
+                "session_dir": root, "session_id": format!("short-take-{detector}"),
+                "device_name": "test", "sample_rate": 48000, "bit_depth": 16,
+                "silence_duration_ms": 200, "silence_threshold_dbfs": -42.0,
+                "silence_detector": detector, "recording_policy": policy,
+                "items": [{"id": "001", "text": "唤醒词"}]
+            }))
+            .unwrap();
+            engine
+                .start_system_test_session(SystemTestStartSessionPayload {
+                    session: payload,
+                    segment_frames: 48_000,
+                })
+                .unwrap();
+            engine.skip_input_audition(None).unwrap();
+            let started = engine.start_attempt("001", true).unwrap();
+            let id = started["attempt_id"].as_str().unwrap().to_string();
+            feed(&mut engine, 14_400, 7, SystemTestSignalPattern::Silence);
+            engine.complete_auto_attempt().unwrap();
+            assert!(engine.session.as_ref().unwrap().active_attempt.is_some());
+            feed(&mut engine, 48_000, 7, SystemTestSignalPattern::Speech);
+            // Changes are saved for the next take, including the silence interval.
+            engine.set_recording_policy(Default::default()).unwrap();
+            let changed = engine
+                .set_silence_settings(SetSilenceSettingsPayload {
+                    threshold_dbfs: -40.0,
+                    silence_duration_ms: 1_000,
+                    silence_detector: None,
+                    enforce_silence: None,
+                })
+                .unwrap();
+            assert_eq!(changed["reset_kind"], "next_attempt");
+            feed(&mut engine, 96_000, 8, SystemTestSignalPattern::Silence);
+            let session = engine.session.as_ref().unwrap();
+            let end = session.head_silence.end_sample.load(Ordering::Acquire);
+            assert!(
+                end > 0,
+                "{detector} did not latch an endpoint: last={}, analyzed={}, phase={}, enabled={}",
+                session.last_signal_sample.load(Ordering::Acquire),
+                session.analyzed_samples.load(Ordering::Acquire),
+                session.head_silence.phase.load(Ordering::Acquire),
+                session.head_silence.auto_end.load(Ordering::Acquire)
+            );
+            let quality_before = session
+                .head_silence
+                .speech_meter
+                .lock()
+                .unwrap()
+                .result()
+                .unwrap();
+            feed(&mut engine, 48_000, 9, SystemTestSignalPattern::Speech);
+            engine.complete_auto_attempt().unwrap();
+            let stopped = engine
+                .stop_attempt_identified(Some(&id), false, true, true)
+                .unwrap();
+            assert_eq!(stopped["already_stopped"], true);
+            assert_eq!(stopped["attempt"]["end_sample"], end);
+            assert_eq!(stopped["attempt"]["end_reason"], "auto_silence");
+            assert_eq!(stopped["attempt"]["required_tail_silence_samples"], 9_600);
+            assert_eq!(stopped["attempt"]["speech_quality"], json!(quality_before));
+            assert!(quality_before.speech_samples > 0 && quality_before.has_warning());
+            assert!(
+                engine
+                    .session
+                    .as_ref()
+                    .unwrap()
+                    .captured
+                    .load(Ordering::Acquire)
+                    > end
+            );
+            engine.accept_attempt("001", &id).unwrap();
+            let persisted: SessionSnapshot = serde_json::from_slice(
+                &std::fs::read(root.join("metadata/items.snapshot.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                persisted.items[0].attempts[0]
+                    .speech_quality
+                    .as_ref()
+                    .unwrap()
+                    .retained_by_operator_at
+                    .is_some()
+            );
+            engine.start_attempt("001", false).unwrap();
+            engine
+                .stop_attempt_identified(Some(&id), true, true, false)
+                .unwrap();
+            assert!(
+                engine.session.as_ref().unwrap().active_attempt.is_some(),
+                "stale stop must not close a new take"
+            );
+            assert!(
+                !engine
+                    .session
+                    .as_ref()
+                    .unwrap()
+                    .head_silence
+                    .auto_end
+                    .load(Ordering::Acquire)
+            );
+            engine.stop_attempt(true, true, false).unwrap();
+            engine.stop_session().unwrap();
+            let saved: SessionSnapshot = serde_json::from_slice(
+                &std::fs::read(root.join("metadata/items.snapshot.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                engine
+                    .set_session_recording_policy(
+                        &root,
+                        "wrong-task",
+                        saved.journal_seq,
+                        policy.clone()
+                    )
+                    .is_err()
+            );
+            assert!(
+                engine
+                    .set_session_recording_policy(
+                        &root,
+                        &saved.session_id,
+                        saved.journal_seq.saturating_sub(1),
+                        policy.clone()
+                    )
+                    .is_err()
+            );
+            let updated = engine
+                .set_session_recording_policy(
+                    &root,
+                    &saved.session_id,
+                    saved.journal_seq,
+                    policy.clone(),
+                )
+                .unwrap();
+            assert_eq!(updated["snapshot"]["recording_policy"], json!(policy));
+            assert_eq!(
+                updated["snapshot"]["items"][0]["attempts"][0],
+                json!(saved.items[0].attempts[0])
+            );
+            assert_eq!(
+                saved.items[0].attempts[0].speech_quality,
+                persisted.items[0].attempts[0].speech_quality
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[cfg(feature = "system-test")]
+    #[test]
     fn system_test_feed_returns_authoritative_analysis_diagnostics() {
         let root = test_root("system-test-feed-diagnostics");
         std::fs::remove_dir_all(&root).unwrap();
@@ -12503,6 +12917,7 @@ mod tests {
         engine
             .start_system_test_session(SystemTestStartSessionPayload {
                 session: StartSessionPayload {
+                    recording_policy: Default::default(),
                     session_dir: root.to_string_lossy().into_owned(),
                     session_id: "system-test-feed-diagnostics".to_string(),
                     script_name: "script.csv".to_string(),
@@ -12569,6 +12984,7 @@ mod tests {
         engine
             .start_system_test_session(SystemTestStartSessionPayload {
                 session: StartSessionPayload {
+                    recording_policy: Default::default(),
                     session_dir: root.to_string_lossy().into_owned(),
                     session_id: "input-audition-lifecycle".to_string(),
                     script_name: "script.csv".to_string(),
@@ -12738,6 +13154,7 @@ mod tests {
         engine
             .start_system_test_session(SystemTestStartSessionPayload {
                 session: StartSessionPayload {
+                    recording_policy: Default::default(),
                     session_dir: root.to_string_lossy().into_owned(),
                     session_id: "input-audition-cache-adoption".to_string(),
                     script_name: "script.csv".to_string(),
@@ -13609,6 +14026,7 @@ mod tests {
 
     fn test_snapshot() -> SessionSnapshot {
         SessionSnapshot {
+            recording_policy: Default::default(),
             schema_version: 1,
             app_version: build_app_version(),
             engine_version: build_engine_version(),
@@ -13663,6 +14081,9 @@ mod tests {
 
     fn test_attempt(attempt_id: &str, start_sample: u64, end_sample: u64, status: &str) -> Attempt {
         Attempt {
+            speech_quality: None,
+            recording_policy: Default::default(),
+            end_reason: None,
             attempt_id: attempt_id.to_string(),
             start_sample,
             recording_started_sample: start_sample,
@@ -13852,6 +14273,9 @@ mod tests {
     fn retained_previous_warning_only_tracks_the_latest_unresolved_bad_retake() {
         let mut old = test_attempt("001-a1", 0, 10, "accepted");
         let bad = Attempt {
+            speech_quality: None,
+            recording_policy: Default::default(),
+            end_reason: None,
             quality_issues: vec![AttemptQualityIssue {
                 code: "vad_queue_overflow".to_string(),
                 start_sample: Some(10),
@@ -14422,6 +14846,9 @@ mod tests {
         std::fs::create_dir_all(root.join("script")).unwrap();
         let mut session = prepare_metadata_test_session(&root);
         let attempt = Attempt {
+            speech_quality: None,
+            recording_policy: Default::default(),
+            end_reason: None,
             attempt_id: "001-a1".to_string(),
             start_sample: 10,
             recording_started_sample: 0,
@@ -15005,6 +15432,9 @@ mod tests {
         assert_eq!(
             snapshot,
             CaptureAnalysisSnapshot {
+                auto_end_sample: 0,
+                speech_quality: None,
+                recording_policy: Default::default(),
                 boundary: 130,
                 head_silence_phase: HEAD_SILENCE_IDLE,
                 head_silence_armed_sample: 0,
@@ -15210,6 +15640,9 @@ mod tests {
         session.snapshot.items[0].status = "accepted".to_string();
         session.snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
         session.snapshot.items[0].attempts.push(Attempt {
+            speech_quality: None,
+            recording_policy: Default::default(),
+            end_reason: None,
             attempt_id: "001-a1".to_string(),
             start_sample: 0,
             recording_started_sample: 0,
@@ -15543,6 +15976,15 @@ mod tests {
 
     #[test]
     fn recovered_discontinuity_retake_keeps_the_previous_accepted_version() {
+        assert_discontinuity_retake_keeps_previous(false);
+    }
+
+    #[test]
+    fn automatic_discontinuity_retake_keeps_previous_and_cannot_be_retained() {
+        assert_discontinuity_retake_keeps_previous(true);
+    }
+
+    fn assert_discontinuity_retake_keeps_previous(automatic: bool) {
         let root = test_root("recovered-discontinuity-keeps-previous");
         let mut session = prepare_metadata_test_session(&root);
         session.snapshot.audio_format.sample_rate = 100;
@@ -15550,6 +15992,9 @@ mod tests {
         session.snapshot.items[0].status = "accepted".to_string();
         session.snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
         session.snapshot.items[0].attempts.push(Attempt {
+            speech_quality: None,
+            recording_policy: Default::default(),
+            end_reason: None,
             attempt_id: "001-a1".to_string(),
             start_sample: 0,
             recording_started_sample: 0,
@@ -15615,11 +16060,28 @@ mod tests {
         let mut engine = Engine::new(Emitter::new());
         engine.session = Some(session);
 
-        let stopped = engine.stop_attempt(false, true, false).unwrap();
+        let stopped = if automatic {
+            let session = engine.session.as_ref().unwrap();
+            session.head_silence.auto_end.store(true, Ordering::Release);
+            session
+                .head_silence
+                .end_sample
+                .store(100, Ordering::Release);
+            engine.complete_auto_attempt().unwrap();
+            engine
+                .stop_attempt_identified(Some("001-a2"), false, true, false)
+                .unwrap()
+        } else {
+            engine.stop_attempt(false, true, false).unwrap()
+        };
 
-        assert_eq!(stopped["recovered_discontinuity"], true);
+        if !automatic {
+            assert_eq!(stopped["recovered_discontinuity"], true);
+        }
         assert_eq!(stopped["attempt"]["status"], "needs_rerecord");
-        assert_eq!(stopped["auto_selected"], false);
+        if !automatic {
+            assert_eq!(stopped["auto_selected"], false);
+        }
         let session = engine.session.as_ref().unwrap();
         assert_eq!(session.snapshot.items[0].status, "accepted");
         assert_eq!(
@@ -18288,6 +18750,9 @@ mod tests {
         cover_committed_test_audio(&mut snapshot);
         snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
         snapshot.items[0].attempts.push(Attempt {
+            speech_quality: None,
+            recording_policy: Default::default(),
+            end_reason: None,
             attempt_id: "001-a1".to_string(),
             start_sample: 10,
             recording_started_sample: 20,
@@ -18417,6 +18882,9 @@ mod tests {
         snapshot.items[0].status = "accepted".to_string();
         snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
         snapshot.items[0].attempts = vec![Attempt {
+            speech_quality: None,
+            recording_policy: Default::default(),
+            end_reason: None,
             attempt_id: "001-a1".to_string(),
             start_sample: 100,
             recording_started_sample: 100,
@@ -18504,6 +18972,9 @@ mod tests {
         snapshot.items[0].status = "accepted".to_string();
         snapshot.items[0].selected_attempt_id = Some("0001-a1".to_string());
         snapshot.items[0].attempts.push(Attempt {
+            speech_quality: None,
+            recording_policy: Default::default(),
+            end_reason: None,
             attempt_id: "0001-a1".to_string(),
             start_sample: 1_866_240,
             recording_started_sample: 1_178_400,
@@ -18526,6 +18997,9 @@ mod tests {
             label: "疑问句".to_string(),
             status: "accepted".to_string(),
             attempts: vec![Attempt {
+                speech_quality: None,
+                recording_policy: Default::default(),
+                end_reason: None,
                 attempt_id: "0003-a1".to_string(),
                 start_sample: 4_024_800,
                 recording_started_sample: 3_976_800,
@@ -18564,6 +19038,9 @@ mod tests {
         snapshot.items[0].status = "accepted".to_string();
         snapshot.items[0].selected_attempt_id = Some("0001-a1".to_string());
         snapshot.items[0].attempts.push(Attempt {
+            speech_quality: None,
+            recording_policy: Default::default(),
+            end_reason: None,
             attempt_id: "0001-a1".to_string(),
             // Click at 1_178_400, first speech at 1_973_760, 1s pad → clip starts
             // at 1_925_760, not at the click or the pending-timer mark.
@@ -18599,6 +19076,7 @@ mod tests {
         let engine = Engine::new(Emitter::new());
         let created = engine
             .create_session(StartSessionPayload {
+                recording_policy: Default::default(),
                 session_dir: root.to_string_lossy().into_owned(),
                 session_id: "offline-create".to_string(),
                 script_name: "script.csv".to_string(),
@@ -18712,6 +19190,9 @@ mod tests {
         snapshot.items[0].status = "accepted".to_string();
         snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
         snapshot.items[0].attempts = vec![Attempt {
+            speech_quality: None,
+            recording_policy: Default::default(),
+            end_reason: None,
             attempt_id: "001-a1".to_string(),
             start_sample: 0,
             recording_started_sample: 0,
@@ -18817,6 +19298,9 @@ mod tests {
         snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
         snapshot.items[0].attempts = vec![
             Attempt {
+                speech_quality: None,
+                recording_policy: Default::default(),
+                end_reason: None,
                 attempt_id: "001-a1".to_string(),
                 start_sample: 0,
                 recording_started_sample: 0,
@@ -18834,6 +19318,9 @@ mod tests {
                 quality_issues: Vec::new(),
             },
             Attempt {
+                speech_quality: None,
+                recording_policy: Default::default(),
+                end_reason: None,
                 attempt_id: "001-a2".to_string(),
                 start_sample: 2,
                 recording_started_sample: 2,
@@ -18851,6 +19338,9 @@ mod tests {
                 quality_issues: Vec::new(),
             },
             Attempt {
+                speech_quality: None,
+                recording_policy: Default::default(),
+                end_reason: None,
                 attempt_id: "001-a3".to_string(),
                 start_sample: 1,
                 recording_started_sample: 1,
@@ -19012,6 +19502,9 @@ mod tests {
         snapshot.items[0].status = "accepted".to_string();
         snapshot.items[0].selected_attempt_id = Some("001-a1".to_string());
         snapshot.items[0].attempts = vec![Attempt {
+            speech_quality: None,
+            recording_policy: Default::default(),
+            end_reason: None,
             attempt_id: "001-a1".to_string(),
             start_sample: 0,
             recording_started_sample: 0,
@@ -19565,6 +20058,9 @@ mod tests {
         stopped.items[0].status = "accepted".to_string();
         stopped.items[0].selected_attempt_id = Some("001-a1".to_string());
         stopped.items[0].attempts.push(Attempt {
+            speech_quality: None,
+            recording_policy: Default::default(),
+            end_reason: None,
             attempt_id: "001-a1".to_string(),
             start_sample: 2,
             recording_started_sample: 2,
@@ -19650,6 +20146,9 @@ mod tests {
         stopped.items[0].status = "accepted".to_string();
         stopped.items[0].selected_attempt_id = Some("001-a1".to_string());
         stopped.items[0].attempts.push(Attempt {
+            speech_quality: None,
+            recording_policy: Default::default(),
+            end_reason: None,
             attempt_id: "001-a1".to_string(),
             start_sample: 4,
             recording_started_sample: 2,
@@ -19703,6 +20202,9 @@ mod tests {
         stopped.items[0].status = "accepted".to_string();
         stopped.items[0].selected_attempt_id = Some("001-a1".to_string());
         stopped.items[0].attempts.push(Attempt {
+            speech_quality: None,
+            recording_policy: Default::default(),
+            end_reason: None,
             attempt_id: "001-a1".to_string(),
             start_sample: 10,
             recording_started_sample: 2,
@@ -19939,6 +20441,7 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
         let mut engine = Engine::new(Emitter::new());
         let payload = StartSessionPayload {
+            recording_policy: Default::default(),
             session_dir: root.to_string_lossy().into_owned(),
             session_id: "mac-dev-feed".to_string(),
             script_name: "script.csv".to_string(),
@@ -20009,6 +20512,7 @@ mod tests {
             std::fs::remove_dir_all(&root).unwrap();
             let created = engine
                 .create_session(StartSessionPayload {
+                    recording_policy: Default::default(),
                     session_dir: root.to_string_lossy().into_owned(),
                     session_id: format!("format-independent-{normalized}"),
                     script_name: "script.csv".to_string(),

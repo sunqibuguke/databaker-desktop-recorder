@@ -1,0 +1,9 @@
+
+> databaker-desktop-recorder@0.2.0 test:license-os
+> npm run build:electron && electron scripts/test-license-os.cjs
+
+
+> databaker-desktop-recorder@0.2.0 build:electron
+> tsc -p electron/tsconfig.json
+
+darwin real Electron safeStorage: encrypted key reload, authenticated record, purpose binding and tamper rejection passed

@@ -1,0 +1,10 @@
+{
+  "platform": "darwin",
+  "beforeSourceFrames": 8000,
+  "afterSourceFrames": 2000,
+  "exitCode": 0,
+  "inputFile": "source.wav",
+  "exportedFile": "source.wav",
+  "outputDirectory": "same as input",
+  "overwrite": true
+}

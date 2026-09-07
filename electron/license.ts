@@ -1,10 +1,11 @@
 import { createPrivateKey, createPublicKey, randomUUID, sign as signBytes, verify as verifyBytes } from 'node:crypto';
 import { promises as fs } from 'node:fs';
-import path from 'node:path';
 
+import { writeProtectedFile, type LicenseProtection } from './license-protection';
 import { LICENSE_PUBLIC_KEYS } from './license-keys';
 import {
   isMachineCode,
+  encodeMachineCode,
   matchFingerprint,
   normalizeMachineCode,
   type MachineFingerprint,
@@ -36,9 +37,13 @@ export type LicenseReason =
   | 'wrong_machine'
   | 'expired'
   | 'clock_rollback'
-  | 'fingerprint_unavailable';
+  | 'fingerprint_unavailable'
+  | 'state_invalid';
 
 export type LicenseStatus = {
+  transitionRevision?: number;
+  captureStopPending?: boolean;
+  captureStopError?: string;
   state: 'valid' | 'invalid';
   reason: LicenseReason | null;
   machineCode: string;
@@ -80,8 +85,8 @@ export class LicenseRequiredError extends Error {
   }
 }
 
-export function isLicenseCheckDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env[LICENSE_DISABLED_ENV] === '1';
+export function isLicenseCheckDisabled(env: NodeJS.ProcessEnv = process.env, isPackaged = true): boolean {
+  return !isPackaged && env[LICENSE_DISABLED_ENV] === '1';
 }
 
 export function isLicenseExemptEngineCommand(command: string): boolean {
@@ -93,6 +98,7 @@ export function isLicenseExemptEngineCommand(command: string): boolean {
 
 export function licenseRequiredMessage(reason: LicenseReason): string {
   switch (reason) {
+    case 'state_invalid': return 'LICENSE_REQUIRED:本地授权记录无法验证，请检查系统安全存储或恢复授权记录';
     case 'expired': return 'LICENSE_REQUIRED:授权已过期';
     case 'wrong_machine': return 'LICENSE_REQUIRED:授权码与本机不匹配';
     case 'clock_rollback': return 'LICENSE_REQUIRED:系统时间异常';
@@ -164,7 +170,7 @@ export function verifyLicenseTicket(
     publicKeys?: Readonly<Record<string, string>>;
     now?: number;
     machineCode?: string;
-    storedComponentHashes?: readonly string[];
+    trustedComponentHashes?: readonly string[];
     currentComponentHashes?: readonly string[];
     lastSeenAt?: number;
   } = {},
@@ -189,7 +195,7 @@ export function verifyLicenseTicket(
   if (!verified) return { reason: 'bad_signature' };
 
   const now = unixSeconds(options.now ?? Date.now());
-  if (options.lastSeenAt !== undefined && now + CLOCK_ROLLBACK_GRACE_SECONDS < options.lastSeenAt) {
+  if (now + CLOCK_ROLLBACK_GRACE_SECONDS < Math.max(decoded.claims.iat, options.lastSeenAt ?? 0)) {
     return { reason: 'clock_rollback' };
   }
   if (decoded.claims.exp !== null && now >= decoded.claims.exp) return { reason: 'expired' };
@@ -200,9 +206,10 @@ export function verifyLicenseTicket(
       : '';
     const midMatches = currentCode !== '' && decoded.claims.mid === currentCode;
     const drifted = Boolean(
-      options.storedComponentHashes
+      options.trustedComponentHashes
+      && encodeMachineCode(options.trustedComponentHashes) === decoded.claims.mid
       && options.currentComponentHashes
-      && matchFingerprint(options.storedComponentHashes, options.currentComponentHashes),
+      && matchFingerprint(options.trustedComponentHashes, options.currentComponentHashes),
     );
     if (!midMatches && !drifted) return { reason: 'wrong_machine' };
   }
@@ -234,99 +241,77 @@ export function statusFromVerification(
 
 export class LicenseRepository {
   private operationTail: Promise<void> = Promise.resolve();
-
-  constructor(
-    private readonly filePath: string,
-    private readonly options: {
-      publicKeys?: Readonly<Record<string, string>>;
-      now?: () => number;
-      createToken?: () => string;
-    } = {},
-  ) {}
+  constructor(private readonly filePath: string, private readonly options: {
+    publicKeys?: Readonly<Record<string, string>>;
+    now?: () => number;
+    createToken?: () => string;
+    protection?: LicenseProtection;
+  } = {}) {}
 
   async load(): Promise<{ license: StoredLicense | null; warning?: string }> {
-    return this.runExclusive(() => this.read());
+    return this.runExclusive(async () => ({ license: (await this.read()).license }));
+  }
+
+  private protection(): LicenseProtection {
+    if (!this.options.protection) throw new Error('系统安全存储不可用');
+    return this.options.protection;
   }
 
   async evaluate(fingerprint: MachineFingerprint): Promise<LicenseStatus> {
-    return this.runExclusive(async () => {
-      if (!fingerprint.machineCode) {
-        return emptyLicenseStatus('', 'fingerprint_unavailable');
-      }
-      const loaded = await this.read();
-      if (!loaded.license) return emptyLicenseStatus(fingerprint.machineCode, 'unlicensed');
-      const now = this.now();
-      const verified = verifyLicenseTicket(loaded.license.ticket, {
-        publicKeys: this.options.publicKeys,
-        now,
-        machineCode: fingerprint.machineCode,
-        storedComponentHashes: loaded.license.componentHashes,
-        currentComponentHashes: fingerprint.componentHashes,
-        lastSeenAt: loaded.license.lastSeenAt,
-      });
-      if ('reason' in verified) {
-        const status = statusFromVerification(fingerprint.machineCode, verified, now);
-        if (verified.reason === 'expired' || verified.reason === 'clock_rollback') {
-          try {
-            const claims = inspectLicenseTicket(loaded.license.ticket);
-            status.licensee = claims.sub;
-            status.expiresAt = claims.exp;
-            status.issuedAt = claims.iat;
-            status.kid = claims.kid;
-          } catch {
-            // Keep the verification reason; claims are informational only.
-          }
-        }
-        return status;
-      }
-      const nextSeen = unixSeconds(now);
-      if (nextSeen >= loaded.license.lastSeenAt) {
-        await this.write({
-          ...loaded.license,
-          lastSeenAt: nextSeen,
-        });
-      }
-      return statusFromVerification(fingerprint.machineCode, verified, now);
-    });
+    return this.runExclusive(() => this.check(fingerprint));
   }
 
   async activate(ticket: string, fingerprint: MachineFingerprint): Promise<LicenseStatus> {
-    return this.runExclusive(async () => {
-      if (!fingerprint.machineCode) {
-        return emptyLicenseStatus('', 'fingerprint_unavailable');
-      }
-      const now = this.now();
-      const verified = verifyLicenseTicket(ticket, {
-        publicKeys: this.options.publicKeys,
-        now,
-        machineCode: fingerprint.machineCode,
-        currentComponentHashes: fingerprint.componentHashes,
-      });
-      if ('reason' in verified) {
-        return statusFromVerification(fingerprint.machineCode, verified, now);
-      }
-      if (verified.claims.mid !== fingerprint.machineCode) {
-        return emptyLicenseStatus(fingerprint.machineCode, 'wrong_machine');
-      }
-      const nowSec = unixSeconds(now);
-      await this.write({
-        schemaVersion: 1,
-        ticket: normalizeTicket(ticket),
-        componentHashes: [...fingerprint.componentHashes],
-        firstSeenAt: nowSec,
-        lastSeenAt: nowSec,
-      });
-      return statusFromVerification(fingerprint.machineCode, verified, now);
+    return this.runExclusive(() => this.check(fingerprint, ticket));
+  }
+
+  private async check(fingerprint: MachineFingerprint, activation?: string): Promise<LicenseStatus> {
+    if (!fingerprint.machineCode) return emptyLicenseStatus('', 'fingerprint_unavailable');
+    const now = this.options.now?.() ?? Date.now();
+    let loaded: Awaited<ReturnType<LicenseRepository['read']>>;
+    let highWater: number;
+    try {
+      loaded = await this.read();
+      highWater = Math.max(await this.readClock(), loaded.license?.lastSeenAt ?? 0);
+    } catch {
+      return emptyLicenseStatus(fingerprint.machineCode, 'state_invalid');
+    }
+    const ticket = activation ?? loaded.license?.ticket;
+    if (!ticket) return emptyLicenseStatus(fingerprint.machineCode, 'unlicensed');
+    const verified = verifyLicenseTicket(ticket, {
+      publicKeys: this.options.publicKeys, now, machineCode: fingerprint.machineCode,
+      // Legacy hashes are unsigned. Only an exact signed machine-code match
+      // may migrate them, using freshly collected components.
+      trustedComponentHashes: loaded.protected ? loaded.license?.componentHashes : undefined,
+      currentComponentHashes: fingerprint.componentHashes, lastSeenAt: highWater,
     });
-  }
-
-  private now(): number {
-    return this.options.now?.() ?? Date.now();
-  }
-
-  private token(): string {
-    const raw = (this.options.createToken ?? randomUUID)().replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128);
-    return raw || `${this.now()}`;
+    if ('reason' in verified) {
+      if (loaded.protected && unixSeconds(now) > highWater) {
+        try { await this.writeClock(unixSeconds(now)); } catch { return emptyLicenseStatus(fingerprint.machineCode, 'state_invalid'); }
+      }
+      const status = statusFromVerification(fingerprint.machineCode, verified, now);
+      if (verified.reason === 'expired' || verified.reason === 'clock_rollback') {
+        const claims = inspectLicenseTicket(ticket);
+        Object.assign(status, { licensee: claims.sub, expiresAt: claims.exp, issuedAt: claims.iat, kid: claims.kid });
+      }
+      return status;
+    }
+    const lastSeenAt = Math.max(highWater, unixSeconds(now));
+    const components = verified.claims.mid === fingerprint.machineCode
+      ? fingerprint.componentHashes : loaded.license!.componentHashes;
+    const next: StoredLicense = {
+      schemaVersion: 1, ticket: normalizeTicket(ticket), componentHashes: [...components],
+      firstSeenAt: loaded.license?.firstSeenAt ?? unixSeconds(now), lastSeenAt,
+    };
+    try {
+      // Persist the monotonic anchor first, including renewals. Replacing or
+      // deleting license.json must not reset the last observed system time.
+      if (lastSeenAt > highWater || !loaded.protected) await this.writeClock(lastSeenAt);
+      if (activation !== undefined || !loaded.protected || loaded.license?.lastSeenAt !== lastSeenAt) await this.write(next);
+    } catch {
+      return emptyLicenseStatus(fingerprint.machineCode, 'state_invalid');
+    }
+    return statusFromVerification(fingerprint.machineCode, verified, now);
   }
 
   private runExclusive<T>(operation: () => Promise<T>): Promise<T> {
@@ -335,51 +320,54 @@ export class LicenseRepository {
     return result;
   }
 
-  private async read(): Promise<{ license: StoredLicense | null; warning?: string }> {
+  private async read(): Promise<{ license: StoredLicense | null; protected: boolean }> {
     let serialized: string;
-    try {
-      serialized = await fs.readFile(this.filePath, 'utf8');
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { license: null };
+    try { serialized = await fs.readFile(this.filePath, 'utf8'); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { license: null, protected: false };
       throw error;
     }
-    try {
-      return { license: validateStoredLicense(JSON.parse(serialized)) };
-    } catch (error) {
-      const backupPath = `${this.filePath}.corrupt-${this.now()}-${this.token()}`;
-      try {
-        await fs.rename(this.filePath, backupPath);
-      } catch (backupError) {
-        throw new Error(
-          `授权记录已损坏，且无法创建安全备份：${errorMessage(backupError)}`,
-          { cause: backupError },
-        );
-      }
-      return {
-        license: null,
-        warning: `授权记录无法读取，已保留为 ${path.basename(backupPath)}：${errorMessage(error)}`,
-      };
+    const raw = JSON.parse(serialized);
+    if (raw?.schemaVersion === 2 && typeof raw.protectedData === 'string') {
+      const license = validateStoredLicense(JSON.parse(await this.protection().open(raw.protectedData, 'license-v2')));
+      return { license, protected: true };
     }
+    // Once protected state exists, never accept a downgraded plaintext record.
+    try { await fs.stat(`${this.filePath}.clock`); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { license: validateStoredLicense(raw), protected: false };
+      throw error;
+    }
+    throw new Error('本地授权记录被降级');
   }
 
-  private async write(license: StoredLicense): Promise<StoredLicense> {
-    const validated = validateStoredLicense(license);
-    await fs.mkdir(path.dirname(this.filePath), { recursive: true });
-    const temporaryPath = `${this.filePath}.tmp-${process.pid}-${this.token()}`;
-    let handle: Awaited<ReturnType<typeof fs.open>> | null = null;
-    try {
-      handle = await fs.open(temporaryPath, 'wx', 0o600);
-      await handle.writeFile(`${JSON.stringify(validated, null, 2)}\n`, 'utf8');
-      await handle.sync();
-      await handle.close();
-      handle = null;
-      await fs.rename(temporaryPath, this.filePath);
-    } catch (error) {
-      if (handle) await handle.close().catch(() => undefined);
-      await fs.rm(temporaryPath, { force: true }).catch(() => undefined);
+  private async readClock(): Promise<number> {
+    let value: string;
+    try { value = await fs.readFile(`${this.filePath}.clock`, 'utf8'); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        // A protected record without its clock is incomplete, not a new install.
+        const raw = await fs.readFile(this.filePath, 'utf8').catch((readError: NodeJS.ErrnoException) => {
+          if (readError.code === 'ENOENT') return '{}';
+          throw readError;
+        });
+        if (JSON.parse(raw)?.schemaVersion === 2) throw new Error('授权时间记录缺失');
+        return 0;
+      }
       throw error;
     }
-    return validated;
+    const clock = JSON.parse(await this.protection().open(value, 'license-clock-v1'));
+    if (!Number.isSafeInteger(clock.lastSeenAt) || clock.lastSeenAt <= 0) throw new Error('授权时间记录无效');
+    return clock.lastSeenAt;
+  }
+
+  private async writeClock(lastSeenAt: number): Promise<void> {
+    await writeProtectedFile(`${this.filePath}.clock`, await this.protection().seal(JSON.stringify({ lastSeenAt }), 'license-clock-v1'));
+  }
+
+  private async write(license: StoredLicense): Promise<void> {
+    const protectedData = await this.protection().seal(JSON.stringify(validateStoredLicense(license)), 'license-v2');
+    await writeProtectedFile(this.filePath, JSON.stringify({ schemaVersion: 2, protectedData }));
   }
 }
 
@@ -494,9 +482,6 @@ function unixSeconds(nowMs: number): number {
   return Math.floor(nowMs / 1_000);
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
 
 function encodeCrockford(bytes: Uint8Array): string {
   let bits = 0;

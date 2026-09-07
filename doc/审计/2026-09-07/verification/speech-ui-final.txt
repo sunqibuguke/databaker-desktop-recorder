@@ -1,0 +1,6 @@
+
+> databaker-desktop-recorder@0.2.0 test:speech-ui
+> node scripts/test-speech-recording-ui.cjs && cross-env DATABAKER_TEST_DELAY_START_REPLY=1 node scripts/test-speech-recording-ui.cjs
+
+Speech recording UI: defaults, automatic review, prompter warning, retention, and next-take settings passed
+Speech recording UI: defaults, automatic review, prompter warning, retention, and next-take settings passed

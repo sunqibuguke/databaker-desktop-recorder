@@ -1,0 +1,8 @@
+{
+  "environmentBypass": true,
+  "activated": "valid",
+  "rollback": "clock_rollback",
+  "reactivated": "valid",
+  "otherMachineBefore": "wrong_machine",
+  "otherMachineAfterEditingUnsignedHashes": "valid"
+}

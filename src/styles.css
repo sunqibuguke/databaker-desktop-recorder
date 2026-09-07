@@ -1006,8 +1006,8 @@ input[type="range"]:focus-visible::-moz-range-thumb { box-shadow: 0 0 0 2px var(
 
 /* Reader prompter: stable canvas. Cue color lives in the chip; live copy is the go signal. */
 html:has(.prompter-shell), body:has(.prompter-shell), body:has(.prompter-shell) #root { min-width: 0; }
-.prompter-shell { --cue-color: var(--quiet); --prompter-copy-size: 2.25rem; --prompter-label-size: 1rem; --prompter-live-color: var(--prompter-live); min-width: 0; height: 100%; display: grid; grid-template-rows: 52px minmax(0, 1fr) auto; overflow: hidden; color: var(--text-bright); background: var(--canvas); user-select: none; }
-.prompter-shell.has-quality-warning { grid-template-rows: 52px auto minmax(0, 1fr) auto; }
+.prompter-shell { --cue-color: var(--quiet); --prompter-copy-size: 2.25rem; --prompter-label-size: 1rem; --prompter-live-color: var(--prompter-live); min-width: 0; height: 100%; display: grid; grid-template-rows: 52px 32px minmax(0, 1fr) auto; overflow: hidden; color: var(--text-bright); background: var(--canvas); user-select: none; }
+.prompter-shell.has-quality-warning { grid-template-rows: 52px 32px minmax(0, 1fr) auto; }
 .prompter-shell.idle, .prompter-shell.review, .prompter-shell.complete { --cue-color: var(--quiet); }
 .prompter-shell.checking, .prompter-shell.pending { --cue-color: var(--warning); }
 .prompter-shell.recording { --cue-color: var(--prompter-rec); }
@@ -1091,8 +1091,8 @@ html:has(.prompter-shell), body:has(.prompter-shell), body:has(.prompter-shell) 
 }
 
 @media (max-height: 420px) {
-  .prompter-shell { grid-template-rows: 36px minmax(0, 1fr) auto; }
-  .prompter-shell.has-quality-warning { grid-template-rows: 36px auto minmax(0, 1fr) auto; }
+  .prompter-shell { grid-template-rows: 36px 32px minmax(0, 1fr) auto; }
+  .prompter-shell.has-quality-warning { grid-template-rows: 36px 32px minmax(0, 1fr) auto; }
   .prompter-content { padding-top: 17px; padding-bottom: 16px; }
   .prompter-label { margin-top: 12px; padding-top: 10px; }
 }
@@ -1140,3 +1140,29 @@ html:has(.prompter-shell), body:has(.prompter-shell), body:has(.prompter-shell) 
   .input-audition-dialog .dialog-warning { margin: -1px 14px 9px; padding: 6px 8px; }
   .input-audition-dialog > footer { padding: 7px 10px; }
 }
+
+.recording-policy-fields { margin: 12px 0; padding: 12px; border: 1px solid var(--line-soft); border-radius: 6px; min-width: 0; display: grid; gap: 10px; }
+.recording-policy-fields legend { font-weight: 600; font-size: .75rem; padding: 0 4px; }
+.recording-policy-fields > label { display: flex; align-items: center; gap: 8px; font-size: .75rem; }
+.recording-policy-fields input[type="checkbox"] { accent-color: var(--accent); }
+.recording-policy-fields p { margin: 0; color: var(--quiet); font-size: .6875rem; line-height: 1.6; }
+.speech-thresholds { display: grid; gap: 8px; }
+.speech-thresholds label { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: .6875rem; }
+.speech-thresholds input { width: 70px; padding: 5px; background: var(--canvas); color: var(--text); border: 1px solid var(--line-soft); border-radius: 4px; }
+.speech-quality-banner { padding: 8px 12px; color: var(--warning); background: var(--canvas); font-size: .75rem; }
+.speech-review { flex: none; display: grid; gap: 4px; padding: 8px 12px; font-size: .6875rem; border-top: 1px solid var(--line-soft); color: var(--quiet); }
+/* Both slots exist before, during and after a warning: no text reflow. */
+.workspace-status-slot { position: relative; flex: none; height: 36px; background: var(--chrome); }
+.workspace-status-slot .workspace-toasts { position: static; transform: none; width: 100%; height: 100%; display: flex; align-items: center; overflow: auto; padding: 2px 8px; }
+.workspace-status-slot .workspace-toasts > * { flex: none; width: auto; max-width: 100%; box-shadow: none; border-radius: 3px; pointer-events: none; }
+.workspace-status-slot .workspace-toasts button { pointer-events: auto; }
+.workspace-status-slot .speech-quality-banner { padding: 4px 8px; }
+.prompter-status-slot { height: 32px; min-width: 0; overflow: auto; }
+.prompter-status-slot .prompter-quality-warning { position: static; min-height: 32px; height: 32px; padding: 3px 12px; border: 0; font-size: 0.75rem; }
+.license-transition { position: fixed; inset: 0; z-index: 10000; display: grid; place-items: center; background: var(--scrim); padding: 24px; }
+.license-transition > div { width: min(520px, 100%); padding: 24px; border: 1px solid var(--line); background: var(--dialog); border-radius: 8px; }
+
+
+.property-group > .recording-policy-fields { grid-column: 2; margin: 0; }
+
+.inline-setting-link { padding: 0; border: 0; background: none; color: var(--accent); font: inherit; text-decoration: underline; cursor: pointer; }

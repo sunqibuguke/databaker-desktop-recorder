@@ -1,0 +1,27 @@
+const fs = require('fs/promises');
+const { generateKeyPairSync } = require('crypto');
+const root = process.cwd();
+const { LicenseRepository, issueLicense, isLicenseCheckDisabled } = require(root + '/dist-electron/license.js');
+const { encodeMachineCode, hashFingerprintComponent } = require(root + '/dist-electron/machine-fingerprint.js');
+(async()=>{
+await fs.mkdir('/tmp/databaker-audit-20260907', {recursive:true});
+const {publicKey, privateKey}=generateKeyPairSync('ed25519');
+const options={publicKeys:{audit:publicKey.export({type:'spki',format:'pem'}).toString()}};
+const hashes=(tag)=>['a','b','c'].map(k=>hashFingerprintComponent(k,tag+k));
+const make=(tag)=>{const componentHashes=hashes(tag);return {componentHashes,machineCode:encodeMachineCode(componentHashes)}};
+const a=make('auditA'), b=make('auditB');
+let now=Date.UTC(2026,8,7);const original=now;
+const ticket=issueLicense({privateKeyPem:privateKey.export({type:'pkcs8',format:'pem'}).toString(),kid:'audit',subject:'isolated review test',machineCode:a.machineCode,now,days:365,jti:'audit-only'});
+const file='/tmp/databaker-audit-20260907/license-fixture.json';
+const repo=new LicenseRepository(file,{...options,now:()=>now});
+const activated=await repo.activate(ticket,a);
+now-=10*86400000;
+const rollback=await repo.evaluate(a);
+const reactivated=await repo.activate(ticket,a);
+now=original;
+await repo.activate(ticket,a);
+const wrongMachine=await repo.evaluate(b);
+const saved=JSON.parse(await fs.readFile(file,'utf8'));saved.componentHashes=b.componentHashes;await fs.writeFile(file,JSON.stringify(saved));
+const edited=await repo.evaluate(b);
+console.log(JSON.stringify({environmentBypass:isLicenseCheckDisabled({DATABAKER_LICENSE_DISABLED:'1'}),activated:activated.state,rollback:rollback.reason,reactivated:reactivated.state,otherMachineBefore:wrongMachine.reason,otherMachineAfterEditingUnsignedHashes:edited.state},null,2));
+})();

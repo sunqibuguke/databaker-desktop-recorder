@@ -3,6 +3,31 @@ import { p1Copy } from './p1.ts';
 import { inputAuditionCopy } from './input-audition.ts';
 
 const es: MessageTree = {
+  speech: {
+    "silenceDuration": "Silencio actual: {seconds} s",
+    "adjustSilence": "Ajustar duración del silencio",
+    "title": "Comprobaciones de voz y frases cortas",
+    "amplitude": "Comprobar el nivel de voz",
+    "rmsMin": "RMS mínimo de voz (dBFS)",
+    "peakMax": "PEAK máximo de voz (dBFS)",
+    "reference": "−30 / −3 dBFS son valores orientativos, no criterios de aceptación.",
+    "autoEnd": "Finalizar frases cortas automáticamente",
+    "autoHint": "Finaliza tras el silencio configurado y espera confirmación. Las repeticiones sin pausa suficiente pueden incluirse; no se reconoce el contenido.",
+    "nextTake": "Los cambios se aplican a la próxima toma. Los resultados anteriores se conservan.",
+    "save": "Guardar ajustes de grabación",
+    "saved": "Ajustes guardados para la próxima toma",
+    "invalid": "Introduzca de −96 a 0 dBFS; el RMS mínimo debe ser inferior al PEAK máximo.",
+    "low": "Voz demasiado baja",
+    "high": "Voz demasiado alta",
+    "autoStopped": "La toma ha finalizado automáticamente. Escuche, confirme o vuelva a grabar.",
+    "retain": "Conservar con advertencia y continuar",
+    "retainOnly": "Conservar esta toma con advertencia",
+    "recordedWarning": "Esta toma tiene advertencias de nivel. Escuche, repita o confirme que desea conservarla.",
+    "retained": "El operador confirmó conservarla",
+    "metrics": "RMS de voz {rms} dBFS · PEAK {peak} dBFS",
+    "unmeasured": "No hay resultados del nivel de voz",
+    "autoFailed": "No se pudo finalizar automáticamente: {message}"
+  },
   common: {
     confirm: 'Confirmar',
     cancel: 'Cancelar',
@@ -73,6 +98,11 @@ const es: MessageTree = {
     manualDefault: 'Pausa después de cada frase',
   },
   license: {
+    titleState: "No se pudo verificar el estado local de la licencia",
+    errorState: "Compruebe el almacenamiento seguro del sistema o pida al administrador que restaure los registros originales. Reintroducir un código no borra registros dañados ni errores de reloj.",
+    "sealing": "Finalizando la grabación de forma segura",
+    "sealingDetail": "La licencia ya no es válida. La activación aparecerá al guardar y cerrar la grabación.",
+    "retrySeal": "Reintentar cierre",
     title: 'El software no está licenciado',
     titleExpired: 'La licencia ha caducado',
     titleWrongMachine: 'La licencia no es de este equipo',

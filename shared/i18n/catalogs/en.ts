@@ -3,6 +3,31 @@ import { p1Copy } from './p1.ts';
 import { inputAuditionCopy } from './input-audition.ts';
 
 const en: MessageTree = {
+  speech: {
+    "silenceDuration": "Current silence duration: {seconds} s",
+    "adjustSilence": "Adjust silence duration",
+    "title": "Speech checks and short recordings",
+    "amplitude": "Speech level check",
+    "rmsMin": "Speech RMS minimum (dBFS)",
+    "peakMax": "Speech PEAK maximum (dBFS)",
+    "reference": "−30 / −3 dBFS are starting values, not acceptance standards.",
+    "autoEnd": "End short recordings automatically",
+    "autoHint": "End after the task’s silence interval, then wait for confirmation. Repeats without a sufficient pause may remain; content is not recognized.",
+    "nextTake": "Saved settings apply to the next take. Historical results stay unchanged.",
+    "save": "Save recording settings",
+    "saved": "Settings saved for the next take",
+    "invalid": "Enter −96 to 0 dBFS with RMS minimum below PEAK maximum.",
+    "low": "Voice too quiet",
+    "high": "Voice too loud",
+    "autoStopped": "Take ended automatically. Listen, confirm or rerecord.",
+    "retain": "Keep despite warning and continue",
+    "retainOnly": "Keep this take despite warning",
+    "recordedWarning": "This take has level warnings. Listen, rerecord or confirm retention.",
+    "retained": "Retention confirmed by operator",
+    "metrics": "Speech RMS {rms} dBFS · PEAK {peak} dBFS",
+    "unmeasured": "No speech level result available",
+    "autoFailed": "Automatic completion failed: {message}"
+  },
   common: {
     confirm: 'Confirm',
     cancel: 'Cancel',
@@ -73,6 +98,11 @@ const en: MessageTree = {
     manualDefault: 'Pause after each sentence',
   },
   license: {
+    titleState: "Local license state could not be verified",
+    errorState: "Check system secure storage or ask your administrator to restore the original license records. Re-entering a ticket does not clear damaged state or clock errors.",
+    "sealing": "Safely ending recording",
+    "sealingDetail": "The license is no longer valid. Activation will appear after the recording is sealed.",
+    "retrySeal": "Retry sealing",
     title: 'Software is not licensed',
     titleExpired: 'License expired',
     titleWrongMachine: 'License is not for this machine',

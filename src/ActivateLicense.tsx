@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import appLogo from '../assets/brand/databaker-recorder-logo.png';
 import { Icon } from './studio-chrome';
 import { APP_LOCALES, LOCALE_NATIVE_NAMES, t, useI18n } from './i18n';
@@ -6,6 +6,7 @@ import type { LicenseReason, LicenseStatus, PendingLicenseSeal } from './types';
 
 function reasonTitle(reason: LicenseReason | null): string {
   switch (reason) {
+    case 'state_invalid': return t('license.titleState');
     case 'expired': return t('license.titleExpired');
     case 'wrong_machine': return t('license.titleWrongMachine');
     case 'clock_rollback': return t('license.titleClock');
@@ -16,6 +17,7 @@ function reasonTitle(reason: LicenseReason | null): string {
 
 function activateErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
+  if (/本地授权记录|安全存储|state_invalid/.test(message)) return t('license.errorState');
   if (/已过期|expired/.test(message)) return t('license.errorExpired');
   if (/不匹配|wrong_machine/.test(message)) return t('license.errorMachine');
   if (/时间|clock/.test(message)) return t('license.errorClock');
@@ -28,11 +30,12 @@ function activateErrorMessage(error: unknown): string {
 
 export function LicenseGate({ children }: { children: (license: LicenseStatus) => ReactNode }) {
   const [status, setStatus] = useState<LicenseStatus | null>(null);
+  const lastValid = useRef<LicenseStatus | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     const apply = (next: LicenseStatus) => {
-      if (!cancelled) setStatus(next);
+      if (!cancelled) setStatus((current) => (current?.transitionRevision ?? -1) > (next.transitionRevision ?? -1) ? current : next);
     };
     if (!window.recorder.getLicenseStatus) {
       apply({
@@ -66,8 +69,30 @@ export function LicenseGate({ children }: { children: (license: LicenseStatus) =
     };
   }, []);
 
+  useEffect(() => {
+    if (!status?.captureStopPending) return;
+    const previousFocus = document.activeElement as HTMLElement | null;
+    const retryButton = document.querySelector<HTMLButtonElement>('.license-transition button');
+    retryButton?.focus();
+    const blockShortcuts = (event: KeyboardEvent) => {
+      if (event.key === 'Tab') { event.preventDefault(); event.stopImmediatePropagation(); retryButton?.focus(); return; }
+      if ((event.target as Element | null)?.closest('.license-transition')) return;
+      event.preventDefault(); event.stopImmediatePropagation();
+    };
+    window.addEventListener('keydown', blockShortcuts, true);
+    return () => { window.removeEventListener('keydown', blockShortcuts, true); if (previousFocus?.isConnected) previousFocus.focus(); };
+  }, [status?.captureStopPending]);
+
   if (!status) {
     return <div className="license-gate license-gate-loading" data-testid="license-loading" />;
+  }
+  if (status.state === 'valid') lastValid.current = status;
+  if (status.captureStopPending) {
+    return <>{lastValid.current && children(lastValid.current)}<div className="license-transition" onKeyDown={(event) => event.stopPropagation()} role="alertdialog" aria-modal="true" aria-label={t('license.sealing')}>
+      <div><strong>{t('license.sealing')}</strong><p>{status.captureStopError || t('license.sealingDetail')}</p>
+        <button className="button" onClick={() => void window.recorder.getLicenseStatus?.().then((next) => setStatus((current) => (current?.transitionRevision ?? -1) > (next.transitionRevision ?? -1) ? current : next)).catch(() => undefined)}>{t('license.retrySeal')}</button>
+      </div>
+    </div></>;
   }
   if (status.state !== 'valid') {
     return <ActivateLicense status={status} onActivated={setStatus} />;
@@ -93,8 +118,8 @@ export function ActivateLicense({
   useEffect(() => {
     if (!window.recorder.listPendingLicenseSeals) return;
     void window.recorder.listPendingLicenseSeals()
-      .then((result) => setPending(result.recordings ?? []))
-      .catch(() => setPending([]));
+      .then((result) => { setPending(result.recordings ?? []); if (result.warning) setError(result.warning); })
+      .catch((error) => { setPending([]); setError(error instanceof Error ? error.message : String(error)); });
   }, []);
 
   async function copyMachineCode() {
@@ -160,7 +185,7 @@ export function ActivateLicense({
     <main id="main" className="license-stage">
       <section className="license-card" aria-labelledby="license-title">
         <h1 id="license-title">{reasonTitle(status.reason)}</h1>
-        <p>{t('license.body')}</p>
+        <p>{t(status.reason === 'state_invalid' ? 'license.errorState' : 'license.body')}</p>
         <label className="license-machine">
           <span>{t('license.machineCode')}</span>
           <div>

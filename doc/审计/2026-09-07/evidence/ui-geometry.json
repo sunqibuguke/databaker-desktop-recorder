@@ -1,0 +1,1056 @@
+{
+  "geometry": [
+    {
+      "name": "home-1366",
+      "viewport": {
+        "w": 1366,
+        "h": 768
+      },
+      "document": {
+        "scroll": 1366,
+        "client": 1366
+      },
+      "regions": [],
+      "covered": []
+    },
+    {
+      "name": "global-settings-1366",
+      "viewport": {
+        "w": 1366,
+        "h": 768
+      },
+      "document": {
+        "scroll": 1366,
+        "client": 1366
+      },
+      "regions": [],
+      "covered": []
+    },
+    {
+      "name": "setup-default-1366",
+      "viewport": {
+        "w": 1366,
+        "h": 768
+      },
+      "document": {
+        "scroll": 1366,
+        "client": 1366
+      },
+      "regions": [
+        {
+          "selector": ".recording-policy-fields",
+          "x": 413,
+          "y": 655.5,
+          "width": 726,
+          "height": 117.59375,
+          "bottom": 773.09375,
+          "right": 1139,
+          "scrollHeight": 100,
+          "clientHeight": 116
+        },
+        {
+          "selector": ".document-actions",
+          "x": 194,
+          "y": 670,
+          "width": 978,
+          "height": 60,
+          "bottom": 730,
+          "right": 1172,
+          "scrollHeight": 59,
+          "clientHeight": 59
+        }
+      ],
+      "covered": []
+    },
+    {
+      "name": "setup-enabled-1366",
+      "viewport": {
+        "w": 1366,
+        "h": 768
+      },
+      "document": {
+        "scroll": 1366,
+        "client": 1366
+      },
+      "regions": [
+        {
+          "selector": ".recording-policy-fields",
+          "x": 413,
+          "y": 332.5,
+          "width": 726,
+          "height": 219.1875,
+          "bottom": 551.6875,
+          "right": 1139,
+          "scrollHeight": 201,
+          "clientHeight": 217
+        },
+        {
+          "selector": ".document-actions",
+          "x": 194,
+          "y": 670,
+          "width": 978,
+          "height": 60,
+          "bottom": 730,
+          "right": 1172,
+          "scrollHeight": 59,
+          "clientHeight": 59
+        }
+      ],
+      "covered": []
+    },
+    {
+      "name": "setup-enabled-1080",
+      "viewport": {
+        "w": 1080,
+        "h": 700
+      },
+      "document": {
+        "scroll": 1080,
+        "client": 1080
+      },
+      "regions": [
+        {
+          "selector": ".recording-policy-fields",
+          "x": 248,
+          "y": 307.5,
+          "width": 748,
+          "height": 219.1875,
+          "bottom": 526.6875,
+          "right": 996,
+          "scrollHeight": 201,
+          "clientHeight": 217
+        },
+        {
+          "selector": ".document-actions",
+          "x": 51,
+          "y": 616,
+          "width": 978,
+          "height": 52,
+          "bottom": 668,
+          "right": 1029,
+          "scrollHeight": 51,
+          "clientHeight": 51
+        }
+      ],
+      "covered": []
+    },
+    {
+      "name": "input-audition-1080",
+      "viewport": {
+        "w": 1080,
+        "h": 700
+      },
+      "document": {
+        "scroll": 1080,
+        "client": 1080
+      },
+      "regions": [
+        {
+          "selector": ".editor-canvas",
+          "x": 220,
+          "y": 103,
+          "width": 574,
+          "height": 574,
+          "bottom": 677,
+          "right": 794,
+          "scrollHeight": 574,
+          "clientHeight": 574
+        },
+        {
+          "selector": ".script-monitor",
+          "x": 227,
+          "y": 110,
+          "width": 560,
+          "height": 344,
+          "bottom": 454,
+          "right": 787,
+          "scrollHeight": 342,
+          "clientHeight": 342
+        },
+        {
+          "selector": ".signal-monitor",
+          "x": 227,
+          "y": 460,
+          "width": 560,
+          "height": 130,
+          "bottom": 590,
+          "right": 787,
+          "scrollHeight": 128,
+          "clientHeight": 128
+        },
+        {
+          "selector": ".transport-panel",
+          "x": 227,
+          "y": 596,
+          "width": 560,
+          "height": 74,
+          "bottom": 670,
+          "right": 787,
+          "scrollHeight": 74,
+          "clientHeight": 72
+        }
+      ],
+      "covered": []
+    },
+    {
+      "name": "recording-warning-1080",
+      "viewport": {
+        "w": 1080,
+        "h": 700
+      },
+      "document": {
+        "scroll": 1080,
+        "client": 1080
+      },
+      "regions": [
+        {
+          "selector": ".editor-canvas",
+          "x": 220,
+          "y": 103,
+          "width": 574,
+          "height": 574,
+          "bottom": 677,
+          "right": 794,
+          "scrollHeight": 574,
+          "clientHeight": 574
+        },
+        {
+          "selector": ".script-monitor",
+          "x": 227,
+          "y": 110,
+          "width": 560,
+          "height": 344,
+          "bottom": 454,
+          "right": 787,
+          "scrollHeight": 342,
+          "clientHeight": 342
+        },
+        {
+          "selector": ".speech-quality-banner",
+          "x": 317,
+          "y": 117,
+          "width": 380,
+          "height": 33,
+          "bottom": 150,
+          "right": 697,
+          "scrollHeight": 33,
+          "clientHeight": 33
+        },
+        {
+          "selector": ".signal-monitor",
+          "x": 227,
+          "y": 460,
+          "width": 560,
+          "height": 130,
+          "bottom": 590,
+          "right": 787,
+          "scrollHeight": 128,
+          "clientHeight": 128
+        },
+        {
+          "selector": ".transport-panel",
+          "x": 227,
+          "y": 596,
+          "width": 560,
+          "height": 74,
+          "bottom": 670,
+          "right": 787,
+          "scrollHeight": 74,
+          "clientHeight": 72
+        }
+      ],
+      "covered": [
+        {
+          "label": "减小正文字号",
+          "x": 584.140625,
+          "y": 115,
+          "width": 23.859375,
+          "height": 20,
+          "bottom": 135,
+          "right": 608
+        },
+        {
+          "label": "增大正文字号",
+          "x": 614,
+          "y": 115,
+          "width": 27.5625,
+          "height": 20,
+          "bottom": 135,
+          "right": 641.5625
+        },
+        {
+          "label": "减小标签字号",
+          "x": 647.5625,
+          "y": 115,
+          "width": 23.859375,
+          "height": 20,
+          "bottom": 135,
+          "right": 671.421875
+        },
+        {
+          "label": "增大标签字号",
+          "x": 677.421875,
+          "y": 115,
+          "width": 27.5625,
+          "height": 20,
+          "bottom": 135,
+          "right": 704.984375
+        }
+      ]
+    },
+    {
+      "name": "review-warning-1080",
+      "viewport": {
+        "w": 1080,
+        "h": 700
+      },
+      "document": {
+        "scroll": 1080,
+        "client": 1080
+      },
+      "regions": [
+        {
+          "selector": ".editor-canvas",
+          "x": 220,
+          "y": 103,
+          "width": 574,
+          "height": 574,
+          "bottom": 677,
+          "right": 794,
+          "scrollHeight": 574,
+          "clientHeight": 574
+        },
+        {
+          "selector": ".script-monitor",
+          "x": 227,
+          "y": 110,
+          "width": 560,
+          "height": 285,
+          "bottom": 395,
+          "right": 787,
+          "scrollHeight": 283,
+          "clientHeight": 283
+        },
+        {
+          "selector": ".speech-quality-banner",
+          "x": 317,
+          "y": 117,
+          "width": 380,
+          "height": 33,
+          "bottom": 150,
+          "right": 697,
+          "scrollHeight": 33,
+          "clientHeight": 33
+        },
+        {
+          "selector": ".signal-monitor",
+          "x": 227,
+          "y": 401,
+          "width": 560,
+          "height": 130,
+          "bottom": 531,
+          "right": 787,
+          "scrollHeight": 128,
+          "clientHeight": 128
+        },
+        {
+          "selector": ".speech-review",
+          "x": 227,
+          "y": 617,
+          "width": 560,
+          "height": 53,
+          "bottom": 670,
+          "right": 787,
+          "scrollHeight": 52,
+          "clientHeight": 52
+        },
+        {
+          "selector": ".transport-panel",
+          "x": 227,
+          "y": 537,
+          "width": 560,
+          "height": 74,
+          "bottom": 611,
+          "right": 787,
+          "scrollHeight": 74,
+          "clientHeight": 72
+        }
+      ],
+      "covered": [
+        {
+          "label": "减小正文字号",
+          "x": 564.140625,
+          "y": 115,
+          "width": 23.859375,
+          "height": 20,
+          "bottom": 135,
+          "right": 588
+        },
+        {
+          "label": "增大正文字号",
+          "x": 594,
+          "y": 115,
+          "width": 27.5625,
+          "height": 20,
+          "bottom": 135,
+          "right": 621.5625
+        },
+        {
+          "label": "减小标签字号",
+          "x": 627.5625,
+          "y": 115,
+          "width": 23.859375,
+          "height": 20,
+          "bottom": 135,
+          "right": 651.421875
+        },
+        {
+          "label": "增大标签字号",
+          "x": 657.421875,
+          "y": 115,
+          "width": 27.5625,
+          "height": 20,
+          "bottom": 135,
+          "right": 684.984375
+        }
+      ]
+    },
+    {
+      "name": "review-warning-1366",
+      "viewport": {
+        "w": 1366,
+        "h": 768
+      },
+      "document": {
+        "scroll": 1366,
+        "client": 1366
+      },
+      "regions": [
+        {
+          "selector": ".editor-canvas",
+          "x": 248,
+          "y": 103,
+          "width": 804,
+          "height": 642,
+          "bottom": 745,
+          "right": 1052,
+          "scrollHeight": 642,
+          "clientHeight": 642
+        },
+        {
+          "selector": ".script-monitor",
+          "x": 258,
+          "y": 113,
+          "width": 784,
+          "height": 272.1875,
+          "bottom": 385.1875,
+          "right": 1042,
+          "scrollHeight": 270,
+          "clientHeight": 270
+        },
+        {
+          "selector": ".speech-quality-banner",
+          "x": 460,
+          "y": 117,
+          "width": 380,
+          "height": 33,
+          "bottom": 150,
+          "right": 840,
+          "scrollHeight": 33,
+          "clientHeight": 33
+        },
+        {
+          "selector": ".signal-monitor",
+          "x": 258,
+          "y": 393.1875,
+          "width": 784,
+          "height": 192.8125,
+          "bottom": 586,
+          "right": 1042,
+          "scrollHeight": 191,
+          "clientHeight": 191
+        },
+        {
+          "selector": ".speech-review",
+          "x": 258,
+          "y": 682,
+          "width": 784,
+          "height": 53,
+          "bottom": 735,
+          "right": 1042,
+          "scrollHeight": 52,
+          "clientHeight": 52
+        },
+        {
+          "selector": ".transport-panel",
+          "x": 258,
+          "y": 594,
+          "width": 784,
+          "height": 80,
+          "bottom": 674,
+          "right": 1042,
+          "scrollHeight": 80,
+          "clientHeight": 78
+        }
+      ],
+      "covered": [
+        {
+          "label": "减小正文字号",
+          "x": 679.140625,
+          "y": 118,
+          "width": 23.859375,
+          "height": 20,
+          "bottom": 138,
+          "right": 703
+        },
+        {
+          "label": "增大正文字号",
+          "x": 759,
+          "y": 118,
+          "width": 27.5625,
+          "height": 20,
+          "bottom": 138,
+          "right": 786.5625
+        },
+        {
+          "label": "减小标签字号",
+          "x": 824.5625,
+          "y": 118,
+          "width": 23.859375,
+          "height": 20,
+          "bottom": 138,
+          "right": 848.421875
+        }
+      ]
+    },
+    {
+      "name": "review-warning-1920",
+      "viewport": {
+        "w": 1920,
+        "h": 1080
+      },
+      "document": {
+        "scroll": 1920,
+        "client": 1920
+      },
+      "regions": [
+        {
+          "selector": ".editor-canvas",
+          "x": 248,
+          "y": 103,
+          "width": 1358,
+          "height": 954,
+          "bottom": 1057,
+          "right": 1606,
+          "scrollHeight": 954,
+          "clientHeight": 954
+        },
+        {
+          "selector": ".script-monitor",
+          "x": 258,
+          "y": 113,
+          "width": 1338,
+          "height": 454.828125,
+          "bottom": 567.828125,
+          "right": 1596,
+          "scrollHeight": 453,
+          "clientHeight": 453
+        },
+        {
+          "selector": ".speech-quality-banner",
+          "x": 737,
+          "y": 117,
+          "width": 380,
+          "height": 33,
+          "bottom": 150,
+          "right": 1117,
+          "scrollHeight": 33,
+          "clientHeight": 33
+        },
+        {
+          "selector": ".signal-monitor",
+          "x": 258,
+          "y": 575.828125,
+          "width": 1338,
+          "height": 322.15625,
+          "bottom": 897.984375,
+          "right": 1596,
+          "scrollHeight": 320,
+          "clientHeight": 320
+        },
+        {
+          "selector": ".speech-review",
+          "x": 258,
+          "y": 993.984375,
+          "width": 1338,
+          "height": 53.015625,
+          "bottom": 1047,
+          "right": 1596,
+          "scrollHeight": 52,
+          "clientHeight": 52
+        },
+        {
+          "selector": ".transport-panel",
+          "x": 258,
+          "y": 905.984375,
+          "width": 1338,
+          "height": 80,
+          "bottom": 985.984375,
+          "right": 1596,
+          "scrollHeight": 80,
+          "clientHeight": 78
+        }
+      ],
+      "covered": []
+    },
+    {
+      "name": "task-settings-1366",
+      "viewport": {
+        "w": 1366,
+        "h": 768
+      },
+      "document": {
+        "scroll": 1366,
+        "client": 1366
+      },
+      "regions": [
+        {
+          "selector": ".editor-canvas",
+          "x": 248,
+          "y": 103,
+          "width": 804,
+          "height": 642,
+          "bottom": 745,
+          "right": 1052,
+          "scrollHeight": 642,
+          "clientHeight": 642
+        },
+        {
+          "selector": ".script-monitor",
+          "x": 258,
+          "y": 113,
+          "width": 784,
+          "height": 272.1875,
+          "bottom": 385.1875,
+          "right": 1042,
+          "scrollHeight": 270,
+          "clientHeight": 270
+        },
+        {
+          "selector": ".speech-quality-banner",
+          "x": 460,
+          "y": 117,
+          "width": 380,
+          "height": 33,
+          "bottom": 150,
+          "right": 840,
+          "scrollHeight": 33,
+          "clientHeight": 33
+        },
+        {
+          "selector": ".signal-monitor",
+          "x": 258,
+          "y": 393.1875,
+          "width": 784,
+          "height": 192.8125,
+          "bottom": 586,
+          "right": 1042,
+          "scrollHeight": 191,
+          "clientHeight": 191
+        },
+        {
+          "selector": ".speech-review",
+          "x": 258,
+          "y": 682,
+          "width": 784,
+          "height": 53,
+          "bottom": 735,
+          "right": 1042,
+          "scrollHeight": 52,
+          "clientHeight": 52
+        },
+        {
+          "selector": ".transport-panel",
+          "x": 258,
+          "y": 594,
+          "width": 784,
+          "height": 80,
+          "bottom": 674,
+          "right": 1042,
+          "scrollHeight": 80,
+          "clientHeight": 78
+        },
+        {
+          "selector": ".recording-policy-fields",
+          "x": 1065,
+          "y": 125,
+          "width": 235,
+          "height": 356.15625,
+          "bottom": 481.15625,
+          "right": 1300,
+          "scrollHeight": 338,
+          "clientHeight": 354
+        }
+      ],
+      "covered": [
+        {
+          "label": "减小正文字号",
+          "x": 679.140625,
+          "y": 118,
+          "width": 23.859375,
+          "height": 20,
+          "bottom": 138,
+          "right": 703
+        },
+        {
+          "label": "增大正文字号",
+          "x": 759,
+          "y": 118,
+          "width": 27.5625,
+          "height": 20,
+          "bottom": 138,
+          "right": 786.5625
+        },
+        {
+          "label": "减小标签字号",
+          "x": 824.5625,
+          "y": 118,
+          "width": 23.859375,
+          "height": 20,
+          "bottom": 138,
+          "right": 848.421875
+        }
+      ]
+    },
+    {
+      "name": "restore-new-policy",
+      "disabled": true,
+      "value": "-20"
+    },
+    {
+      "name": "detection-1366",
+      "viewport": {
+        "w": 1366,
+        "h": 768
+      },
+      "document": {
+        "scroll": 1366,
+        "client": 1366
+      },
+      "regions": [
+        {
+          "selector": ".editor-canvas",
+          "x": 248,
+          "y": 103,
+          "width": 804,
+          "height": 642,
+          "bottom": 745,
+          "right": 1052,
+          "scrollHeight": 642,
+          "clientHeight": 642
+        },
+        {
+          "selector": ".script-monitor",
+          "x": 258,
+          "y": 113,
+          "width": 784,
+          "height": 272.1875,
+          "bottom": 385.1875,
+          "right": 1042,
+          "scrollHeight": 270,
+          "clientHeight": 270
+        },
+        {
+          "selector": ".speech-quality-banner",
+          "x": 460,
+          "y": 117,
+          "width": 380,
+          "height": 33,
+          "bottom": 150,
+          "right": 840,
+          "scrollHeight": 33,
+          "clientHeight": 33
+        },
+        {
+          "selector": ".signal-monitor",
+          "x": 258,
+          "y": 393.1875,
+          "width": 784,
+          "height": 192.8125,
+          "bottom": 586,
+          "right": 1042,
+          "scrollHeight": 191,
+          "clientHeight": 191
+        },
+        {
+          "selector": ".speech-review",
+          "x": 258,
+          "y": 682,
+          "width": 784,
+          "height": 53,
+          "bottom": 735,
+          "right": 1042,
+          "scrollHeight": 52,
+          "clientHeight": 52
+        },
+        {
+          "selector": ".transport-panel",
+          "x": 258,
+          "y": 594,
+          "width": 784,
+          "height": 80,
+          "bottom": 674,
+          "right": 1042,
+          "scrollHeight": 80,
+          "clientHeight": 78
+        }
+      ],
+      "covered": [
+        {
+          "label": "减小正文字号",
+          "x": 679.140625,
+          "y": 118,
+          "width": 23.859375,
+          "height": 20,
+          "bottom": 138,
+          "right": 703
+        },
+        {
+          "label": "增大正文字号",
+          "x": 759,
+          "y": 118,
+          "width": 27.5625,
+          "height": 20,
+          "bottom": 138,
+          "right": 786.5625
+        },
+        {
+          "label": "减小标签字号",
+          "x": 824.5625,
+          "y": 118,
+          "width": 23.859375,
+          "height": 20,
+          "bottom": 138,
+          "right": 848.421875
+        }
+      ]
+    },
+    {
+      "name": "issues-1366",
+      "viewport": {
+        "w": 1366,
+        "h": 768
+      },
+      "document": {
+        "scroll": 1366,
+        "client": 1366
+      },
+      "regions": [
+        {
+          "selector": ".editor-canvas",
+          "x": 248,
+          "y": 103,
+          "width": 804,
+          "height": 642,
+          "bottom": 745,
+          "right": 1052,
+          "scrollHeight": 642,
+          "clientHeight": 642
+        },
+        {
+          "selector": ".script-monitor",
+          "x": 258,
+          "y": 113,
+          "width": 784,
+          "height": 272.1875,
+          "bottom": 385.1875,
+          "right": 1042,
+          "scrollHeight": 270,
+          "clientHeight": 270
+        },
+        {
+          "selector": ".speech-quality-banner",
+          "x": 460,
+          "y": 117,
+          "width": 380,
+          "height": 33,
+          "bottom": 150,
+          "right": 840,
+          "scrollHeight": 33,
+          "clientHeight": 33
+        },
+        {
+          "selector": ".signal-monitor",
+          "x": 258,
+          "y": 393.1875,
+          "width": 784,
+          "height": 192.8125,
+          "bottom": 586,
+          "right": 1042,
+          "scrollHeight": 191,
+          "clientHeight": 191
+        },
+        {
+          "selector": ".speech-review",
+          "x": 258,
+          "y": 682,
+          "width": 784,
+          "height": 53,
+          "bottom": 735,
+          "right": 1042,
+          "scrollHeight": 52,
+          "clientHeight": 52
+        },
+        {
+          "selector": ".transport-panel",
+          "x": 258,
+          "y": 594,
+          "width": 784,
+          "height": 80,
+          "bottom": 674,
+          "right": 1042,
+          "scrollHeight": 80,
+          "clientHeight": 78
+        }
+      ],
+      "covered": [
+        {
+          "label": "减小正文字号",
+          "x": 679.140625,
+          "y": 118,
+          "width": 23.859375,
+          "height": 20,
+          "bottom": 138,
+          "right": 703
+        },
+        {
+          "label": "增大正文字号",
+          "x": 759,
+          "y": 118,
+          "width": 27.5625,
+          "height": 20,
+          "bottom": 138,
+          "right": 786.5625
+        },
+        {
+          "label": "减小标签字号",
+          "x": 824.5625,
+          "y": 118,
+          "width": 23.859375,
+          "height": 20,
+          "bottom": 138,
+          "right": 848.421875
+        }
+      ]
+    },
+    {
+      "name": "export-1366",
+      "viewport": {
+        "w": 1366,
+        "h": 768
+      },
+      "document": {
+        "scroll": 1366,
+        "client": 1366
+      },
+      "regions": [
+        {
+          "selector": ".editor-canvas",
+          "x": 248,
+          "y": 103,
+          "width": 804,
+          "height": 642,
+          "bottom": 745,
+          "right": 1052,
+          "scrollHeight": 642,
+          "clientHeight": 642
+        },
+        {
+          "selector": ".script-monitor",
+          "x": 258,
+          "y": 113,
+          "width": 784,
+          "height": 272.1875,
+          "bottom": 385.1875,
+          "right": 1042,
+          "scrollHeight": 270,
+          "clientHeight": 270
+        },
+        {
+          "selector": ".speech-quality-banner",
+          "x": 460,
+          "y": 117,
+          "width": 380,
+          "height": 33,
+          "bottom": 150,
+          "right": 840,
+          "scrollHeight": 33,
+          "clientHeight": 33
+        },
+        {
+          "selector": ".signal-monitor",
+          "x": 258,
+          "y": 393.1875,
+          "width": 784,
+          "height": 192.8125,
+          "bottom": 586,
+          "right": 1042,
+          "scrollHeight": 191,
+          "clientHeight": 191
+        },
+        {
+          "selector": ".speech-review",
+          "x": 258,
+          "y": 682,
+          "width": 784,
+          "height": 53,
+          "bottom": 735,
+          "right": 1042,
+          "scrollHeight": 52,
+          "clientHeight": 52
+        },
+        {
+          "selector": ".transport-panel",
+          "x": 258,
+          "y": 594,
+          "width": 784,
+          "height": 80,
+          "bottom": 674,
+          "right": 1042,
+          "scrollHeight": 80,
+          "clientHeight": 78
+        }
+      ],
+      "covered": [
+        {
+          "label": "减小正文字号",
+          "x": 679.140625,
+          "y": 118,
+          "width": 23.859375,
+          "height": 20,
+          "bottom": 138,
+          "right": 703
+        },
+        {
+          "label": "增大正文字号",
+          "x": 759,
+          "y": 118,
+          "width": 27.5625,
+          "height": 20,
+          "bottom": 138,
+          "right": 786.5625
+        },
+        {
+          "label": "减小标签字号",
+          "x": 824.5625,
+          "y": 118,
+          "width": 23.859375,
+          "height": 20,
+          "bottom": 138,
+          "right": 848.421875
+        }
+      ]
+    }
+  ],
+  "errors": []
+}
