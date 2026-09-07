@@ -452,7 +452,9 @@ async function runScenario() {
       assert.equal(dialogCalls.length, 1, 'the retry must not silently bypass through an idle helper');
     }
   } finally {
-    await fs.rm(root, { recursive: true, force: true });
+    // Pending log writes or Windows file handles may briefly race teardown.
+    // Retry transient cleanup errors, but still fail if cleanup cannot finish.
+    await fs.rm(root, { recursive: true, force: true, maxRetries: 8, retryDelay: 50 });
   }
 }
 
