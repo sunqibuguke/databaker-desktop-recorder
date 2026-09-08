@@ -1,4 +1,4 @@
-import { DEFAULT_RECORDING_POLICY, validRecordingPolicy, type RecordingPolicy, type SpeechQuality, type StoppedAttempt } from './recording-policy';
+import { DEFAULT_RECORDING_POLICY, recordingPolicyForTask, validRecordingPolicy, type RecordingPolicy, type SpeechQuality, type StoppedAttempt } from './recording-policy';
 import type { DebugLogDraft, DebugLogEntry, DebugLogSnapshot } from './debug-log';
 import { formatDebugLogText } from './debug-log';
 import {
@@ -438,7 +438,12 @@ export function installDevRecorderMock() {
       takeQuality.rms_dbfs = -20;
       takeQuality.peak_dbfs = -9;
       takeQuality.warnings = [ ...(takePolicy.rms_min_dbfs > -20 ? ['speech_low'] : []), ...(takePolicy.peak_max_dbfs < -9 ? ['speech_high'] : []) ];
-      takeQuality.live_warnings = takeQuality.warnings;
+      if (takePolicy.peak_samp) {
+        takeQuality.peak_samp = 11627; // round(32768 * 10 ** (-9 / 20)), synthetic PCM16 peak
+        takeQuality.peak_dbfs = 20 * Math.log10(takeQuality.peak_samp / 32768);
+        takeQuality.warnings = [ ...(takeQuality.peak_samp < takePolicy.peak_samp.min ? ['speech_low'] : []), ...(takeQuality.peak_samp > takePolicy.peak_samp.max ? ['speech_high'] : []) ];
+        takeQuality.live_warnings = takeQuality.warnings.filter(code => code === 'speech_high');
+      } else takeQuality.live_warnings = takeQuality.warnings;
     }
     if (activeAttempt && takePolicy.auto_end && firstAttemptSignalSample && lastSignalSample && !speaking && !autoEndBoundary
       && capturedSamples >= lastSignalSample + activeAttempt.required_head_silence_samples) {
@@ -467,7 +472,9 @@ export function installDevRecorderMock() {
       input_discontinuity_silence_samples: inputDiscontinuitySilenceSamples,
       storage_status: 'healthy',
       storage_safe_remaining_seconds: 12 * 60 * 60,
-      speech_quality: takeQuality,
+      speech_quality: takeQuality?.policy.peak_samp
+        ? { ...takeQuality, warnings: takeQuality.warnings.filter(code => code !== 'speech_low') }
+        : takeQuality,
       peak: pulse,
       rms: pulse * .42,
       silence_samples: silenceSamples,
@@ -523,8 +530,9 @@ export function installDevRecorderMock() {
       const requestedDevice = mockDevices.find((device) => device.id === String(data.device_id));
       if (!requestedDevice) throw new Error('未找到指定的录音设备');
       const now = new Date().toISOString();
+      if (!validRecordingPolicy(recordingPolicyForTask(data.recording_policy as RecordingPolicy), Number(data.bit_depth))) throw new Error('16-bit 峰值设置无效');
       snapshot = {
-        recording_policy: { ...DEFAULT_RECORDING_POLICY, ...(data.recording_policy as Partial<RecordingPolicy>) },
+        recording_policy: recordingPolicyForTask(data.recording_policy as RecordingPolicy),
         schema_version: 1,
         journal_seq: 1,
         session_id: String(data.session_id),
@@ -906,13 +914,13 @@ export function installDevRecorderMock() {
     }
     if (command === 'set_session_recording_policy') {
       if (data.expected_journal_seq !== snapshot.journal_seq || data.expected_session_id !== snapshot.session_id) throw new Error('任务已变更');
-      if (!validRecordingPolicy(data.recording_policy as RecordingPolicy)) throw new Error('人声幅值设置无效');
+      if (!validRecordingPolicy(data.recording_policy as RecordingPolicy, snapshot.audio_format.bit_depth)) throw new Error('人声幅值设置无效');
       snapshot.recording_policy = { ...(data.recording_policy as RecordingPolicy) };
       snapshot.journal_seq += 1;
       return { snapshot: snapshotCopy() } as T;
     }
     if (command === 'set_recording_policy') {
-      if (!validRecordingPolicy(data as RecordingPolicy)) throw new Error('人声幅值设置无效');
+      if (!validRecordingPolicy(data as RecordingPolicy, snapshot.audio_format.bit_depth)) throw new Error('人声幅值设置无效');
       snapshot.recording_policy = { ...data } as RecordingPolicy;
       snapshot.journal_seq += 1;
       return { snapshot: snapshotCopy(), applies_from: 'next_attempt' } as T;
@@ -971,7 +979,7 @@ export function installDevRecorderMock() {
     if (command === 'start_attempt') {
       if (!captureActive || snapshot.status !== 'recording') throw new Error('当前任务未进入采集状态');
       if (activeAttempt) throw new Error('已有录音正在进行');
-      takePolicy = { ...DEFAULT_RECORDING_POLICY, ...snapshot.recording_policy };
+      takePolicy = recordingPolicyForTask(snapshot.recording_policy);
       autoEndBoundary = 0;
       takeQuality = takePolicy.amplitude_enabled ? { policy: { ...takePolicy }, speech_samples: 0,
         rms_dbfs: null, peak_dbfs: null, warnings: [], live_warnings: [], retained_by_operator_at: null } : null;

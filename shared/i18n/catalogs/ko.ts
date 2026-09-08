@@ -4,6 +4,20 @@ import { inputAuditionCopy } from './input-audition.ts';
 
 const ko: MessageTree = {
   speech: {
+    "unit": "진폭 단위",
+    "peakMin": "음성 피크 하한({unit})",
+    "peakUpper": "음성 피크 상한({unit})",
+    "peakReference": "16-bit PCM 음성 샘플의 최대 절댓값입니다. 기본값은 3000~20000 samp이며 프로젝트 요구에 맞게 조정하세요.",
+    "peakTiming": "상한 초과는 즉시, 하한 미만은 문장 녹음 종료 후 알립니다. 경계값과 같으면 통과합니다.",
+    "pcm16Only": "샘플 피크 검사는 16-bit PCM만 지원합니다. 저장 비트 깊이를 변경하거나 검사를 끄세요.",
+    "canonicalSamp": "판정 범위: {min}~{max} samp(단위 전환 시 기준값 유지)",
+    "legacyMode": "이 작업은 기존 RMS 하한/PEAK 상한 검사를 유지합니다. 이전 결과는 바뀌지 않습니다.",
+    "usePeak": "16-bit 피크 검사 사용",
+    "peakMetrics": "음성 피크 {value} {unit}",
+    "peakLowReason": "음성 피크 {value} samp가 이번 하한 {min} samp보다 낮습니다",
+    "peakHighReason": "음성 피크 {value} samp가 이번 상한 {max} samp를 초과합니다",
+    "peakInvalid": "기준값은 1~32766 samp 정수이며 하한이 상한보다 작아야 합니다. 16-bit PCM 전용입니다.",
+
     "lowReason": "음성 RMS {value} dBFS가 이번 녹음의 하한 {limit} dBFS보다 낮습니다",
     "highReason": "음성 PEAK {value} dBFS가 이번 녹음의 상한 {limit} dBFS를 초과합니다",
     "liveLowReason": "녹음 중 낮은 음량이 지속되었습니다(RMS 하한 {limit} dBFS)",

@@ -2000,6 +2000,7 @@ impl Engine {
         policy.validate()?;
         let session = self.active_session_mut()?;
         session.ensure_metadata_mutation_allowed()?;
+        policy.validate_for_depth(session.snapshot.audio_format.bit_depth)?;
         session.snapshot.recording_policy = policy.clone();
         session.persist(
             "recording_policy_changed",
@@ -2030,6 +2031,7 @@ impl Engine {
             snapshot.journal_seq == expected_journal_seq,
             "任务已变更，请刷新后重试"
         );
+        policy.validate_for_depth(snapshot.audio_format.bit_depth)?;
         snapshot.recording_policy = policy.clone();
         persist_offline_snapshot(
             session_dir,
@@ -2243,7 +2245,9 @@ impl Engine {
     }
 
     pub fn create_session(&self, payload: StartSessionPayload) -> Result<Value> {
-        payload.recording_policy.validate()?;
+        payload
+            .recording_policy
+            .validate_for_depth(payload.bit_depth)?;
         require_explicit_input_device_id(payload.device_id.as_deref(), "创建录制任务")?;
         let (session_dir, mut snapshot) = self.prepare_new_session(payload, None)?;
         snapshot.status = "stopped".to_string();
@@ -2410,7 +2414,9 @@ impl Engine {
         payload: StartSessionPayload,
         segment_frames_override: Option<u64>,
     ) -> Result<(PathBuf, SessionSnapshot)> {
-        payload.recording_policy.validate()?;
+        payload
+            .recording_policy
+            .validate_for_depth(payload.bit_depth)?;
         if self.session.is_some() {
             bail!("当前已有录制进行中");
         }
@@ -3626,7 +3632,7 @@ impl Engine {
                             );
                         last_fault_marker_attempt = Instant::now();
                     }
-                    let speech_quality = head_silence_thread.speech_meter.lock().unwrap().result();
+                    let speech_quality = head_silence_thread.speech_meter.lock().unwrap().live_result();
                     emitter.event(
                         "meter",
                         json!({
@@ -7557,7 +7563,9 @@ fn validate_snapshot_for_cut_scope(snapshot: &SessionSnapshot, scope: ExportScop
 }
 
 fn validate_snapshot_identifiers(snapshot: &SessionSnapshot) -> Result<()> {
-    snapshot.recording_policy.validate()?;
+    snapshot
+        .recording_policy
+        .validate_for_depth(snapshot.audio_format.bit_depth)?;
     let mut item_ids = std::collections::HashSet::<&str>::new();
     for item in &snapshot.items {
         if item.id.trim().is_empty() || !item_ids.insert(item.id.as_str()) {
@@ -12751,160 +12759,180 @@ mod tests {
                 remaining -= count;
             }
         }
-        for detector in ["energy", "vad"] {
-            let root = test_root(&format!("short-take-{detector}"));
-            std::fs::remove_dir_all(&root).unwrap();
-            let mut engine = Engine::new(Emitter::new());
-            let policy = crate::speech_quality::RecordingPolicy {
-                amplitude_enabled: true,
-                auto_end: true,
-                rms_min_dbfs: -1.0,
-                peak_max_dbfs: -0.5,
-            };
-            let payload: StartSessionPayload = serde_json::from_value(json!({
-                "session_dir": root, "session_id": format!("short-take-{detector}"),
-                "device_name": "test", "sample_rate": 48000, "bit_depth": 16,
-                "silence_duration_ms": 200, "silence_threshold_dbfs": -42.0,
-                "silence_detector": detector, "recording_policy": policy,
-                "items": [{"id": "001", "text": "唤醒词"}]
-            }))
-            .unwrap();
-            engine
-                .start_system_test_session(SystemTestStartSessionPayload {
-                    session: payload,
-                    segment_frames: 48_000,
-                })
+        for samp_mode in [false, true] {
+            for detector in ["energy", "vad"] {
+                let root = test_root(&format!("short-take-{detector}-{samp_mode}"));
+                std::fs::remove_dir_all(&root).unwrap();
+                let mut engine = Engine::new(Emitter::new());
+                let policy = crate::speech_quality::RecordingPolicy {
+                    amplitude_enabled: true,
+                    auto_end: true,
+                    rms_min_dbfs: -1.0,
+                    peak_max_dbfs: -0.5,
+                    peak_samp: samp_mode.then_some(crate::speech_quality::PeakSampPolicy {
+                        min: 30000,
+                        max: 32000,
+                        unit: crate::speech_quality::AmplitudeUnit::Samp,
+                    }),
+                };
+                let payload: StartSessionPayload = serde_json::from_value(json!({
+                    "session_dir": root, "session_id": format!("short-take-{detector}-{samp_mode}"),
+                    "device_name": "test", "sample_rate": 48000, "bit_depth": 16,
+                    "silence_duration_ms": 200, "silence_threshold_dbfs": -42.0,
+                    "silence_detector": detector, "recording_policy": policy,
+                    "items": [{"id": "001", "text": "唤醒词"}]
+                }))
                 .unwrap();
-            engine.skip_input_audition(None).unwrap();
-            let started = engine.start_attempt("001", true).unwrap();
-            let id = started["attempt_id"].as_str().unwrap().to_string();
-            feed(&mut engine, 14_400, 7, SystemTestSignalPattern::Silence);
-            engine.complete_auto_attempt().unwrap();
-            assert!(engine.session.as_ref().unwrap().active_attempt.is_some());
-            feed(&mut engine, 48_000, 7, SystemTestSignalPattern::Speech);
-            // Changes are saved for the next take, including the silence interval.
-            engine.set_recording_policy(Default::default()).unwrap();
-            let changed = engine
-                .set_silence_settings(SetSilenceSettingsPayload {
-                    threshold_dbfs: -40.0,
-                    silence_duration_ms: 1_000,
-                    silence_detector: None,
-                    enforce_silence: None,
-                })
-                .unwrap();
-            assert_eq!(changed["reset_kind"], "next_attempt");
-            feed(&mut engine, 96_000, 8, SystemTestSignalPattern::Silence);
-            let session = engine.session.as_ref().unwrap();
-            let end = session.head_silence.end_sample.load(Ordering::Acquire);
-            assert!(
-                end > 0,
-                "{detector} did not latch an endpoint: last={}, analyzed={}, phase={}, enabled={}",
-                session.last_signal_sample.load(Ordering::Acquire),
-                session.analyzed_samples.load(Ordering::Acquire),
-                session.head_silence.phase.load(Ordering::Acquire),
-                session.head_silence.auto_end.load(Ordering::Acquire)
-            );
-            let quality_before = session
-                .head_silence
-                .speech_meter
-                .lock()
-                .unwrap()
-                .result()
-                .unwrap();
-            feed(&mut engine, 48_000, 9, SystemTestSignalPattern::Speech);
-            engine.complete_auto_attempt().unwrap();
-            let stopped = engine
-                .stop_attempt_identified(Some(&id), false, true, true)
-                .unwrap();
-            assert_eq!(stopped["already_stopped"], true);
-            assert_eq!(stopped["attempt"]["end_sample"], end);
-            assert_eq!(stopped["attempt"]["end_reason"], "auto_silence");
-            assert_eq!(stopped["attempt"]["required_tail_silence_samples"], 9_600);
-            assert_eq!(stopped["attempt"]["speech_quality"], json!(quality_before));
-            assert!(quality_before.speech_samples > 0 && quality_before.has_warning());
-            assert!(
                 engine
-                    .session
-                    .as_ref()
-                    .unwrap()
-                    .captured
-                    .load(Ordering::Acquire)
-                    > end
-            );
-            engine.accept_attempt("001", &id).unwrap();
-            let persisted: SessionSnapshot = serde_json::from_slice(
-                &std::fs::read(root.join("metadata/items.snapshot.json")).unwrap(),
-            )
-            .unwrap();
-            assert!(
-                persisted.items[0].attempts[0]
-                    .speech_quality
-                    .as_ref()
-                    .unwrap()
-                    .retained_by_operator_at
-                    .is_some()
-            );
-            engine.start_attempt("001", false).unwrap();
-            engine
-                .stop_attempt_identified(Some(&id), true, true, false)
-                .unwrap();
-            assert!(
-                engine.session.as_ref().unwrap().active_attempt.is_some(),
-                "stale stop must not close a new take"
-            );
-            assert!(
-                !engine
-                    .session
-                    .as_ref()
-                    .unwrap()
+                    .start_system_test_session(SystemTestStartSessionPayload {
+                        session: payload,
+                        segment_frames: 48_000,
+                    })
+                    .unwrap();
+                engine.skip_input_audition(None).unwrap();
+                let started = engine.start_attempt("001", true).unwrap();
+                let id = started["attempt_id"].as_str().unwrap().to_string();
+                feed(&mut engine, 14_400, 7, SystemTestSignalPattern::Silence);
+                engine.complete_auto_attempt().unwrap();
+                assert!(engine.session.as_ref().unwrap().active_attempt.is_some());
+                feed(&mut engine, 48_000, 7, SystemTestSignalPattern::Speech);
+                // Changes are saved for the next take, including the silence interval.
+                engine.set_recording_policy(Default::default()).unwrap();
+                let changed = engine
+                    .set_silence_settings(SetSilenceSettingsPayload {
+                        threshold_dbfs: -40.0,
+                        silence_duration_ms: 1_000,
+                        silence_detector: None,
+                        enforce_silence: None,
+                    })
+                    .unwrap();
+                assert_eq!(changed["reset_kind"], "next_attempt");
+                feed(&mut engine, 96_000, 8, SystemTestSignalPattern::Silence);
+                let session = engine.session.as_ref().unwrap();
+                let end = session.head_silence.end_sample.load(Ordering::Acquire);
+                assert!(
+                    end > 0,
+                    "{detector} did not latch an endpoint: last={}, analyzed={}, phase={}, enabled={}",
+                    session.last_signal_sample.load(Ordering::Acquire),
+                    session.analyzed_samples.load(Ordering::Acquire),
+                    session.head_silence.phase.load(Ordering::Acquire),
+                    session.head_silence.auto_end.load(Ordering::Acquire)
+                );
+                let quality_before = session
                     .head_silence
-                    .auto_end
-                    .load(Ordering::Acquire)
-            );
-            engine.stop_attempt(true, true, false).unwrap();
-            engine.stop_session().unwrap();
-            let saved: SessionSnapshot = serde_json::from_slice(
-                &std::fs::read(root.join("metadata/items.snapshot.json")).unwrap(),
-            )
-            .unwrap();
-            assert!(
+                    .speech_meter
+                    .lock()
+                    .unwrap()
+                    .result()
+                    .unwrap();
+                feed(&mut engine, 48_000, 9, SystemTestSignalPattern::Speech);
+                engine.complete_auto_attempt().unwrap();
+                let stopped = engine
+                    .stop_attempt_identified(Some(&id), false, true, true)
+                    .unwrap();
+                assert_eq!(stopped["already_stopped"], true);
+                assert_eq!(stopped["attempt"]["end_sample"], end);
+                assert_eq!(stopped["attempt"]["end_reason"], "auto_silence");
+                assert_eq!(stopped["attempt"]["required_tail_silence_samples"], 9_600);
+                assert_eq!(stopped["attempt"]["speech_quality"], json!(quality_before));
+                assert!(quality_before.speech_samples > 0 && quality_before.has_warning());
+                assert!(
+                    engine
+                        .session
+                        .as_ref()
+                        .unwrap()
+                        .captured
+                        .load(Ordering::Acquire)
+                        > end
+                );
+                if samp_mode {
+                    let quality = engine.session.as_ref().unwrap().snapshot.items[0].attempts[0]
+                        .speech_quality
+                        .as_ref()
+                        .unwrap();
+                    assert!(
+                        quality
+                            .peak_samp
+                            .is_some_and(|value| value > 0 && value < 30000)
+                    );
+                    assert!(quality.warnings.contains(&"speech_low".to_string()));
+                    assert!(!quality.live_warnings.contains(&"speech_low".to_string()));
+                }
+                engine.accept_attempt("001", &id).unwrap();
+                let persisted: SessionSnapshot = serde_json::from_slice(
+                    &std::fs::read(root.join("metadata/items.snapshot.json")).unwrap(),
+                )
+                .unwrap();
+                assert!(
+                    persisted.items[0].attempts[0]
+                        .speech_quality
+                        .as_ref()
+                        .unwrap()
+                        .retained_by_operator_at
+                        .is_some()
+                );
+                engine.start_attempt("001", false).unwrap();
                 engine
-                    .set_session_recording_policy(
-                        &root,
-                        "wrong-task",
-                        saved.journal_seq,
-                        policy.clone()
-                    )
-                    .is_err()
-            );
-            assert!(
-                engine
+                    .stop_attempt_identified(Some(&id), true, true, false)
+                    .unwrap();
+                assert!(
+                    engine.session.as_ref().unwrap().active_attempt.is_some(),
+                    "stale stop must not close a new take"
+                );
+                assert!(
+                    !engine
+                        .session
+                        .as_ref()
+                        .unwrap()
+                        .head_silence
+                        .auto_end
+                        .load(Ordering::Acquire)
+                );
+                engine.stop_attempt(true, true, false).unwrap();
+                engine.stop_session().unwrap();
+                let saved: SessionSnapshot = serde_json::from_slice(
+                    &std::fs::read(root.join("metadata/items.snapshot.json")).unwrap(),
+                )
+                .unwrap();
+                assert!(
+                    engine
+                        .set_session_recording_policy(
+                            &root,
+                            "wrong-task",
+                            saved.journal_seq,
+                            policy.clone()
+                        )
+                        .is_err()
+                );
+                assert!(
+                    engine
+                        .set_session_recording_policy(
+                            &root,
+                            &saved.session_id,
+                            saved.journal_seq.saturating_sub(1),
+                            policy.clone()
+                        )
+                        .is_err()
+                );
+                let updated = engine
                     .set_session_recording_policy(
                         &root,
                         &saved.session_id,
-                        saved.journal_seq.saturating_sub(1),
-                        policy.clone()
+                        saved.journal_seq,
+                        policy.clone(),
                     )
-                    .is_err()
-            );
-            let updated = engine
-                .set_session_recording_policy(
-                    &root,
-                    &saved.session_id,
-                    saved.journal_seq,
-                    policy.clone(),
-                )
-                .unwrap();
-            assert_eq!(updated["snapshot"]["recording_policy"], json!(policy));
-            assert_eq!(
-                updated["snapshot"]["items"][0]["attempts"][0],
-                json!(saved.items[0].attempts[0])
-            );
-            assert_eq!(
-                saved.items[0].attempts[0].speech_quality,
-                persisted.items[0].attempts[0].speech_quality
-            );
-            let _ = std::fs::remove_dir_all(root);
+                    .unwrap();
+                assert_eq!(updated["snapshot"]["recording_policy"], json!(policy));
+                assert_eq!(
+                    updated["snapshot"]["items"][0]["attempts"][0],
+                    json!(saved.items[0].attempts[0])
+                );
+                assert_eq!(
+                    saved.items[0].attempts[0].speech_quality,
+                    persisted.items[0].attempts[0].speech_quality
+                );
+                let _ = std::fs::remove_dir_all(root);
+            }
         }
     }
 

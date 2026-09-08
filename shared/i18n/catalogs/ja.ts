@@ -4,6 +4,20 @@ import { inputAuditionCopy } from './input-audition.ts';
 
 const ja: MessageTree = {
   speech: {
+    "unit": "振幅の単位",
+    "peakMin": "音声ピーク下限（{unit}）",
+    "peakUpper": "音声ピーク上限（{unit}）",
+    "peakReference": "16-bit PCM の音声サンプルの最大絶対値。初期値は 3000～20000 samp。案件の要件に合わせて調整してください。",
+    "peakTiming": "上限超過は即時、下限未満は文の録音終了後に通知します。境界値と等しい場合は合格です。",
+    "pcm16Only": "サンプルピーク検査は 16-bit PCM 専用です。保存ビット深度を変更するか検査を無効にしてください。",
+    "canonicalSamp": "判定範囲：{min}～{max} samp（単位切替で閾値は変わりません）",
+    "legacyMode": "このタスクは従来の RMS 下限／PEAK 上限検査を使用します。過去の結果は変更しません。",
+    "usePeak": "16-bit ピーク検査に切替",
+    "peakMetrics": "音声ピーク {value} {unit}",
+    "peakLowReason": "音声ピーク {value} samp は今回の下限 {min} samp 未満です",
+    "peakHighReason": "音声ピーク {value} samp は今回の上限 {max} samp を超えています",
+    "peakInvalid": "閾値は 1～32766 samp の整数で、下限は上限未満にしてください。16-bit PCM 専用です。",
+
     "lowReason": "音声 RMS {value} dBFS は今回の下限 {limit} dBFS 未満です",
     "highReason": "音声 PEAK {value} dBFS は今回の上限 {limit} dBFS を超えています",
     "liveLowReason": "録音中に低音量が持続しました（RMS 下限 {limit} dBFS）",

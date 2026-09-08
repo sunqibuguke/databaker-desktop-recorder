@@ -11,7 +11,7 @@ from reportlab.graphics.shapes import Drawing, Rect, String, Line
 import build_manual as b
 
 ROOT = Path(__file__).resolve().parent
-OUT = ROOT.parent.parent / 'output/pdf/标贝音频采集_新增功能快速上手_2026-09-07.pdf'
+OUT = ROOT.parent.parent / 'output/pdf/标贝音频采集_新增功能快速上手_2026-09-08.pdf'
 W = 174 * mm
 TEAL = colors.HexColor('#277E79')
 INK = colors.HexColor('#202B30')
@@ -49,7 +49,7 @@ def pic(name, caption, height):
 def footer(c,doc):
     c.setStrokeColor(TEAL); c.setLineWidth(3);c.line(18*mm,282*mm,192*mm,282*mm)
     c.setFont('PF-M',8);c.setFillColor(MUTED)
-    c.drawString(18*mm,11*mm,'标贝音频采集 · 0.2.0 · 2026-09-07')
+    c.drawString(18*mm,11*mm,'标贝音频采集 · 0.2.0 · 2026-09-08')
     c.drawRightString(192*mm,11*mm,f'{doc.page} / 6')
 
 def timeline():
@@ -83,7 +83,7 @@ def story():
     s.extend(pic('14-new-recording-policy.png','新建录制：勾选所需开关后，按原流程创建任务。图示为两个开关均已开启。',57))
     s.append(p('已有任务：右侧「设置」→ 修改 → 保存录制设置','section'))
     s.append(Spacer(1,8))
-    left=[p('① 开启需要的功能','cardtitle'),p('两项互不影响；不需要哪项，就关闭哪项。'),Spacer(1,9),p('② 填写幅值参考值','cardtitle'),p('初始为 RMS 下限 −30、PEAK 上限 −3 dBFS。先按项目要求试录确定。'),Spacer(1,9),p('③ 调整静音时长','cardtitle'),p('点击「调整静音时长」。范围 0.2～5 秒，默认 1 秒。'),Spacer(1,9),p('④ 点击「保存录制设置」','cardtitle'),p('从下一次开始录制本句生效。正在录的这一遍沿用开始时的设置。')]
+    left=[p('① 开启需要的功能','cardtitle'),p('两项互不影响；不需要哪项，就关闭哪项。'),Spacer(1,9),p('② 填写幅值参考值','cardtitle'),p('选择 16-bit PCM，默认峰值 3000～20000 samp。可切换 dBFS，阈值不变。'),Spacer(1,9),p('③ 调整静音时长','cardtitle'),p('点击「调整静音时长」。范围 0.2～5 秒，默认 1 秒。'),Spacer(1,9),p('④ 点击「保存录制设置」','cardtitle'),p('从下一次开始录制本句生效。正在录的这一遍沿用开始时的设置。')]
     t=Table([[left,b.img(ROOT/'captures/17-task-recording-policy.png',max_w=57*mm,max_h=96*mm)]],colWidths=[113*mm,61*mm])
     t.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'TOP'),('LEFTPADDING',(0,0),(-1,-1),0),('RIGHTPADDING',(0,0),(-1,-1),8)]));s.append(t)
     s.extend([Spacer(1,12),note('修改后什么时候生效？','两个新开关和幅值阈值，从下一次录制生效。短句模式下，相关静音参数也从下一次录制生效；历史录音不重新判定。')])
@@ -96,9 +96,9 @@ def story():
         ['听起来可用','按项目要求核对后，点击「确认保留并录下一句」。软件会记下人工保留记录。'],
     ],header=['看到什么','怎么处理']))
     s.extend([Spacer(1,15),p('两个数值怎么理解？','section'),Spacer(1,5),rows([
-        ['RMS 下限 −30','看人声的整体音量。−40 低于 −30，会触发偏小检查。'],
-        ['PEAK 上限 −3','看人声最响的峰值。−1 高于 −3，会触发过大提醒。'],
-    ]),Spacer(1,12),note('−30 / −3 dBFS 是参考值，不是验收标准','阈值应按项目要求确定；等于边界不算异常。软件只统计检测器识别的人声区间，首尾静音不会拉低人声 RMS。',AMBER),Spacer(1,10),p('提示时机：偏小使用 200 毫秒窗口，持续低于下限达 300 毫秒时提醒；峰值超限立即提醒。结束后还会检查整句，短促人声也会检查，录制中出现过的提醒仍保留。','small')])
+        ['峰值下限 3000 samp','整句最大绝对采样值为 2999：偏小；达到 3000：达标。'],
+        ['峰值上限 20000 samp','最大绝对采样值为 20001：超限；等于 20000：达标。'],
+    ]),Spacer(1,12),note('默认范围适用于本项目；其他项目按要求修改','其他项目可设为 5000～25000 samp，25000 是参考上限，不是截幅点。仅支持 16-bit PCM，取正负值的最大绝对值，不取峰峰值。',AMBER),Spacer(1,10),p('提示时机：超限立即提醒，偏小在整句结束后判断。与 AU 对比时，须使用同一段 16-bit 音频及相同人声范围；dBFS 换算仅用于显示。','small')])
 
     title(s,4,'读完后安静，软件自动停句','以下以「静音时长 1 秒」为例。只在已经检测到有效人声后，才开始判断是否自动结束。')
     s.append(timeline())
@@ -126,7 +126,7 @@ def story():
     title(s,6,'遇到这些情况，照着处理','本页集中说明这次更新涉及的保存、授权和导出变化。')
     s.append(rows([
         ['设置改了，这一遍没变','正常。新设置从下一次录制生效；短句模式下，相关静音参数也遵循这一规则。'],
-        ['整句数值正常，仍有提醒','录制中曾发生的幅值异常会保留。先试听，再按项目要求决定是否保留。'],
+        ['旧任务还是 RMS / dBFS','旧任务保留原方式。在设置中改用 16-bit 峰值检查，从下一次录制生效。历史结果不变。'],
         ['录制中提示授权失效','立即停止朗读。等软件安全停止并封存后进入激活页；处理中不要强退或拔盘。失败时检查存储，按提示重试。'],
         ['激活页有待封存任务','处理页面列出的任务；目录异常时先核对原保存位置。外接盘更换后，不要仅凭相同盘符就继续录制。'],
         ['系统时间 / 授权记录异常','先核对系统时间；仍异常时保留原文件并联系管理员处理。'],

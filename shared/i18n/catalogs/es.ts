@@ -4,6 +4,20 @@ import { inputAuditionCopy } from './input-audition.ts';
 
 const es: MessageTree = {
   speech: {
+    "unit": "Unidad de amplitud",
+    "peakMin": "Pico de voz mínimo ({unit})",
+    "peakUpper": "Pico de voz máximo ({unit})",
+    "peakReference": "PCM de 16 bits; valor absoluto máximo de las muestras de voz. Valor inicial: 3000–20000 samp; ajústelo al proyecto.",
+    "peakTiming": "Los picos altos avisan al instante; los bajos se comprueban al terminar la toma. La igualdad es válida.",
+    "pcm16Only": "La comprobación requiere PCM de 16 bits. Cambie la profundidad de salida o desactive la comprobación.",
+    "canonicalSamp": "Intervalo de evaluación: {min}–{max} samp (cambiar la unidad conserva los límites)",
+    "legacyMode": "Esta tarea mantiene la comprobación original de RMS mínimo / PEAK máximo. El historial no cambia.",
+    "usePeak": "Usar picos de 16 bits",
+    "peakMetrics": "Pico de voz {value} {unit}",
+    "peakLowReason": "El pico de voz {value} samp está por debajo del mínimo {min} samp de esta toma",
+    "peakHighReason": "El pico de voz {value} samp supera el máximo {max} samp de esta toma",
+    "peakInvalid": "Los límites deben ser enteros de 1 a 32766 samp, con mínimo inferior al máximo. Requiere PCM de 16 bits.",
+
     "lowReason": "El RMS de voz de {value} dBFS está por debajo del mínimo de esta toma: {limit} dBFS",
     "highReason": "El PEAK de voz de {value} dBFS supera el máximo de esta toma: {limit} dBFS",
     "liveLowReason": "Hubo un nivel bajo sostenido durante la toma (mínimo RMS: {limit} dBFS)",

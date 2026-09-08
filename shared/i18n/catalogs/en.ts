@@ -4,6 +4,20 @@ import { inputAuditionCopy } from './input-audition.ts';
 
 const en: MessageTree = {
   speech: {
+    "unit": "Amplitude unit",
+    "peakMin": "Speech peak minimum ({unit})",
+    "peakUpper": "Speech peak maximum ({unit})",
+    "peakReference": "16-bit PCM; maximum absolute speech sample. Default 3000–20000 samp; adjust to project requirements.",
+    "peakTiming": "High peaks warn immediately; low peaks are checked when the take ends. Equality passes.",
+    "pcm16Only": "Sample-peak checking requires 16-bit PCM. Change the delivery bit depth or turn off amplitude checking.",
+    "canonicalSamp": "Comparison range: {min}–{max} samp (switching units preserves thresholds)",
+    "legacyMode": "This task retains its original RMS minimum / PEAK maximum check. Historical results stay unchanged.",
+    "usePeak": "Use 16-bit peak checking",
+    "peakMetrics": "Speech peak {value} {unit}",
+    "peakLowReason": "Speech peak {value} samp is below this take’s minimum {min} samp",
+    "peakHighReason": "Speech peak {value} samp exceeds this take’s maximum {max} samp",
+    "peakInvalid": "Peak limits must be integers from 1 to 32766 samp, minimum below maximum. Requires 16-bit PCM.",
+
     "lowReason": "Speech RMS {value} dBFS is below this take’s minimum of {limit} dBFS",
     "highReason": "Speech PEAK {value} dBFS exceeds this take’s maximum of {limit} dBFS",
     "liveLowReason": "Sustained low level during recording (RMS minimum {limit} dBFS)",

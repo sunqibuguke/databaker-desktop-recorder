@@ -23,11 +23,12 @@ async function main() {
     await page.reload();
     await page.getByTestId('new-recording').click();
     await page.getByTestId('script-file').setInputFiles({ name: '唤醒词示例.csv', mimeType: 'text/csv', buffer: Buffer.from('序号,正文,标签\n001,你好小贝,自然音量\n002,小贝小贝,自然音量\n003,你好小贝,自然音量') });
+    await page.getByTestId('delivery-bit-depth').selectOption('16');
     await page.getByLabel('人声幅值检查', { exact: true }).check();
     await page.getByLabel('短句自动结束', { exact: true }).check();
     await page.getByTestId('recording-policy-fields').screenshot({ path: path.join(out, '14-new-recording-policy.png') });
-    // Raise the lower limit solely to exercise the warning with synthetic PCM.
-    await page.getByLabel('人声 RMS 下限（dBFS）', { exact: true }).fill('-10');
+    // Lower the upper limit solely to exercise the warning with synthetic PCM.
+    await page.getByLabel('人声峰值上限（samp）', { exact: true }).fill('8000');
     await page.getByTestId('start-session').click();
     await page.getByRole('button', { name: '跳过试听', exact: true }).click();
     await page.getByTestId('main-transport').click();
@@ -37,10 +38,10 @@ async function main() {
     const prompt = await context.newPage();
     await prompt.setViewportSize({ width: 720, height: 500 });
     await prompt.goto('http://127.0.0.1:5183/?view=prompter');
-    await expect(prompt.locator('.prompter-quality-warning')).toHaveText('声音偏小');
+    await expect(prompt.locator('.prompter-quality-warning')).toHaveText('声音过大');
     await prompt.screenshot({ path: path.join(out, '16-prompter-speech-warning.png') });
     await page.getByRole('button', { name: '设置', exact: true }).click();
-    await page.getByLabel('人声 RMS 下限（dBFS）', { exact: true }).fill('-30');
+    await page.getByLabel('人声峰值上限（samp）', { exact: true }).fill('20000');
     await page.getByRole('button', { name: '保存录制设置', exact: true }).click();
     await page.getByTestId('recording-policy-fields').screenshot({ path: path.join(out, '17-task-recording-policy.png') });
     console.log('Saved current recording policy, review and prompter screenshots. Synthetic preview only.');

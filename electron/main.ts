@@ -854,6 +854,9 @@ function isFiniteNumber(value: unknown): value is number {
 function isValidRecordingPolicy(value: unknown): boolean {
   if (value === undefined) return true;
   if (!isRecord(value)) return false;
+  const peak = value.peak_samp;
+  if (peak != null && (!isRecord(peak) || !isNonNegativeSafeInteger(peak.min) || !isNonNegativeSafeInteger(peak.max)
+    || peak.min < 1 || peak.min >= peak.max || peak.max > 32766 || !['samp', 'dbfs'].includes(String(peak.unit)))) return false;
   return typeof value.amplitude_enabled === 'boolean' && typeof value.auto_end === 'boolean'
     && isFiniteNumber(value.rms_min_dbfs) && isFiniteNumber(value.peak_max_dbfs)
     && value.rms_min_dbfs >= -96 && value.peak_max_dbfs <= 0 && value.rms_min_dbfs < value.peak_max_dbfs;
@@ -865,6 +868,7 @@ function isValidSpeechQuality(value: unknown): boolean {
   return isNonNegativeSafeInteger(value.speech_samples)
     && (value.rms_dbfs === null || isFiniteNumber(value.rms_dbfs))
     && (value.peak_dbfs === null || isFiniteNumber(value.peak_dbfs))
+    && (value.peak_samp == null || (isNonNegativeSafeInteger(value.peak_samp) && value.peak_samp <= 32768))
     && codes(value.warnings) && codes(value.live_warnings)
     && (value.retained_by_operator_at === null || typeof value.retained_by_operator_at === 'string');
 }

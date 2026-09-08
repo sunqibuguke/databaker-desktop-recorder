@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 const { pathToFileURL } = require('node:url');
 const path = require('node:path');
 async function main() {
-  const { speechQualityWarning, speechQualityWarningDetail, DEFAULT_RECORDING_POLICY } = await import(pathToFileURL(path.resolve('src/recording-policy.ts')));
+  const { speechQualityWarning, speechQualityWarningDetail, LEGACY_RECORDING_POLICY: DEFAULT_RECORDING_POLICY } = await import(pathToFileURL(path.resolve('src/recording-policy.ts')));
   const { APP_LOCALES, setLocale } = await import(pathToFileURL(path.resolve('shared/i18n/index.ts')));
   const result = (rms, peak, warnings = [], live = []) => ({ policy: { ...DEFAULT_RECORDING_POLICY, amplitude_enabled: true }, speech_samples: 48000, rms_dbfs: rms, peak_dbfs: peak, warnings, live_warnings: live, retained_by_operator_at: null });
   setLocale('zh-CN');

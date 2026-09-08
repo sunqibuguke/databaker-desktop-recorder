@@ -4,6 +4,20 @@ import { inputAuditionCopy } from './input-audition.ts';
 
 const pt: MessageTree = {
   speech: {
+    "unit": "Unidade de amplitude",
+    "peakMin": "Pico de voz mínimo ({unit})",
+    "peakUpper": "Pico de voz máximo ({unit})",
+    "peakReference": "PCM de 16 bits; maior valor absoluto das amostras de voz. Padrão: 3000–20000 samp; ajuste conforme o projeto.",
+    "peakTiming": "Picos altos geram aviso imediato; picos baixos são verificados ao concluir a gravação. Igualdade é aceita.",
+    "pcm16Only": "A verificação requer PCM de 16 bits. Altere a profundidade de saída ou desative a verificação.",
+    "canonicalSamp": "Faixa de avaliação: {min}–{max} samp (trocar a unidade preserva os limites)",
+    "legacyMode": "Esta tarefa mantém a verificação original de RMS mínimo / PEAK máximo. O histórico não muda.",
+    "usePeak": "Usar picos de 16 bits",
+    "peakMetrics": "Pico de voz {value} {unit}",
+    "peakLowReason": "O pico de voz {value} samp está abaixo do mínimo {min} samp desta gravação",
+    "peakHighReason": "O pico de voz {value} samp excede o máximo {max} samp desta gravação",
+    "peakInvalid": "Os limites devem ser inteiros de 1 a 32766 samp, com mínimo menor que máximo. Requer PCM de 16 bits.",
+
     "lowReason": "O RMS da voz de {value} dBFS está abaixo do mínimo desta tomada: {limit} dBFS",
     "highReason": "O PEAK da voz de {value} dBFS excede o máximo desta tomada: {limit} dBFS",
     "liveLowReason": "Houve nível baixo contínuo durante a gravação (RMS mínimo: {limit} dBFS)",

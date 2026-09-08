@@ -14,7 +14,7 @@ import build_manual as b
 ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parent.parent
 CAP = ROOT / "captures"
-OUT = REPO / "output" / "pdf" / "标贝音频采集_详细操作手册_2026-09-07.pdf"
+OUT = REPO / "output" / "pdf" / "标贝音频采集_详细操作手册_2026-09-08.pdf"
 APP_VERSION = "0.2.0"
 
 
@@ -59,7 +59,7 @@ def cover(canv, doc) -> None:
     canv.setFillColor(HexColor("#9AA0A0"))
     canv.setFont("PF", 8.5)
     canv.drawString(22 * mm, 20 * mm, f"产品版本 {APP_VERSION} · 采录人员操作手册")
-    canv.drawRightString(b.PAGE_W - 22 * mm, 20 * mm, "文档版本 2026-09-07")
+    canv.drawRightString(b.PAGE_W - 22 * mm, 20 * mm, "文档版本 2026-09-08")
     canv.restoreState()
 
 
@@ -72,7 +72,7 @@ def body(canv, doc) -> None:
     canv.line(b.LEFT, 11 * mm, b.PAGE_W - b.RIGHT, 11 * mm)
     canv.setFillColor(b.MUTED)
     canv.setFont("PF", 8)
-    canv.drawString(b.LEFT, 6.2 * mm, f"{APP_VERSION} · 2026-09-07 · 采录人员版")
+    canv.drawString(b.LEFT, 6.2 * mm, f"{APP_VERSION} · 2026-09-08 · 采录人员版")
     canv.drawRightString(b.PAGE_W - b.RIGHT, 6.2 * mm, f"{doc.page}")
     canv.restoreState()
 

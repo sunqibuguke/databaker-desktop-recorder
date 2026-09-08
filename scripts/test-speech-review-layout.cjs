@@ -24,6 +24,7 @@ async function main() {
       await page.reload();
       await page.getByTestId('new-recording').click();
       await page.getByTestId('script-file').setInputFiles({ name: 'layout.csv', mimeType: 'text/csv', buffer: Buffer.from('id,text,label\n001,你好小贝,正常\n002,你好小贝,正常\n003,你好小贝,正常') });
+      await page.getByTestId('delivery-bit-depth').selectOption('16');
       await page.getByLabel('人声幅值检查', { exact: true }).check();
       await page.getByLabel('短句自动结束', { exact: true }).check();
       await page.getByTestId('start-session').click();
@@ -44,19 +45,19 @@ async function main() {
       await page.getByTestId('main-transport').click();
       await expect(page.getByTestId('main-transport')).toContainText('确认并录下一句', { timeout: 12000 });
       const review = page.getByTestId('speech-quality-result');
-      await expect(review).toContainText('人声 RMS');
+      await expect(review).toContainText('人声峰值');
       await expect(review).not.toHaveClass(/has-warning/);
       await expect(review.locator('svg')).toHaveCount(0);
       await page.getByRole('button', { name: '设置', exact: true }).click();
-      await page.getByLabel('人声 RMS 下限（dBFS）', { exact: true }).fill('-10');
+      await page.getByLabel('人声峰值上限（samp）', { exact: true }).fill('8000');
       await page.getByRole('button', { name: '保存录制设置', exact: true }).click();
       await expect(review).not.toHaveClass(/has-warning/); // saved take uses its own policy
       await page.getByTestId('main-transport').click();
       await expect(review).toHaveCount(0);
-      await expect(page.locator('.speech-quality-banner')).toContainText('声音偏小', { timeout: 12000 });
+      await expect(page.locator('.speech-quality-banner')).toContainText('声音过大', { timeout: 12000 });
       await expect(page.getByTestId('main-transport')).toContainText('确认保留并录下一句', { timeout: 12000 });
       await expect(review).toHaveClass(/has-warning/);
-      await expect(review).toContainText('低于本次下限 -10 dBFS');
+      await expect(review).toContainText('超过本次上限 8000 samp');
       await expect(review.locator('svg')).toHaveCount(1);
       await expect(page.locator('.speech-quality-banner')).toHaveCount(0); // no duplicate review warning
       const layout = await page.evaluate(() => { window.__trackLayout = false; return window.__layoutSamples; });

@@ -4,6 +4,20 @@ import { inputAuditionCopy } from './input-audition.ts';
 
 const th: MessageTree = {
   speech: {
+    "unit": "หน่วยแอมพลิจูด",
+    "peakMin": "พีคเสียงขั้นต่ำ ({unit})",
+    "peakUpper": "พีคเสียงสูงสุด ({unit})",
+    "peakReference": "PCM 16 บิต ใช้ค่าสัมบูรณ์สูงสุดของตัวอย่างเสียง ค่าเริ่มต้น 3000–20000 samp ปรับตามข้อกำหนดโครงการ",
+    "peakTiming": "แจ้งพีคเกินทันที ตรวจพีคต่ำเมื่อจบประโยค ค่าเท่าขอบเขตถือว่าผ่าน",
+    "pcm16Only": "การตรวจพีครองรับ PCM 16 บิตเท่านั้น โปรดเปลี่ยนความลึกบิตที่บันทึกหรือปิดการตรวจ",
+    "canonicalSamp": "ช่วงที่ใช้ตัดสิน: {min}–{max} samp (เปลี่ยนหน่วยไม่เปลี่ยนเกณฑ์)",
+    "legacyMode": "งานนี้ยังใช้เกณฑ์ RMS ขั้นต่ำ / PEAK สูงสุดเดิม ผลย้อนหลังไม่เปลี่ยน",
+    "usePeak": "ใช้การตรวจพีค 16 บิต",
+    "peakMetrics": "พีคเสียง {value} {unit}",
+    "peakLowReason": "พีคเสียง {value} samp ต่ำกว่าเกณฑ์ {min} samp ของครั้งนี้",
+    "peakHighReason": "พีคเสียง {value} samp เกินเกณฑ์ {max} samp ของครั้งนี้",
+    "peakInvalid": "เกณฑ์ต้องเป็นจำนวนเต็ม 1–32766 samp โดยขั้นต่ำต่ำกว่าสูงสุด รองรับ PCM 16 บิตเท่านั้น",
+
     "lowReason": "RMS เสียงพูด {value} dBFS ต่ำกว่าขีดจำกัดล่างของเทคนี้ที่ {limit} dBFS",
     "highReason": "PEAK เสียงพูด {value} dBFS เกินขีดจำกัดบนของเทคนี้ที่ {limit} dBFS",
     "liveLowReason": "ระหว่างบันทึกเสียงเบาต่อเนื่อง (RMS ขั้นต่ำ {limit} dBFS)",

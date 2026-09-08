@@ -3,12 +3,30 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AmplitudeUnit {
+    Samp,
+    Dbfs,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PeakSampPolicy {
+    pub min: u16,
+    pub max: u16,
+    pub unit: AmplitudeUnit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct RecordingPolicy {
     pub amplitude_enabled: bool,
     pub auto_end: bool,
     pub rms_min_dbfs: f32,
     pub peak_max_dbfs: f32,
+    // Absent in old tasks: retain the original RMS/dBFS detector.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_samp: Option<PeakSampPolicy>,
 }
 
 impl Default for RecordingPolicy {
@@ -18,12 +36,27 @@ impl Default for RecordingPolicy {
             auto_end: false,
             rms_min_dbfs: -30.0,
             peak_max_dbfs: -3.0,
+            peak_samp: None,
         }
     }
 }
 
 impl RecordingPolicy {
+    pub fn validate_for_depth(&self, depth: u16) -> anyhow::Result<()> {
+        self.validate()?;
+        anyhow::ensure!(
+            !self.amplitude_enabled || self.peak_samp.is_none() || depth == 16,
+            "samp 峰值检查仅支持 16-bit PCM，请调整保存位深或关闭人声幅值检查"
+        );
+        Ok(())
+    }
     pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(peak) = &self.peak_samp {
+            anyhow::ensure!(
+                peak.min > 0 && peak.min < peak.max && peak.max <= 32_766,
+                "16-bit 峰值范围须为 1～32766 samp，且下限小于上限"
+            );
+        }
         anyhow::ensure!(
             self.rms_min_dbfs.is_finite()
                 && self.peak_max_dbfs.is_finite()
@@ -42,6 +75,8 @@ pub struct SpeechQuality {
     pub speech_samples: u64,
     pub rms_dbfs: Option<f32>,
     pub peak_dbfs: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_samp: Option<u16>,
     pub warnings: Vec<String>,
     pub live_warnings: Vec<String>,
     pub retained_by_operator_at: Option<String>,
@@ -62,6 +97,7 @@ pub(crate) struct SpeechMeter {
     count: u64,
     sum: f64,
     peak: f32,
+    peak_samp: u16,
     window: VecDeque<f64>,
     window_sum: f64,
     low_samples: u64,
@@ -118,6 +154,7 @@ impl SpeechMeter {
             count: 0,
             sum: 0.0,
             peak: 0.0,
+            peak_samp: 0,
             window: VecDeque::with_capacity(rate as usize / 5 + 1),
             window_sum: 0.0,
             low_samples: 0,
@@ -139,6 +176,14 @@ impl SpeechMeter {
         self.count += 1;
         self.sum += square;
         self.peak = self.peak.max(sample.abs());
+        if let Some(peak) = &self.policy.peak_samp {
+            // PCM16 values are exact multiples of 1/32768 in f32. Compare the
+            // integer from the saved PCM domain, never a rounded dB display.
+            let samp = (sample * 32_768.0).abs() as u16;
+            self.peak_samp = self.peak_samp.max(samp);
+            self.high_seen |= samp > peak.max;
+            return; // A low whole-take peak is only decided at completion.
+        }
         self.high_seen |= sample.abs() > self.peak_max_linear;
         self.window.push_back(square);
         self.window_sum += square;
@@ -155,6 +200,14 @@ impl SpeechMeter {
             }
         }
     }
+    pub fn live_result(&self) -> Option<SpeechQuality> {
+        self.result().map(|mut quality| {
+            if self.policy.peak_samp.is_some() {
+                quality.warnings.retain(|code| code != "speech_low");
+            }
+            quality
+        })
+    }
     pub fn result(&self) -> Option<SpeechQuality> {
         if !self.policy.amplitude_enabled {
             return None;
@@ -162,10 +215,20 @@ impl SpeechMeter {
         let rms = (self.count > 0).then(|| db((self.sum / self.count as f64).sqrt()));
         let peak = (self.count > 0).then(|| db(f64::from(self.peak)));
         let mut warnings = Vec::new();
-        if rms.is_some_and(|v| v < self.policy.rms_min_dbfs) {
+        let low = if let Some(bounds) = &self.policy.peak_samp {
+            self.count > 0 && self.peak_samp < bounds.min
+        } else {
+            rms.is_some_and(|v| v < self.policy.rms_min_dbfs)
+        };
+        let high = if let Some(bounds) = &self.policy.peak_samp {
+            self.count > 0 && self.peak_samp > bounds.max
+        } else {
+            peak.is_some_and(|v| v > self.policy.peak_max_dbfs)
+        };
+        if low {
             warnings.push("speech_low".into());
         }
-        if peak.is_some_and(|v| v > self.policy.peak_max_dbfs) {
+        if high {
             warnings.push("speech_high".into());
         }
         let mut live_warnings = Vec::new();
@@ -180,6 +243,8 @@ impl SpeechMeter {
             speech_samples: self.count,
             rms_dbfs: rms,
             peak_dbfs: peak,
+            peak_samp: (self.policy.peak_samp.is_some() && self.count > 0)
+                .then_some(self.peak_samp),
             warnings,
             live_warnings,
             retained_by_operator_at: None,
@@ -190,6 +255,88 @@ impl SpeechMeter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn samp_policy() -> RecordingPolicy {
+        RecordingPolicy {
+            amplitude_enabled: true,
+            peak_samp: Some(PeakSampPolicy {
+                min: 3000,
+                max: 20000,
+                unit: AmplitudeUnit::Samp,
+            }),
+            ..Default::default()
+        }
+    }
+    #[test]
+    fn pcm16_samp_exact_peaks_and_inclusive_boundaries() {
+        for (value, low, high) in [
+            (2999_i32, true, false),
+            (3000, false, false),
+            (20000, false, false),
+            (20001, false, true),
+            (-3000, false, false),
+            (-20000, false, false),
+            (-20001, false, true),
+            (32767, false, true),
+            (-32768, false, true),
+        ] {
+            let mut meter = SpeechMeter::new(samp_policy(), 48000, 16);
+            meter.push(value as f32 / 32768.0);
+            let q = meter.result().unwrap();
+            assert_eq!(q.peak_samp, Some(value.unsigned_abs() as u16));
+            assert_eq!(q.warnings.contains(&"speech_low".into()), low);
+            assert_eq!(q.warnings.contains(&"speech_high".into()), high);
+            assert!(!q.live_warnings.contains(&"speech_low".into()));
+            assert_eq!(q.live_warnings.contains(&"speech_high".into()), high);
+        }
+    }
+    #[test]
+    fn samp_low_is_final_only_and_silence_does_not_dilute_peak() {
+        let mut meter = SpeechMeter::new(samp_policy(), 1000, 16);
+        for _ in 0..1000 {
+            meter.push(2000.0 / 32768.0);
+        }
+        assert!(meter.result().unwrap().live_warnings.is_empty());
+        assert!(meter.live_result().unwrap().warnings.is_empty());
+        meter.silence();
+        meter.push(-5000.0 / 32768.0);
+        let q = meter.result().unwrap();
+        assert_eq!(q.peak_samp, Some(5000));
+        assert!(q.warnings.is_empty());
+        assert!(q.live_warnings.is_empty());
+        let mut empty = SpeechMeter::new(samp_policy(), 1000, 16);
+        empty.silence();
+        let q = empty.result().unwrap();
+        assert_eq!(q.peak_samp, None);
+        assert!(q.warnings.is_empty());
+    }
+    #[test]
+    fn samp_policy_is_pcm16_only_and_legacy_is_not_migrated() {
+        let policy = samp_policy();
+        assert!(policy.validate_for_depth(16).is_ok());
+        for depth in [8, 24, 32] {
+            assert!(policy.validate_for_depth(depth).is_err());
+        }
+        let mut invalid = policy.clone();
+        invalid.peak_samp.as_mut().unwrap().max = 32767;
+        assert!(invalid.validate().is_err());
+        invalid.peak_samp.as_mut().unwrap().max = 3000;
+        assert!(invalid.validate().is_err());
+        let old: RecordingPolicy = serde_json::from_str(
+            r#"{"amplitude_enabled":true,"rms_min_dbfs":-30,"peak_max_dbfs":-3}"#,
+        )
+        .unwrap();
+        assert!(old.peak_samp.is_none());
+        assert!(old.validate_for_depth(24).is_ok());
+        assert!(
+            serde_json::to_value(old)
+                .unwrap()
+                .get("peak_samp")
+                .is_none()
+        );
+        let saved = serde_json::to_value(&policy).unwrap();
+        let restored: RecordingPolicy = serde_json::from_value(saved).unwrap();
+        assert_eq!(restored, policy);
+    }
     fn meter() -> SpeechMeter {
         SpeechMeter::new(
             RecordingPolicy {

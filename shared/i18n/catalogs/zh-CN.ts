@@ -3,6 +3,20 @@ import { inputAuditionCopy } from './input-audition.ts';
 
 const zhCN = {
   speech: {
+    "unit": "幅值单位",
+    "peakMin": "人声峰值下限（{unit}）",
+    "peakUpper": "人声峰值上限（{unit}）",
+    "peakReference": "16-bit PCM；取人声正负采样值的最大绝对值。默认 3000～20000 samp，请按项目要求调整。",
+    "peakTiming": "峰值超限立即提醒，峰值偏小在本句结束后提醒；等于边界算达标。",
+    "pcm16Only": "samp 峰值检查仅支持 16-bit PCM，请调整保存位深或关闭人声幅值检查。",
+    "canonicalSamp": "实际判定范围：{min}～{max} samp（切换单位不改变阈值）",
+    "legacyMode": "此任务沿用原 RMS 下限／PEAK 上限检查。历史结果保持原样。",
+    "usePeak": "改用 16-bit 峰值检查",
+    "peakMetrics": "人声峰值 {value} {unit}",
+    "peakLowReason": "人声峰值 {value} samp 低于本次下限 {min} samp",
+    "peakHighReason": "人声峰值 {value} samp 超过本次上限 {max} samp",
+    "peakInvalid": "峰值范围须为 1～32766 的整数 samp，且下限小于上限；仅支持 16-bit PCM。",
+
     "lowReason": "人声 RMS {value} dBFS 低于本次下限 {limit} dBFS",
     "highReason": "人声 PEAK {value} dBFS 超过本次上限 {limit} dBFS",
     "liveLowReason": "录制中曾持续偏小（本次 RMS 下限 {limit} dBFS）",

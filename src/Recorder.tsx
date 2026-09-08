@@ -1,5 +1,5 @@
 import { RecordingPolicyFields } from './RecordingPolicyFields';
-import { DEFAULT_RECORDING_POLICY, validRecordingPolicy, speechQualityWarning, speechQualityWarningDetail, type RecordingPolicy, type StoppedAttempt, type AutomaticStopEvent } from './recording-policy';
+import { DEFAULT_RECORDING_POLICY, recordingPolicyForTask, speechQualityMetrics, validRecordingPolicy, speechQualityWarning, speechQualityWarningDetail, type RecordingPolicy, type StoppedAttempt, type AutomaticStopEvent } from './recording-policy';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { HomeHeader, Icon, StudioChrome, StudioStatus, type EngineStatus, type Phase } from './studio-chrome';
 import {
@@ -2714,8 +2714,8 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     keepItemId?: string | null,
   ) {
     const nextSnapshot = current.snapshot;
-    setRecordingPolicy({ ...DEFAULT_RECORDING_POLICY, ...nextSnapshot.recording_policy });
-    setTaskInitialRecordingPolicy({ ...DEFAULT_RECORDING_POLICY, ...nextSnapshot.recording_policy });
+    setRecordingPolicy(recordingPolicyForTask(nextSnapshot.recording_policy));
+    setTaskInitialRecordingPolicy(recordingPolicyForTask(nextSnapshot.recording_policy));
     activeAttemptIdRef.current = current.active_attempt?.attempt_id ?? null;
     const nextSessionDir = current.session_dir || activeSessionDirRef.current || sessionDir;
     const threshold = nextSnapshot.silence_threshold_dbfs ?? nextSnapshot.noise_check?.threshold_dbfs ?? -42;
@@ -2845,8 +2845,8 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   }
 
   function enterInspectionWorkspace(current: InspectedSessionState) {
-    setRecordingPolicy({ ...DEFAULT_RECORDING_POLICY, ...current.snapshot.recording_policy });
-    setTaskInitialRecordingPolicy({ ...DEFAULT_RECORDING_POLICY, ...current.snapshot.recording_policy });
+    setRecordingPolicy(recordingPolicyForTask(current.snapshot.recording_policy));
+    setTaskInitialRecordingPolicy(recordingPolicyForTask(current.snapshot.recording_policy));
     const nextSnapshot = current.snapshot;
     const authoritativeScriptPreview = scriptPreviewFromSnapshotItems(nextSnapshot.items);
     clearAudioPreview();
@@ -3120,7 +3120,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       }
       return false;
     }
-    if (!validRecordingPolicy(recordingPolicy)) { setError(t('speech.invalid')); return false; }
+    if (!validRecordingPolicy(recordingPolicy, bitDepth)) { setError(t(recordingPolicy.peak_samp ? 'speech.peakInvalid' : 'speech.invalid')); return false; }
     const sessionId = `${safeSessionName(sessionName.replace(/-\d{8}-\d{6}$/, ''))}-${timestamp()}`;
     const destination = await window.recorder.joinPath(outputDir, sessionId);
     const result = await run(t('notice.creatingTask'), () => window.recorder.request<InspectedSessionState>('create_session', {
@@ -3389,7 +3389,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
 
   async function saveRecordingPolicy(policy = recordingPolicy): Promise<boolean> {
     if (!snapshot) return false;
-    if (!validRecordingPolicy(policy)) { setError(t('speech.invalid')); return false; }
+    if (!validRecordingPolicy(policy, bitDepthForDisplay)) { setError(t(policy.peak_samp ? 'speech.peakInvalid' : 'speech.invalid')); return false; }
     const result = await run(t('speech.save'), () => window.recorder.request<{ snapshot: SessionSnapshot }>(captureActive ? 'set_recording_policy' : 'set_session_recording_policy', captureActive ? policy : { session_dir: sessionDir, expected_session_id: snapshot.session_id, expected_journal_seq: snapshot.journal_seq, recording_policy: policy }));
     if (!result) return false;
     setSnapshot(result.snapshot);
@@ -5282,7 +5282,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
                   />
                 </div>
               </details>
-              <RecordingPolicyFields silenceDurationMs={silenceDurationMs} onAdjustSilence={() => {
+              <RecordingPolicyFields bitDepth={bitDepth} silenceDurationMs={silenceDurationMs} onAdjustSilence={() => {
                 const details = document.querySelector<HTMLDetailsElement>('[data-testid="setup-detection-advanced"]');
                 if (details) { details.open = true; details.scrollIntoView({ block: 'nearest' }); details.querySelector<HTMLInputElement>('[data-testid="setup-silence-duration"]')?.focus(); }
               }} value={recordingPolicy} onChange={setRecordingPolicy} disabled={Boolean(busy)} />
@@ -5402,7 +5402,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
             {!recording && speechResult && <div className={`speech-review${speechWarning ? ' has-warning' : ''}`} data-testid="speech-quality-result" role="status">
               <div className="speech-review-heading">
                 {speechWarning && <><Icon name="warning" size={15} /><strong>{speechWarning}</strong></>}
-                <span className="speech-review-metrics">{speechResult.speech_samples ? t('speech.metrics', { rms: speechResult.rms_dbfs?.toFixed(1) ?? '—', peak: speechResult.peak_dbfs?.toFixed(1) ?? '—' }) : t('speech.unmeasured')}</span>
+                <span className="speech-review-metrics">{speechQualityMetrics(speechResult)}</span>
                 {speechResult.retained_by_operator_at && <span className="speech-review-retained">{t('speech.retained')}</span>}
               </div>
               {speechWarningDetail && <div className="speech-review-reason" title={speechWarningDetail}>{speechWarningDetail}</div>}
@@ -5529,7 +5529,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
               <button className="restore-settings" onClick={() => void applyTaskSilenceSettings(taskInitialSilenceThresholdDbfs, taskInitialSilenceDurationMs)} disabled={!captureActive || workspaceFaulted || captureFault || silenceSettingsSaving || (noiseThresholdDbfs === taskInitialSilenceThresholdDbfs && silenceDurationMs === taskInitialSilenceDurationMs)}>{t('recorder.restoreInitial')}</button>
             </section>}
             {monitorPanelTab === 'settings' && <section className="monitor-section recording-settings" data-testid="task-recording-settings">
-              <RecordingPolicyFields silenceDurationMs={silenceDurationMs} onAdjustSilence={() => setMonitorPanelTab('detection')} value={recordingPolicy} onChange={setRecordingPolicy} onSave={() => void saveRecordingPolicy()} disabled={Boolean(busy) || captureFault || workspaceFaulted} />
+              <RecordingPolicyFields bitDepth={bitDepthForDisplay} silenceDurationMs={silenceDurationMs} onAdjustSilence={() => setMonitorPanelTab('detection')} value={recordingPolicy} onChange={setRecordingPolicy} onSave={() => void saveRecordingPolicy()} disabled={Boolean(busy) || captureFault || workspaceFaulted} />
               <h3>{t('recorder.recordingSettingsTitle')}</h3>
               <p>{t('recorder.recordingSettingsHelp')}</p>
               <RecordingRuleGroups

@@ -1500,17 +1500,18 @@ test('real Electron short utterance stops at a fixed boundary and requires expli
     await importScript(page, '序号,正文,标签\n001,你好小贝,唤醒词\n002,你好小贝,唤醒词', 'short-utterance.csv');
     await expect(page.getByLabel('人声幅值检查', { exact: true })).not.toBeChecked();
     await expect(page.getByLabel('短句自动结束', { exact: true })).not.toBeChecked();
+    await page.getByTestId('delivery-bit-depth').selectOption('16');
     await page.getByLabel('人声幅值检查', { exact: true }).check();
     await page.getByLabel('短句自动结束', { exact: true }).check();
-    await page.getByLabel('人声 RMS 下限（dBFS）', { exact: true }).fill('-1');
-    await page.getByLabel('人声 PEAK 上限（dBFS）', { exact: true }).fill('-0.5');
+    await page.getByLabel('人声峰值上限（samp）', { exact: true }).fill('32000');
+    await page.getByLabel('人声峰值下限（samp）', { exact: true }).fill('30000');
     await enterCreatedRecording(page);
     const transport = page.getByTestId('main-transport');
     await transport.click();
     await feedPaced(page, 72_000, 'silence');
     expect((await readEngineState(page)).active_attempt?.item_id).toBe('001');
     await feedPaced(page, 48_000, 'speech');
-    await expect(page.locator('.speech-quality-banner')).toContainText('声音偏小');
+    await expect(page.locator('.speech-quality-banner')).toHaveCount(0); // low peak is final-only
     await feedPaced(page, 12_000, 'silence');
     expect((await readEngineState(page)).active_attempt?.item_id).toBe('001');
     await feedPaced(page, 24_000, 'speech');
