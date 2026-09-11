@@ -13185,7 +13185,20 @@ mod tests {
             );
             engine.system_test_checkpoint().unwrap();
             let segment = root.join("audio/segments/master-000001.wav");
-            let first_bytes = std::fs::read(&segment).unwrap();
+            // Snapshot through the writer: Windows correctly prevents reopening
+            // the active master while its exclusive recording lock is held.
+            let canceled_preview = root.join("canceled-master-prefix.wav");
+            assert_eq!(
+                engine
+                    .session
+                    .as_mut()
+                    .unwrap()
+                    .render_range(&canceled_preview, 0, 24_000)
+                    .unwrap(),
+                24_000
+            );
+            let first_bytes = std::fs::read(&canceled_preview).unwrap();
+            assert_eq!(first_bytes.len(), 44 + 24_000 * 2);
             let canceled_pcm = first_bytes[44..44 + 24_000 * 2].to_vec();
             assert!(canceled_pcm.iter().any(|byte| *byte != 0));
 
