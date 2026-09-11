@@ -11,6 +11,7 @@ async function main() {
   const workflow = await import(pathToFileURL(path.join(root, 'src', 'p1-workflow.ts')).href);
   const context = await import(pathToFileURL(path.join(root, 'src', 'workspace-context.ts')).href);
   const historyWorkflow = await import(pathToFileURL(path.join(root, 'electron', 'p1-history.ts')).href);
+  const silenceReadout = await import(pathToFileURL(path.join(root, 'src', 'silence-readout.ts')).href);
   const fullProvenance = fixture.capture_provenance;
   const deriveHistorySummary = (snapshot) => historyWorkflow.deriveHistoryWorkflowSummary({
     audio_format: fixture.audio_format,
@@ -21,6 +22,7 @@ async function main() {
     const actual = workflow.deriveItemWorkflow(scenario.item, {
       committedSamples: fixture.committed_samples,
       provenance: fullProvenance,
+      sampleRate: fixture.audio_format.sample_rate,
     });
     assert.equal(actual.disposition, scenario.expected.disposition, `${scenario.name}: disposition`);
     assert.equal(actual.recommendedAction, scenario.expected.recommendedAction, `${scenario.name}: action`);
@@ -94,7 +96,7 @@ async function main() {
 
   for (const scenario of fixture.warning_cases ?? []) {
     assert.deepEqual(
-      workflow.deliveryWarningCodesForAttempt(scenario.attempt),
+      workflow.deliveryWarningCodesForAttempt(scenario.attempt, fixture.audio_format.sample_rate),
       scenario.expected_warning_codes,
       `${scenario.name}: warning codes`,
     );
@@ -120,6 +122,244 @@ async function main() {
   }
 
   const byName = new Map(fixture.cases.map((scenario) => [scenario.name, scenario.item]));
+  for (const sampleRate of [16_000, 44_100, 48_000, 96_000, 192_000]) {
+    const sample = (ms) => Math.round(ms * sampleRate / 1_000);
+    const earlier = {
+      attempt_id: 'timing-a1', status: 'rejected_by_operator', created_at: '2026-09-11T00:00:00Z',
+      start_sample: sample(1_000), recording_started_sample: sample(1_000),
+      head_silence_armed_sample: sample(1_000), head_silence_passed_sample: sample(1_970),
+      required_head_silence_samples: sample(1_000), content_started_sample: sample(2_100),
+      end_sample: sample(4_000), tail_silence_samples: sample(1_000),
+      required_tail_silence_samples: sample(1_000),
+    };
+    const candidate = {
+      ...earlier, attempt_id: 'timing-a2', status: 'recorded',
+      start_sample: sample(5_000), recording_started_sample: sample(5_000),
+      head_silence_armed_sample: sample(5_000), head_silence_passed_sample: sample(5_970),
+      content_started_sample: sample(5_970), end_sample: sample(8_000),
+      tail_silence_samples: sample(970),
+    };
+    const committedSamples = sample(10_000);
+    const provenance = [{ ...fullProvenance[0], start_sample: 0, end_sample: committedSamples, sample_rate: sampleRate }];
+    const options = { committedSamples, provenance, sampleRate };
+    const item = { id: 'timing', text: 'hi celia', label: '', status: 'review', attempts: [earlier, candidate] };
+    const review = workflow.deriveItemWorkflow(item, options);
+    assert.equal(review.disposition, 'first_take_review', `${sampleRate}: an earlier 970 ms gate cannot poison a retake`);
+    assert.equal(review.candidateAttemptId, candidate.attempt_id);
+    assert.deepEqual(review.blockers, []);
+    assert.equal(workflow.isAttemptPreviewSafe(candidate, {
+      committed_samples: committedSamples, capture_provenance: provenance,
+    }), true, `${sampleRate}: the 970 ms candidate remains available to audition and confirm`);
+    assert.deepEqual(workflow.deliveryWarningCodesForAttempt(candidate, sampleRate), [], `${sampleRate}: 970 ms fits review tolerance`);
+    assert.deepEqual(workflow.deliveryWarningCodesForAttempt(candidate), ['head_silence_short', 'tail_silence_short'],
+      'missing sample rate must not guess a 100 ms sample count');
+    const roundedTrim = {
+      ...candidate, status: 'accepted', start_sample: sample(5_030),
+      content_started_sample: sample(6_000), head_silence_passed_sample: sample(5_970),
+    };
+    const roundedTrimSnapshot = {
+      status: 'stopped', overflow_samples: 0, committed_samples: committedSamples,
+      audio_format: { sample_rate: sampleRate }, capture_provenance: provenance, silence_detector: 'vad',
+      items: [{ ...item, status: 'accepted', selected_attempt_id: roundedTrim.attempt_id, attempts: [earlier, roundedTrim] }],
+    };
+    assert.deepEqual(workflow.attemptStructuralReasons(roundedTrim, committedSamples, 'vad'), [],
+      'a safe VAD clip with 970 ms of head padding need not equal the ideal trim formula');
+    assert.equal(workflow.deriveTaskWorkflow(roundedTrimSnapshot).confirmedOnly.ready, true);
+    assert.equal(deriveHistorySummary(roundedTrimSnapshot).confirmed_only_readiness.ready, true);
+
+    for (const [requiredMs, measuredMs, expectedWarnings] of [
+      [1_000, 970, []],
+      [1_000, 900, []],
+      [1_000, 890, ['head_silence_short', 'tail_silence_short']],
+      [1_100, 1_000, []],
+      [1_100, 970, ['head_silence_short', 'tail_silence_short']],
+      [1_100, 300, ['head_silence_short', 'tail_silence_short']],
+    ]) {
+      const selected = {
+        ...candidate, status: 'accepted',
+        head_silence_passed_sample: candidate.recording_started_sample + sample(measuredMs),
+        content_started_sample: candidate.recording_started_sample + sample(measuredMs),
+        required_head_silence_samples: sample(requiredMs), required_tail_silence_samples: sample(requiredMs),
+        tail_silence_samples: sample(measuredMs),
+      };
+      const snapshot = {
+        status: 'stopped', overflow_samples: 0, committed_samples: committedSamples,
+        audio_format: { sample_rate: sampleRate }, capture_provenance: provenance,
+        items: [{ ...item, status: 'accepted', selected_attempt_id: selected.attempt_id, attempts: [earlier, selected] }],
+      };
+      const task = workflow.deriveTaskWorkflow(snapshot);
+      const history = deriveHistorySummary(snapshot);
+      assert.equal(task.items[0].disposition, 'selected', `${sampleRate}/${requiredMs}/${measuredMs}: timing alone never invalidates selection`);
+      assert.deepEqual(task.items[0].warnings, expectedWarnings);
+      assert.equal(task.confirmedOnly.ready, true, 'quiet interval hints do not block delivery');
+      assert.equal(history.confirmed_only_readiness.ready, true, 'history agrees that the selected take is usable');
+      assert.equal(history.confirmed_only_readiness.warning_count, expectedWarnings.length, 'review warning parity across processes');
+    }
+
+    for (const invalid of [
+      { head_silence_passed_sample: sample(4_999) },
+      { head_silence_passed_sample: sample(8_001) },
+      { head_silence_passed_sample: sample(5_970) + 0.5 },
+      { end_sample: committedSamples + 1 },
+    ]) {
+      const unsafe = { ...candidate, ...invalid };
+      assert.notDeepEqual(workflow.attemptStructuralReasons(unsafe, committedSamples), [], 'real range errors remain blocked');
+      assert.equal(workflow.isAttemptPreviewSafe(unsafe, {
+        committed_samples: committedSamples, capture_provenance: provenance,
+      }), false);
+    }
+    assert.equal(workflow.isAttemptPreviewSafe({
+      ...candidate, quality_issues: [{ code: 'input_discontinuity' }],
+    }, { committed_samples: committedSamples, capture_provenance: provenance }), false,
+    'review timing tolerance must not soften discontinuity protection');
+
+    const early = {
+      ...earlier, attempt_id: 'early-a1', status: 'accepted',
+      start_sample: 0, recording_started_sample: 0, head_silence_armed_sample: 0,
+      head_silence_passed_sample: sample(200), content_started_sample: sample(200),
+      end_sample: sample(970), tail_silence_samples: sample(300),
+      required_head_silence_samples: sample(1_100), required_tail_silence_samples: sample(1_100),
+    };
+    const earlySnapshot = {
+      status: 'stopped', overflow_samples: 0, committed_samples: early.end_sample,
+      audio_format: { sample_rate: sampleRate },
+      capture_provenance: [{ ...provenance[0], end_sample: early.end_sample }],
+      items: [{ id: 'early', text: 'hi celia', label: '', status: 'accepted', selected_attempt_id: early.attempt_id, attempts: [early] }],
+    };
+    assert.deepEqual(workflow.attemptStructuralReasons(early, early.end_sample), [],
+      'a configured quiet interval longer than the first take is not an out-of-bounds audio coordinate');
+    assert.equal(workflow.deriveTaskWorkflow(earlySnapshot).confirmedOnly.ready, true);
+    assert.equal(deriveHistorySummary(earlySnapshot).confirmed_only_readiness.ready, true);
+    assert.ok(workflow.attemptStructuralReasons({ ...early, tail_silence_samples: early.end_sample + 1 }, early.end_sample)
+      .includes('selected_range_invalid'), 'measured tail duration must still fit inside the recorded take');
+
+    for (const detector of ['energy', 'vad']) {
+      for (const origin of [0, sample(1_000)]) {
+        const earlyVoiced = {
+          ...early, status: 'recorded', start_sample: origin, recording_started_sample: origin,
+          head_silence_armed_sample: origin, head_silence_passed_sample: 0,
+          content_started_sample: origin + sample(200), end_sample: origin + sample(970),
+          input_continuity: {
+            input_discontinuity_count_at_start: 0, input_discontinuity_count_at_end: 0,
+            input_discontinuity_silence_samples_at_start: 0, input_discontinuity_silence_samples_at_end: 0,
+          },
+        };
+        const freshSnapshot = {
+          status: 'stopped', overflow_samples: 0, committed_samples: earlyVoiced.end_sample,
+          input_discontinuity_count: 0, input_discontinuity_silence_samples: 0,
+          audio_format: { sample_rate: sampleRate }, silence_detector: detector,
+          capture_provenance: [{ ...provenance[0], end_sample: earlyVoiced.end_sample }],
+          items: [{ ...item, attempts: [earlyVoiced] }],
+        };
+        const freshReview = workflow.deriveTaskWorkflow(freshSnapshot);
+        assert.equal(freshReview.items[0].disposition, 'first_take_review',
+          `${sampleRate}/${detector}/${origin}: voiced early stop remains reviewable before head gate passes`);
+        assert.equal(workflow.isAttemptPreviewSafe(earlyVoiced, freshSnapshot), true,
+          'a real passed=0 marker does not disable preview or confirmation eligibility');
+        assert.equal(silenceReadout.reviewSilencePair({ attempt: earlyVoiced, sampleRate, requiredMs: 1_000, detector }).headWarn,
+          true, 'the short head pad remains a soft reminder');
+        const acceptedFresh = {
+          ...freshSnapshot,
+          items: [{ ...freshSnapshot.items[0], status: 'accepted', selected_attempt_id: earlyVoiced.attempt_id,
+            attempts: [{ ...earlyVoiced, status: 'accepted' }] }],
+        };
+        assert.equal(workflow.deriveTaskWorkflow(acceptedFresh).confirmedOnly.ready, true,
+          'an accepted early voiced take can be exported without inventing a passed timestamp');
+        assert.equal(deriveHistorySummary(acceptedFresh).confirmed_only_readiness.ready, true);
+        assert.deepEqual(workflow.deriveTaskWorkflow(acceptedFresh).items[0].warnings,
+          ['head_silence_short', 'tail_silence_short']);
+
+        const laterSnapshot = {
+          ...freshSnapshot, committed_samples: committedSamples, capture_provenance: provenance,
+          items: [{ ...item, attempts: [earlyVoiced, candidate] }],
+        };
+        const laterReview = workflow.deriveTaskWorkflow(laterSnapshot).items[0];
+        assert.equal(laterReview.disposition, 'first_take_review');
+        assert.equal(laterReview.candidateAttemptId, candidate.attempt_id,
+          'an earlier unconfirmed passed=0 take cannot poison the next candidate');
+        const acceptedLater = {
+          ...laterSnapshot,
+          items: [{ ...item, status: 'accepted', selected_attempt_id: candidate.attempt_id,
+            attempts: [{ ...earlyVoiced, status: 'rejected_by_operator' }, { ...candidate, status: 'accepted' }] }],
+        };
+        assert.equal(workflow.deriveTaskWorkflow(acceptedLater).confirmedOnly.ready, true);
+        assert.equal(deriveHistorySummary(acceptedLater).confirmed_only_readiness.ready, true,
+          'history and export remain usable after declining the early voiced take');
+
+        for (const invalidFields of [
+          { head_silence_armed_sample: origin + 1 },
+          { head_silence_passed_sample: origin - 1 },
+          { head_silence_passed_sample: earlyVoiced.end_sample + 1 },
+          { head_silence_passed_sample: origin + 1, required_head_silence_samples: 0 },
+          { end_sample: origin },
+          { start_sample: earlyVoiced.content_started_sample + 1 },
+        ]) {
+          const bad = { ...earlyVoiced, ...invalidFields };
+          assert.ok(workflow.attemptStructuralReasons(bad, earlyVoiced.end_sample, detector).length > 0,
+            'early-stop tolerance keeps actual marker, arm, range and empty-audio errors blocked');
+          assert.equal(workflow.isAttemptPreviewSafe(bad, freshSnapshot), false);
+          const badSnapshot = {
+            ...freshSnapshot,
+            items: [{ ...item, status: 'accepted', selected_attempt_id: bad.attempt_id,
+              attempts: [{ ...bad, status: 'accepted' }] }],
+          };
+          assert.equal(deriveHistorySummary(badSnapshot).confirmed_only_readiness.ready, false,
+            'Electron applies the same remaining structural guards');
+        }
+      }
+      for (const measuredMs of [300, 900, 970, 1_000]) {
+        const measuredHead = {
+          ...earlier, status: 'accepted',
+          start_sample: sample(detector === 'vad' ? 1_900 : 1_000),
+          head_silence_passed_sample: sample(3_000), required_head_silence_samples: sample(1_100),
+          content_started_sample: sample(1_900 + measuredMs),
+          required_tail_silence_samples: sample(1_100), tail_silence_samples: sample(1_100),
+        };
+        const expectedHeadShort = measuredMs < 1_000;
+        const sampleSnapshot = {
+          status: 'stopped', overflow_samples: 0, committed_samples: committedSamples,
+          audio_format: { sample_rate: sampleRate }, capture_provenance: provenance, silence_detector: detector,
+          items: [{ ...item, status: 'accepted', selected_attempt_id: measuredHead.attempt_id, attempts: [measuredHead] }],
+        };
+        const pair = silenceReadout.reviewSilencePair({ attempt: measuredHead, sampleRate, requiredMs: 1_000, detector });
+        const task = workflow.deriveTaskWorkflow(sampleSnapshot);
+        const history = deriveHistorySummary(sampleSnapshot);
+        assert.equal(pair.headWarn, expectedHeadShort, `${detector}: review measures only the actual head pad`);
+        assert.deepEqual(task.items[0].warnings, expectedHeadShort ? ['head_silence_short'] : []);
+        assert.equal(history.confirmed_only_readiness.warning_count, expectedHeadShort ? 1 : 0,
+          `${detector}: UI, workflow and export summary agree after a long wait before speech`);
+      }
+      for (const offset of [-1, 0, 1]) {
+        const requiredSamples = sample(1_101) + 7;
+        const measuredSamples = requiredSamples - Math.floor(sampleRate * 100 / 1_000) + offset;
+        const edge = {
+          ...earlier, status: 'accepted',
+          head_silence_passed_sample: earlier.recording_started_sample + measuredSamples,
+          content_started_sample: earlier.recording_started_sample + measuredSamples,
+          required_head_silence_samples: requiredSamples,
+          required_tail_silence_samples: requiredSamples,
+          tail_silence_samples: measuredSamples,
+        };
+        const edgeSnapshot = {
+          status: 'stopped', overflow_samples: 0, committed_samples: committedSamples,
+          audio_format: { sample_rate: sampleRate }, capture_provenance: provenance, silence_detector: detector,
+          items: [{ ...item, status: 'accepted', selected_attempt_id: edge.attempt_id, attempts: [edge] }],
+        };
+        const pair = silenceReadout.reviewSilencePair({ attempt: edge, sampleRate, requiredMs: 1_000, detector });
+        const marks = silenceReadout.itemSilenceMarks(edgeSnapshot.items[0], sampleRate, 1_000, detector);
+        const expectedShort = offset < 0;
+        assert.equal(pair.headWarn, expectedShort, 'review compares raw head samples before rounding displayed milliseconds');
+        assert.equal(pair.tailStatus === 'short', expectedShort, 'review compares raw tail samples before rounding displayed milliseconds');
+        assert.equal(marks.headShort, expectedShort);
+        assert.equal(marks.tailShort, expectedShort);
+        assert.match(pair.headText, /^首 \d+ ms$/, 'the displayed duration remains an integer');
+        assert.deepEqual(workflow.deriveTaskWorkflow(edgeSnapshot).items[0].warnings,
+          expectedShort ? ['head_silence_short', 'tail_silence_short'] : []);
+        assert.equal(deriveHistorySummary(edgeSnapshot).confirmed_only_readiness.warning_count, expectedShort ? 2 : 0,
+          'UI and export agree exactly at tolerance boundary and one sample either side');
+      }
+    }
+  }
   for (const scenario of fixture.provenance_cases ?? []) {
     const item = byName.get(scenario.item_name);
     const provenance = scenario.mode === 'empty' ? [] : undefined;

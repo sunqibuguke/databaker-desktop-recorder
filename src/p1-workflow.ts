@@ -1,3 +1,4 @@
+import { silenceSamplesAreShort } from '../shared/silence-timing.ts';
 import type {
   Attempt,
   CaptureProvenanceSpan,
@@ -174,7 +175,7 @@ function isSample(value: unknown): value is number {
 export function attemptStructuralReasons(
   attempt: Attempt,
   committedSamples?: number,
-  silenceDetector: SilenceDetector = 'energy',
+  _silenceDetector: SilenceDetector = 'energy',
 ): WorkflowReasonCode[] {
   const reasons: WorkflowReasonCode[] = [];
   if (typeof attempt.attempt_id !== 'string' || attempt.attempt_id.trim().length === 0) {
@@ -187,9 +188,12 @@ export function attemptStructuralReasons(
     attempt.content_started_sample,
     attempt.end_sample,
   ];
-  const optionalSamples = [
+  const optionalCoordinates = [
     attempt.head_silence_armed_sample,
     attempt.head_silence_passed_sample,
+  ].filter((value) => value !== undefined);
+  const optionalSamples = [
+    ...optionalCoordinates,
     attempt.required_head_silence_samples,
     attempt.tail_silence_samples,
     attempt.required_tail_silence_samples,
@@ -198,23 +202,14 @@ export function attemptStructuralReasons(
   const headSilencePassedSample = attempt.head_silence_passed_sample ?? 0;
   const requiredHeadSilenceSamples = attempt.required_head_silence_samples ?? 0;
   const abnormalAttempt = attempt.status === 'interrupted' || attempt.status === 'needs_rerecord';
-  const validCompletedStart = attempt.start_sample === attempt.recording_started_sample
-    || attempt.start_sample === headSilencePassedSample
-    || (silenceDetector === 'vad'
-      && attempt.content_started_sample !== 0
-      && attempt.start_sample === Math.max(
-        attempt.content_started_sample - requiredHeadSilenceSamples,
-        attempt.recording_started_sample,
-      ));
-  const headSilenceContractInvalid = headSilencePassedSample === 0
-    ? !abnormalAttempt && (headSilenceArmedSample !== 0 || requiredHeadSilenceSamples !== 0)
-    : !abnormalAttempt && (
-      headSilenceArmedSample > headSilencePassedSample
-      || requiredHeadSilenceSamples === 0
-      || headSilencePassedSample - headSilenceArmedSample < requiredHeadSilenceSamples
-      || attempt.recording_started_sample !== headSilenceArmedSample
-      || !validCompletedStart
-    );
+  // A voiced early stop may legitimately finish before the head gate passes.
+  // Keep the zero marker; timing is advisory while the actual range stays intact.
+  const hasHeadSilenceContract = requiredHeadSilenceSamples > 0
+    || headSilenceArmedSample !== 0 || headSilencePassedSample !== 0;
+  const headSilenceContractInvalid = !abnormalAttempt && (
+    (hasHeadSilenceContract && attempt.recording_started_sample !== headSilenceArmedSample)
+    || (headSilencePassedSample !== 0 && requiredHeadSilenceSamples === 0)
+  );
   if (requiredSamples.some((value) => !isSample(value))
     || optionalSamples.some((value) => !isSample(value))
     || (abnormal
@@ -223,6 +218,8 @@ export function attemptStructuralReasons(
     || attempt.recording_started_sample > attempt.start_sample
     || attempt.recording_started_sample > attempt.end_sample
     || attempt.content_started_sample > attempt.end_sample
+    || (isSample(attempt.tail_silence_samples)
+      && attempt.tail_silence_samples > attempt.end_sample - attempt.recording_started_sample)
     || (attempt.content_started_sample !== 0
       && attempt.content_started_sample < attempt.start_sample)
     || (isSample(headSilenceArmedSample)
@@ -243,7 +240,9 @@ export function attemptStructuralReasons(
   if (typeof committedSamples === 'number') {
     if (!isSample(committedSamples)
       || requiredSamples.some((value) => isSample(value) && value > committedSamples)
-      || optionalSamples.some((value) => isSample(value) && value > committedSamples)) {
+      // Required pad lengths may exceed the whole first take after an early stop.
+      // Only absolute coordinates are constrained by the durable audio watermark.
+      || optionalCoordinates.some((value) => isSample(value) && value > committedSamples)) {
       reasons.push('selected_beyond_committed');
     }
   }
@@ -381,19 +380,35 @@ function selectedAttempt(item: ItemState): Attempt | undefined {
   return item.attempts.find((attempt) => attempt.attempt_id === item.selected_attempt_id);
 }
 
-export function deliveryWarningCodesForAttempt(attempt: Attempt | undefined): WorkflowReasonCode[] {
+export function deliveryWarningCodesForAttempt(
+  attempt: Attempt | undefined,
+  sampleRate?: number,
+  silenceDetector: SilenceDetector = 'energy',
+): WorkflowReasonCode[] {
   if (!attempt) return [];
   const warnings: WorkflowReasonCode[] = [];
+  const headStart = silenceDetector === 'vad'
+    ? attempt.start_sample
+    : Math.max(attempt.recording_started_sample,
+      (attempt.head_silence_passed_sample ?? 0) - (attempt.required_head_silence_samples ?? 0));
   if (typeof attempt.required_head_silence_samples === 'number'
     && attempt.required_head_silence_samples > 0
     && typeof attempt.content_started_sample === 'number'
     && attempt.content_started_sample > 0
-    && attempt.content_started_sample - attempt.recording_started_sample < attempt.required_head_silence_samples) {
+    && silenceSamplesAreShort(
+      attempt.content_started_sample - headStart,
+      attempt.required_head_silence_samples,
+      sampleRate,
+    )) {
     warnings.push('head_silence_short');
   }
   if (typeof attempt.required_tail_silence_samples === 'number'
     && attempt.required_tail_silence_samples > 0
-    && (attempt.tail_silence_samples ?? 0) < attempt.required_tail_silence_samples) {
+    && silenceSamplesAreShort(
+      attempt.tail_silence_samples ?? 0,
+      attempt.required_tail_silence_samples,
+      sampleRate,
+    )) {
     warnings.push('tail_silence_short');
   }
   return warnings;
@@ -405,6 +420,7 @@ export function deriveItemWorkflow(
     committedSamples?: number;
     provenance?: readonly CaptureProvenanceSpan[];
     silenceDetector?: SilenceDetector;
+    sampleRate?: number;
   } = {},
 ): DerivedItemWorkflow {
   const blockers: WorkflowReasonCode[] = [];
@@ -470,14 +486,14 @@ export function deriveItemWorkflow(
     && latest?.status === 'needs_rerecord'
     && selected?.status === 'accepted') {
     disposition = 'retained_previous';
-    warnings.push('retained_previous', ...deliveryWarningCodesForAttempt(selected));
+    warnings.push('retained_previous', ...deliveryWarningCodesForAttempt(selected, options.sampleRate, options.silenceDetector));
   } else if (latest?.status === 'needs_rerecord') disposition = 'rerecord_required';
   else if (item.status === 'review' && candidate && selected?.status === 'accepted'
     && selected.attempt_id !== candidate.attempt_id) disposition = 'retake_review';
   else if (item.status === 'review' && candidate) disposition = 'first_take_review';
   else if (item.status === 'accepted' && selected?.status === 'accepted') {
     disposition = 'selected';
-    warnings.push(...deliveryWarningCodesForAttempt(selected));
+    warnings.push(...deliveryWarningCodesForAttempt(selected, options.sampleRate, options.silenceDetector));
   } else if (item.status === 'pending' && !item.selected_attempt_id) disposition = 'unrecorded';
   else disposition = 'inconsistent';
 
@@ -593,6 +609,7 @@ export function deriveTaskWorkflow(
       committedSamples: snapshot.committed_samples,
       provenance: snapshot.capture_provenance,
       silenceDetector: snapshot.silence_detector,
+      sampleRate: snapshot.audio_format?.sample_rate,
     });
     if (!duplicateItemIds.has(item.id)) return derived;
     return {

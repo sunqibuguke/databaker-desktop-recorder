@@ -1,4 +1,5 @@
 import { t } from '../shared/i18n/index.ts';
+import { silenceDurationIsShort, silenceSamplesAreShort } from '../shared/silence-timing.ts';
 import { loadAutomationRules, saveSessionAutomationRules } from './automation-rules.ts';
 import type { Attempt, HeadSilencePhase, ItemState, SilenceDetector } from './types';
 
@@ -113,18 +114,18 @@ export function attemptHeadStartSample(
 ): number {
   if (detector === 'vad') return Math.max(0, attempt.start_sample);
   return headSilencePadStartSample({
-    recordingStartedSample: attempt.recording_started_sample || attempt.start_sample || 0,
+    recordingStartedSample: attempt.recording_started_sample ?? attempt.start_sample ?? 0,
     headSilencePassedSample: attempt.head_silence_passed_sample,
     requiredHeadSilenceSamples: attempt.required_head_silence_samples,
   });
 }
 
 export function isHeadSilenceShort(headMs: number | null, requiredMs: number): boolean {
-  return headMs !== null && requiredMs > 0 && headMs < requiredMs;
+  return headMs !== null && silenceDurationIsShort(headMs, requiredMs);
 }
 
 export function isTailSilenceShort(tailMs: number | null, requiredMs: number): boolean {
-  return tailMs !== null && requiredMs > 0 && tailMs < requiredMs;
+  return tailMs !== null && silenceDurationIsShort(tailMs, requiredMs);
 }
 
 export function silenceReadoutClass(status: SilencePadStatus): string {
@@ -133,10 +134,10 @@ export function silenceReadoutClass(status: SilencePadStatus): string {
   return 'silence-readout';
 }
 
-export function padStatus(measuredMs: number | null, requiredMs: number): SilencePadStatus {
+export function padStatus(measuredMs: number | null, requiredMs: number, toleranceMs = 0): SilencePadStatus {
   if (measuredMs === null) return 'unknown';
   if (requiredMs <= 0) return 'unknown';
-  return measuredMs < requiredMs ? 'short' : 'met';
+  return silenceDurationIsShort(measuredMs, requiredMs, toleranceMs) ? 'short' : 'met';
 }
 
 function isUsableAttempt(attempt: Attempt): boolean {
@@ -161,8 +162,17 @@ function attemptTailMs(attempt: Attempt, sampleRate: number): number | null {
     : samplesToMs(attempt.tail_silence_samples, sampleRate);
 }
 
-function attemptTailIsShort(attempt: Attempt, tailMs: number | null, requiredMs: number): boolean {
-  return attempt.forced_without_tail_silence === true || isTailSilenceShort(tailMs, requiredMs);
+function reviewPadStatus(
+  measuredSamples: number | null,
+  requiredSamples: number | undefined,
+  sampleRate: number,
+  fallbackMs: number,
+): SilencePadStatus {
+  if (measuredSamples === null || !Number.isSafeInteger(sampleRate) || sampleRate <= 0) return 'unknown';
+  const target = requiredSamples ?? Math.round(Math.max(0, fallbackMs) * sampleRate / 1_000);
+  if (target <= 0) return 'unknown';
+  // Compare sample counts before display rounding, matching workflow/export hints.
+  return silenceSamplesAreShort(measuredSamples, target, sampleRate) ? 'short' : 'met';
 }
 
 export function itemSilenceMarks(
@@ -177,8 +187,13 @@ export function itemSilenceMarks(
   const start = attemptHeadStartSample(attempt, detector);
   const headMs = actualHeadSilenceMs(start, attempt.content_started_sample, sampleRate);
   const tailMs = attemptTailMs(attempt, sampleRate);
-  const headShort = isHeadSilenceShort(headMs, requiredMs);
-  const tailShort = attemptTailIsShort(attempt, tailMs, requiredMs);
+  const headShort = reviewPadStatus(
+    attempt.content_started_sample > 0 ? Math.max(0, attempt.content_started_sample - start) : null,
+    attempt.required_head_silence_samples, sampleRate, requiredMs,
+  ) === 'short';
+  const tailShort = attempt.tail_silence_samples === undefined && attempt.forced_without_tail_silence === true
+    || reviewPadStatus(attempt.tail_silence_samples ?? null,
+      attempt.required_tail_silence_samples, sampleRate, requiredMs) === 'short';
   if (!headShort && !tailShort) return EMPTY_SILENCE_MARKS;
   const requiredLabel = `${(Math.max(0, requiredMs) / 1_000).toFixed(1)} s`;
   const headLabel = headMs === null ? t('common.dash') : formatSilenceMs(headMs);
@@ -276,10 +291,15 @@ export function reviewSilencePair(input: {
   const start = attemptHeadStartSample(attempt, input.detector ?? 'energy');
   const headMs = actualHeadSilenceMs(start, attempt.content_started_sample, input.sampleRate);
   const tailMs = attemptTailMs(attempt, input.sampleRate);
-  const headStatus = padStatus(headMs, required);
-  const tailStatus = attempt.forced_without_tail_silence === true
+  const headStatus = reviewPadStatus(
+    attempt.content_started_sample > 0 ? Math.max(0, attempt.content_started_sample - start) : null,
+    attempt.required_head_silence_samples, input.sampleRate, required,
+  );
+  // A forced-stop flag does not override a measured pad within review tolerance.
+  const tailStatus = attempt.tail_silence_samples === undefined && attempt.forced_without_tail_silence === true
     ? 'short'
-    : padStatus(tailMs, required);
+    : reviewPadStatus(attempt.tail_silence_samples ?? null,
+      attempt.required_tail_silence_samples, input.sampleRate, required);
   const showHeadTailHints = input.showHeadTailHints !== false;
   const headShort = showHeadTailHints && headStatus === 'short';
   const tailShort = showHeadTailHints && tailStatus === 'short';

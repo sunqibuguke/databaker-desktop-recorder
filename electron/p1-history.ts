@@ -128,7 +128,7 @@ function issueCodeKnown(issue: unknown): boolean {
 function attemptStructuralReasons(
   attempt: Record<string, unknown>,
   committedSamples: number,
-  silenceDetector: unknown = 'energy',
+  _silenceDetector: unknown = 'energy',
 ): Reason[] {
   const reasons: Reason[] = [];
   if (!attemptId(attempt)) reasons.push('attempt_id_invalid');
@@ -139,9 +139,12 @@ function attemptStructuralReasons(
     attempt.content_started_sample,
     attempt.end_sample,
   ];
-  const optional = [
+  const optionalCoordinates = [
     attempt.head_silence_armed_sample,
     attempt.head_silence_passed_sample,
+  ].filter((value) => value !== undefined);
+  const optional = [
+    ...optionalCoordinates,
     attempt.required_head_silence_samples,
     attempt.tail_silence_samples,
     attempt.required_tail_silence_samples,
@@ -150,31 +153,14 @@ function attemptStructuralReasons(
   const headSilencePassedSample = attempt.head_silence_passed_sample ?? 0;
   const requiredHeadSilenceSamples = attempt.required_head_silence_samples ?? 0;
   const abnormalAttempt = attempt.status === 'interrupted' || attempt.status === 'needs_rerecord';
-  const validCompletedStart = safeSample(attempt.start_sample)
-    && safeSample(attempt.recording_started_sample)
-    && safeSample(attempt.content_started_sample)
-    && safeSample(headSilencePassedSample)
-    && safeSample(requiredHeadSilenceSamples)
-    && (attempt.start_sample === attempt.recording_started_sample
-      || attempt.start_sample === headSilencePassedSample
-      || (silenceDetector === 'vad'
-        && attempt.content_started_sample !== 0
-        && attempt.start_sample === Math.max(
-          attempt.content_started_sample - requiredHeadSilenceSamples,
-          attempt.recording_started_sample,
-        )));
+  // An early voiced take keeps passed=0 honestly; only its coordinates are structural.
   const headSilenceContractInvalid = safeSample(headSilenceArmedSample)
     && safeSample(headSilencePassedSample)
     && safeSample(requiredHeadSilenceSamples)
-    && (headSilencePassedSample === 0
-      ? !abnormalAttempt && (headSilenceArmedSample !== 0 || requiredHeadSilenceSamples !== 0)
-      : !abnormalAttempt && (
-        headSilenceArmedSample > headSilencePassedSample
-        || requiredHeadSilenceSamples === 0
-        || headSilencePassedSample - headSilenceArmedSample < requiredHeadSilenceSamples
-        || attempt.recording_started_sample !== headSilenceArmedSample
-        || !validCompletedStart
-      ));
+    && !abnormalAttempt
+    && (((requiredHeadSilenceSamples > 0 || headSilenceArmedSample !== 0 || headSilencePassedSample !== 0)
+      && attempt.recording_started_sample !== headSilenceArmedSample)
+      || (headSilencePassedSample !== 0 && requiredHeadSilenceSamples === 0));
   if (required.some((value) => !safeSample(value))
     || optional.some((value) => !safeSample(value))
     || (safeSample(attempt.start_sample)
@@ -182,6 +168,10 @@ function attemptStructuralReasons(
       && (abnormal
         ? attempt.end_sample < attempt.start_sample
         : attempt.end_sample <= attempt.start_sample))
+    || (safeSample(attempt.tail_silence_samples)
+      && safeSample(attempt.end_sample)
+      && safeSample(attempt.recording_started_sample)
+      && attempt.tail_silence_samples > attempt.end_sample - attempt.recording_started_sample)
     || (safeSample(attempt.start_sample)
       && safeSample(attempt.recording_started_sample)
       && safeSample(attempt.end_sample)
@@ -212,7 +202,8 @@ function attemptStructuralReasons(
   }
   if (!safeSample(committedSamples)
     || required.some((value) => safeSample(value) && value > committedSamples)
-    || optional.some((value) => safeSample(value) && value > committedSamples)) {
+    // Target pad lengths are durations, not locations inside the durable master.
+    || optionalCoordinates.some((value) => safeSample(value) && value > committedSamples)) {
     reasons.push('selected_beyond_committed');
   }
   const issues = qualityIssues(attempt);
@@ -334,20 +325,36 @@ function attemptSafetyReasons(
   return unique(reasons);
 }
 
-function silenceWarnings(attempt: Record<string, unknown> | undefined): Reason[] {
+function silenceWarnings(
+  attempt: Record<string, unknown> | undefined,
+  sampleRate: unknown,
+  silenceDetector: unknown,
+): Reason[] {
   if (!attempt) return [];
   const warnings: Reason[] = [];
+  // Keep the review-only tolerance in sync with shared/silence-timing.ts.
+  // Electron compiles independently; workflow parity tests cover both implementations.
+  const toleranceSamples = safeSample(sampleRate) && sampleRate > 0
+    ? Math.floor(sampleRate * 100 / 1_000)
+    : 0;
+  const short = (measured: number, required: number) => required > 0
+    && (measured <= 0 || measured + toleranceSamples < required);
+  const headStart = silenceDetector === 'vad' && safeSample(attempt.start_sample)
+    ? attempt.start_sample
+    : Math.max(safeSample(attempt.recording_started_sample) ? attempt.recording_started_sample : 0,
+      (safeSample(attempt.head_silence_passed_sample) ? attempt.head_silence_passed_sample : 0)
+        - (safeSample(attempt.required_head_silence_samples) ? attempt.required_head_silence_samples : 0));
   if (safeSample(attempt.required_head_silence_samples)
     && attempt.required_head_silence_samples > 0
     && safeSample(attempt.content_started_sample)
     && attempt.content_started_sample > 0
     && safeSample(attempt.recording_started_sample)
-    && attempt.content_started_sample - attempt.recording_started_sample
-      < attempt.required_head_silence_samples) warnings.push('head_silence_short');
+    && short(attempt.content_started_sample - headStart,
+      attempt.required_head_silence_samples)) warnings.push('head_silence_short');
   if (safeSample(attempt.required_tail_silence_samples)
     && attempt.required_tail_silence_samples > 0
     && (!safeSample(attempt.tail_silence_samples)
-      || attempt.tail_silence_samples < attempt.required_tail_silence_samples)) {
+      || short(attempt.tail_silence_samples, attempt.required_tail_silence_samples))) {
     warnings.push('tail_silence_short');
   }
   return warnings;
@@ -358,6 +365,7 @@ function deriveItem(
   committedSamples: number,
   provenance: readonly Record<string, unknown>[] | null,
   silenceDetector: unknown,
+  sampleRate: unknown,
 ): DerivedItem {
   const item = record(rawItem);
   if (!item) return { disposition: 'inconsistent', blockers: ['unknown_item_status'], warnings: [] };
@@ -434,7 +442,7 @@ function deriveItem(
     && latest?.status === 'needs_rerecord'
     && selected?.status === 'accepted') {
     disposition = 'retained_previous';
-    warnings.push('retained_previous', ...silenceWarnings(selected));
+    warnings.push('retained_previous', ...silenceWarnings(selected, sampleRate, silenceDetector));
   } else if (latest?.status === 'needs_rerecord') disposition = 'rerecord_required';
   else if (item.status === 'review'
     && candidate
@@ -443,7 +451,7 @@ function deriveItem(
   else if (item.status === 'review' && candidate) disposition = 'first_take_review';
   else if (item.status === 'accepted' && selected?.status === 'accepted') {
     disposition = 'selected';
-    warnings.push(...silenceWarnings(selected));
+    warnings.push(...silenceWarnings(selected, sampleRate, silenceDetector));
   } else if (item.status === 'pending' && !selectedId) disposition = 'unrecorded';
   else disposition = 'inconsistent';
   if (disposition === 'inconsistent' && blockers.length === 0) blockers.push('unknown_item_status');
@@ -539,12 +547,14 @@ export function deriveHistoryWorkflowSummary(snapshotValue: unknown): HistoryWor
     if (seenItemIds.has(item.id)) duplicateItemIds.add(item.id);
     else seenItemIds.add(item.id);
   }
+  const audioFormat = record(snapshot.audio_format);
   const items = snapshot.items.map((rawItem) => {
     const derived = deriveItem(
       rawItem,
       snapshot.committed_samples as number,
       provenance,
       snapshot.silence_detector,
+      audioFormat?.sample_rate,
     );
     const item = record(rawItem);
     if (!item || typeof item.id !== 'string' || !duplicateItemIds.has(item.id)) return derived;
@@ -559,7 +569,6 @@ export function deriveHistoryWorkflowSummary(snapshotValue: unknown): HistoryWor
   if (snapshot.audio_fault_marker === true
     || !safeSample(snapshot.overflow_samples)
     || snapshot.overflow_samples !== 0) taskBlockers.push('task_audio_fault');
-  const audioFormat = record(snapshot.audio_format);
   if (!fullTrackCoveredByProvenance(
     snapshot.committed_samples as number,
     provenance,

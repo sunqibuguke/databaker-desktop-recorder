@@ -1,6 +1,7 @@
 import { DEFAULT_RECORDING_POLICY, recordingPolicyForTask, validRecordingPolicy, type RecordingPolicy, type SpeechQuality, type StoppedAttempt } from './recording-policy';
 import type { DebugLogDraft, DebugLogEntry, DebugLogSnapshot } from './debug-log';
 import { formatDebugLogText } from './debug-log';
+import { captureSilenceDurationMs } from '../shared/silence-timing';
 import {
   createCurrentInputAuditionDecision,
   inputAuditionCaptureFingerprint,
@@ -18,6 +19,8 @@ type MockActiveAttempt = {
   head_silence_passed_sample: number;
   head_silence_progress_samples: number;
   required_head_silence_samples: number;
+  silence_duration_ms: number;
+  silence_threshold_dbfs: number;
   head_silence_phase: HeadSilencePhase;
   content_started_sample: number;
   discontinuity_injected?: boolean;
@@ -381,7 +384,8 @@ export function installDevRecorderMock() {
       if (enforceSilence) {
         activeAttempt.head_silence_progress_samples = Math.min(
           requiredHeadSilence,
-          (activeAttempt.head_silence_progress_samples ?? 0) + newSamples,
+          (activeAttempt.head_silence_progress_samples ?? 0)
+            + Math.min(newSamples, Math.max(0, capturedSamples - activeAttempt.head_silence_armed_sample)),
         );
       } else {
         activeAttempt.head_silence_progress_samples = Math.min(
@@ -401,15 +405,21 @@ export function installDevRecorderMock() {
     const mockSpeechStart = activeAttempt
       ? Math.max(
         activeAttempt.recording_started_sample + mockSpeechDelay,
-        (activeAttempt.head_silence_passed_sample || activeAttempt.recording_started_sample) + mockSpeechDelay,
+        (enforceSilence
+          ? activeAttempt.head_silence_passed_sample || activeAttempt.recording_started_sample
+          : activeAttempt.recording_started_sample) + mockSpeechDelay,
       )
       : 0;
     if (activeAttempt && !activeAttempt.content_started_sample
-      && activeAttempt.head_silence_phase !== 'waiting_for_head_silence'
+      && (!enforceSilence || activeAttempt.head_silence_phase !== 'waiting_for_head_silence')
       && capturedSamples >= mockSpeechStart) {
       activeAttempt.content_started_sample = mockSpeechStart;
       firstAttemptSignalSample = activeAttempt.content_started_sample;
-      activeAttempt.head_silence_phase = 'speech_started';
+      // An unenforced take can contain speech before its head timer passes.
+      // Keep the timer running and preserve its real (possibly absent) marker.
+      if (activeAttempt.head_silence_phase !== 'waiting_for_head_silence') {
+        activeAttempt.head_silence_phase = 'speech_started';
+      }
     }
     if (activeAttempt?.content_started_sample
       && !activeAttempt.discontinuity_injected
@@ -487,8 +497,11 @@ export function installDevRecorderMock() {
       required_head_silence_samples: activeAttempt?.required_head_silence_samples ?? 0,
       head_silence_passed_sample: activeAttempt?.head_silence_passed_sample ?? 0,
       content_started_sample: activeAttempt?.content_started_sample ?? 0,
-      silence_threshold_dbfs: snapshot?.silence_threshold_dbfs ?? -42,
-      silence_duration_ms: activeAttempt && takePolicy.auto_end ? activeAttempt.required_head_silence_samples / mockSampleRate * 1_000 : snapshot?.silence_duration_ms ?? 1_000,
+      silence_threshold_dbfs: activeAttempt?.silence_threshold_dbfs ?? snapshot?.silence_threshold_dbfs ?? -42,
+      silence_duration_ms: activeAttempt?.silence_duration_ms ?? snapshot?.silence_duration_ms ?? 1_000,
+      silence_target_ms: activeAttempt
+        ? activeAttempt.required_head_silence_samples / mockSampleRate * 1_000
+        : captureSilenceDurationMs(snapshot?.silence_duration_ms ?? 1_000),
       silence_detector: snapshot?.silence_detector ?? 'vad',
       waveform,
       waveform_end_sample: waveformSampleCursor,
@@ -934,37 +947,19 @@ export function installDevRecorderMock() {
       if (!Number.isSafeInteger(silenceDurationMs) || silenceDurationMs < 200 || silenceDurationMs > 5_000) {
         throw new Error('静音时长必须在 0.2 到 5 秒之间');
       }
-      if (activeAttempt && takePolicy.auto_end) {
+      if (data.silence_detector !== undefined && data.silence_detector !== snapshot.silence_detector) {
+        throw new Error('录制任务启动后不能切换静音检测器；请安全退出后重新配置任务');
+      }
+      if (activeAttempt) {
         snapshot.silence_threshold_dbfs = thresholdDbfs;
         snapshot.silence_duration_ms = silenceDurationMs;
         return { threshold_dbfs: thresholdDbfs, silence_duration_ms: silenceDurationMs,
           silence_detector: snapshot.silence_detector, reset_kind: 'next_attempt', snapshot: snapshotCopy() } as T;
       }
-      const phase = activeAttempt?.head_silence_phase ?? 'idle';
-      let resetKind = 'idle';
-      if (phase === 'waiting_for_head_silence' || phase === 'ready_for_speech') {
-        resetKind = 'head_silence';
-        if (activeAttempt) {
-          activeAttempt.head_silence_phase = 'waiting_for_head_silence';
-          activeAttempt.head_silence_armed_sample = capturedSamples;
-          activeAttempt.head_silence_progress_samples = 0;
-          activeAttempt.head_silence_passed_sample = 0;
-          activeAttempt.content_started_sample = 0;
-          activeAttempt.required_head_silence_samples = mockSampleRate * silenceDurationMs / 1_000;
-        }
-        firstAttemptSignalSample = 0;
-        lastSignalSample = 0;
-      } else if (phase === 'speech_started') {
-        resetKind = 'tail_silence';
-        lastSignalSample = capturedSamples;
-      }
       silenceSamples = 0;
       if (typeof data.enforce_silence === 'boolean') enforceSilence = data.enforce_silence;
       snapshot.silence_threshold_dbfs = thresholdDbfs;
       snapshot.silence_duration_ms = silenceDurationMs;
-      if (data.silence_detector === 'energy' || data.silence_detector === 'vad') {
-        snapshot.silence_detector = data.silence_detector;
-      }
       snapshot.updated_at = new Date().toISOString();
       return {
         threshold_dbfs: thresholdDbfs,
@@ -972,7 +967,7 @@ export function installDevRecorderMock() {
         silence_detector: snapshot.silence_detector,
         analysis_boundary: capturedSamples,
         active_attempt: Boolean(activeAttempt),
-        reset_kind: resetKind,
+        reset_kind: 'idle',
         snapshot: snapshotCopy(),
       } as T;
     }
@@ -984,7 +979,7 @@ export function installDevRecorderMock() {
       takeQuality = takePolicy.amplitude_enabled ? { policy: { ...takePolicy }, speech_samples: 0,
         rms_dbfs: null, peak_dbfs: null, warnings: [], live_warnings: [], retained_by_operator_at: null } : null;
       enforceSilence = data.enforce_silence === true;
-      const required = mockSampleRate * snapshot.silence_duration_ms / 1_000;
+      const required = Math.ceil(mockSampleRate * captureSilenceDurationMs(snapshot.silence_duration_ms) / 1_000);
       const item = snapshot.items.find((candidate) => candidate.id === data.item_id);
       if (!item) throw new Error('找不到指定句子');
       activeAttempt = {
@@ -996,6 +991,8 @@ export function installDevRecorderMock() {
         head_silence_passed_sample: 0,
         head_silence_progress_samples: 0,
         required_head_silence_samples: required,
+        silence_duration_ms: snapshot.silence_duration_ms,
+        silence_threshold_dbfs: snapshot.silence_threshold_dbfs,
         head_silence_phase: 'waiting_for_head_silence',
         content_started_sample: 0,
       };
@@ -1018,12 +1015,14 @@ export function installDevRecorderMock() {
       // writer checkpoint before sealing the attempt.
       if (!data.automatic) emitMeter(false);
       const discardEmpty = data.discard_empty !== false;
-      if (!firstAttemptSignalSample && discardEmpty) {
+      // Cancelling while still waiting is not an empty completed take, even
+      // when the caller opts to retain empty takes after the head timer passes.
+      if (!firstAttemptSignalSample && (discardEmpty || !activeAttempt.head_silence_passed_sample)) {
         const itemId = activeAttempt.item_id;
         activeAttempt = null;
         return { item_id: itemId, attempt: null, discarded: true, forced: true } as T;
       }
-      const requiredSilence = takePolicy.auto_end ? activeAttempt.required_head_silence_samples : mockSampleRate * snapshot.silence_duration_ms / 1_000;
+      const requiredSilence = activeAttempt.required_head_silence_samples;
       const forcedWithoutTailSilence = silenceSamples < requiredSilence;
       if (data.force !== true && firstAttemptSignalSample && forcedWithoutTailSilence) {
         throw new Error('尾静音未满，不能结束本句');

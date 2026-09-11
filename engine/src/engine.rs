@@ -1,4 +1,3 @@
-#[cfg(test)]
 use crate::attempt::HEAD_SILENCE_IDLE;
 use crate::attempt::{
     HEAD_SILENCE_PASSED, HEAD_SILENCE_SPEECH_STARTED, HEAD_SILENCE_WAITING, HeadSilenceMonitor,
@@ -875,6 +874,16 @@ fn default_noise_threshold_dbfs() -> f32 {
 
 fn default_silence_duration_ms() -> u32 {
     1_000
+}
+
+// Leave a little room for callback/VAD scheduling instead of cutting exactly
+// at the operator's nominal interval. Keep the configured value in metadata.
+const SILENCE_SAFETY_MARGIN_MS: u32 = 100;
+
+fn capture_silence_samples(sample_rate: u32, duration_ms: u32) -> u64 {
+    u64::from(sample_rate)
+        .saturating_mul(u64::from(duration_ms) + u64::from(SILENCE_SAFETY_MARGIN_MS))
+        .div_ceil(1_000)
 }
 
 fn default_silence_detector_legacy() -> SilenceDetector {
@@ -3139,9 +3148,10 @@ impl Engine {
         let silence_threshold_bits =
             Arc::new(AtomicU32::new(snapshot.silence_threshold_dbfs.to_bits()));
         let silence_duration_ms = Arc::new(AtomicU32::new(snapshot.silence_duration_ms));
-        let required_head_silence_samples = u64::from(snapshot.audio_format.sample_rate)
-            .saturating_mul(u64::from(snapshot.silence_duration_ms))
-            / 1_000;
+        let required_head_silence_samples = capture_silence_samples(
+            snapshot.audio_format.sample_rate,
+            snapshot.silence_duration_ms,
+        );
         let head_silence = HeadSilenceMonitor::new(required_head_silence_samples);
         // VAD inference is deliberately isolated from the authoritative writer.
         // The callback never blocks: one second of PCM and 1,024 messages are
@@ -3661,6 +3671,12 @@ impl Engine {
                             "last_signal_sample": last_signal_sample_thread.load(Ordering::Acquire),
                             "silence_threshold_dbfs": f32::from_bits(silence_threshold_thread.load(Ordering::Relaxed)),
                             "silence_duration_ms": silence_duration_ms_thread.load(Ordering::Acquire),
+                            "silence_target_ms": if head_silence_thread.phase.load(Ordering::Acquire) != HEAD_SILENCE_IDLE {
+                                head_silence_thread.required_samples() * 1_000 / u64::from(sample_rate)
+                            } else {
+                                u64::from(silence_duration_ms_thread.load(Ordering::Acquire))
+                                    + u64::from(SILENCE_SAFETY_MARGIN_MS)
+                            },
                             "silence_detector": SilenceDetector::from_u32(
                                 silence_detector_thread.load(Ordering::Acquire)
                             ),
@@ -4697,8 +4713,9 @@ impl Engine {
             bail!("音频写盘异常，请结束并恢复当前录制");
         }
 
-        let deferred = session.active_attempt.is_some()
-            && session.head_silence.auto_end.load(Ordering::Acquire);
+        // A take keeps one timing contract through stop/confirmation, including
+        // manual mode. Re-arming midway would invalidate its original boundary.
+        let deferred = session.active_attempt.is_some();
         if !deferred && let Some(enforce_silence) = payload.enforce_silence {
             session.head_silence.set_enforce(enforce_silence);
         }
@@ -4923,7 +4940,12 @@ impl Engine {
         } else {
             observed_content_started_sample
         };
-        if content_started_sample == 0 && discard_empty {
+        // Canceling before the pending interval completed never creates a
+        // normal empty take. Keep the PCM in the master, but do not retain a
+        // candidate just because optional post-pending empty retention is on.
+        if content_started_sample == 0
+            && (discard_empty || analysis.head_silence_passed_sample == 0)
+        {
             session.persist(
                 "attempt_discarded",
                 json!({
@@ -5070,7 +5092,7 @@ impl Engine {
             attempt_id: active.attempt_id.clone(),
             // Energy gating starts the clip where the required head pad
             // completed. AI VAD trims extra silence so each take keeps about
-            // `silence_duration_ms` on both sides of detected speech.
+            // the configured interval plus the safety margin on both sides of speech.
             start_sample,
             recording_started_sample: active.recording_started_sample,
             head_silence_armed_sample: analysis.head_silence_armed_sample,
@@ -5992,14 +6014,21 @@ impl Engine {
                 continue;
             }
             if export_cuts {
-                export_warnings.extend(cut_export_warning_codes(item, attempt).into_iter().map(
-                    |code| {
+                export_warnings.extend(
+                    cut_export_warning_codes(
+                        item,
+                        attempt,
+                        snapshot.audio_format.sample_rate,
+                        snapshot.silence_detector,
+                    )
+                    .into_iter()
+                    .map(|code| {
                         json!({
                             "code": code,
                             "item_id": item.id,
                         })
-                    },
-                ));
+                    }),
+                );
             }
             let file_name =
                 allocate_sentence_file_name(&item.id, item_index, &mut used_file_names)?;
@@ -6807,32 +6836,32 @@ fn validate_offline_seal_snapshot(snapshot: &SessionSnapshot) -> Result<()> {
 }
 
 fn attempt_boundaries_are_valid(
-    snapshot: &SessionSnapshot,
+    _snapshot: &SessionSnapshot,
     attempt: &Attempt,
     durable_frames: u64,
 ) -> bool {
     let abnormal = matches!(attempt.status.as_str(), "interrupted" | "needs_rerecord");
-    let head_silence_invalid = if attempt.head_silence_passed_sample == 0 {
-        !abnormal
-            && (attempt.head_silence_armed_sample != 0
-                || attempt.required_head_silence_samples != 0)
-    } else {
-        !abnormal
-            && (attempt.head_silence_armed_sample > attempt.head_silence_passed_sample
-                || attempt.required_head_silence_samples == 0
-                || attempt
-                    .head_silence_passed_sample
-                    .saturating_sub(attempt.head_silence_armed_sample)
-                    < attempt.required_head_silence_samples
-                || attempt.recording_started_sample != attempt.head_silence_armed_sample
-                || !valid_completed_attempt_start(attempt, snapshot.silence_detector))
-    };
+    let has_head_silence_contract = attempt.head_silence_armed_sample > 0
+        || attempt.head_silence_passed_sample > 0
+        || attempt.required_head_silence_samples > 0;
+    // A zero passed marker means that the timer had not completed when a
+    // non-enforced take was stopped. Its actual PCM can still be intact and
+    // reviewable; never invent a passed timestamp or poison later retakes.
+    let head_silence_invalid = !abnormal
+        && ((has_head_silence_contract
+            && attempt.recording_started_sample != attempt.head_silence_armed_sample)
+            || (attempt.head_silence_passed_sample > 0
+                && attempt.required_head_silence_samples == 0));
     attempt.start_sample <= durable_frames
         && attempt.recording_started_sample <= durable_frames
         && attempt.head_silence_armed_sample <= durable_frames
         && attempt.head_silence_passed_sample <= durable_frames
         && attempt.content_started_sample <= durable_frames
         && attempt.end_sample <= durable_frames
+        && attempt.tail_silence_samples
+            <= attempt
+                .end_sample
+                .saturating_sub(attempt.recording_started_sample)
         && attempt_sample_order_is_valid(attempt)
         && !head_silence_invalid
         && (!abnormal || attempt.end_sample >= attempt.start_sample)
@@ -6901,9 +6930,7 @@ fn attempt_is_delivery_safe(snapshot: &SessionSnapshot, attempt: &Attempt) -> Re
         attempt.status.as_str(),
         "recorded" | "accepted" | "rejected_by_operator"
     ) && attempt.quality_issues.is_empty()
-        && attempt_sample_order_is_valid(attempt)
-        && attempt.end_sample > attempt.start_sample
-        && attempt.end_sample <= snapshot.committed_samples
+        && attempt_boundaries_are_valid(snapshot, attempt, snapshot.committed_samples)
         && attempt_range_has_provenance(snapshot, attempt))
 }
 
@@ -6957,28 +6984,6 @@ fn attempt_sample_order_is_valid(attempt: &Attempt) -> bool {
             || (attempt.start_sample <= attempt.content_started_sample
                 && attempt.recording_started_sample <= attempt.content_started_sample
                 && attempt.content_started_sample <= attempt.end_sample))
-}
-
-fn valid_completed_attempt_start(attempt: &Attempt, detector: SilenceDetector) -> bool {
-    attempt.start_sample == attempt.recording_started_sample
-        || attempt.start_sample == attempt.head_silence_passed_sample
-        || (detector == SilenceDetector::Vad && valid_vad_trimmed_clip_start(attempt))
-}
-
-/// VAD stop-trim keeps about `required_head_silence_samples` before first speech,
-/// clamped to the operator click. That start is neither the click nor the
-/// elapsed pending-timer mark, so export must accept it as a third legal origin.
-fn valid_vad_trimmed_clip_start(attempt: &Attempt) -> bool {
-    if attempt.content_started_sample == 0 {
-        return false;
-    }
-    let expected = attempt
-        .content_started_sample
-        .saturating_sub(attempt.required_head_silence_samples)
-        .max(attempt.recording_started_sample);
-    attempt.start_sample == expected
-        && attempt.start_sample <= attempt.content_started_sample
-        && attempt.content_started_sample <= attempt.end_sample
 }
 
 fn capture_span_from_snapshot(
@@ -7583,7 +7588,21 @@ fn validate_snapshot_identifiers(snapshot: &SessionSnapshot) -> Result<()> {
     Ok(())
 }
 
-fn cut_export_warning_codes(item: &ItemState, selected: &Attempt) -> Vec<&'static str> {
+// Review tolerance only. Live capture continues waiting for its full target,
+// including the safety margin; do not use this helper to end a take early.
+const SILENCE_TIMING_TOLERANCE_MS: u32 = 100;
+
+fn silence_samples_are_short(measured: u64, required: u64, sample_rate: u32) -> bool {
+    let tolerance = u64::from(sample_rate) * u64::from(SILENCE_TIMING_TOLERANCE_MS) / 1_000;
+    required > 0 && (measured == 0 || measured.saturating_add(tolerance) < required)
+}
+
+fn cut_export_warning_codes(
+    item: &ItemState,
+    selected: &Attempt,
+    sample_rate: u32,
+    detector: SilenceDetector,
+) -> Vec<&'static str> {
     let mut warnings = Vec::new();
     if selected.status == "accepted"
         && item.attempts.last().is_some_and(|candidate| {
@@ -7593,17 +7612,34 @@ fn cut_export_warning_codes(item: &ItemState, selected: &Attempt) -> Vec<&'stati
     {
         warnings.push("retained_previous");
     }
+    // Match the review readout: VAD uses the actual trimmed clip; Energy uses
+    // the qualifying quiet interval, which can restart after an early utterance.
+    let head_pad_start = match detector {
+        SilenceDetector::Vad => selected.start_sample,
+        SilenceDetector::Energy => selected.recording_started_sample.max(
+            selected
+                .head_silence_passed_sample
+                .saturating_sub(selected.required_head_silence_samples),
+        ),
+    };
     if selected.required_head_silence_samples > 0
         && selected.content_started_sample > 0
-        && selected
-            .content_started_sample
-            .saturating_sub(selected.recording_started_sample)
-            < selected.required_head_silence_samples
+        && silence_samples_are_short(
+            selected
+                .content_started_sample
+                .saturating_sub(head_pad_start),
+            selected.required_head_silence_samples,
+            sample_rate,
+        )
     {
         warnings.push("head_silence_short");
     }
     if selected.required_tail_silence_samples > 0
-        && selected.tail_silence_samples < selected.required_tail_silence_samples
+        && silence_samples_are_short(
+            selected.tail_silence_samples,
+            selected.required_tail_silence_samples,
+            sample_rate,
+        )
     {
         warnings.push("tail_silence_short");
     }
@@ -8393,12 +8429,13 @@ fn mark_active_attempt_interrupted(
 
 impl RecordingSession {
     fn required_silence_samples(&self) -> u64 {
-        if self.active_attempt.is_some() && self.head_silence.auto_end.load(Ordering::Acquire) {
+        if self.active_attempt.is_some() {
             return self.head_silence.required_samples();
         }
-        u64::from(self.snapshot.audio_format.sample_rate)
-            .saturating_mul(u64::from(self.snapshot.silence_duration_ms))
-            / 1_000
+        capture_silence_samples(
+            self.snapshot.audio_format.sample_rate,
+            self.snapshot.silence_duration_ms,
+        )
     }
 
     fn arm_attempt_analysis(&self) -> Result<u64> {
@@ -8417,6 +8454,7 @@ impl RecordingSession {
             .store(self.required_silence_samples(), Ordering::Release);
         self.attempt_signal_start_sample.store(0, Ordering::Release);
         self.last_signal_sample.store(0, Ordering::Release);
+        self.silence_samples.store(0, Ordering::Release);
         self.head_silence.configure(
             self.snapshot.recording_policy.clone(),
             self.snapshot.audio_format.sample_rate,
@@ -8441,9 +8479,8 @@ impl RecordingSession {
             .store(threshold_dbfs.to_bits(), Ordering::Release);
         self.silence_duration_ms
             .store(silence_duration_ms, Ordering::Release);
-        let required_samples = u64::from(self.snapshot.audio_format.sample_rate)
-            .saturating_mul(u64::from(silence_duration_ms))
-            / 1_000;
+        let required_samples =
+            capture_silence_samples(self.snapshot.audio_format.sample_rate, silence_duration_ms);
         self.silence_samples.store(0, Ordering::Release);
         let phase = self.head_silence.phase.load(Ordering::Acquire);
         let reset_kind = match phase {
@@ -12792,7 +12829,7 @@ mod tests {
                 engine.skip_input_audition(None).unwrap();
                 let started = engine.start_attempt("001", true).unwrap();
                 let id = started["attempt_id"].as_str().unwrap().to_string();
-                feed(&mut engine, 14_400, 7, SystemTestSignalPattern::Silence);
+                feed(&mut engine, 19_200, 7, SystemTestSignalPattern::Silence);
                 engine.complete_auto_attempt().unwrap();
                 assert!(engine.session.as_ref().unwrap().active_attempt.is_some());
                 feed(&mut engine, 48_000, 7, SystemTestSignalPattern::Speech);
@@ -12833,7 +12870,7 @@ mod tests {
                 assert_eq!(stopped["already_stopped"], true);
                 assert_eq!(stopped["attempt"]["end_sample"], end);
                 assert_eq!(stopped["attempt"]["end_reason"], "auto_silence");
-                assert_eq!(stopped["attempt"]["required_tail_silence_samples"], 9_600);
+                assert_eq!(stopped["attempt"]["required_tail_silence_samples"], 14_400);
                 assert_eq!(stopped["attempt"]["speech_quality"], json!(quality_before));
                 assert!(quality_before.speech_samples > 0 && quality_before.has_warning());
                 assert!(
@@ -12933,6 +12970,255 @@ mod tests {
                 );
                 let _ = std::fs::remove_dir_all(root);
             }
+        }
+    }
+
+    #[cfg(feature = "system-test")]
+    fn start_early_stop_test_engine(detector: &str) -> (PathBuf, Engine) {
+        let root = test_root(&format!("early-stop-{detector}"));
+        std::fs::remove_dir_all(&root).unwrap();
+        let mut engine = Engine::new(Emitter::new());
+        let session: StartSessionPayload = serde_json::from_value(json!({
+            "session_dir": root,
+            "session_id": format!("early-stop-{detector}"),
+            "device_name": "synthetic early-stop regression",
+            "sample_rate": 48_000,
+            "bit_depth": 16,
+            "silence_duration_ms": 1_000,
+            "silence_threshold_dbfs": -42.0,
+            "silence_detector": detector,
+            "recording_policy": { "auto_end": false, "amplitude_enabled": true },
+            "items": [{ "id": "001", "text": "early stop regression" }]
+        }))
+        .unwrap();
+        engine
+            .start_system_test_session(SystemTestStartSessionPayload {
+                session,
+                segment_frames: 48_000,
+            })
+            .unwrap();
+        engine.skip_input_audition(None).unwrap();
+        (root, engine)
+    }
+
+    #[cfg(feature = "system-test")]
+    fn feed_early_stop_test_audio(
+        engine: &mut Engine,
+        mut frames: u64,
+        pattern: SystemTestSignalPattern,
+    ) {
+        while frames > 0 {
+            let count = frames.min(4_800);
+            engine.system_test_feed(count, 7, 480, pattern).unwrap();
+            let session = engine.session.as_ref().unwrap();
+            let boundary = session.captured.load(Ordering::Acquire);
+            assert_eq!(
+                session.flush_vad_analysis(boundary),
+                VadFlushOutcome::Complete
+            );
+            frames -= count;
+        }
+    }
+
+    #[cfg(feature = "system-test")]
+    #[test]
+    fn early_stop_real_pcm_and_later_retake_can_be_confirmed_and_exported() {
+        for (detector, idle_frames) in
+            [("energy", 0), ("energy", 4_800), ("vad", 0), ("vad", 4_800)]
+        {
+            let (root, mut engine) = start_early_stop_test_engine(detector);
+            feed_early_stop_test_audio(&mut engine, idle_frames, SystemTestSignalPattern::Silence);
+            let first = engine.start_attempt("001", false).unwrap();
+            let first_id = first["attempt_id"].as_str().unwrap().to_string();
+            assert_eq!(first["recording_started_sample"], idle_frames);
+            // Regression window: 1.05 s is past the nominal 1 s, but before the
+            // new 1.1 s target. Keep real speech without inventing a passed mark.
+            feed_early_stop_test_audio(&mut engine, 50_400, SystemTestSignalPattern::Speech);
+            let early = engine.stop_attempt(true, true, false).unwrap();
+            assert_eq!(early["attempt"]["status"], "recorded");
+            assert_eq!(early["attempt"]["head_silence_passed_sample"], 0);
+            assert_eq!(early["attempt"]["required_head_silence_samples"], 52_800);
+            assert_eq!(early["attempt"]["end_sample"], idle_frames + 50_400);
+            assert!(early["attempt"]["content_started_sample"].as_u64().unwrap() > 0);
+            assert!(
+                early["attempt"]["speech_quality"]["speech_samples"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+            engine.accept_attempt("001", &first_id).unwrap();
+            let first_snapshot = engine.session.as_ref().unwrap().live_snapshot();
+            usable_preview_attempt(&first_snapshot, "001", &first_id).unwrap();
+            validate_attempt_boundaries(&first_snapshot, first_snapshot.committed_samples).unwrap();
+
+            let second = engine.start_attempt("001", true).unwrap();
+            let second_id = second["attempt_id"].as_str().unwrap().to_string();
+            feed_early_stop_test_audio(&mut engine, 60_000, SystemTestSignalPattern::Silence);
+            feed_early_stop_test_audio(&mut engine, 24_000, SystemTestSignalPattern::Speech);
+            feed_early_stop_test_audio(&mut engine, 96_000, SystemTestSignalPattern::Silence);
+            let retake = engine.stop_attempt(false, true, true).unwrap();
+            assert_eq!(retake["attempt"]["status"], "recorded");
+            assert!(
+                retake["attempt"]["head_silence_passed_sample"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+            engine.accept_attempt("001", &second_id).unwrap();
+            engine.stop_session().unwrap();
+            let snapshot: SessionSnapshot = serde_json::from_slice(
+                &std::fs::read(root.join("metadata/items.snapshot.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(snapshot.items[0].attempts.len(), 2);
+            assert_eq!(snapshot.items[0].attempts[0].head_silence_passed_sample, 0);
+            assert_eq!(
+                snapshot.items[0].selected_attempt_id.as_deref(),
+                Some(second_id.as_str())
+            );
+            engine
+                .render_session_attempt_expected(&root, &snapshot.session_id, "001", &second_id)
+                .unwrap();
+            engine
+                .export_session_artifact_with_options_expected(
+                    &root,
+                    &snapshot.session_id,
+                    ExportArtifact::CutsZip,
+                    ExportScope::CompleteTask,
+                    Some(snapshot.journal_seq),
+                    &[],
+                )
+                .unwrap();
+            assert!(root.join("export/cuts.zip").is_file());
+            let manifest: Value = serde_json::from_slice(
+                &std::fs::read(root.join("export/cuts-manifest.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(manifest["warnings"], json!([]));
+
+            // The early take itself also remains a deliverable choice after
+            // pause/reopen; timing warnings need acknowledgement, not repair.
+            let selected = engine
+                .select_session_attempt_expected(
+                    &root,
+                    &snapshot.session_id,
+                    "001",
+                    &first_id,
+                    snapshot.journal_seq,
+                )
+                .unwrap();
+            let selected_seq = selected["snapshot"]["journal_seq"].as_u64().unwrap();
+            let acknowledgements = [
+                "head_silence_short".to_string(),
+                "tail_silence_short".to_string(),
+            ];
+            engine
+                .export_session_artifact_with_options_expected(
+                    &root,
+                    &snapshot.session_id,
+                    ExportArtifact::CutsZip,
+                    ExportScope::CompleteTask,
+                    Some(selected_seq),
+                    &acknowledgements,
+                )
+                .unwrap();
+            let early_manifest: Value = serde_json::from_slice(
+                &std::fs::read(root.join("export/cuts-manifest.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(early_manifest["included"][0]["attempt_id"], first_id);
+            assert_eq!(
+                early_manifest["included"][0]["head_silence_passed_sample"],
+                0
+            );
+            assert_eq!(early_manifest["included"][0]["duration_samples"], 50_400);
+            assert_eq!(
+                early_manifest["acknowledged_warning_codes"],
+                json!(acknowledgements)
+            );
+            // Read the actual stored ZIP entry: per-artifact exports remove
+            // their staging WAVs after committing the archive.
+            let archive = std::fs::read(root.join("export/cuts.zip")).unwrap();
+            assert_eq!(&archive[..4], b"PK\x03\x04");
+            assert_eq!(u16::from_le_bytes(archive[8..10].try_into().unwrap()), 0);
+            let name_len = usize::from(u16::from_le_bytes(archive[26..28].try_into().unwrap()));
+            let extra_len = usize::from(u16::from_le_bytes(archive[28..30].try_into().unwrap()));
+            let payload_len = u32::from_le_bytes(archive[22..26].try_into().unwrap()) as usize;
+            assert_eq!(
+                std::str::from_utf8(&archive[30..30 + name_len]).unwrap(),
+                early_manifest["included"][0]["file"].as_str().unwrap()
+            );
+            let payload_start = 30 + name_len + extra_len;
+            let early_wav = &archive[payload_start..payload_start + payload_len];
+            assert_eq!(early_wav.len(), 44 + 50_400 * 2);
+            assert!(early_wav[44..].iter().any(|byte| *byte != 0));
+            drop(engine);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[cfg(feature = "system-test")]
+    #[test]
+    fn early_stop_pending_cancel_keeps_master_pcm_without_creating_an_empty_take() {
+        for detector in ["energy", "vad"] {
+            let (root, mut engine) = start_early_stop_test_engine(detector);
+            engine.start_attempt("001", true).unwrap();
+            // Speech before an enforced head pad has passed is not take content,
+            // but its actual non-zero PCM still belongs to the continuous master.
+            feed_early_stop_test_audio(&mut engine, 24_000, SystemTestSignalPattern::Speech);
+            let canceled = engine.stop_attempt(true, false, true).unwrap();
+            assert_eq!(canceled["discarded"], true);
+            assert_eq!(canceled["attempt"], Value::Null);
+            assert!(
+                engine.session.as_ref().unwrap().snapshot.items[0]
+                    .attempts
+                    .is_empty()
+            );
+            assert_eq!(
+                engine
+                    .session
+                    .as_ref()
+                    .unwrap()
+                    .captured
+                    .load(Ordering::Acquire),
+                24_000
+            );
+            engine.system_test_checkpoint().unwrap();
+            let segment = root.join("audio/segments/master-000001.wav");
+            let first_bytes = std::fs::read(&segment).unwrap();
+            let canceled_pcm = first_bytes[44..44 + 24_000 * 2].to_vec();
+            assert!(canceled_pcm.iter().any(|byte| *byte != 0));
+
+            // Preserve the existing explicit empty-retention option once the
+            // head pad has actually completed, in a fresh take after cancellation.
+            engine.start_attempt("001", true).unwrap();
+            feed_early_stop_test_audio(&mut engine, 60_000, SystemTestSignalPattern::Silence);
+            let retained = engine.stop_attempt(true, false, true).unwrap();
+            assert_eq!(retained["attempt"]["status"], "recorded");
+            assert_eq!(retained["attempt"]["content_started_sample"], 0);
+            assert!(
+                retained["attempt"]["head_silence_passed_sample"]
+                    .as_u64()
+                    .unwrap()
+                    > 0
+            );
+            assert_eq!(
+                engine.session.as_ref().unwrap().snapshot.items[0]
+                    .attempts
+                    .len(),
+                1
+            );
+            engine.stop_session().unwrap();
+            let final_bytes = std::fs::read(&segment).unwrap();
+            assert_eq!(&final_bytes[44..44 + 24_000 * 2], canceled_pcm.as_slice());
+            let snapshot: SessionSnapshot = serde_json::from_slice(
+                &std::fs::read(root.join("metadata/items.snapshot.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(snapshot.committed_samples, 84_000);
+            assert_eq!(snapshot.items[0].attempts.len(), 1);
+            drop(engine);
+            std::fs::remove_dir_all(root).unwrap();
         }
     }
 
@@ -14320,7 +14606,10 @@ mod tests {
             attempts: vec![old.clone(), bad],
             selected_attempt_id: Some("001-a1".to_string()),
         };
-        assert!(cut_export_warning_codes(&item, &old).contains(&"retained_previous"));
+        assert!(
+            cut_export_warning_codes(&item, &old, 48_000, SilenceDetector::Energy)
+                .contains(&"retained_previous")
+        );
 
         old.status = "rejected_by_operator".to_string();
         item.attempts[0] = old;
@@ -14328,7 +14617,8 @@ mod tests {
         item.attempts.push(clean.clone());
         item.selected_attempt_id = Some(clean.attempt_id.clone());
         assert!(
-            !cut_export_warning_codes(&item, &clean).contains(&"retained_previous"),
+            !cut_export_warning_codes(&item, &clean, 48_000, SilenceDetector::Energy)
+                .contains(&"retained_previous"),
             "a historical bad take followed by a clean selected take is no longer unresolved"
         );
     }
@@ -15515,7 +15805,7 @@ mod tests {
         );
         assert_eq!(session.silence_samples.load(Ordering::Acquire), 0);
         assert_eq!(session.silence_duration_ms.load(Ordering::Acquire), 800);
-        assert_eq!(session.head_silence.required_samples(), 38_400);
+        assert_eq!(session.head_silence.required_samples(), 43_200);
         assert_eq!(
             session.head_silence.armed_sample.load(Ordering::Acquire),
             120
@@ -15549,7 +15839,7 @@ mod tests {
         assert_eq!(reset_kind, "tail_silence");
         assert_eq!(session.silence_samples.load(Ordering::Acquire), 0);
         assert_eq!(session.silence_duration_ms.load(Ordering::Acquire), 1_500);
-        assert_eq!(session.head_silence.required_samples(), 38_400);
+        assert_eq!(session.head_silence.required_samples(), 43_200);
         assert_eq!(
             session.attempt_signal_start_sample.load(Ordering::Acquire),
             150
@@ -15617,6 +15907,7 @@ mod tests {
         session.snapshot.audio_format.sample_rate = 100;
         session.snapshot.silence_duration_ms = 200;
         session.snapshot.silence_detector = SilenceDetector::Vad;
+        session.head_silence = HeadSilenceMonitor::new(30);
         session.captured.store(100, Ordering::Release);
         session.committed.store(100, Ordering::Release);
         session.analyzed_samples.store(100, Ordering::Release);
@@ -15651,7 +15942,7 @@ mod tests {
         engine.session = Some(session);
 
         let stopped = engine.stop_attempt(true, true, true).unwrap();
-        assert_eq!(stopped["attempt"]["start_sample"], 30);
+        assert_eq!(stopped["attempt"]["start_sample"], 20);
         assert_eq!(stopped["attempt"]["end_sample"], 100);
         assert_eq!(stopped["attempt"]["content_started_sample"], 50);
         assert_eq!(stopped["attempt"]["tail_silence_samples"], 20);
@@ -15687,7 +15978,7 @@ mod tests {
             input_continuity: clean_input_continuity(0, 0),
             quality_issues: Vec::new(),
         });
-        session.head_silence = HeadSilenceMonitor::new(20);
+        session.head_silence = HeadSilenceMonitor::new(30);
         session.snapshot.captured_samples = 100;
         session.snapshot.committed_samples = 100;
         cover_committed_test_audio(&mut session.snapshot);
@@ -15743,7 +16034,7 @@ mod tests {
         assert_eq!(stopped["attempt"]["end_sample"], 100);
         assert_eq!(stopped["attempt"]["forced_without_tail_silence"], true);
         assert_eq!(stopped["attempt"]["tail_silence_samples"], 5);
-        assert_eq!(stopped["attempt"]["required_tail_silence_samples"], 20);
+        assert_eq!(stopped["attempt"]["required_tail_silence_samples"], 30);
         let session = engine.session.as_ref().unwrap();
         assert!(session.active_attempt.is_none());
         assert_eq!(stopped["auto_selected"], false);
@@ -15788,7 +16079,7 @@ mod tests {
         let mut session = prepare_metadata_test_session(&root);
         session.snapshot.audio_format.sample_rate = 100;
         session.snapshot.silence_duration_ms = 200;
-        session.head_silence = HeadSilenceMonitor::new(20);
+        session.head_silence = HeadSilenceMonitor::new(30);
         session.captured.store(100, Ordering::Release);
         session.committed.store(100, Ordering::Release);
         session.analyzed_samples.store(100, Ordering::Release);
@@ -15836,7 +16127,7 @@ mod tests {
         let mut session = prepare_metadata_test_session(&root);
         session.snapshot.audio_format.sample_rate = 100;
         session.snapshot.silence_duration_ms = 200;
-        session.head_silence = HeadSilenceMonitor::new(20);
+        session.head_silence = HeadSilenceMonitor::new(30);
         session.captured.store(100, Ordering::Release);
         session.committed.store(100, Ordering::Release);
         session.analyzed_samples.store(100, Ordering::Release);
@@ -15905,14 +16196,15 @@ mod tests {
             .capture_recovery
             .discontinuities
             .store(1, Ordering::Release);
-        session.head_silence = HeadSilenceMonitor::new(20);
+        session.head_silence = HeadSilenceMonitor::new(30);
         session.snapshot.captured_samples = 100;
         session.snapshot.committed_samples = 100;
         cover_committed_test_audio(&mut session.snapshot);
         session.captured.store(100, Ordering::Release);
         session.committed.store(100, Ordering::Release);
         session.analyzed_samples.store(100, Ordering::Release);
-        session.last_signal_sample.store(80, Ordering::Release);
+        // 300 ms includes the configured 200 ms plus the capture margin.
+        session.last_signal_sample.store(70, Ordering::Release);
         session
             .attempt_signal_start_sample
             .store(50, Ordering::Release);
@@ -16047,14 +16339,15 @@ mod tests {
             .capture_recovery
             .inserted_silence_frames
             .store(1, Ordering::Release);
-        session.head_silence = HeadSilenceMonitor::new(20);
+        session.head_silence = HeadSilenceMonitor::new(30);
         session.snapshot.captured_samples = 100;
         session.snapshot.committed_samples = 100;
         cover_committed_test_audio(&mut session.snapshot);
         session.captured.store(100, Ordering::Release);
         session.committed.store(100, Ordering::Release);
         session.analyzed_samples.store(100, Ordering::Release);
-        session.last_signal_sample.store(80, Ordering::Release);
+        // 300 ms includes the configured 200 ms plus the capture margin.
+        session.last_signal_sample.store(70, Ordering::Release);
         session
             .attempt_signal_start_sample
             .store(50, Ordering::Release);
@@ -16154,11 +16447,12 @@ mod tests {
             .capture_recovery
             .inserted_silence_frames
             .store(1, Ordering::Release);
-        session.head_silence = HeadSilenceMonitor::new(20);
+        session.head_silence = HeadSilenceMonitor::new(30);
         session.captured.store(100, Ordering::Release);
         session.committed.store(100, Ordering::Release);
         session.analyzed_samples.store(100, Ordering::Release);
-        session.last_signal_sample.store(80, Ordering::Release);
+        // 300 ms includes the configured 200 ms plus the capture margin.
+        session.last_signal_sample.store(70, Ordering::Release);
         session
             .attempt_signal_start_sample
             .store(50, Ordering::Release);
@@ -16256,7 +16550,7 @@ mod tests {
         let mut session = prepare_metadata_test_session(&root);
         session.snapshot.audio_format.sample_rate = 100;
         session.snapshot.silence_duration_ms = 200;
-        session.head_silence = HeadSilenceMonitor::new(20);
+        session.head_silence = HeadSilenceMonitor::new(30);
         session.captured.store(100, Ordering::Release);
         session.committed.store(35, Ordering::Release);
         session.analyzed_samples.store(100, Ordering::Release);
@@ -18901,7 +19195,113 @@ mod tests {
     }
 
     #[test]
-    fn offline_preview_enforces_the_complete_head_silence_contract() {
+    fn manual_take_keeps_its_timing_contract_when_settings_are_saved() {
+        for phase in [
+            HEAD_SILENCE_WAITING,
+            HEAD_SILENCE_PASSED,
+            HEAD_SILENCE_SPEECH_STARTED,
+        ] {
+            let root = test_root("manual-take-frozen-silence-settings");
+            let mut session = prepare_metadata_test_session(&root);
+            session.head_silence = HeadSilenceMonitor::new(52_800);
+            session.head_silence.arm(100);
+            session.head_silence.phase.store(phase, Ordering::Release);
+            session.active_attempt = Some(ActiveAttempt {
+                item_id: "001".to_string(),
+                attempt_id: "001-a1".to_string(),
+                start_sample: 100,
+                recording_started_sample: 100,
+                input_discontinuity_count_at_start: 0,
+                input_discontinuity_silence_samples_at_start: 0,
+            });
+            let mut engine = Engine::new(Emitter::new());
+            engine.session = Some(session);
+            let changed = engine
+                .set_silence_settings(SetSilenceSettingsPayload {
+                    threshold_dbfs: -36.0,
+                    silence_duration_ms: 1_500,
+                    silence_detector: None,
+                    enforce_silence: None,
+                })
+                .unwrap();
+            assert_eq!(changed["reset_kind"], "next_attempt");
+            let session = engine.session.as_mut().unwrap();
+            assert!(!session.head_silence.auto_end.load(Ordering::Acquire));
+            assert_eq!(
+                session.head_silence.armed_sample.load(Ordering::Acquire),
+                100
+            );
+            assert_eq!(session.head_silence.phase.load(Ordering::Acquire), phase);
+            assert_eq!(session.required_silence_samples(), 52_800);
+            assert_eq!(session.silence_duration_ms.load(Ordering::Acquire), 1_000);
+            session.active_attempt = None;
+            session.silence_samples.store(100_000, Ordering::Release);
+            session.arm_attempt_analysis().unwrap();
+            assert_eq!(session.required_silence_samples(), 76_800);
+            assert_eq!(session.head_silence.required_samples(), 76_800);
+            assert_eq!(session.silence_samples.load(Ordering::Acquire), 0);
+            drop(engine);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn repeated_retakes_with_970_ms_padding_can_be_confirmed_and_exported() {
+        for selected_id in ["001-a1", "001-a6"] {
+            let root = test_root("retakes-with-timing-tolerance");
+            let mut session = prepare_metadata_test_session(&root);
+            session.snapshot.silence_detector = SilenceDetector::Vad;
+            session.snapshot.items[0].status = "review".to_string();
+            for index in 0..6 {
+                let armed = 100 + index * 160_000;
+                let mut attempt = test_attempt(
+                    &format!("001-a{}", index + 1),
+                    armed + 2_000,
+                    armed + 120_000,
+                    "recorded",
+                );
+                attempt.recording_started_sample = armed;
+                attempt.head_silence_armed_sample = armed;
+                attempt.head_silence_passed_sample = armed + 46_560;
+                attempt.content_started_sample = attempt.start_sample + 46_560;
+                attempt.required_head_silence_samples = 48_000;
+                attempt.required_tail_silence_samples = 48_000;
+                attempt.tail_silence_samples = 46_560;
+                session.snapshot.items[0].attempts.push(attempt);
+            }
+            session.snapshot.captured_samples = 1_000_000;
+            session.snapshot.committed_samples = 1_000_000;
+            cover_committed_test_audio(&mut session.snapshot);
+            session.captured.store(1_000_000, Ordering::Release);
+            session.committed.store(1_000_000, Ordering::Release);
+            let mut engine = Engine::new(Emitter::new());
+            engine.session = Some(session);
+            engine.accept_attempt("001", selected_id).unwrap();
+            let mut snapshot = engine.session.as_ref().unwrap().live_snapshot();
+            snapshot.status = "stopped".to_string();
+            assert_eq!(
+                snapshot.items[0].selected_attempt_id.as_deref(),
+                Some(selected_id)
+            );
+            usable_preview_attempt(&snapshot, "001", selected_id).unwrap();
+            validate_snapshot_for_cut_scope(&snapshot, ExportScope::CompleteTask).unwrap();
+            drop(engine);
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn capture_silence_margin_is_sample_rate_independent() {
+        for rate in [16_000, 44_100, 48_000, 96_000, 192_000] {
+            for configured_ms in [200, 1_000, 5_000] {
+                let expected = (u64::from(rate) * u64::from(configured_ms + 100)).div_ceil(1_000);
+                assert_eq!(capture_silence_samples(rate, configured_ms), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn short_silence_does_not_invalidate_otherwise_intact_audio() {
         let mut snapshot = test_snapshot();
         snapshot.status = "stopped".to_string();
         snapshot.captured_samples = 1_000;
@@ -18931,10 +19331,13 @@ mod tests {
         }];
 
         assert!(attempt_is_delivery_safe(&snapshot, &snapshot.items[0].attempts[0]).unwrap());
-        assert!(usable_preview_attempt(&snapshot, "001", "001-a1").is_err());
-
-        snapshot.items[0].attempts[0].required_head_silence_samples = 100;
         usable_preview_attempt(&snapshot, "001", "001-a1").unwrap();
+        validate_snapshot_for_cut_scope(&snapshot, ExportScope::CompleteTask).unwrap();
+
+        // A real coordinate reversal still blocks preview and export.
+        snapshot.items[0].attempts[0].head_silence_passed_sample = 99;
+        assert!(usable_preview_attempt(&snapshot, "001", "001-a1").is_err());
+        assert!(validate_snapshot_for_cut_scope(&snapshot, ExportScope::CompleteTask).is_err());
     }
 
     #[test]
@@ -19051,6 +19454,8 @@ mod tests {
         validate_snapshot_for_artifact(&snapshot, Some(ExportArtifact::CutsZip)).unwrap();
 
         snapshot.items[0].attempts[0].start_sample = 1_500_000;
+        validate_attempt_boundaries(&snapshot, snapshot.committed_samples).unwrap();
+        snapshot.items[0].attempts[0].start_sample = 1_178_399;
         let error = validate_attempt_boundaries(&snapshot, snapshot.committed_samples).unwrap_err();
         assert!(format!("{error:#}").contains("句子时间戳"));
     }
@@ -19092,6 +19497,8 @@ mod tests {
         validate_snapshot_for_artifact(&snapshot, Some(ExportArtifact::CutsZip)).unwrap();
 
         snapshot.items[0].attempts[0].start_sample = 1_500_000;
+        validate_attempt_boundaries(&snapshot, snapshot.committed_samples).unwrap();
+        snapshot.items[0].attempts[0].start_sample = 1_178_399;
         let error = validate_attempt_boundaries(&snapshot, snapshot.committed_samples).unwrap_err();
         assert!(format!("{error:#}").contains("句子时间戳"));
     }
@@ -19733,6 +20140,90 @@ mod tests {
     }
 
     #[test]
+    fn cut_silence_warnings_allow_100ms_slack_but_keep_missing_padding_visible() {
+        let mut snapshot = test_snapshot();
+        select_safe_first_attempt(&mut snapshot, 2_000_000);
+        let item = &snapshot.items[0];
+        let mut selected = item.attempts[0].clone();
+        selected.recording_started_sample = 100;
+        // A manual stop flag must not override an otherwise sufficient interval.
+        selected.forced_without_tail_silence = true;
+        for sample_rate in [1_000_u32, 44_100, 48_000, 96_000, 192_000] {
+            let required = u64::from(sample_rate);
+            selected.required_head_silence_samples = required;
+            selected.required_tail_silence_samples = required;
+            for (measured, expected_warning) in [
+                (required, false),
+                (required * 970 / 1_000, false),
+                (required - required * 100 / 1_000, false),
+                (required - required * 100 / 1_000 - 1, true),
+                (0, true),
+            ] {
+                selected.content_started_sample = selected.recording_started_sample + measured;
+                selected.tail_silence_samples = measured;
+                let warnings =
+                    cut_export_warning_codes(item, &selected, sample_rate, SilenceDetector::Energy);
+                assert_eq!(
+                    warnings.contains(&"head_silence_short"),
+                    expected_warning,
+                    "head rate={sample_rate} measured={measured}"
+                );
+                assert_eq!(
+                    warnings.contains(&"tail_silence_short"),
+                    expected_warning,
+                    "tail rate={sample_rate} measured={measured}"
+                );
+            }
+        }
+        // As in the TS helper, an unavailable rate cannot justify a sample allowance.
+        assert!(silence_samples_are_short(970, 1_000, 0));
+        assert!(!silence_samples_are_short(1_000, 1_000, 0));
+        assert!(!silence_samples_are_short(0, 0, 48_000));
+    }
+
+    #[test]
+    fn cut_head_warning_uses_the_same_pad_origin_as_review() {
+        let mut snapshot = test_snapshot();
+        select_safe_first_attempt(&mut snapshot, 4_000);
+        let item = &snapshot.items[0];
+        let mut selected = item.attempts[0].clone();
+        selected.recording_started_sample = 100;
+        selected.head_silence_passed_sample = 2_500;
+        selected.required_head_silence_samples = 1_000;
+        selected.content_started_sample = 2_470;
+        selected.start_sample = 2_450;
+
+        // VAD exports only 20 ms of head padding despite a much earlier click.
+        assert!(
+            cut_export_warning_codes(item, &selected, 1_000, SilenceDetector::Vad)
+                .contains(&"head_silence_short")
+        );
+        // Energy review includes the 970 ms since the qualifying interval began.
+        assert!(
+            !cut_export_warning_codes(item, &selected, 1_000, SilenceDetector::Energy)
+                .contains(&"head_silence_short")
+        );
+        selected.start_sample = 1_500;
+        assert!(
+            !cut_export_warning_codes(item, &selected, 1_000, SilenceDetector::Vad)
+                .contains(&"head_silence_short")
+        );
+
+        // Restarting Energy's quiet interval cannot count pre-restart room tone.
+        selected.head_silence_passed_sample = 2_600;
+        assert!(
+            cut_export_warning_codes(item, &selected, 1_000, SilenceDetector::Energy)
+                .contains(&"head_silence_short")
+        );
+        // Nor can either detector count audio before the operator's click.
+        selected.recording_started_sample = 2_300;
+        assert!(
+            cut_export_warning_codes(item, &selected, 1_000, SilenceDetector::Energy)
+                .contains(&"head_silence_short")
+        );
+    }
+
+    #[test]
     fn cut_warning_acknowledgements_are_explicit_and_bound_to_journal_sequence() {
         let root = test_root("cut-warning-acknowledgements");
         for directory in ["audio", "metadata", "script", "preview", "export"] {
@@ -19752,10 +20243,10 @@ mod tests {
         let selected = &mut stopped.items[0].attempts[0];
         selected.head_silence_armed_sample = 0;
         selected.head_silence_passed_sample = 2;
-        selected.required_head_silence_samples = 2;
+        selected.required_head_silence_samples = 9_600;
         selected.content_started_sample = 1;
         selected.tail_silence_samples = 1;
-        selected.required_tail_silence_samples = 2;
+        selected.required_tail_silence_samples = 9_600;
         write_snapshot_file(&root.join("metadata/items.snapshot.json"), &stopped);
         write_journal(&root, &[sequenced_event("session_stopped", &stopped)]);
         let engine = Engine::new(Emitter::new());

@@ -54,7 +54,7 @@ const detectionPanel = recorder.slice(
 assert.doesNotMatch(detectionPanel, /RecordingRuleGroups|rule-auto-start-next|rule-pause-on-label-change/);
 assert.match(css, /\.rule-switch/);
 assert.match(css, /\.dependent-rule/);
-assert.match(recorder, /startAttempt\(nextItem, \{ acknowledgeLabelTransition: false \}\)/);
+assert.match(recorder, /startAttempt\(nextItem, \{ acknowledgeLabelTransition: false, allowDuringAccept: true \}\)/);
 assert.match(recorder, /acceptTarget\?\.status === 'review' \|\| acceptPausesForLabelChange/);
 assert.match(recorder, /acceptAttempt\(retainedDeliveryAttempt\.attempt_id\)/);
 assert.match(recorder, /nextPhysicalItemIndex\(currentIndex, latest\.items\.length\)/);

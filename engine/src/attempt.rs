@@ -52,6 +52,10 @@ pub(crate) struct HeadSilenceMonitor {
     pub(crate) passed_sample: Arc<AtomicU64>,
     pub(crate) required_samples: Arc<AtomicU64>,
     pub(crate) enforce: Arc<AtomicBool>,
+    // Measurement runs before annotation under the same analysis writer guard.
+    // Keep separate watermarks so each consumer sees every new sample once.
+    measured_until_sample: Arc<AtomicU64>,
+    annotated_until_sample: Arc<AtomicU64>,
 }
 
 impl HeadSilenceMonitor {
@@ -67,6 +71,8 @@ impl HeadSilenceMonitor {
             passed_sample: Arc::new(AtomicU64::new(0)),
             required_samples: Arc::new(AtomicU64::new(required_samples)),
             enforce: Arc::new(AtomicBool::new(false)),
+            measured_until_sample: Arc::new(AtomicU64::new(0)),
+            annotated_until_sample: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -85,6 +91,10 @@ impl HeadSilenceMonitor {
         self.armed_sample.store(armed_sample, Ordering::Release);
         self.progress_samples.store(0, Ordering::Release);
         self.passed_sample.store(0, Ordering::Release);
+        self.measured_until_sample
+            .store(armed_sample, Ordering::Release);
+        self.annotated_until_sample
+            .store(armed_sample, Ordering::Release);
         self.phase.store(HEAD_SILENCE_WAITING, Ordering::Release);
     }
 
@@ -104,6 +114,7 @@ impl HeadSilenceMonitor {
         *self.speech_meter.lock().unwrap() = SpeechMeter::new(policy, rate, depth);
     }
 
+    /// Must be called under the analysis writer guard, before annotation.
     pub(crate) fn measure(&self, samples: &[f32], start: u64, speech: bool) {
         if !self.amplitude_enabled.load(Ordering::Acquire)
             || self.phase.load(Ordering::Acquire) == HEAD_SILENCE_IDLE
@@ -111,21 +122,28 @@ impl HeadSilenceMonitor {
         {
             return;
         }
+        let end = start.saturating_add(samples.len() as u64);
+        let effective_start = start
+            .max(self.armed_sample.load(Ordering::Acquire))
+            .max(self.measured_until_sample.load(Ordering::Acquire));
+        if end <= effective_start {
+            return;
+        }
+        self.measured_until_sample.store(end, Ordering::Release);
         let mut meter = self.speech_meter.lock().unwrap();
         if !speech {
             meter.silence();
             return;
         }
-        let armed = self.armed_sample.load(Ordering::Acquire);
         if self.enforce.load(Ordering::Acquire)
             && self.phase.load(Ordering::Acquire) == HEAD_SILENCE_WAITING
         {
             return;
         }
-        for (offset, sample) in samples.iter().enumerate() {
-            if start + offset as u64 >= armed {
-                meter.push(*sample);
-            }
+        let offset = (effective_start - start) as usize;
+        let end_offset = (end - start) as usize;
+        for sample in &samples[offset..end_offset] {
+            meter.push(*sample);
         }
     }
 }
@@ -156,23 +174,43 @@ pub(crate) fn annotate_attempt_block(
     block_start: u64,
     block_end: u64,
 ) {
+    let mut phase = head_silence.phase.load(Ordering::Acquire);
     // Freeze the first eligible endpoint even if the command loop or UI is late.
-    if head_silence.end_sample.load(Ordering::Acquire) != 0 {
+    // Idle room-tone analysis must resume after the take has been disarmed.
+    if phase != HEAD_SILENCE_IDLE && head_silence.end_sample.load(Ordering::Acquire) != 0 {
         return;
     }
     let armed_sample = head_silence.armed_sample.load(Ordering::Acquire);
-    let mut phase = head_silence.phase.load(Ordering::Acquire);
+    let block_end = block_end.min(block_start.saturating_add(frames));
+    let effective_start = block_start
+        .max(head_silence.annotated_until_sample.load(Ordering::Acquire))
+        .max(if phase == HEAD_SILENCE_IDLE {
+            0
+        } else {
+            armed_sample
+        });
+    if block_end <= effective_start {
+        return;
+    }
+    head_silence
+        .annotated_until_sample
+        .store(block_end, Ordering::Release);
+    // A queued block can straddle arm(), and VAD classification intervals can
+    // overlap. Count only the new intersection with this take, never full frames
+    // that include audio before its start or that have already been analyzed.
+    let effective_frames = block_end - effective_start;
 
     let enforce = head_silence.enforce.load(Ordering::Acquire);
     if !is_speech {
-        let _ = silence_samples.fetch_add(frames, Ordering::AcqRel);
+        let previous = silence_samples.load(Ordering::Acquire);
+        silence_samples.store(previous.saturating_add(effective_frames), Ordering::Release);
     } else {
         silence_samples.store(0, Ordering::Release);
         let count_as_content = phase != HEAD_SILENCE_IDLE
             && block_end > armed_sample
             && !(enforce && phase == HEAD_SILENCE_WAITING);
         if count_as_content {
-            let candidate = block_start.max(armed_sample).max(1);
+            let candidate = effective_start.max(1);
             let _ = attempt_signal_start_sample.compare_exchange(
                 0,
                 candidate,
@@ -192,7 +230,7 @@ pub(crate) fn annotate_attempt_block(
                 head_silence
                     .progress_samples
                     .load(Ordering::Acquire)
-                    .saturating_add(frames)
+                    .saturating_add(effective_frames)
                     .min(required_samples)
             }
         } else {
@@ -238,6 +276,182 @@ pub(crate) fn annotate_attempt_block(
 #[cfg(test)]
 mod short_take_tests {
     use super::*;
+
+    struct Analysis {
+        head: HeadSilenceMonitor,
+        silence: AtomicU64,
+        last: AtomicU64,
+        first: AtomicU64,
+    }
+
+    impl Analysis {
+        fn new(required: u64, armed: u64, enforce: bool, auto_end: bool) -> Self {
+            let state = Self {
+                head: HeadSilenceMonitor::new(required),
+                silence: AtomicU64::new(0),
+                last: AtomicU64::new(0),
+                first: AtomicU64::new(0),
+            };
+            state.head.set_enforce(enforce);
+            state.arm(armed, auto_end);
+            state
+        }
+
+        fn arm(&self, armed: u64, auto_end: bool) {
+            self.head.configure(
+                RecordingPolicy {
+                    amplitude_enabled: true,
+                    auto_end,
+                    ..Default::default()
+                },
+                48_000,
+                16,
+            );
+            self.first.store(0, Ordering::Release);
+            self.last.store(0, Ordering::Release);
+            self.silence.store(0, Ordering::Release);
+            self.head.arm(armed);
+        }
+
+        fn feed(&self, speech: bool, start: u64, end: u64, amplitude: f32) {
+            let pcm = vec![amplitude; (end - start) as usize];
+            // Match both the callback and VAD worker call order. A shared
+            // watermark would accidentally make annotation ignore this block.
+            self.head.measure(&pcm, start, speech);
+            annotate_attempt_block(
+                &self.head,
+                &self.silence,
+                &self.last,
+                &self.first,
+                speech,
+                end - start,
+                start,
+                end,
+            );
+        }
+    }
+
+    #[test]
+    fn cached_vad_frame_does_not_pass_head_silence_98_samples_early() {
+        let analysis = Analysis::new(48_000, 2_486_400, true, false);
+        // Real diagnostic boundaries: a 480-sample callback was buffered
+        // before arm. At 48 kHz, each VAD interval covers 766 of 768 samples.
+        for index in 0..63 {
+            let start = 2_485_920 + index * 768;
+            analysis.feed(false, start, start + 766, 0.0);
+        }
+        let former_passed = 2_485_920 + 62 * 768 + 766;
+        assert_eq!(former_passed, 2_534_302);
+        assert_eq!(former_passed - 2_486_400, 48_000 - 98);
+        assert_eq!(
+            analysis.head.progress_samples.load(Ordering::Acquire),
+            47_778
+        );
+        assert_eq!(analysis.head.passed_sample.load(Ordering::Acquire), 0);
+        let start = 2_485_920 + 63 * 768;
+        analysis.feed(false, start, start + 766, 0.0);
+        assert_eq!(
+            analysis.head.progress_samples.load(Ordering::Acquire),
+            48_000
+        );
+        assert!(analysis.head.passed_sample.load(Ordering::Acquire) >= 2_486_400 + 48_000);
+        assert_eq!(
+            analysis.head.phase.load(Ordering::Acquire),
+            HEAD_SILENCE_PASSED
+        );
+    }
+
+    #[test]
+    fn duplicate_late_and_overlapping_blocks_only_count_new_samples() {
+        let analysis = Analysis::new(400, 1_000, true, false);
+        analysis.feed(true, 800, 1_000, 1.0); // Entirely before arm.
+        analysis.feed(false, 900, 1_100, 0.0); // Only 100 samples belong to this take.
+        analysis.feed(true, 900, 1_100, 1.0); // Duplicate classification must not reset silence.
+        analysis.feed(false, 1_050, 1_300, 0.0); // Only the new 200 samples count.
+        analysis.feed(true, 1_100, 1_200, 1.0); // Late old speech is also irrelevant.
+        assert_eq!(analysis.head.progress_samples.load(Ordering::Acquire), 300);
+        assert_eq!(analysis.silence.load(Ordering::Acquire), 300);
+        assert_eq!(analysis.head.passed_sample.load(Ordering::Acquire), 0);
+        analysis.feed(false, 1_300, 1_400, 0.0);
+        assert_eq!(analysis.head.passed_sample.load(Ordering::Acquire), 1_400);
+
+        analysis.feed(true, 1_390, 1_450, 0.125);
+        analysis.feed(true, 1_400, 1_450, 1.0); // Replayed PCM must not change PEAK/RMS.
+        analysis.feed(true, 1_425, 1_500, 0.125);
+        let quality = analysis.head.speech_meter.lock().unwrap().result().unwrap();
+        assert_eq!(analysis.first.load(Ordering::Acquire), 1_400);
+        assert_eq!(analysis.last.load(Ordering::Acquire), 1_500);
+        assert_eq!(quality.speech_samples, 100);
+        assert!((quality.rms_dbfs.unwrap() - 20.0 * 0.125_f32.log10()).abs() < 0.0001);
+        assert!(quality.warnings.is_empty());
+    }
+
+    #[test]
+    fn speech_during_head_silence_restarts_only_the_current_wait() {
+        let analysis = Analysis::new(200, 1_000, true, false);
+        analysis.feed(false, 1_000, 1_150, 0.0);
+        analysis.feed(true, 1_150, 1_200, 0.125);
+        assert_eq!(analysis.head.progress_samples.load(Ordering::Acquire), 0);
+        assert_eq!(analysis.first.load(Ordering::Acquire), 0);
+        analysis.feed(false, 1_200, 1_390, 0.0);
+        assert_eq!(analysis.head.passed_sample.load(Ordering::Acquire), 0);
+        analysis.feed(false, 1_390, 1_410, 0.0);
+        assert_eq!(analysis.head.passed_sample.load(Ordering::Acquire), 1_410);
+        assert_eq!(
+            analysis
+                .head
+                .speech_meter
+                .lock()
+                .unwrap()
+                .result()
+                .unwrap()
+                .speech_samples,
+            0
+        );
+    }
+
+    #[test]
+    fn auto_stop_freezes_results_and_retake_starts_with_clean_statistics() {
+        let analysis = Analysis::new(200, 1_000, true, true);
+        analysis.feed(false, 1_000, 1_200, 0.0);
+        analysis.feed(true, 1_200, 1_250, 0.01);
+        analysis.feed(false, 1_250, 1_450, 0.0);
+        let frozen = analysis.head.speech_meter.lock().unwrap().result().unwrap();
+        assert_eq!(analysis.head.end_sample.load(Ordering::Acquire), 1_450);
+        assert_eq!(frozen.speech_samples, 50);
+        assert_eq!(frozen.warnings, ["speech_low"]);
+        analysis.feed(true, 1_400, 1_500, 1.0); // Overlap the stop boundary.
+        analysis.feed(true, 1_500, 2_000, 1.0);
+        assert_eq!(
+            analysis.head.speech_meter.lock().unwrap().result().unwrap(),
+            frozen
+        );
+        assert_eq!(analysis.last.load(Ordering::Acquire), 1_250);
+        assert_eq!(analysis.head.end_sample.load(Ordering::Acquire), 1_450);
+
+        analysis.head.disarm();
+        let idle_silence = analysis.silence.load(Ordering::Acquire);
+        analysis.feed(false, 2_000, 2_100, 0.0);
+        assert_eq!(analysis.silence.load(Ordering::Acquire), idle_silence + 100);
+        assert_eq!(
+            analysis.head.speech_meter.lock().unwrap().result().unwrap(),
+            frozen
+        );
+
+        analysis.arm(3_000, true);
+        assert_eq!(analysis.head.end_sample.load(Ordering::Acquire), 0);
+        assert_eq!(analysis.head.passed_sample.load(Ordering::Acquire), 0);
+        assert_eq!(analysis.head.progress_samples.load(Ordering::Acquire), 0);
+        analysis.feed(true, 1_500, 2_000, 1.0); // Previous take arrives late.
+        analysis.feed(false, 3_000, 3_200, 0.0);
+        analysis.feed(true, 3_200, 3_250, 0.125);
+        let quality = analysis.head.speech_meter.lock().unwrap().result().unwrap();
+        assert_eq!(quality.speech_samples, 50);
+        assert!(quality.warnings.is_empty());
+        assert!(quality.live_warnings.is_empty());
+        assert_eq!(analysis.first.load(Ordering::Acquire), 3_200);
+    }
+
     #[test]
     fn first_eligible_boundary_stays_fixed_despite_more_speech() {
         let h = HeadSilenceMonitor::new(200);

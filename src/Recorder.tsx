@@ -1,4 +1,5 @@
 import { RecordingPolicyFields } from './RecordingPolicyFields';
+import { captureSilenceDurationMs } from '../shared/silence-timing';
 import { DEFAULT_RECORDING_POLICY, recordingPolicyForTask, speechQualityMetrics, validRecordingPolicy, speechQualityWarning, speechQualityWarningDetail, type RecordingPolicy, type StoppedAttempt, type AutomaticStopEvent } from './recording-policy';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { HomeHeader, Icon, StudioChrome, StudioStatus, type EngineStatus, type Phase } from './studio-chrome';
@@ -892,7 +893,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const [noiseCheckLive, setNoiseCheckLive] = useState<NoiseCheckProgress | null>(null);
   const [noiseCheckSamples, setNoiseCheckSamples] = useState<number[]>([]);
   const [noiseCheckError, setNoiseCheckError] = useState('');
-  const [busy, setBusy] = useState('');
+  const [operationBusy, setBusy] = useState('');
+  const [accepting, setAccepting] = useState(false);
+  // A nested request may finish before confirmation's refresh and navigation.
+  const busy = operationBusy || (accepting ? t('notice.savingAccept') : '');
   const [notice, setNotice] = useState(() => t('notice.connectingEngine'));
   const [error, setError] = useState('');
   const [dataSafetyAlert, setDataSafetyAlert] = useState('');
@@ -938,6 +942,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const previewWaveformRequestRef = useRef(0);
   const sealOperationRef = useRef(false);
   const pauseOperationRef = useRef(false);
+  const acceptOperationRef = useRef(false);
   const presetOperationRef = useRef(false);
   const noiseCheckActivationRef = useRef(0);
   const noiseCheckRequestSequenceRef = useRef(0);
@@ -1181,6 +1186,9 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     : Math.max(-96, Math.min(0, 20 * Math.log10(meter.rms)));
   const liveRmsOnThresholdScale = Math.min(100, Math.max(0, (liveRmsDbfs + 72) / 60 * 100));
   const effectiveSilenceDurationMs = recording ? meter.silence_duration_ms : snapshot?.silence_duration_ms ?? silenceDurationMs;
+  const captureSilenceTargetMs = recording && Number(meter.silence_target_ms) > 0
+    ? Number(meter.silence_target_ms)
+    : captureSilenceDurationMs(effectiveSilenceDurationMs);
   const silenceActiveItemIndex = recording ? currentIndex : -1;
   const itemSilenceViews = useMemo(() => items.map((item, index) => (
     index === silenceActiveItemIndex
@@ -1215,11 +1223,12 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         else itemRowRefs.current.delete(item.id);
       }}
       className={`professional-item${item.status === 'skipped' ? ' skipped' : ''}${flagged ? ' has-silence-issue' : ''}${labelBoundary ? ' label-boundary' : ''}${requiresRerecord ? ' requires-rerecord' : ''}${retainedWarning ? ' retained-warning' : ''}`}
-      disabled={recording || Boolean(captureFault)}
+      disabled={recording || Boolean(captureFault) || accepting}
       tabIndex={-1}
       aria-label={accessibleParts}
       title={[marks.title, item.label].filter(Boolean).join(' · ') || undefined}
       onClick={(event) => {
+        if (acceptOperationRef.current) return;
         const previous = event.currentTarget.parentElement?.querySelector<HTMLButtonElement>('.professional-item.active');
         if (previous && previous !== event.currentTarget) {
           previous.classList.remove('active');
@@ -1235,6 +1244,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         setReviewAttemptId(null);
       }}
       onKeyDown={(event) => {
+        if (acceptOperationRef.current) return;
         const nextIndex = event.key === 'ArrowDown'
           ? Math.min(items.length - 1, index + 1)
           : event.key === 'ArrowUp'
@@ -1262,9 +1272,9 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         <ItemSilenceMarkPills marks={marks} />
       </span>
     </button>;
-  }), [captureFault, itemSilenceViews, items, locale, recording]);
-  const requiredSilenceSamples = sampleRateForDisplay * effectiveSilenceDurationMs / 1_000;
-  const headSilenceRequiredSamples = Math.max(1, meter.required_head_silence_samples ?? requiredSilenceSamples);
+  }), [accepting, captureFault, itemSilenceViews, items, locale, recording]);
+  const requiredSilenceSamples = Math.ceil(sampleRateForDisplay * captureSilenceTargetMs / 1_000);
+  const headSilenceRequiredSamples = Math.max(1, meter.required_head_silence_samples || requiredSilenceSamples);
   const headSilenceProgressSamples = Math.min(
     headSilenceRequiredSamples,
     Math.max(0, meter.head_silence_progress_samples ?? 0),
@@ -1283,9 +1293,9 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   );
   const liveSilenceMs = Math.round((meter.silence_samples ?? 0) / Math.max(sampleRateForDisplay, 1) * 1_000);
   const displayedLiveSilenceMs = silenceDetector === 'vad'
-    ? Math.min(liveSilenceMs, effectiveSilenceDurationMs)
+    ? Math.min(liveSilenceMs, captureSilenceTargetMs)
     : liveSilenceMs;
-  const tailSilenceMet = liveSilenceMs >= effectiveSilenceDurationMs;
+  const tailSilenceMet = (meter.silence_samples ?? 0) >= requiredSilenceSamples;
   const liveTakeStartSample = displayedTakeStartSample({
     detector: silenceDetector,
     enforce: automationRules.enforceHeadTailSilence,
@@ -1316,7 +1326,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     spoken: Boolean(hasSpoken),
     pendingRemainingMs,
     liveSilenceMs: displayedLiveSilenceMs,
-    requiredMs: effectiveSilenceDurationMs,
+    requiredMs: captureSilenceTargetMs,
   });
   const reviewAttempt = !recording && currentItem
     ? (currentItem.status === 'review' ? latestReviewCandidate(currentItem) : undefined)
@@ -1358,10 +1368,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   const safeAttemptIds = useMemo(() => new Set(snapshot && currentWorkflow?.disposition !== 'inconsistent'
     ? (currentItem?.attempts ?? []).filter((attempt) => isAttemptPreviewSafe(attempt, snapshot)).map((attempt) => attempt.attempt_id)
     : []), [currentItem?.attempts, currentWorkflow?.disposition, snapshot]);
-  const defaultAcceptAttemptId = retakeCandidateAttempt?.attempt_id
-    ?? reviewAttemptId
-    ?? currentItem?.selected_attempt_id
-    ?? (currentItem ? latestUsableAttempt(currentItem)?.attempt_id : undefined);
+  const defaultAcceptAttemptId = reviewAttempt?.attempt_id;
   const defaultAcceptAttemptSafe = Boolean(
     defaultAcceptAttemptId && safeAttemptIds.has(defaultAcceptAttemptId),
   );
@@ -1414,7 +1421,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     pending: isPendingTake,
     spoken: Boolean(hasSpoken),
     pendingRemainingMs,
-    requiredMs: effectiveSilenceDurationMs,
+    requiredMs: captureSilenceTargetMs,
     liveSilenceMs: displayedLiveSilenceMs,
     headMs: liveHeadMsFromMeter({
       sampleRate: sampleRateForDisplay,
@@ -1550,7 +1557,12 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       if (selectedIssueId) setSelectedIssueId(null);
       return;
     }
-    if (nextIssue.id !== selectedIssueId) locateWorkbenchIssue(nextIssue);
+    if (nextIssue.id !== selectedIssueId) {
+      // The issue queue can refresh during confirmation, but its selection
+      // must not override confirmation's pending physical-item transition.
+      if (acceptOperationRef.current) setSelectedIssueId(nextIssue.id);
+      else locateWorkbenchIssue(nextIssue);
+    }
   }, [monitorPanelTab, recording, selectedIssueId, visibleWorkbenchIssues]);
   const entryBlocksAttempt = noiseCheckBlocksAttempt
     || deviceWarningOpen
@@ -1627,12 +1639,12 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     cueLabel: readerCueLabel,
     readerCueLabel,
     silenceProgress: isPendingTake ? silenceProgress : 0,
-    silenceDurationMs: effectiveSilenceDurationMs,
+    silenceDurationMs: captureSilenceTargetMs,
     qualityWarning: speechWarning,
     itemDisposition: currentWorkflow?.disposition,
     recommendedAction: currentWorkflow?.recommendedAction,
     deliveryHealth: currentWorkflow?.deliveryHealth,
-  }), [speechWarning, captureFault, cue, currentIndex, currentItem?.id, currentItem?.label, currentItem?.text, currentLabelTransition, currentWorkflow?.deliveryHealth, currentWorkflow?.disposition, currentWorkflow?.recommendedAction, effectiveSilenceDurationMs, isPendingTake, items.length, readerCue, readerCueLabel, sessionName, showCurrentLabelTransition, silenceProgress, snapshot?.session_id, t, workflowComplete]);
+  }), [speechWarning, captureFault, cue, currentIndex, currentItem?.id, currentItem?.label, currentItem?.text, currentLabelTransition, currentWorkflow?.deliveryHealth, currentWorkflow?.disposition, currentWorkflow?.recommendedAction, captureSilenceTargetMs, isPendingTake, items.length, readerCue, readerCueLabel, sessionName, showCurrentLabelTransition, silenceProgress, snapshot?.session_id, t, workflowComplete]);
 
   async function run<T>(label: string, action: () => Promise<T>): Promise<T | null> {
     setBusy(label);
@@ -1686,6 +1698,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   }
 
   function applyAutomationRules(next: AutomationRules) {
+    if (acceptOperationRef.current) return;
     const previous = automationRules;
     setAutomationRules(next);
     if (sessionDir) saveSessionAutomationRules(sessionDir, next);
@@ -2803,6 +2816,9 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       overflow_samples: nextSnapshot.overflow_samples,
       silence_threshold_dbfs: threshold,
       silence_duration_ms: nextSnapshot.silence_duration_ms,
+      silence_target_ms: current.active_attempt?.required_head_silence_samples
+        ? current.active_attempt.required_head_silence_samples * 1_000 / nextSnapshot.audio_format.sample_rate
+        : captureSilenceDurationMs(nextSnapshot.silence_duration_ms),
       silence_detector: detector,
       head_silence_phase: current.active_attempt?.head_silence_phase ?? 'idle',
       head_silence_armed_sample: current.active_attempt?.head_silence_armed_sample ?? 0,
@@ -3007,6 +3023,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     thresholdValue: number,
     durationValue: number,
   ) {
+    if (acceptOperationRef.current) return;
     const threshold = Math.min(-12, Math.max(-72, Math.round(thresholdValue)));
     const durationMs = Math.min(5_000, Math.max(200, Math.round(durationValue / 100) * 100));
     const detector = silenceDetector;
@@ -3045,6 +3062,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         ...previous,
         silence_threshold_dbfs: result.threshold_dbfs,
         silence_duration_ms: result.silence_duration_ms,
+        silence_target_ms: captureSilenceDurationMs(result.silence_duration_ms),
         silence_detector: appliedDetector,
         silence_samples: 0,
         ...(result.reset_kind === 'head_silence' ? {
@@ -3303,8 +3321,11 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       acknowledgeLabelTransition?: boolean;
       beginRetakeSequence?: boolean;
       allowAfterSealedTake?: boolean;
+      /** Only the confirmation workflow may start its next item while locked. */
+      allowDuringAccept?: boolean;
     } = {},
   ) {
+    if (acceptOperationRef.current && !options.allowDuringAccept) return false;
     if (!item || (recording && !options.allowAfterSealedTake) || phase !== 'running' || captureFault || !captureActive) return false;
     if (deviceWarningKind || currentNoiseGate !== 'ready' || !inputAuditionDecision || inputAuditionOpen) {
       if (!deviceWarningKind && currentNoiseGate === 'ready' && !inputAuditionOpen) {
@@ -3352,6 +3373,9 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       ...previous,
       speech_quality: null,
       silence_duration_ms: snapshot?.silence_duration_ms ?? silenceDurationMs,
+      silence_target_ms: result.required_head_silence_samples
+        ? result.required_head_silence_samples * 1_000 / sampleRateForDisplay
+        : captureSilenceDurationMs(snapshot?.silence_duration_ms ?? silenceDurationMs),
       silence_samples: 0,
       last_signal_sample: 0,
       head_silence_phase: result.head_silence_phase ?? 'waiting_for_head_silence',
@@ -3388,7 +3412,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   }, [recording, currentItem?.id, snapshot?.session_id]);
 
   async function saveRecordingPolicy(policy = recordingPolicy): Promise<boolean> {
-    if (!snapshot) return false;
+    if (!snapshot || acceptOperationRef.current) return false;
     if (!validRecordingPolicy(policy, bitDepthForDisplay)) { setError(t(policy.peak_samp ? 'speech.peakInvalid' : 'speech.invalid')); return false; }
     const result = await run(t('speech.save'), () => window.recorder.request<{ snapshot: SessionSnapshot }>(captureActive ? 'set_recording_policy' : 'set_session_recording_policy', captureActive ? policy : { session_dir: sessionDir, expected_session_id: snapshot.session_id, expected_journal_seq: snapshot.journal_seq, recording_policy: policy }));
     if (!result) return false;
@@ -3423,6 +3447,9 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     setAttemptRecordingStartedSample(0);
     if (!result.attempt) {
       setReviewAttemptId(null);
+      // No replacement was retained: restore the original review flow. Any
+      // real pending retake is still derived from the refreshed item itself.
+      setRetakeItemId(null);
       try {
         await refreshState();
       } catch (caught) {
@@ -3560,6 +3587,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   }
 
   function locateNextRerecord() {
+    if (acceptOperationRef.current) return;
     const nextIndex = findNextRerecordIndex(items, currentIndex);
     if (nextIndex < 0) return;
     setRetakeSequenceActive(false);
@@ -3578,7 +3606,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   }
 
   function locateWorkbenchIssue(issue: WorkbenchIssue, wrapped = false) {
-    if (recording) return;
+    if (recording || acceptOperationRef.current) return;
     setSelectedIssueId(issue.id);
     setMonitorPanelTab('issues');
     if (issue.itemIndex !== null && items[issue.itemIndex]) {
@@ -3603,77 +3631,87 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
     // handler executes.
     if (captureFault || !currentItem || currentItem.status !== 'review' || recording) return;
     const retainedAttemptId = currentItem.selected_attempt_id;
-    const retakeCandidateId = retakeCandidateAttempt?.attempt_id;
     const isRetakeDecision = hasRetakeDecision;
-    const attemptId = targetAttemptId
-      ?? retakeCandidateId
-      ?? reviewAttemptId
-      ?? currentItem.selected_attempt_id
-      ?? latestUsableAttempt(currentItem)?.attempt_id;
+    const attemptId = targetAttemptId ?? defaultAcceptAttemptId;
     if (!attemptId || !currentItem.attempts.some((attempt) => attempt.attempt_id === attemptId)) return;
     if (!safeAttemptIds.has(attemptId)) return;
-    const accepted = await run(t('notice.savingAccept'), () => window.recorder.request('accept_attempt', {
-      item_id: currentItem.id,
-      attempt_id: attemptId,
-    }));
-    if (!accepted) return;
-    const latest = await refreshState();
-    setReviewAttemptId(null);
-    setRetakeItemId(null);
-    if (!latest) return;
-    if (isRetakeDecision) {
-      const nextIndex = nextPhysicalItemIndex(currentIndex, latest.items.length);
-      const nextItem = latest.items[nextIndex];
-      if (nextIndex >= 0) moveToAutomaticTarget(currentItem, nextItem, nextIndex);
-      setRetakeSequenceActive(shouldContinueRetakeSequence(
-        retakeSequenceActive,
-        currentIndex,
-        nextIndex,
-        nextItem,
-      ));
-      const keptPrevious = attemptId === retainedAttemptId;
-      setNotice(nextIndex === currentIndex
-        ? t(keptPrevious ? 'notice.retakeKeptPreviousLast' : 'notice.retakeUsedCandidateLast')
-        : t(keptPrevious ? 'notice.retakeKeptPreviousNext' : 'notice.retakeUsedCandidateNext'));
-      return;
-    }
-    const continuation = continuationAfterAccept(latest.items, currentIndex);
-    if (continuation.kind === 'start') {
-      const nextItem = latest.items[continuation.nextIndex];
-      const nextLabelTransition = moveToAutomaticTarget(
-        currentItem,
-        nextItem,
-        continuation.nextIndex,
-      ) ?? labelTransition(currentItem.label, nextItem.label);
-      const autoStartsNext = options.autoStartNext !== false && shouldAutoStartAfterAccept(continuation, {
-        autoStartNext: automationRules.autoStartNext,
-        pauseOnLabelChange: automationRules.pauseOnLabelChange,
-        labelChanged: nextLabelTransition.changed,
-      });
-      if (autoStartsNext) {
-        await startAttempt(nextItem, { acknowledgeLabelTransition: false });
-      } else {
-        setNotice(
-          nextLabelTransition.changed && automationRules.pauseOnLabelChange
-            ? t('notice.labelChangedBeforeStart')
-            : t('notice.acceptedReady'),
-        );
+    // React's busy render can lag a second click or queued Space event.
+    // Hold this lock through persistence, refresh, and next-item transition.
+    if (acceptOperationRef.current) return;
+    acceptOperationRef.current = true;
+    setAccepting(true);
+    try {
+      const accepted = await run(t('notice.savingAccept'), () => window.recorder.request('accept_attempt', {
+        item_id: currentItem.id,
+        attempt_id: attemptId,
+      }));
+      if (!accepted) return;
+      const latest = await refreshState();
+      setReviewAttemptId(null);
+      setRetakeItemId(null);
+      if (!latest) return;
+      if (isRetakeDecision) {
+        const nextIndex = nextPhysicalItemIndex(currentIndex, latest.items.length);
+        const nextItem = latest.items[nextIndex];
+        if (nextIndex >= 0) moveToAutomaticTarget(currentItem, nextItem, nextIndex);
+        setRetakeSequenceActive(shouldContinueRetakeSequence(
+          retakeSequenceActive,
+          currentIndex,
+          nextIndex,
+          nextItem,
+        ));
+        const keptPrevious = attemptId === retainedAttemptId;
+        setNotice(nextIndex === currentIndex
+          ? t(keptPrevious ? 'notice.retakeKeptPreviousLast' : 'notice.retakeUsedCandidateLast')
+          : t(keptPrevious ? 'notice.retakeKeptPreviousNext' : 'notice.retakeUsedCandidateNext'));
+        return;
       }
-    } else if (continuation.kind === 'review') {
-      moveToAutomaticTarget(currentItem, latest.items[continuation.nextIndex], continuation.nextIndex);
-      setNotice(t('notice.acceptedNeedConfirm'));
-    } else if (continuation.kind === 'finish') {
-      setCurrentIndex(-1);
-      setNotice(t('notice.allProcessedFinish'));
-    } else {
-      setNotice(t('notice.abnormalCheckList'));
+      const continuation = continuationAfterAccept(latest.items, currentIndex);
+      if (continuation.kind === 'start') {
+        const nextItem = latest.items[continuation.nextIndex];
+        const nextLabelTransition = moveToAutomaticTarget(
+          currentItem,
+          nextItem,
+          continuation.nextIndex,
+        ) ?? labelTransition(currentItem.label, nextItem.label);
+        const autoStartsNext = options.autoStartNext !== false && shouldAutoStartAfterAccept(continuation, {
+          autoStartNext: automationRules.autoStartNext,
+          pauseOnLabelChange: automationRules.pauseOnLabelChange,
+          labelChanged: nextLabelTransition.changed,
+        });
+        if (autoStartsNext) {
+          await startAttempt(nextItem, { acknowledgeLabelTransition: false, allowDuringAccept: true });
+        } else {
+          setNotice(
+            nextLabelTransition.changed && automationRules.pauseOnLabelChange
+              ? t('notice.labelChangedBeforeStart')
+              : t('notice.acceptedReady'),
+          );
+        }
+      } else if (continuation.kind === 'review') {
+        moveToAutomaticTarget(currentItem, latest.items[continuation.nextIndex], continuation.nextIndex);
+        setNotice(t('notice.acceptedNeedConfirm'));
+      } else if (continuation.kind === 'finish') {
+        setCurrentIndex(-1);
+        setNotice(t('notice.allProcessedFinish'));
+      } else {
+        setNotice(t('notice.abnormalCheckList'));
+      }
+    } catch (caught) {
+      // Confirmation may already be durable; release the UI so a retry can
+      // reconcile that same selected take after a failed state refresh.
+      setError(errorMessage(caught));
+      reportRendererError('确认录音后刷新任务', caught);
+    } finally {
+      acceptOperationRef.current = false;
+      setAccepting(false);
     }
   }
 
   async function skipItem() {
     // Keep a second mutation gate in the handler for stale DOM and queued
     // keyboard events. The engine performs the authoritative final guard.
-    if (captureFault
+    if (acceptOperationRef.current || captureFault
       || !currentItem
       || !['pending', 'review'].includes(currentItem.status)
       || recording
@@ -3703,7 +3741,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   }
 
   async function previewAttempt(targetAttemptId?: string) {
-    if (!currentItem || recording) return;
+    if (!currentItem || recording || acceptOperationRef.current) return;
     const attemptId = targetAttemptId
       ?? reviewAttempt?.attempt_id
       ?? reviewAttemptId
@@ -4237,14 +4275,14 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   }
 
   function requestFinishCapture() {
-    if (!sessionDir || !captureActive || busy) return;
+    if (acceptOperationRef.current || !sessionDir || !captureActive || busy) return;
     if (captureExitDialog(recording, captureFault, exitAction) !== 'finish') return;
     setPauseConfirmOpen(false);
     setFinishConfirmOpen(true);
   }
 
   function requestSafePause() {
-    if (phase !== 'running' || busy || !sessionDir) return;
+    if (acceptOperationRef.current || phase !== 'running' || busy || !sessionDir) return;
     if (!captureActive) {
       leaveInspectionWorkspace();
       return;
@@ -4258,7 +4296,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
   }
 
   function requestPauseCapture() {
-    if (phase !== 'running' || busy || !sessionDir || !captureActive) return;
+    if (acceptOperationRef.current || phase !== 'running' || busy || !sessionDir || !captureActive) return;
     if (captureFault) {
       setPauseConfirmOpen(false);
       setFinishConfirmOpen(true);
@@ -4732,7 +4770,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
         if (event.key === 'Escape') closePreviewPlayer();
         return;
       }
-      if (phase !== 'running' || busy) return;
+      if (phase !== 'running' || busy || acceptOperationRef.current) return;
       if (captureActive && !captureFault && !showNoiseCheckDialog && !showDeviceWarningDialog && event.key === 'Escape' && recording && isPendingTake) {
         event.preventDefault();
         void stopAttempt();
@@ -5366,7 +5404,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
               <button
                 type="button"
                 className="rerecord-locator"
-                disabled={rerecordCount === 0 || recording || Boolean(captureFault)}
+                disabled={rerecordCount === 0 || recording || accepting || Boolean(captureFault)}
                 aria-label={rerecordCount > 0
                   ? t('recorder.locateNextRerecordAria', { count: rerecordCount })
                   : t('recorder.noRerecordAria')}
@@ -5381,7 +5419,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
       </aside>
       <main id="main" className="editor-document">
         <div className="document-tabs"><span className="active"><Icon name="microphone" size={13} /> {workflowComplete ? t('recorder.taskComplete') : currentItem?.id ?? 'Item'} <i>×</i></span></div>
-        <div className="editor-toolbar"><div className="editor-nav"><button title={t('recorder.prevItem')} disabled={recording || currentIndex === 0} onClick={() => { setRetakeSequenceActive(false); setCurrentIndex((index) => Math.max(0, index - 1)); }}><Icon name="chevron-left" /></button><span>{currentIndex + 1} / {items.length}</span><button title={t('recorder.nextItem')} disabled={recording || currentIndex >= items.length - 1} onClick={() => { setRetakeSequenceActive(false); setCurrentIndex((index) => Math.min(items.length - 1, index + 1)); }}><Icon name="chevron-right" /></button></div><div className="editor-time"><strong className={recording ? 'recording' : ''}>{recording ? attemptDuration : sessionDuration}</strong></div><div className="editor-toolbar-actions"><button className="prompter-launch" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? t('recorder.locatePrompter') : t('recorder.openPrompter')}</button></div><div className={`save-health ${workspaceFaulted || captureFault ? 'fault' : meter.storage_status === 'warning' ? 'warning' : ''}`}><i />{workspaceFaulted ? t('recorder.healthReadonly') : !captureActive ? t('recorder.healthView') : captureFault ? t('recorder.healthFaultStop', { title: captureFaultCopy.title }) : meter.storage_status === 'warning' ? t('recorder.healthWarning', { minutes: Math.max(0, Math.floor(meter.storage_safe_remaining_seconds / 60)) }) : t('recorder.healthLive')}</div></div>
+        <div className="editor-toolbar"><div className="editor-nav"><button title={t('recorder.prevItem')} disabled={recording || accepting || currentIndex === 0} onClick={() => { if (acceptOperationRef.current) return; setRetakeSequenceActive(false); setCurrentIndex((index) => Math.max(0, index - 1)); }}><Icon name="chevron-left" /></button><span>{currentIndex + 1} / {items.length}</span><button title={t('recorder.nextItem')} disabled={recording || accepting || currentIndex >= items.length - 1} onClick={() => { if (acceptOperationRef.current) return; setRetakeSequenceActive(false); setCurrentIndex((index) => Math.min(items.length - 1, index + 1)); }}><Icon name="chevron-right" /></button></div><div className="editor-time"><strong className={recording ? 'recording' : ''}>{recording ? attemptDuration : sessionDuration}</strong></div><div className="editor-toolbar-actions"><button className="prompter-launch" onClick={() => void openPrompterPanel()}><Icon name="play" size={13} />{prompterStatus.ready ? t('recorder.locatePrompter') : t('recorder.openPrompter')}</button></div><div className={`save-health ${workspaceFaulted || captureFault ? 'fault' : meter.storage_status === 'warning' ? 'warning' : ''}`}><i />{workspaceFaulted ? t('recorder.healthReadonly') : !captureActive ? t('recorder.healthView') : captureFault ? t('recorder.healthFaultStop', { title: captureFaultCopy.title }) : meter.storage_status === 'warning' ? t('recorder.healthWarning', { minutes: Math.max(0, Math.floor(meter.storage_safe_remaining_seconds / 60)) }) : t('recorder.healthLive')}</div></div>
         <div className="editor-canvas">
           <section className="script-monitor" style={{ ['--prompter-copy-size' as string]: prompterFontSizeRem(appearance.fontSize), ['--prompter-label-size' as string]: prompterLabelFontSizeRem(appearance.labelFontSize) }}>
             <header>
@@ -5428,7 +5466,7 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
               <small>{captureFault ? captureFaultCopy.detail : entryBlocksAttempt ? (inputAuditionBlocksAttempt || inputAuditionOpen ? t('inputAudition.introBody') : deviceWarningOpen ? t('deviceWarning.warning') : noiseCheckMessage) : workflowComplete ? t('recorder.exportLater') : <>{currentItem?.id}</>}</small>
             </div>
           </section>
-          <section className="signal-monitor"><header><div><strong>{t('recorder.waveform')}</strong>{captureActive || shouldUseRecordedSilencePair(recording, reviewAttempt) ? <SilencePairReadout pair={silencePair} /> : null}</div><div>{captureActive ? <><span>RMS <b>{db(meter.rms)}</b></span><span>PEAK <b className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</b></span></> : <span>{reviewAttempt ? formatDuration(reviewAttempt.end_sample - reviewAttempt.start_sample, sampleRateForDisplay) : t('recorder.noTakeWaveform')}</span>}</div></header><div className="signal-scope"><WebGLWaveform key={showReviewWaveform ? `${sessionDir}:${reviewAttempt?.attempt_id}` : `${sessionDir}:${waveformGeneration}`} mode={showReviewWaveform ? 'review' : 'live'} bins={showReviewWaveform ? reviewWaveformBins : (meter.waveform ?? [])} capturedSamples={meter.captured_samples} waveformEndSample={meter.waveform_end_sample} recording={waveformTakeIsActive(recording && !captureFault, hasSpoken)} takeStartSample={recording && !captureFault ? liveTakeStartSample : undefined} takeEndSample={recording && !captureFault ? liveTakeEndSample : undefined} sampleRate={sampleRateForDisplay} />{captureActive ? <LiveSilenceHint liveMs={displayedLiveSilenceMs} requiredMs={effectiveSilenceDurationMs} /> : null}<div className="scope-scale"><span>−1.0</span><span>−0.5</span><span>0</span><span>+0.5</span><span>+1.0</span></div></div><div className="horizontal-meter"><i className="meter-rms" style={{ width: `${rmsPercent}%` }} /><i className="meter-peak" style={{ left: `${peakPercent}%` }} /></div></section>
+          <section className="signal-monitor"><header><div><strong>{t('recorder.waveform')}</strong>{captureActive || shouldUseRecordedSilencePair(recording, reviewAttempt) ? <SilencePairReadout pair={silencePair} /> : null}</div><div>{captureActive ? <><span>RMS <b>{db(meter.rms)}</b></span><span>PEAK <b className={meter.peak > .92 ? 'clip' : ''}>{db(meter.peak)}</b></span></> : <span>{reviewAttempt ? formatDuration(reviewAttempt.end_sample - reviewAttempt.start_sample, sampleRateForDisplay) : t('recorder.noTakeWaveform')}</span>}</div></header><div className="signal-scope"><WebGLWaveform key={showReviewWaveform ? `${sessionDir}:${reviewAttempt?.attempt_id}` : `${sessionDir}:${waveformGeneration}`} mode={showReviewWaveform ? 'review' : 'live'} bins={showReviewWaveform ? reviewWaveformBins : (meter.waveform ?? [])} capturedSamples={meter.captured_samples} waveformEndSample={meter.waveform_end_sample} recording={waveformTakeIsActive(recording && !captureFault, hasSpoken)} takeStartSample={recording && !captureFault ? liveTakeStartSample : undefined} takeEndSample={recording && !captureFault ? liveTakeEndSample : undefined} sampleRate={sampleRateForDisplay} />{captureActive ? <LiveSilenceHint liveMs={displayedLiveSilenceMs} requiredMs={captureSilenceTargetMs} /> : null}<div className="scope-scale"><span>−1.0</span><span>−0.5</span><span>0</span><span>+0.5</span><span>+1.0</span></div></div><div className="horizontal-meter"><i className="meter-rms" style={{ width: `${rmsPercent}%` }} /><i className="meter-peak" style={{ left: `${peakPercent}%` }} /></div></section>
           <section className="transport-panel">
             <div className="transport-review">
               {hasRetakeChoice
@@ -5552,10 +5590,10 @@ export function RecorderApp({ license }: { license?: LicenseStatus } = {}) {
               <button onClick={() => void exportRecordingArtifact({ session_id: snapshot.session_id, session_dir: sessionDir }, 'cuts_zip', exportScope)} disabled={Boolean(busy) || recording || captureFault || workspaceFaulted || !cutsReadiness.ready || !exportWarningsAcknowledged}><Icon name="export" /><span><strong>{t('recorder.cutsShort')}</strong><small>{!cutsReadiness.ready ? t('p1.exportBlockedSummary', { count: cutsReadiness.blockers.length }) : !exportWarningsAcknowledged ? t('p1.exportAcknowledgeFirst') : artifactStatusCopy(workspaceRecording, 'cuts_zip')}</small></span></button>
             </div></section>}
             {monitorPanelTab === 'issues' && <section className="monitor-section monitor-issues issue-workbench" data-testid="issue-workbench">
-              <header><div><h3>{t('recorder.issuesTitle')}</h3><small>{t('p1.issueSummary', { blockers: workbenchIssues.filter((issue) => issue.severity === 'blocker').length, warnings: workbenchIssues.filter((issue) => issue.severity === 'warning').length })}</small></div><div className="issue-navigation"><button onClick={() => moveWorkbenchIssue(-1)} disabled={recording || visibleWorkbenchIssues.length === 0} title={t('p1.previousIssue')}><Icon name="chevron-left" size={12} /></button><button onClick={() => moveWorkbenchIssue(1)} disabled={recording || visibleWorkbenchIssues.length === 0} title={t('p1.nextIssue')}><Icon name="chevron-right" size={12} /></button></div></header>
+              <header><div><h3>{t('recorder.issuesTitle')}</h3><small>{t('p1.issueSummary', { blockers: workbenchIssues.filter((issue) => issue.severity === 'blocker').length, warnings: workbenchIssues.filter((issue) => issue.severity === 'warning').length })}</small></div><div className="issue-navigation"><button onClick={() => moveWorkbenchIssue(-1)} disabled={recording || accepting || visibleWorkbenchIssues.length === 0} title={t('p1.previousIssue')}><Icon name="chevron-left" size={12} /></button><button onClick={() => moveWorkbenchIssue(1)} disabled={recording || accepting || visibleWorkbenchIssues.length === 0} title={t('p1.nextIssue')}><Icon name="chevron-right" size={12} /></button></div></header>
               <div className="issue-filters" role="group" aria-label={t('p1.issueFilterAria')}>{(['all', 'blocker', 'warning'] as const).map((filter) => <button key={filter} className={issueFilter === filter ? 'active' : ''} onClick={() => { setIssueFilter(filter); setSelectedIssueId(null); }}>{t(`p1.issueFilter.${filter}`)}</button>)}</div>
               {qualityWarning && <p><strong>{t('quality.bannerTitle')}</strong><span>{qualityWarning}</span></p>}
-              {visibleWorkbenchIssues.length === 0 ? <div className="issue-empty"><Icon name="check" size={14} /><span>{t('p1.noIssuesInFilter')}</span>{!hasMonitorIssues ? <button data-testid="go-to-delivery" className="button primary" onClick={() => setMonitorPanelTab('export')}>{t('p1.goToDelivery')}</button> : null}</div> : <div className="issue-list">{visibleWorkbenchIssues.map((issue) => <button key={issue.id} className={`${issue.severity}${selectedIssueId === issue.id ? ' active' : ''}`} onClick={() => locateWorkbenchIssue(issue)} disabled={recording}>
+              {visibleWorkbenchIssues.length === 0 ? <div className="issue-empty"><Icon name="check" size={14} /><span>{t('p1.noIssuesInFilter')}</span>{!hasMonitorIssues ? <button data-testid="go-to-delivery" className="button primary" onClick={() => setMonitorPanelTab('export')}>{t('p1.goToDelivery')}</button> : null}</div> : <div className="issue-list">{visibleWorkbenchIssues.map((issue) => <button key={issue.id} className={`${issue.severity}${selectedIssueId === issue.id ? ' active' : ''}`} onClick={() => locateWorkbenchIssue(issue)} disabled={recording || accepting}>
                 <i />
                 <span><strong>{t(`p1.issueKind.${issue.kind}`)}</strong><small>{issue.itemId ? t('p1.issueItem', { id: issue.itemId }) : t('p1.issueTaskLevel')}</small></span>
                 <em>{issue.severity === 'blocker' ? t('p1.blocker') : t('p1.warning')}</em>

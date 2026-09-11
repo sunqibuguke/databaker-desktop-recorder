@@ -346,6 +346,8 @@ export type Meter = {
   content_started_sample?: number;
   silence_threshold_dbfs: number;
   silence_duration_ms: number;
+  /** Actual live capture target, including the scheduling safety margin. */
+  silence_target_ms?: number;
   silence_detector?: SilenceDetector;
   vad_health?: VadHealth;
   vad_backlog_samples?: number;

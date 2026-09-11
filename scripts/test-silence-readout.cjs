@@ -25,6 +25,8 @@ async function main() {
     shouldUseRecordedSilencePair,
     takeReviewPeak,
   } = await import(pathToFileURL(path.join(__dirname, '..', 'src', 'silence-readout.ts')).href);
+  const timing = await import(pathToFileURL(path.join(__dirname, '..', 'shared', 'silence-timing.ts')).href);
+  assert.equal(timing.captureSilenceDurationMs(1_000), 1_100, 'capture reserves an extra 100 ms beyond the setting');
 
   assert.equal(actualHeadSilenceMs(1_000, 1_480, 48_000), 10);
   assert.equal(actualHeadSilenceMs(1_000, 0, 48_000), null);
@@ -33,6 +35,10 @@ async function main() {
     headSilencePassedSample: 192_000,
     requiredHeadSilenceSamples: 48_000,
   }), 144_000);
+  assert.equal(attemptHeadStartSample({
+    recording_started_sample: 0, start_sample: 48_000,
+    head_silence_passed_sample: 48_000, required_head_silence_samples: 48_000,
+  }, 'energy'), 0, 'the first sample is a valid recording origin, not a missing value');
   assert.equal(liveHeadMsFromMeter({
     sampleRate: 48_000,
     armedSample: 0,
@@ -309,6 +315,37 @@ async function main() {
   assert.equal(goodMarks.headShort, false);
   assert.equal(goodMarks.tailShort, false);
   assert.equal(goodMarks.title, '');
+
+  for (const sampleRate of [16_000, 44_100, 48_000, 96_000, 192_000]) {
+    const sample = (ms) => Math.round(ms * sampleRate / 1_000);
+    for (const [requiredMs, actualMs, expectedStatus] of [
+      [1_000, 970, 'met'],
+      [1_000, 900, 'met'],
+      [1_000, 890, 'short'],
+      [1_100, 1_000, 'met'],
+      [1_100, 970, 'short'],
+    ]) {
+      const nearBoundaryAttempt = {
+        ...goodAttempt, start_sample: sample(5_000), recording_started_sample: sample(5_000),
+        head_silence_armed_sample: sample(5_000), head_silence_passed_sample: sample(5_000 + actualMs),
+        required_head_silence_samples: sample(requiredMs), content_started_sample: sample(5_000 + actualMs),
+        end_sample: sample(8_000), tail_silence_samples: sample(actualMs),
+        required_tail_silence_samples: sample(requiredMs), forced_without_tail_silence: true,
+      };
+      const pair = reviewSilencePair({ attempt: nearBoundaryAttempt, sampleRate, requiredMs: 1_000 });
+      assert.equal(pair.headStatus, expectedStatus, `${sampleRate}/${actualMs}: head review uses the persisted target with tolerance`);
+      assert.equal(pair.tailStatus, expectedStatus, `${sampleRate}/${actualMs}: forced-stop flag cannot override measured timing tolerance`);
+      const marks = itemSilenceMarks(scriptItem({ attempts: [nearBoundaryAttempt] }), sampleRate, 1_000);
+      assert.equal(marks.headShort, expectedStatus === 'short');
+      assert.equal(marks.tailShort, expectedStatus === 'short');
+    }
+  }
+  const liveNearBoundary = liveSilencePair({
+    recording: true, pending: false, spoken: true, pendingRemainingMs: 0,
+    requiredMs: 1_100, liveSilenceMs: 1_000, headMs: 1_100,
+  });
+  assert.equal(liveNearBoundary.tailMet, false, 'review tolerance must not complete a live capture early');
+  assert.equal(canFinishSpokenTake({ enforce: true, pending: false, spoken: true, tailMet: liveNearBoundary.tailMet }), false);
 
   const legacyTailMarks = itemSilenceMarks(scriptItem({
     attempts: [{
